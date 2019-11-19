@@ -1,0 +1,698 @@
+protocol PGM
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Pragmatic General Multicast Protocol",
+    ShortName = "PGM",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3208"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using IPv4;
+
+endpoint Node
+    over ReassemblyNode
+    accepts Packet;
+
+endpoint ReassemblyNode
+    over IPv4.Node
+    accepts Packet
+{
+    map<uint, array<Packet>> fragments = {};
+    process this accepts d:Packet
+    {
+        ReassemblePGMFragment(d, ref fragments);
+    }
+}
+
+autostart actor ReassemblyServerActor(ReassemblyNode reassemblyNode)
+{
+    // destructor
+    // map<uint, array<Packet>> fragments
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        if ((reassemblyNode.fragments.Values).Count > 0)
+        {
+            foreach (var packets in reassemblyNode.fragments.Values) // packets type is array<Packet>
+            {
+                foreach (var packet in packets)
+                {
+                    ReportInsufficientData(packet, DiagnosisLevel.Error, "PGM: Insufficient fragments for full reassembly.");
+                    DisplayTopLevelMessage(packet);
+                }
+            }
+            reassemblyNode.fragments = {};
+        }
+    }
+}
+
+// Since Bug 36618, change all the "binding" to actor temporarily.
+//binding PGMOverIPv4: ReassemblyNode over node:IPv4.Node
+//{
+    //rule node accepts IPv4.Datagram{Protocol is ProtocolType.PGM, Payload is p:Packet from PGMDecoder} =>
+        //ReassemblyNode accepts p;
+//}
+
+autostart actor PGMOverIPv4(IPv4.Node node)
+{
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.PGM
+    {
+        switch (d.Payload)
+        {
+            case p:Packet from PGMDecoder =>
+                dispatch (endpoint ReassemblyNode over node) accepts p;
+            default => 
+                ThrowDecodingException("PGM");
+        }
+    }
+}
+
+void ReassemblePGMFragment(Packet d, ref map<uint, array<Packet>> fragments)
+{
+    var node = endpoint PGM.Node;
+    if (!(d.Body is DataPacket))
+    {
+        dispatch node accepts d;
+    }
+    else
+    {
+        // Catch the fragment
+        DataPacket k = d.Body as DataPacket;
+        uint key;
+        uint length;
+        array<Option> options = k.Options as array<Option>;
+        foreach (Option optfragment1 in options)
+        {
+            if (optfragment1.Option is OptFragmentation)
+            {
+                OptFragmentation optfragment = optfragment1.Option as OptFragmentation;
+                key = optfragment.FirstSequenceNumber as uint;
+                length = optfragment.Length;
+            }
+        }
+        if (!(key in fragments))
+        {
+            // This is the first arrived fragment
+            fragments[key] = [d];
+        }
+        else // Store the fragment in order from small to large by the DataPacketSequenceNumber
+        {
+            // This is a follow up fragment
+            bool flag = true;
+            foreach (Packet fragment in fragments[key])
+            {
+                DataPacket t = fragment.Body as DataPacket;
+                if (k.DataPacketSequenceNumber == t.DataPacketSequenceNumber)
+                {
+                    flag = false;
+                }
+            }
+            if (flag == true)
+            {
+                int i = fragments[key].Count();
+                fragments[key] += [d];
+                while (i > 0)
+                {
+                    DataPacket f = fragments[key][i-1].Body as DataPacket;
+                    if ( k.DataPacketSequenceNumber > f.DataPacketSequenceNumber)
+                    {
+                        break;
+                    }
+                    fragments[key][i] = fragments[key][i-1];
+                    i--;
+                }
+                fragments[key][i] = d;
+            }
+        }
+        
+        DataPacket firstfragment = fragments[key][0].Body as DataPacket;
+        if (firstfragment.DataPacketSequenceNumber == key)
+        {
+            ushort tsdulength; // Use to get the total length of the fragment
+            foreach (var fragment in fragments[key])
+            {
+                tsdulength = (tsdulength + fragment.TSDULength) as ushort;
+            }
+            if (tsdulength == length) // Reassemble
+            {
+                binary payload = $[];
+                optional binary bodyData = $[];
+                foreach (Packet fragment in fragments[key])
+                {
+                    payload += fragment.Payload == nothing? $[] : (fragment.Payload as binary);
+                }
+                foreach (Packet fragment in fragments[key])
+                {     
+                    bodyData = ((fragment.Body as DataPacket).Data == nothing) ? bodyData : (bodyData as binary) + ((fragment.Body as DataPacket).Data as binary);
+                }
+                Packet msg = new Packet{};
+                msg.SourcePort = fragments[key][0].SourcePort;
+                msg.DestinationPort = fragments[key][0].DestinationPort;
+                msg.Type = fragments[key][0].Type;
+
+                // For msg.Options
+                Options opt = new Options{};
+                opt.E = 0;
+                opt.N = fragments[key][0].Options.N;
+                opt.P = fragments[key][0].Options.P;
+                opt.T = fragments[key][0].Options.T;
+                opt.Reserved = fragments[key][0].Options.Reserved;
+                msg.Options = opt;
+
+                msg.Checksum = fragments[key][0].Checksum;
+                msg.GlobalSourceID = fragments[key][0].GlobalSourceID;
+                msg.TSDULength = length as ushort;
+
+                // For msg.Body
+                DataPacket n = new DataPacket{};
+                DataPacket s = fragments[key][0].Body as DataPacket;
+                n.DataPacketSequenceNumber = s.DataPacketSequenceNumber;
+                n.TrailingEdgeSequenceNumber = s.TrailingEdgeSequenceNumber;
+                n.Options = [];
+                n.Options = s.Options;
+                n.Data = bodyData == $[] ? nothing : bodyData;
+                msg.Body = n;
+
+                msg.Payload = payload == $[] ? nothing : bodyData;
+                foreach (Packet p in fragments[key])
+                {
+                    msg.Origins += [p];
+                    msg.SourceData = (msg.SourceData as binary) + (p.SourceData as binary);
+                }
+                
+                msg.AssignFieldEncodingInfo("SourcePort", 0, 16);
+                msg.AssignFieldEncodingInfo("DestinationPort", 16, 16);
+                msg.AssignFieldEncodingInfo("Type", 32, 8);
+                msg.AssignFieldEncodingInfo("Options", 40, 8);
+                msg.Options.AssignFieldEncodingInfo("P", 40, 1);
+                msg.Options.AssignFieldEncodingInfo("T", 41, 1);
+                msg.Options.AssignFieldEncodingInfo("Reserved", 42, 4);
+                msg.Options.AssignFieldEncodingInfo("N", 46, 1);
+                msg.Options.AssignFieldEncodingInfo("E", 47, 1);
+                msg.AssignFieldEncodingInfo("Checksum", 48, 16);
+                msg.AssignFieldEncodingInfo("GlobalSourceID", 64, 48);
+                msg.AssignFieldEncodingInfo("TSDULength", 112, 16);
+                int lengthOfOptions;
+                if ((msg.Body as DataPacket).Options == nothing)
+                {
+                    lengthOfOptions = 0;
+                }
+                else
+                {
+                    lengthOfOptions = (((msg.Body as DataPacket).Options as array<Option>)[0].Option as OptLength).TotalLengthOfAllOptions;
+                }
+                n.AssignFieldEncodingInfo("DataPacketSequenceNumber", 128, 32);
+                n.AssignFieldEncodingInfo("TrailingEdgeSequenceNumber", 160, 32);
+                n.AssignFieldEncodingInfo("Data", 192 + lengthOfOptions * 8, bodyData == nothing ? 0 : (bodyData as binary).Count);
+                
+                // Clear buffered fragments
+                fragments = fragments.Remove(key);
+                dispatch node accepts msg;
+            }
+        }
+    }
+}
+
+type Type
+{
+    byte Version with BinaryEncoding{Width = 2};
+    byte Reserved where ValidationCheck(value == 0, null, "The Reserved in type Type must be zero.") with BinaryEncoding{Width = 2};
+    byte Type with BinaryEncoding{Width = 4};
+}
+
+type Options
+{
+    byte P with BinaryEncoding{Width = 1};
+    byte T with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 4};
+    byte N with BinaryEncoding{Width = 1};
+    byte E with BinaryEncoding{Width = 1};
+}
+
+message Packet
+{
+    ushort SourcePort;
+    ushort DestinationPort;
+    Type Type;
+    Options Options;
+    ushort Checksum;
+    ulong GlobalSourceID with BinaryEncoding{Width = 48};
+    ushort TSDULength;
+    ([|Type.Type == 0x00|] SourcePathMessage
+    | [|Type.Type == 0x01|] PollRequest
+    | [|Type.Type == 0x02|] PollResponse
+    | [|Type.Type in {0x04, 0x05}|] DataPacket
+    | [|Type.Type in {0x08, 0x09, 0x0A}|] NAKAndNCF
+    | [|Type.Type == 0x0C|] SPMRequest
+    | binary) Body;
+    optional binary Payload with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string display = "";
+        switch (Type.Type)
+        {
+            case 0x00 => display += "Source Path Message";
+            case 0x01 => display += "Poll Request";
+            case 0x02 => display += "Poll Response";
+            case 0x04 => display += "Original Data Packet";
+            case 0x05 => display += "RData Packet";
+            case 0x08 => display += "Negative Acknowledgment";
+            case 0x09 => display += "Null Negative Acknowledgment";
+            case 0x0A => display += "NAK Confirmation";
+            case 0x0C => display += "SPM Request";
+            default => 
+                display += "Unknown Packet Type(" + Utility.DecToHexFormat(Type.Type) + ")";
+        }
+        display += ", SrcPort: " + (SourcePort as string) + ", DstPort: " + (DestinationPort as string) + ", TSDULength: " + (TSDULength as string);
+        return display;
+    }
+}
+
+optional Packet PGMDecoder(stream payload)
+{
+    optional array<Option> options = nothing;
+    optional Packet d1 = BinaryDecoder<Packet>(payload);
+    if (d1 == nothing)
+    {
+        return nothing;
+    }
+    Packet d = d1 as Packet;
+    if (payload.BytePosition == payload.ByteLength)
+    {
+        return d;
+    }
+    if (d.Options.E == 1)
+    {
+        optional Option optOptional = BinaryDecoder<Option>(payload);
+        if (optOptional != nothing && (optOptional as Option).Option is OptLength)
+        {
+            var opt = optOptional as Option;
+            options = [opt];
+            OptLength optlength = opt.Option as OptLength;
+            int offset = payload.BytePosition;
+            while ((payload.BytePosition - offset) < (optlength.TotalLengthOfAllOptions - 4))
+            {
+                optional Option option = BinaryDecoder<Option>(payload);
+                if (option == nothing)
+                {
+                    break;
+                }
+                options = (options as array<Option>) + [option as Option];
+            }
+        }
+    }
+    else
+    {
+        d.Payload = payload.PeekBytes(payload.BitPosition);
+    }
+    if (d.Body is SourcePathMessage)
+    {
+        SourcePathMessage k = d.Body as SourcePathMessage;
+        k.Options = options;
+    }
+    else if (d.Body is PollRequest)
+    {
+        PollRequest k = d.Body as PollRequest;
+        k.Options = options;
+    }
+    else if (d.Body is PollResponse)
+    {
+        PollResponse k = d.Body as PollResponse;
+        k.Options = options;
+    }
+    else if (d.Body is DataPacket)
+    {
+        DataPacket k = d.Body as DataPacket;
+        k.Data = payload.PeekBytes(payload.BitPosition);
+        k.Options = options;
+    }
+    else if (d.Body is NAKAndNCF)
+    {
+        NAKAndNCF k = d.Body as NAKAndNCF;
+        k.Options = options;
+    }
+    else if (d.Body is SPMRequest)
+    {
+        SPMRequest k = d.Body as SPMRequest;
+        k.Options = options;
+    }
+    return d;
+}
+
+type Option
+{
+    (OptLength
+    | OptFragmentation
+    | OptNAKList
+    | OptJoin
+    | OptNAKBackOffInterval
+    | OptNAKBackOffRange
+    | OptRedirect
+    | OptParityPRM
+    | OptParityGRP
+    | OptCurrentTGSize
+    | OptNeighborUnreachable
+    | OptPathNLA
+    | OptSynchronization
+    | OptSessionFin
+    | OptSessionReset
+    | OptCongestionReport
+    | OptCongestionReportRequest
+    | DefaultOption) Option;
+}
+
+// Flags.Type = 0x00
+type SourcePathMessage
+{
+    uint SPMSequenceNumber;
+    uint TrailingEdgeSequenceNumber;
+    uint LeadingEdgeSequenceNumber;
+    ushort NLAAFI;
+    ushort Reserved;
+    ([|NLAAFI == 1|] IPv4Address
+    | [|NLAAFI == 2|] IPv6Address
+    | uint) PathNLA;
+    optional array<Option> Options with Encoding{Ignore = true};
+}
+
+// Flags.Type = 0x01
+type PollRequest
+{
+    uint POLLSequenceNumber;
+    ushort POLLRound;
+    ushort POLLSubtype;
+    ushort NLAAFI;
+    ushort Reserved;
+    ([|NLAAFI == 1|] IPv4Address
+    | [|NLAAFI == 2|] IPv6Address
+    | uint) PathNLA;
+    uint POLLBackoffInterval;
+    uint RandomString;
+    uint MatchingBitMask;
+    optional array<Option> Options with Encoding{Ignore = true};
+}
+
+// Flags.Type = 0x02
+type PollResponse
+{
+    uint POLLSequenceNumber;
+    ushort POLLRound;
+    ushort Reserved;
+    optional array<Option> Options with Encoding{Ignore = true};
+}
+
+// Flags.Type = 0x04 || Flags.Type = 0x05
+type DataPacket
+{
+    uint DataPacketSequenceNumber;
+    uint TrailingEdgeSequenceNumber;
+    optional array<Option> Options with Encoding{Ignore = true};
+    optional binary Data with Encoding{Ignore = true};
+}
+
+// Flags.Type = 0x08 || Flags.Type = 0x09 || Flags.Type =  0x0A
+type NAKAndNCF
+{
+    uint RequestedSequenceNumber;
+    ushort SourceNLAAFI;
+    ushort Reserved1;
+    ([|SourceNLAAFI == 1|] IPv4Address
+    | [|SourceNLAAFI == 2|] IPv6Address
+    | uint) SourceNLA;
+    ushort GroupNLAAFI;
+    ushort Reserved2;
+    ([|GroupNLAAFI == 1|] IPv4Address
+    | [|GroupNLAAFI == 2|] IPv6Address
+    | uint) GroupNLA;
+    optional array<Option> Options with Encoding{Ignore = true};
+}
+
+// Flags.Type = 0x0C
+type SPMRequest
+{
+    optional array<Option> Options with Encoding{Ignore = true};
+}
+
+type OptLength
+{
+    (byte where value == 0x00) OptionType;
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptLength should be 4.");
+    ushort TotalLengthOfAllOptions;
+}
+
+type OptFragmentation
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x01) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 16, null, "The OptionLength in type OptFragmentation should be 16.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint FirstSequenceNumber;
+    uint Offset;
+    uint Length;
+}
+
+type OptNAKList
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x02) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value >= 4, null, "The OptionLength in type OptNAKList should be greater than or equal to 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    array<uint> RequestedSequenceNumber with BinaryEncoding{Length = ((OptionLength - 4) / 4)};
+}
+
+type OptJoin
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x03) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 8, null, "The OptionLength in type OptJoin should be 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint MinimumSequenceNumber;
+}
+
+type OptNAKBackOffInterval
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x04) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 12, null, "The OptionLength in type OptNAKBackOffInterval should be 12.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint NAKBackOffInterval;
+    uint NAKBackOffIntervalSQN;
+}
+
+type OptNAKBackOffRange
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x05) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 12, null, "The OptionLength in type OptNAKBackOffRange should be 12.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint MaximumNAKBackOffInterval;
+    uint MinimumNAKBackOffInterval;
+}
+
+type OptRedirect
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x07) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value >= 8, null, "The OptionLength in type OptRedirect should be greater than or equal to 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    ushort NLAAFI;
+    ushort Reserved1;
+    ([|NLAAFI == 1|] IPv4Address
+    | [|NLAAFI == 2|] IPv6Address
+    | BlobString[(OptionLength - 20) as uint]) DLRNLA;
+}
+
+type OptParityPRM
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x08) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 8, null, "The OptionLength in type OptParityPRM should be 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 5};
+    byte P with BinaryEncoding{Width = 1};
+    byte O with BinaryEncoding{Width = 1};
+    uint TransmissionGroupSize;
+}
+
+type OptParityGRP
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x09) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 8, null, "The OptionLength in type OptParityGRP should be 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint ParityGroupNumber;
+}
+
+type OptCurrentTGSize
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0A) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 8, null, "The OptionLength in type OptCurrentTGSize should be 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    uint ActualTransmissionGroupSize;
+}
+
+type OptNeighborUnreachable
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0B) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptNeighborUnreachable should be 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+}
+
+type OptPathNLA
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0C) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 8, null, "The OptionLength in type OptPathNLA should be 8.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+    IPv4Address PathNLA;
+}
+
+type OptSynchronization
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0D) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptSynchronization should be 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+}
+
+type OptSessionFin
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0E) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptSessionFin should be 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 7};
+}
+
+type OptSessionReset
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x0F) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptSessionReset should be 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte N with BinaryEncoding{Width = 1};
+    byte ErrorCode with BinaryEncoding{Width = 6};
+}
+
+type OptCongestionReport
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x10) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength;
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 4};
+    byte L with BinaryEncoding{Width = 1};
+    byte P with BinaryEncoding{Width = 1};
+    byte R with BinaryEncoding{Width = 1};
+    uint CongestionReportReferenceSQN;
+    ushort NEWorstLink;
+    ushort NEWorstPath;
+    ushort RcvrWorstPath;
+    ushort Reserved1;
+    ushort NLAAFI;
+    ushort Reserved2;
+    ([|NLAAFI == 1|] IPv4Address
+    | [|NLAAFI == 2|] IPv6Address
+    | BlobString[(OptionLength - 20) as uint]) WorstReceiverNLA;
+}
+
+type OptCongestionReportRequest
+{
+    byte E with BinaryEncoding{Width = 1};
+    (byte where value == 0x11) OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength where ValidationCheck(value == 4, null, "The OptionLength in type OptCongestionReportRequest should be 4.");
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Unused with BinaryEncoding{Width = 4};
+    byte L with BinaryEncoding{Width = 1};
+    byte P with BinaryEncoding{Width = 1};
+    byte R with BinaryEncoding{Width = 1};
+}
+
+type DefaultOption
+{
+    byte E with BinaryEncoding{Width = 1};
+    byte OptionType with BinaryEncoding{Width = 7};
+    byte OptionLength;
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte F with BinaryEncoding{Width = 1};
+    byte OPX with BinaryEncoding{Width = 2};
+    byte U with BinaryEncoding{Width = 1};
+    byte Specific with BinaryEncoding{Width = 7};
+    binary OptionValue with BinaryEncoding{Length = (OptionLength - 4)};
+}

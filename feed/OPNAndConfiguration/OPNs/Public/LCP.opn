@@ -1,0 +1,424 @@
+protocol LCP with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "PPP link control protocol",
+    ShortName = "LCP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1334"},
+            new Reference{Name = "RFC 1570"},
+            new Reference{Name = "RFC 1661"},
+            new Reference{Name = "RFC 1663"},
+            new Reference{Name = "RFC 1717"},
+            new Reference{Name = "RFC 1934"},
+            new Reference{Name = "RFC 1994"},
+            new Reference{Name = "RFC 2125"},
+            new Reference{Name = "RFC 2153"},
+            new Reference{Name = "RFC 2484"},
+            new Reference{Name = "RFC 2686"},
+            new Reference{Name = "RFC 2823"},
+            new Reference{Name = "LCP", Link = "http://www.networksorcery.com/enp/protocol/lcp.htm"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using Standard;
+using PPP;
+using Utility;
+
+endpoint Node[byte Id]
+    over PPP.Node
+    accepts Datagram;
+
+autostart actor LCPOverPPP(PPP.Node node)
+{
+    process node accepts f:PPP.Frame where GetPacketTypeValue(f.PacketType) == 0xC021
+    {
+        switch (f.Payload)
+        {
+            case d:Datagram from LCPDecoder =>
+                var n = endpoint LCP.Node[d.Identifier];
+                dispatch n accepts d;
+            default =>
+                ThrowDecodingException("LCP");
+        }
+    }
+}
+
+optional Datagram LCPDecoder(stream streamValue)
+{
+    optional Datagram d = BinaryDecoder<Datagram>(streamValue);
+    if (d == nothing)
+    {
+        return nothing;
+    }
+    Datagram datagram = d as Datagram;
+    switch (datagram.Code)
+    {
+        case 0 =>
+            datagram.MessageBody = BinaryDecoder<VendorSpecific[datagram.Length - 12 as ushort]>(streamValue) as VendorSpecific[datagram.Length - 12 as ushort];
+        case 5 =>
+            datagram.MessageBody = BinaryDecoder<Terminate[datagram.Length - 4 as ushort]>(streamValue) as Terminate[datagram.Length - 4 as ushort];
+        case 6 =>
+            datagram.MessageBody = BinaryDecoder<Terminate[datagram.Length - 4 as ushort]>(streamValue) as Terminate[datagram.Length - 4 as ushort];
+        case 7 =>
+            datagram.MessageBody = BinaryDecoder<CodeReject[datagram.Length - 4 as ushort]>(streamValue) as CodeReject[datagram.Length - 4 as ushort];
+        case 8 =>
+            datagram.MessageBody = BinaryDecoder<ProtocolReject[datagram.Length - 6 as ushort]>(streamValue) as ProtocolReject[datagram.Length - 6 as ushort];
+        case 9 =>
+            datagram.MessageBody = BinaryDecoder<Echo[datagram.Length - 8 as ushort]>(streamValue) as Echo[datagram.Length - 8 as ushort];
+        case 10 =>
+            datagram.MessageBody = BinaryDecoder<Echo[datagram.Length - 8 as ushort]>(streamValue) as Echo[datagram.Length - 8 as ushort];
+        case 11 =>
+            datagram.MessageBody = BinaryDecoder<DiscardRequest[datagram.Length - 8 as ushort]>(streamValue) as DiscardRequest[datagram.Length - 8 as ushort];
+        case 12 =>
+            datagram.MessageBody = BinaryDecoder<Identification[datagram.Length - 8 as ushort]>(streamValue) as Identification[datagram.Length - 8 as ushort];
+        case 13 =>
+            datagram.MessageBody = BinaryDecoder<TimeRemaining[datagram.Length - 12 as ushort]>(streamValue) as TimeRemaining[datagram.Length - 12 as ushort];
+        default =>
+            if (datagram.Code in {1,2,3,4})
+            {
+                DecodeForOptions(ref datagram, streamValue);
+            }
+            else
+            {
+                datagram.MessageBody = streamValue.PeekBytes(streamValue.BytePosition * 8);
+            }
+    }
+    return datagram;
+}
+
+void DecodeForOptions(ref Datagram datagram, stream optionPayload)
+{
+    ushort totalLen;
+    totalLen = datagram.Length - 4 as ushort;
+    array<ConfigurationOption> optionArray = [];
+    while (totalLen > 0)
+    {
+        var option = BinaryDecoder<ConfigurationOption>(optionPayload);
+        if (option != null && option != nothing && (option as ConfigurationOption).Length > 0 && (option as ConfigurationOption).Length <= totalLen)
+        {
+            var opt = option as ConfigurationOption;
+            if (opt.Type == 26)
+            {
+                var prefixElision = opt.OptionBody as PrefixElision;
+                byte prefixLen = opt.Length - 2 as byte;
+                prefixElision.Prefixs = [];
+                byte prefixPointer = 0;
+                while (prefixLen > 0)
+                {
+                    var perfix = BinaryDecoder<Prefix>((prefixElision.PrefixPayload as binary).Segment(prefixPointer));
+                    if (perfix != null && perfix != nothing && (perfix as Prefix).Length >= 0 && (perfix as Prefix).Length <= prefixLen)
+                    {
+                        prefixElision.Prefixs = (prefixElision.Prefixs as array<Prefix>) + [perfix as Prefix];
+                        prefixLen = prefixLen - (perfix as Prefix).Length - 2 as byte;
+                        prefixPointer = prefixPointer + ((perfix as Prefix).Length + 2) as byte;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+                prefixElision.PrefixPayload = nothing;
+                if ((prefixElision.Prefixs as array<Prefix>).Count == 0)
+                {
+                    prefixElision.Prefixs = nothing;
+                }
+                opt.OptionBody = prefixElision;
+            }
+            optionArray += [opt];
+            totalLen = totalLen - opt.Length as ushort;
+        }
+        else
+        {
+            break;
+        }
+    }
+    if (optionArray.Count == 0)
+    {
+        datagram.MessageBody = nothing;
+    }
+    else
+    {
+        OptionList list = new OptionList{};
+        list.OptionList = optionArray;
+        datagram.MessageBody = list;
+    }
+}
+
+message Datagram
+{
+    Code Code;
+    byte Identifier;
+    ushort Length;
+    optional ((VendorSpecific [Length - 12 as ushort])             // RFC 2153  Code:0
+        // Similar to bug 28904, if use "array<ConfigurationOption>" instead of "OptionList" below, 
+        // you will not be able to expand this array on UI.
+        | OptionList                                            // RFC 1661  Code:1,2,3,4
+        | (Terminate [Length - 4 as ushort])                      // RFC 1661  Code:5,6
+        | (CodeReject [Length - 4 as ushort])                     // RFC 1661  Code:7
+        | (ProtocolReject [Length - 6 as ushort])                 // RFC 1661  Code:8
+        | (Echo [Length - 8 as ushort])                           // RFC 1661  Code:9,10
+        | (DiscardRequest [Length - 8 as ushort])                 // RFC 1661  Code:11
+        | (Identification [Length - 8 as ushort])                 // RFC 1570  Code:12
+        | (TimeRemaining [Length - 12 as ushort])                 // RFC 1570  Code:13
+        | binary) MessageBody with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        return (InRange<Code>(Code) ? "" : "Unknown Type Code: ") + EnumToString<LCP.Code>(Code, false) 
+               + ", Identifier: " + (Utility.DecToHexFormat(Identifier)) + ", Length: " + Length.ToString();
+    }
+}
+
+pattern Code = enum byte
+{
+    $"Vendor Specific" = 0,
+    $"Configure-Request" = 1,
+    $"Configure-Ack" = 2,
+    $"Configure-Nak" = 3,
+    $"Configure-Reject" = 4,
+    $"Terminate-Request" = 5,
+    $"Terminate-Ack" = 6,
+    $"Code-Reject" = 7,
+    $"Protocol-Reject" = 8,
+    $"Echo-Request" = 9,
+    $"Echo-Reply" = 10, 
+    $"Discard-Request" = 11,
+    $"Identification" = 12,
+    $"Time-Remaining" = 13,
+    ...
+};
+
+type OptionList
+{
+    array<ConfigurationOption> OptionList;
+}
+
+type VendorSpecific[ushort len]
+{
+    uint MagicNumber;
+    uint OUI with BinaryEncoding{Width = 24};
+    byte Kind;
+    optional [|len > 0|] string Value with BinaryEncoding{Length = len, TextEncoding = TextEncoding.ASCII};
+}
+
+type Terminate[ushort len]
+{
+    optional [|len > 0|] string Data with BinaryEncoding{Length = len, TextEncoding = TextEncoding.ASCII};
+}
+
+type CodeReject[ushort len]
+{
+    optional [|len > 0|] string RejectedPacket with BinaryEncoding{Length = len, TextEncoding = TextEncoding.ASCII};
+}
+
+type ProtocolReject[ushort len]
+{
+    ushort RejectedProtocol;
+    optional [|len > 0|] binary RejectedInformation with BinaryEncoding{Length = len};
+}
+
+type Echo[ushort len]
+{
+    uint MagicNumber;
+    optional [|len > 0|] binary Data with BinaryEncoding{Length = len};
+}
+
+type DiscardRequest[ushort len]
+{
+    uint MagicNumber;
+    optional [|len > 0|] binary Data with BinaryEncoding{Length = len};
+}
+
+type Identification[ushort len]
+{
+    uint MagicNumber;
+    optional [|len > 0|] string Message with BinaryEncoding{Length = len, TextEncoding = TextEncoding.ASCII};
+}
+
+type TimeRemaining[ushort len]
+{
+    uint MagicNumber;
+    uint SecondsRemaining;
+    optional [|len > 0|] string Message with BinaryEncoding{Length = len, TextEncoding = TextEncoding.ASCII};
+}
+
+type ConfigurationOption
+{
+    byte Type;
+    byte Length;
+    ([|Type == 0|] VendorSpecificOption[Length]                   // Type:0   RFC 2153
+        | [|Type == 1|] MaximumReceiveUnit                        // Type:1   RFC 1661
+        | [|Type == 2|] AsyncControlCharacterMap                  // Type:2   NPL
+        | [|Type == 3|] AuthenticationProtocol                    // Type:3   RFC 1334,1661,1994
+        | [|Type == 4|] QualityProtocol                           // Type:4   RFC 1661
+        | [|Type == 5|] MagicNumber                               // Type:5   RFC 1661
+        | [|Type == 7|] ProtocolFieldCompression                  // Type:7   RFC 1661
+        | [|Type == 8|] AddressAndControlFieldCompression         // Type:8   RFC 1661
+        | [|Type == 9|] FCSAlternatives                           // Type:9   RFC 1570
+        | [|Type == 10|] SelfDescribingPad                        // Type:10  RFC 1570
+        | [|Type == 11|] NumberedMode[Length]                     // Type:11  RFC 1663
+        | [|Type == 13|] Callback[Length]                         // Type:13  RFC 1570
+        | [|Type == 15|] CompoundFrames                           // Type:15  RFC 1570
+        | [|Type == 17|] MultilinkMaxReceiveReconstructedUnit     // Type:17  RFC 1717
+        | [|Type == 18|] MultilinkShortSequenceNumberHeaderFormat // Type:18  RFC 1717
+        | [|Type == 19|] MultilinkEndpointDiscriminator[Length]   // Type:19  RFC 1717
+        | [|Type == 22|] MPProcedureOption                        // Type:22  RFC 1934
+        | [|Type == 23|] LinkDiscriminatorForBACP                 // Type:23  RFC 2125
+        | [|Type == 26|] PrefixElision[Length]                    // Type:26  RFC 2686
+        | [|Type == 27|] MultilinkHeaderFormat                    // Type:27  RFC 2686
+        | [|Type == 28|] Internationalization[Length]             // Type:28  RFC 2484
+        | [|Type == 29|] SimpleDataLinkOnSonetOrSdh               // Type:29  RFC 2823
+        | Blob[Length - 2 as uint]) OptionBody;
+}
+
+type VendorSpecificOption[byte len]
+{
+    uint OUI with BinaryEncoding{Width = 24};
+    byte Kind;
+    optional [|len > 0|] string Value with BinaryEncoding{Length = len - 6, TextEncoding = TextEncoding.ASCII};
+}
+
+type MaximumReceiveUnit
+{
+    ushort MaximumReceiveUnit;
+}
+
+type AsyncControlCharacterMap
+{
+    uint AsyncControlCharacterMap;
+}
+
+type AuthenticationProtocol
+{
+    ushort AuthenticationProtocol;
+    optional [|AuthenticationProtocol == 0xC223|] byte Data;
+}
+
+type QualityProtocol
+{
+    ushort QualityProtocol;
+}
+
+type MagicNumber
+{
+    uint MagicNumber;
+}
+
+pattern ProtocolFieldCompression = Empty;
+
+pattern AddressAndControlFieldCompression = Empty;
+
+type FCSAlternatives
+{
+    byte Options;
+}
+
+type SelfDescribingPad
+{
+    byte Maximum;
+}
+
+type NumberedMode[byte len]
+{
+    byte Window;
+    HDLCAddress[len] HDLCAddress;
+}
+
+type HDLCAddress [byte len]
+{
+    byte EA with BinaryEncoding{Width = 1};
+    byte CR with BinaryEncoding{Width = 1};
+    byte SAP with BinaryEncoding{Width = 6};
+    optional [|len > 4|] string ExtendedAddress with BinaryEncoding{Length = len - 4, TextEncoding = TextEncoding.ASCII};
+}
+
+type Callback[byte len]
+{
+    byte Operation;
+    optional [|len > 3|] string Message with BinaryEncoding{Length = len - 3, TextEncoding = TextEncoding.ASCII};
+}
+
+pattern CompoundFrames = Empty;
+
+type MultilinkMaxReceiveReconstructedUnit
+{
+    ushort MaxReceiveReconstructedUnit;
+}
+
+pattern MultilinkShortSequenceNumberHeaderFormat = Empty;
+
+type MultilinkEndpointDiscriminator[byte len]
+{
+    byte Class;
+    ([|Class == 0|] Blob[0]
+        | [|Class == 1|] LocallyAssignedAddress[len - 3 as byte]
+        | [|Class == 2|] IPv4Address
+        | [|Class == 3|] MacAddress
+        | [|Class == 4|] MagicNumberInMultilinkEndpointDiscriminator[len]
+        | [|Class == 5|] PublicSwitchedNetworkDirectoryNumber[len - 3 as byte]
+        | Blob[len - 3 as uint]) Address;
+}
+
+type LocallyAssignedAddress[byte len]
+{
+    optional [|len > 0|] binary LocallyAssignedAddress with BinaryEncoding{Length = len};
+}
+
+type PublicSwitchedNetworkDirectoryNumber[byte len]
+{
+    optional [|len > 0|] binary PublicSwitchedNetworkDirectoryNumber with BinaryEncoding{Length = len};
+}
+
+type  MagicNumberInMultilinkEndpointDiscriminator[byte len]
+{
+    array<uint> MagicNumber with BinaryEncoding{Length = (len - 3) / 4};
+}
+
+type MPProcedureOption
+{
+    ushort CurrentlyUnused;
+}
+
+type LinkDiscriminatorForBACP
+{
+    ushort LinkDiscriminator;
+}
+
+// Decode By Hand
+type PrefixElision[byte len]
+{
+    optional binary PrefixPayload with BinaryEncoding{Length = len - 2};
+    optional array<Prefix> Prefixs with Encoding{Ignore = true};
+}
+
+type Prefix
+{
+    byte Class;
+    byte Length;
+    string Prefix with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type MultilinkHeaderFormat
+{
+    byte Code;
+    byte SuspClses;
+}
+
+type Internationalization[byte len]
+{
+    uint MIBenum;
+    string LanguageTag with BinaryEncoding{Length = len - 6, TextEncoding = TextEncoding.ASCII};
+}
+
+pattern SimpleDataLinkOnSonetOrSdh = Empty;

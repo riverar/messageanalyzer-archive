@@ -1,0 +1,328 @@
+protocol RTP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Real-Time Transport Protocol",
+    ShortName = "RTP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3550"},
+            new Reference{Name = "RFC 3551"},
+            new Reference{Name = "RFC 5285"},
+            new Reference{Name = "RFC 6051"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "378314", Date = "06/30/2015"}
+        ]
+};
+
+using Standard;
+using IANA;
+using UDP;
+using Configurations;
+
+// Keep the values for RTCP
+annotation ushort Datagram#DestinationPort;
+annotation ushort Datagram#SourcePort;
+annotation binary Datagram#SourceAddress;
+annotation binary Datagram#DestinationAddress;
+
+endpoint Node over UDP.Host accepts Datagram;
+
+autostart actor RTPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where IsRTP(d)
+    {
+        if (!DecodeAndDispatchPacket(d, host))
+        {
+            reject;
+        }
+    }
+}
+
+message Datagram
+{
+    byte Version where ValidationCheck(value == 2, null, "The Version in message Datagram must be 2.") with BinaryEncoding{Width = 2};
+    bool Padding with BinaryEncoding{Width = 1};
+    bool Extension with BinaryEncoding{Width = 1};
+    byte CSRCCount  with BinaryEncoding{Width = 4};
+    bool Marker with BinaryEncoding{Width = 1};
+    byte PayloadType with BinaryEncoding{Width = 7};
+    ushort SequenceNumber;
+    uint TimeStamp;
+    uint SSRC;
+    optional [|CSRCCount != 0|] array<uint> CSRCList with BinaryEncoding{Length = CSRCCount};
+    optional HeaderExtension ExtensionHead with Encoding{Ignore = true};
+    optional binary Payload with Encoding{Ignore = true};
+    optional any Paddingload with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string summary = null;
+        summary = "PayloadType: " + PayloadTypeToString(PayloadType) +
+            ", SSRC: " + (SSRC.ToString()) +
+            ", SequenceNumber: " + (SequenceNumber.ToString()) +
+            ", TimeStamp: " + (TimeStamp.ToString()) + ", ";
+        if (Marker == true)
+        {
+            summary = summary + "Mark";
+        }
+        else
+        {
+            summary = summary + "NotMark";
+        }
+        return summary;
+    }
+}
+
+type HeaderExtension
+{
+    ushort DefinedByProfile;
+    ushort Length;
+    array<any> ExtensionElements with Encoding{Ignore = true};
+}
+
+type OneByteHead
+{
+    byte ID where ValidationCheck((value >= 1 && value <= 14), null, "The ID in type OneByteHead should be in the range 1 - 14 inclusive.") with BinaryEncoding{Width = 4};
+    byte Length with BinaryEncoding{Width = 4};
+    array<byte> Data with BinaryEncoding{Length = (Length + 1)};
+}
+
+type TwoByteHead
+{
+    byte ID;
+    byte Length;
+    array<byte> Data with BinaryEncoding{Length = Length};
+}
+
+bool DecodeAndDispatchPacket(UDP.Datagram d, UDP.Host host)
+{
+    stream m = d.Payload;
+    optional Datagram msg = BinaryDecoder<Datagram>(m);
+    // WORKAROUND: Can't define annotation for optional Datagram.
+    Datagram datagram = new Datagram{};
+    if (msg != nothing)
+    {
+        datagram = msg as Datagram;
+        if (datagram.Extension == true)
+        {
+            HeaderExtension headerEx = BinaryDecoder<HeaderExtension>(m) as HeaderExtension;
+            ushort definedByProfile = headerEx.DefinedByProfile;
+            array<any> elements = [];
+            int endPosition = m.BytePosition + headerEx.Length * 4;
+            int lastBytePosition = m.BytePosition;
+            while (m.BytePosition < endPosition)
+            {
+                // RFC 5285 4.2. One-Byte Header
+                if (definedByProfile == 0xBEDE)
+                {
+                    OneByteHead element = BinaryDecoder<OneByteHead>(m) as OneByteHead;
+                    elements += [element];
+                }
+                // RFC 5285 4.3. Two-Byte Header
+                if (definedByProfile >= 4096 && definedByProfile <= 4111)
+                {
+                    TwoByteHead element = BinaryDecoder<TwoByteHead>(m) as TwoByteHead;
+                    elements += [element];
+                }
+                while (m.CurrentByte == 0 && m.BytePosition < endPosition)
+                {
+                    BinaryDecoder<byte>(m);
+                }
+                // Break parsing if BytePosition does not move forward.
+                if (lastBytePosition == m.BytePosition)
+                {
+                    return false;
+                }
+                else
+                {
+                    lastBytePosition = m.BytePosition;
+                }
+            }
+            headerEx.ExtensionElements = elements;
+            datagram.ExtensionHead = headerEx;
+        }
+        else 
+        {
+            datagram.ExtensionHead = nothing;
+        }
+        if (datagram.Padding == true)
+        {
+            int length = d.Payload[d.Payload.Count - 1];
+            datagram.Payload = m.PeekBytes(m.BitPosition, m.ByteLength - m.BytePosition - length);
+            datagram.Paddingload = m.PeekBytes((m.ByteLength - length) * 8, length);
+        }
+        else
+        {
+            datagram.Payload = m.PeekBytes(m.BitPosition, m.ByteLength - m.BytePosition);
+            datagram.Paddingload = nothing;
+        }
+        datagram#DestinationPort = d.DestinationPort;
+        datagram#SourcePort = d.SourcePort;
+        datagram#SourceAddress = d#SourceAddress;
+        datagram#DestinationAddress = d#DestinationAddress;
+
+        // Future Reference: #3396119, RTP datagram should be dispatched with ordering.
+        dispatch (endpoint Node over host) accepts datagram;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+bool IsRTP(UDP.Datagram udpDatagram)
+{
+    binary binaryValue = udpDatagram.Payload;
+    if (binaryValue.Count < 12)
+    {
+        return false;
+    }
+    
+    RTPConfiguration config = GetConfigurableValue<RTPConfiguration>();
+
+    int rtpPayloadType = (binaryValue[1] & 0x7F);
+    // RTP chooce a even number port in port 1024 -- port 65535.
+    // WORKAROUND:should add port 2303 in enum port when DPL8R has be implemented.
+    if ((!InRange<IANA.Port>(udpDatagram.DestinationPort) && udpDatagram.DestinationPort != 2302) && 
+        (!InRange<IANA.Port>(udpDatagram.SourcePort) && udpDatagram.SourcePort != 2302) &&
+        ((udpDatagram.SourcePort >= 1024 && ((udpDatagram.SourcePort) % 2 == 0))             || 
+         (udpDatagram.DestinationPort >= 1024 && ((udpDatagram.DestinationPort) % 2 == 0))   ||
+         (udpDatagram.DestinationPort in config.Ports || udpDatagram.SourcePort in config.Ports))   && 
+        (((binaryValue[0] as byte) & 0xC0) == 0x80)                                          && 
+        ((binaryValue[1] as byte) != 200 && (binaryValue[1] as byte) != 201)                && 
+        ((rtpPayloadType >= 0 && rtpPayloadType <= 19)    || 
+         (rtpPayloadType == 25)                           || 
+         (rtpPayloadType == 26)                           || 
+         (rtpPayloadType == 28)                           || 
+         (rtpPayloadType >= 31 && rtpPayloadType <= 34)   || 
+         (rtpPayloadType >= 72 && rtpPayloadType <= 76)   || 
+         (rtpPayloadType >= 96 && rtpPayloadType <= 127))
+        )
+    {
+        int csrcListLength = ((binaryValue[0] as byte) & 0x0F) * 4;
+        bool isPading = (binaryValue[0] & 0x20) == 0x20 ? true : false;
+        bool isExtersion = (binaryValue[0] & 0x10) == 0x10 ? true : false;
+        int padLength = 0;
+        int exHeadLen = 0;
+        if (12 + csrcListLength + 2 > binaryValue.Count)
+        {
+            return false;
+        }
+        if (isPading)
+        {
+            padLength = binaryValue[binaryValue.Count - 1] as int;
+            if (isExtersion)
+            {
+                // Padding bit set
+                // Extersion bit set
+                // Padding Length is less than the total packet length minus the header size.
+                ushort hel = BinaryDecoder<ushort>(binaryValue.Segment((12 + csrcListLength + 2), 2)) as ushort;
+                exHeadLen = hel as int;
+                if (exHeadLen > (binaryValue.Count - 12 - csrcListLength - 2) || (binaryValue.Count - 12 - csrcListLength - exHeadLen) < padLength)
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                // Padding bit set
+                // Padding Length is less than the total packet length minus the header size.
+                if ((csrcListLength > binaryValue.Count - 12) || (binaryValue.Count - 12 - csrcListLength) < padLength)
+                {
+                    return false;
+                }
+            }
+        }
+        else
+        {
+            if (isExtersion)
+            {
+                // Extersion bit set
+                // Padding Length is less than the total packet length minus the header size.
+                ushort hel = BinaryDecoder<ushort>(binaryValue.Segment((12 + csrcListLength + 2), 2)) as ushort;
+                exHeadLen = hel as int;
+                if (exHeadLen > (binaryValue.Count - 12 - csrcListLength - 2))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                if (csrcListLength > binaryValue.Count - 12)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+// RFC 3551  6. Payload Type Definitions
+string PayloadTypeToString(byte typeValue)
+{
+    if (typeValue >= 72 && typeValue <= 75)
+    {
+        return "Reserved";
+    }
+    else if (typeValue >= 96 && typeValue <= 127)
+    {
+        switch (typeValue)
+        {
+            case 111 => return "Audio, Codec: Siren, ClockRate: 16000, P-Times: 20,40,60,100,200, Channels: 1";
+            case 112 => return "Audio, Codec: G.722.1, ClockRate: 16000, P-Times: 20,40,60, Channels: 1";
+            case 114 => return "Audio, Codec: RT Audio, ClockRate: 16000, P-Times: 20,40,60, Channels: 1";
+            case 115 => return "Audio, Codec: RT Audio, ClockRate: 8000, P-Times: 20,40,60, Channels: 1";
+            case 116 => return "Audio, Codec: G.726, ClockRate: 8000, P-Times: 20,40,60, Channels: 1";
+            case 121 => return "Video, Codec: RT Video, ClockRate: 90000";
+            default => return "dynamic";
+        }
+    }
+    else
+    {
+        switch (typeValue)
+        {
+            case 0 => return "PCMU Audio, 8000Hz [1 Channel]";
+            case 1 => return "1016 Audio, 8000Hz [1 Channel]";
+            case 2 => return "G721 Audio, 8000Hz [1 Channel]";
+            case 3 => return "GSM Audio, 8000Hz [1 Channel]";
+            case 4 => return "G723 Audio, 8000Hz [1 Channel]";
+            case 5 => return "DVI4 Audio, 8000Hz [1 Channel]";
+            case 6 => return "DVI4 Audio, 16000Hz [1 Channel]";
+            case 7 => return "LPC Audio, 8000Hz [1 Channel]";
+            case 8 => return "PCMA Audio, 8000Hz [1 Channel]";
+            case 9 => return "G722 Audio, 8000Hz [1 Channel]";
+            case 10 => return "L16 Audio, 44100Hz [2 Channels]";
+            case 11 => return "L16 Audio, 44100Hz [1 Channel]";
+            case 12 => return "QCELP Audio, 8000Hz [1 Channel]";
+            case 13 => return "CN Audio, 8000Hz [1 Channel]";
+            case 14 => return "MPA Audio, 90000Hz [? Channels]";
+            case 15 => return "G728 Audio, 8000Hz [1 Channel]";
+            case 16 => return "DVI4 Audio, 11025Hz [1 Channel]";
+            case 17 => return "DVI4 Audio, 22050Hz [1 Channel]";
+            case 18 => return "G729 Audio, 8000Hz [1 Channel]";
+            case 19 => return "Reserved";
+            case 25 => return "CellB Video, 90000Hz";
+            case 26 => return "JPEG Video, 90000Hz";
+            case 28 => return "nv Video, 90000Hz";
+            case 31 => return "H261 Video, 90000Hz";
+            case 32 => return "MPV Video, 90000Hz";
+            case 33 => return "MP2T Audio/Video, 90000Hz";
+            case 34 => return "H263 Video, 90000Hz";
+            default => return ("Unhandled RTP Type(" + (typeValue.ToString()) + ")");
+        }
+    }
+}

@@ -1,0 +1,289 @@
+protocol GRE with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Generic Routing Encapsulation Protocol",
+    ShortName = "GRE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1701"},
+            new Reference{Name = "RFC 2784"},
+            new Reference{Name = "RFC 2890"},
+            new Reference{Name = "RFC 2637"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="377030", Date="04/17/2015"}
+        ]
+};
+
+
+using Standard;
+using Utility;
+using IPv4;
+using IPv6;
+using TCP;
+using UDP;
+using ICMP;
+using IANA;
+using Ethernet;
+
+//The annotation is used for recording the sourceAddress, which is useful for TCPOverGRE.
+annotation binary GRE.Packet#SourceAddress;
+annotation binary GRE.Packet#DestinationAddress;
+
+// Future Reference: Add support for GRE over WFP and other protocols over WFP choke point
+//endpoint IPoverGRENode accepts GRE.IPPacket issues GRE.IPPacket;
+endpoint Node[binary LocalAddress]
+    accepts GRE.Packet
+    accepts GRE.IPPacket;
+
+autostart actor GREOverIPv4(IPv4.Node node)
+{
+    process node accepts p:IPv4.Datagram where (p.Protocol == ProtocolType.GRE)
+    {
+        switch (p.Payload)
+        {
+            case d:GRE.Packet from BinaryDecoder<GRE.Packet> =>
+                d#SourceAddress = p.SourceAddress.FlatAddress;
+                d#DestinationAddress = p.DestinationAddress.FlatAddress;
+                dispatch endpoint Node[p.DestinationAddress.FlatAddress] accepts d;
+            default =>
+                ThrowDecodingException("GRE", "Packet");
+        }
+    }
+}
+
+autostart actor GREOverIPv6(IPv6.Node node)
+{
+    process node accepts p:IPv6.Datagram where (p.NextProtocol == ProtocolType.GRE)
+    {
+        switch (p.Payload)
+        {
+            case d:GRE.Packet from BinaryDecoder<GRE.Packet> =>
+                d#SourceAddress = p.SourceAddress.FlatAddress;
+                d#DestinationAddress = p.DestinationAddress.FlatAddress;
+                dispatch endpoint Node[p.DestinationAddress.FlatAddress] accepts d;
+            default =>
+                ThrowDecodingException("GRE", "Packet");
+        }
+    }
+}
+
+///*Higher Layer of GRE: payload of GRE*/
+autostart actor EthernetOverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.TransparentEthernetBridging && p.Payload.Count > 0) //0x6558
+    {
+        switch (p.Payload)
+        {
+            case f:Ethernet.Frame from BinaryDecoder<Ethernet.Frame[false]> =>
+                ValidationCheck(!(p.ChecksumPresent || p.SequenceNumberPresent), p,
+                    "GRE: The C (Checksum Present) and S (Sequence Number Present) bits in the GRE header must be zero.");
+                ValidationCheck(p.KeyPresent, p,
+                    "GRE: The K bit (Key Present) in the GRE header must be one.");
+                dispatch (endpoint Ethernet.Node) accepts f;
+            default =>
+                ThrowDecodingException("GRE", "Ethernet.Frame");
+        }
+    }
+}
+
+autostart actor IPv4OverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.IPPacket where (p.ProtocolType == GREProtocolType.IP && p.Payload.Count > 0) //0x0800
+    {
+        switch (p.Payload)
+        {
+            case d:IPv4.Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("GRE", "IPv4.Datagram");
+        }
+    }
+}
+
+autostart actor TCPOverGRE(GRE.Node node)
+{
+    TcpEndpointHelper eptHelper = new TcpEndpointHelper{};
+
+    process node accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.TCP && p.Payload.Count > 0)
+    {
+        TCP.DecodeAndDispatchSegment(eptHelper, p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload);
+    }
+}
+
+autostart actor UDPOverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.UDP && p.Payload.Count > 0)
+    {
+        UDP.DecodeDatagram(p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload);
+    }
+}
+
+autostart actor ICMPOverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.ICMP && p.Payload.Count > 0)
+    {
+        ICMP.DecodeDatagram(p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload, false);
+    }
+}
+
+//rfc 1701
+message Packet
+{
+    bool ChecksumPresent with BinaryEncoding{Width = 1};
+    bool RoutingPresent with BinaryEncoding{Width = 1};
+    bool KeyPresent with BinaryEncoding{Width = 1};
+    bool SequenceNumberPresent with BinaryEncoding{Width = 1};
+    bool StrictSourceRoute with BinaryEncoding{Width = 1};
+    byte RecursionControl  with BinaryEncoding{Width = 3};
+    bool AcknowledgementSequenceNumberPresent with BinaryEncoding{Width = 1};
+    byte Flags with BinaryEncoding{Width = 4};
+    ushort VersionNumber with BinaryEncoding{Width = 3};
+    
+    GREProtocolType ProtocolType;
+    optional [|ProtocolType == GREProtocolType.PPP|] ushort PayloadLength;
+    optional [|ProtocolType == GREProtocolType.PPP|] ushort CallID;
+    optional [|RoutingPresent|] ushort Offset;
+    optional [|ChecksumPresent|] ushort Checksum;
+    
+    //rfc 2890 : Key,SequenceNumber
+    optional [|KeyPresent && ProtocolType != GREProtocolType.PPP|] uint Key;
+    optional [|SequenceNumberPresent|] uint SequenceNumber;
+    optional [|AcknowledgementSequenceNumberPresent|] uint AcknowledgementSequenceNumber;
+    optional [|RoutingPresent|] SourceRouteEntryPacketArray Routing;
+
+    binary Payload;
+    
+    override string ToString()
+    {
+        string flag = "";
+        if (ChecksumPresent)
+        {
+            flag += "|C";
+        }
+        if (RoutingPresent)
+        {
+            flag += "|R";
+        }
+        if (KeyPresent)
+        {
+            flag += "|K";
+        }
+        if (SequenceNumberPresent)
+        {
+            flag += "|S";
+        }
+        if (StrictSourceRoute)
+        {
+            flag += "|s";
+        }
+        if (RecursionControl == 1)
+        {
+            flag += "|Recur";
+        }
+        if (AcknowledgementSequenceNumberPresent)
+        {
+            flag += "|A";
+        }
+        
+        string summary = "Packet, Protocol: " + EnumToString<GRE.GREProtocolType>(ProtocolType, true, Utility.DecToHexFormat(ProtocolType));
+        summary += ", Flag: " + ((flag.Count == 0) ? "0" : flag.Segment(1));
+        summary += ", Version: " + (VersionNumber as string);
+        summary += (VersionNumber == 1) ? (", Payload Length: " + (PayloadLength as string)) : "";
+        summary += (VersionNumber == 1) ? (", CallID: " + (CallID as string)) : "";
+        return summary;
+    }
+}
+
+//rfc 2784 Payload = IPv4;
+message IPPacket
+{
+    bool ChecksumPresent with BinaryEncoding{Width = 1};
+    ushort Reserved with BinaryEncoding{Width = 11};
+    bool AcknowledgementSequenceNumberPresent with BinaryEncoding{Width = 1};
+    ushort VersionNumber where value == 0 with BinaryEncoding{Width = 3};
+    
+    optional [|ChecksumPresent|] ushort Checksum;
+    (GREProtocolType where value == 0x0800) ProtocolType;
+    binary Payload;
+    
+    override string ToString()
+    {
+        string sflag = (ChecksumPresent ? "|C" : "") + (AcknowledgementSequenceNumberPresent ? "|A" : "");
+
+        return "IPPacket, Protocol: " + EnumToString<GRE.GREProtocolType>(ProtocolType, true, Utility.DecToHexFormat(ProtocolType))
+            + ", Flag: " + (sflag.Count == 0 ? "0" : sflag.Segment(1)) + ", Version: " + (VersionNumber as string);
+    }
+}
+
+//rfc 1700
+pattern GREProtocolType = enum ushort
+{
+    ICMP = 0x0001,
+    SNA = 0x0004,
+    TCP = 0x0006,
+    UDP = 0x0011,
+    ESP = 0x0032,
+    AH = 0x0033,
+    OSINetworkLayer = 0x00FE,
+    PUP = 0x0200,
+    XNS = 0x0600,
+    IP = 0x0800,
+    Chaos = 0x0804,
+    ARP = 0x0806, //RFC826
+    FrameRelayARP = 0x0808,
+    VINES = 0x0BAD,
+    VINESEcho = 0x0BAE,
+    VINESLoopback = 0x0BAF,
+    DECnet = 0x6003,//(PhaseIV)
+    TransparentEthernetBridging = 0x6558,
+    RawFrameRelay = 0x6559,
+    ApolloDomain = 0x8019,
+    Ethertalk = 0x809B,//(Appletalk)
+    NovellIPX = 0x8137,
+    IPv6 = 0x86DD,
+    TCPIPcompression = 0x876B,//RFC1144
+    IPAutonomousSystems = 0x876C,
+    SecureData = 0x876D,
+    PPP = 0x880B //rfc 2637, page 48
+};
+
+//rfc 1701: Source Route Entry Packet
+type SourceRouteEntryPacket 
+{
+    ushort AddressFamily;
+    byte SREOffset;
+    byte SRELength;
+    ([|AddressFamily == 0x0800 && SRELength > 0|] IPv4Addresses[SRELength] 
+    | [|AddressFamily == 0xfffe && SRELength > 0|] AutonomousSystemNumber[SRELength] 
+    | [|SRELength > 0|] RoutingInformation[SRELength]) RoutingInformation;
+}
+//rfc1702 page 2
+type IPv4Addresses[byte len]
+{
+    array<uint> IPv4Address with BinaryEncoding{Length = len/4};
+}
+
+type AutonomousSystemNumber[byte len]
+{
+    array<ushort> AutonomousSystemNumber with BinaryEncoding{Length = len/2};
+}
+
+type RoutingInformation[byte len]
+{
+    array<byte> RoutingInformation with BinaryEncoding{Length = len};
+}
+
+type SourceRouteEntryPacketArray
+{
+    SourceRouteEntryPacket SourceRouteEntry;
+    optional [|SourceRouteEntry.AddressFamily != 0x0000 && SourceRouteEntry.SRELength != 0|] SourceRouteEntryPacketArray SourceRouteEntryPacketArray;
+}
+

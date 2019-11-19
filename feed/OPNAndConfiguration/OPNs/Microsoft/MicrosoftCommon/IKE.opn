@@ -1,0 +1,1464 @@
+protocol IKE with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Internet Key Exchange",
+    ShortName = "IKE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2407"},
+            new Reference{Name = "RFC 2408"},
+            new Reference{Name = "RFC 2409"},
+            new Reference{Name = "RFC 3947"},
+            new Reference{Name = "RFC 4306"},
+            new Reference{Name = "RFC 5996"},
+            new Reference{Name = "draft-ietf-ipsec-isakmp-gss-auth-07"},
+            new Reference{Name = "MS-IKEE", Version = "25.0", Date = "09/15/2017", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using IANA;
+using UDP;
+using GSSAPI;
+using Standard;
+using Utility;
+using MicrosoftCommonResources;
+using Diagnostics;
+using X509;
+using Technologies.ASN1;
+
+annotation array<byte> IKEDatagram#PayloadsType;
+
+endpoint Node[ulong InitiatorSPI] 
+    over UDP.Host
+    accepts IKEDatagram;
+
+endpoint ReassemblyNode[ulong InitiatorSPI]
+    over UDP.Host
+    accepts IKEDatagram
+{
+    map<ushort, array<IKEDatagram>> fragments = {};
+    map<ushort, byte> hasReceivedLastFragmentsMap = {};
+    process this accepts d:IKEDatagram
+    {
+        ReassembleIKEFragment(d, ref fragments, ref hasReceivedLastFragmentsMap, this.GetTransport<UDP.Host>());
+    }
+    
+    // destructor
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        if ((reassemblyNode.fragments.Values).Count > 0)
+        {
+            foreach (array<IKEDatagram> datagrams in reassemblyNode.fragments.Values)
+            {
+                for (int i = 0; i < datagrams.Count; i++)
+                {
+                    ReportInsufficientData(datagrams[i], DiagnosisLevel.Error, IKE_STR_INCOMPLETE_IKE_PAYLOADS);
+                    DisplayTopLevelMessage(datagrams[i]);
+                }
+            }
+            reassemblyNode.fragments = {};
+        }
+        reassemblyNode.hasReceivedLastFragmentsMap = {};
+    }
+}
+    
+autostart actor IKEOverUDP(UDP.Host host)
+{
+    process host accepts p:UDP.Datagram where (((p.SourcePort == Port.NATT || p.DestinationPort == Port.NATT) && p.Length > 12 && p.Payload.Segment(0,4) == $[00000000]) || p.SourcePort == Port.IKE || p.DestinationPort == Port.IKE) && !IsAuthIP(p.Payload)
+    {
+        switch (p.Payload)
+        {
+            case d:IKEDatagram from IKEDecoder =>
+                if (d.NextPayload == 132)
+                {
+                    var ep = endpoint IKE.ReassemblyNode[d.InitiatorSPI] over host;
+                    dispatch ep accepts d;
+                }
+                else
+                {
+                    var ep = endpoint IKE.Node[d.InitiatorSPI] over host;
+                    dispatch ep accepts d;
+                }
+            default =>
+                ThrowDecodingException("IKE", "IKEDatagram");
+        }
+    }
+}
+
+optional IKEDatagram IKEDecoder(binary binaryValue)
+{
+    if (binaryValue.Count < 4)
+    {
+        return nothing;
+    }
+    if (binaryValue.Segment(0,4) == $[00000000])
+    {
+        binaryValue = binaryValue.Segment(4);
+    }
+    stream s = binaryValue;
+    var datagram = BinaryDecoder<IKEDatagram>(s);
+    if (datagram == nothing)
+    {
+        return nothing;
+    }
+    var d = datagram as IKEDatagram;
+    array<byte> payloadsType = [];
+    if (d.Flags is f1:Flagsv1)
+    {
+        if (f1.Encryption == 1)
+        {
+            d.Payloads = [s.PeekBytes(s.BitPosition)];
+            d#PayloadsType = payloadsType;
+            DataChunks pChunk = new DataChunks{
+                        DataSource = s, 
+                        Chunks = [new BinaryChunk{BitPosition = s.BitPosition, BitLength = s.BitLength - s.BitPosition}],
+            };
+            d.AssociateArrayField("Payloads", [pChunk]);
+            d.AssociateField("Payloads", pChunk);
+            return d;
+        }
+    }
+    byte nextType = d.NextPayload;
+    int prePos = s.BitPosition;
+    int startPos = prePos;
+    array<PayloadChoice> arrPayloads = [];
+    array<DataChunks> chunks = [];
+    while (s.BytePosition < s.ByteLength)
+    {
+        byte currentType = nextType;
+        nextType = s.CurrentByte;
+        var p = BinaryDecoder<Payloads[currentType]>(s);
+        if (p != nothing)
+        {
+            PayloadChoice payload = (p as Payloads).Payload;
+            if (currentType == 129 && 
+                payload is gssapiTokenPayload:GssapiTokenPayload &&
+                gssapiTokenPayload.TokenData is b:binary &&
+                IsGSSAPIByCheckingTag(b))
+            {
+                var gssapi = DecodeGssapiAndSetAnnotation(b, d);
+                if (gssapi != nothing)
+                {
+                    gssapiTokenPayload.TokenData = gssapi;
+                }
+            }
+            arrPayloads += [payload];
+            chunks += [new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitPosition - prePos}]}];
+            payloadsType += [currentType];
+            prePos = s.BitPosition;
+        }
+        else
+        {
+            // WORKAROUND for truncation parsing: disable the validation since it's very easy to trigger under truncation situation.
+            // ValidationCheck(false, d, "Parsing payload failed due to invalid data.");
+            break;
+        }
+            
+        if (nextType == 0)
+        {
+            break;
+        }
+    }
+    DataChunks payloadChunk = new DataChunks{
+                DataSource = s, 
+                Chunks = [new BinaryChunk{BitPosition = startPos, BitLength = s.BitPosition - startPos}],
+                };
+    d.Payloads = arrPayloads;
+    d#PayloadsType = payloadsType;
+    d.AssociateArrayField("Payloads", chunks);
+    d.AssociateField("Payloads", payloadChunk);
+    
+    return d;
+}
+
+message IKEDatagram
+{
+    ulong InitiatorSPI where ValidationCheck(value != 0, null, DiagnosisLevel.Error, IKE_STR_CHECK_INITIATORSPI);
+    ulong ResponderSPI;
+    byte NextPayload with DisplayInfo{ToText = NextPayloadToText};
+    byte MajorVersion where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Warning, () => Format(IKE_STR_CHECK_MAJORVERSION, value.ToString())) with BinaryEncoding{Width = 4};
+    byte MinorVersion with BinaryEncoding{Width = 4};
+    byte ExchangeType with DisplayInfo{ToText = ExchangeTypeEnum};
+    ([|MajorVersion == 1|] Flagsv1 | [|MajorVersion == 2|] Flagsv2) Flags;
+    uint MessageId;
+    uint Length;
+    array<PayloadChoice> Payloads with Encoding{Ignore = true}, DisplayInfo{ToText = ((Payloads != null && Payloads[0] is binary) ? ((any input) => "Encrypted Payloads") : ((any input) => input.ToString()))};
+    
+    override string ToString()
+    {
+        string summary = "Version: "+ (MajorVersion as string) + "." + (MinorVersion as string) + ", " + "ExchangeType: " + ExchangeTypeEnum(ExchangeType);
+        string flagsSummary = ", Flags: ";
+        string payloadsSummary = ", Payloads: [HDR";
+        if (Flags is f1:Flagsv1)
+        {
+            flagsSummary += f1.ToString();
+            if (f1.Encryption == 1)
+            {
+                payloadsSummary += "*";
+            }
+        }
+        else if (Flags is f2:Flagsv2)
+        {
+            flagsSummary += f2.ToString();
+        }
+        
+        array<byte> payloadsType = this#PayloadsType as array<byte>;
+        if (payloadsType.Count > 0)
+        {
+            string payloadTypeString;
+            foreach (byte pt in payloadsType)
+            {
+                payloadTypeString = GetPayloadSummary(pt);
+                if (payloadsSummary.IndexOf(payloadTypeString) == -1)
+                {
+                    payloadsSummary += ", " + payloadTypeString;
+                }
+            }
+        }
+        
+        summary += payloadsSummary + "]" + flagsSummary;
+        summary += ", Length: " + (Length as string);
+        return summary;
+    }
+}
+
+string GetPayloadSummary(byte next)
+{
+    switch (next)
+    {
+        case (1 | 33) => return "SA";
+        case 2 => return "P";
+        case 3 => return "T";
+        case (4 | 34) => return "KE";
+        case (5 | 35 | 36) => return "ID";
+        case (6 | 37) => return "CERT";
+        case (7 | 38) => return "CERTREQ";
+        case 8 => return "HASH";
+        case 9 => return "SIG";
+        case (10 | 40) => return "NC";
+        case (11 | 41) => return "N";
+        case (12 | 42) => return "D";
+        case (13 | 43) => return "VID";
+        case (20 | 130) => return "NAT-D";
+        case (21 | 131) => return "NAT-OA";
+        case 39 => return "AUTH";
+        case (44 | 45) => return "TS";
+        case 46 => return "SK";
+        case 47 => return "CP";
+        case 48 => return "EAP";
+        case 129 => return "GSS";
+        case 132 => return "FRAG";
+        case 200 => return "CORRELATION";
+        case 250 => return "IDi";
+        default => return "";
+    }
+}
+
+string ExchangeTypeEnum(any exchangeType)
+{  
+    if (exchangeType is val:byte)
+    {
+        switch (val)
+        {
+            //ISAKMP - RFC 2408
+            case  0x00 => return "None";
+            case  0x01 => return "Base";
+            case  0x02 => return "Identity protection (Main Mode)";
+            case  0x03 => return "Authentication only";
+            case  0x04 => return "Aggressive Mode";
+            case  0x05 => return "Informational";
+            case  0x06 => return "Transaction (Config Mode)";
+            case  0x20 => return "Quick Mode";
+            case  0x21 => return "New Group Mode";
+
+            //IKEv2 - RFC 4306
+            case  0x22 => return "IKE_SA_INIT";
+            case  0x23 => return "IKE_AUTH";
+            case  0x24 => return "CREATE_CHILD_SA";
+            case  0x25 => return "INFORMATIONAL";
+
+            //Authenticated IP
+            case  0xF3 => return "Main Mode";
+            case  0xF4 => return "Quick Mode";
+            case  0xF5 => return "Extended Mode";
+            case  0xF6 => return "Notify";
+        
+            default => return "";
+        }
+    
+        if (val >= 0x06 && val <= 0x1F)
+        {
+            return "ISAKMP future use (" + val.ToString() + ")";
+        }
+        else if (val >= 0x20 && val <= 0xEF)
+        {
+            return "DOI specific use (" + val.ToString() + ")";
+        }
+        else
+        {
+            return "Private use (" + val.ToString() + ")";
+        }
+    }
+    return "";
+}
+
+type Payloads[byte Type]
+{ 
+    ([|Type == 1|] SecurityAssociationPayloadv1                         // 1
+        | [|Type == 2|] ProposalPayloadv1                               // 2
+        | [|Type == 3|] TransformPayloadv1                              // 3
+        | [|Type == 4|] KeyExchangePayloadv1                            // 4
+        | [|Type == 5|] IdentificationPayloadv1                         // 5
+        | [|Type == 6|] CertificatePayloadv1                            // 6
+        | [|Type == 7|] CertificateRequestPayloadv1                     // 7
+        | [|Type == 8|] HashPayloadv1                                   // 8
+        | [|Type == 9|] SignaturePayloadv1                              // 9
+        | [|Type == 10|] NoncePayloadv1                                 // 10
+        | [|Type == 11|] NotificationPayloadv1                          // 11
+        | [|Type == 12|] DeletePayloadv1                                // 12
+        | [|Type == 13|] VendorIDPayloadv1                              // 13
+        | [|Type == 20|] NATDiscoveryPayload                            // 20
+        | [|Type == 21|] NATOriginalAddressPayload                      // 21
+        | [|Type == 33|] SecurityAssociationPayloadv2                   // 33
+        | [|Type == 34|] KeyExchangePayloadv2                           // 34
+        | [|Type == 35 || Type == 36|] IdentificationPayloadsv2         // 35/36
+        | [|Type == 37|] CertificatePayloadv2                           // 37
+        | [|Type == 38|] CertificateRequestPayloadv2                    // 38
+        | [|Type == 39|] AuthenticationPayloadv2                        // 39
+        | [|Type == 40|] NoncePayloadv2                                 // 40
+        | [|Type == 41|] NotifyPayloadv2                                // 41
+        | [|Type == 42|] DeletePayloadv2                                // 42
+        | [|Type == 43|] VendorIDPayloadv2                              // 43
+        | [|Type == 44 || Type == 45|] TrafficSelectorPayloadv2         // 44/45
+        | [|Type == 46|] EncryptedPayloadv2                             // 46
+        | [|Type == 47|] ConfigurationPayloadv2                         // 47
+        | [|Type == 48|] EAPPayloadv2                                   // 48
+        | [|Type >= 49 && Type <=127|] ReservedPayloadv2                // 49~127
+        | [|Type == 129|] GssapiTokenPayload                            // 129
+        | [|Type == 130|] NATDiscoveryPayload                           // 130
+        | [|Type == 131|] NATOriginalAddressPayload                     // 131
+        | [|Type == 132|] FragmentPayload                               // 132
+        | [|Type == 200|] CorrelationPayload                            // 200
+        | [|Type == 250|] IDIPV6CGAIdentificationPayload                // 250
+        | [|Type >=128|] PrivateUsePayloadv2) Payload;                  // 128~255
+}
+
+pattern PayloadChoice = SecurityAssociationPayloadv1 | ProposalPayloadv1 | TransformPayloadv1 | KeyExchangePayloadv1 | IdentificationPayloadv1
+        | CertificatePayloadv1 | CertificateRequestPayloadv1 | HashPayloadv1 | SignaturePayloadv1 | NoncePayloadv1 | NotificationPayloadv1
+        | DeletePayloadv1 | VendorIDPayloadv1 | NATDiscoveryPayload | NATOriginalAddressPayload | SecurityAssociationPayloadv2 | KeyExchangePayloadv2
+        | IdentificationPayloadsv2 | CertificatePayloadv2 | CertificateRequestPayloadv2 | AuthenticationPayloadv2 | NoncePayloadv2 | NotifyPayloadv2
+        | DeletePayloadv2 | VendorIDPayloadv2 | TrafficSelectorPayloadv2 | EncryptedPayloadv2 | ConfigurationPayloadv2 | EAPPayloadv2
+        | ReservedPayloadv2 | GssapiTokenPayload | FragmentPayload | CorrelationPayload | IDIPV6CGAIdentificationPayload | PrivateUsePayloadv2 | binary;
+
+type Flagsv1
+{
+    byte RESERVED where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "IKE", "RESERVED", "Flagsv1", value) with BinaryEncoding{Width = 5};
+    byte AuthenticationOnly with BinaryEncoding{Width = 1};
+    byte Commit with BinaryEncoding{Width = 1};
+    byte Encryption with BinaryEncoding{Width = 1};
+    
+    override string ToString()
+    {
+        string flagsV1 = "";
+        bool hasOne = false;
+        if (AuthenticationOnly == 1)
+        {
+            flagsV1 += "AuthOnly";
+            hasOne = true;
+        }
+        if (Commit == 1)
+        {
+            flagsV1 += hasOne ? "|Commit" : "Commit";
+            hasOne = true;
+        }
+        if (Encryption == 1)
+        {
+            flagsV1 += hasOne ? "|Encryption" : "Encryption";
+            hasOne = true;
+        }
+        return flagsV1;
+    }
+}
+
+type Flagsv2
+{
+    byte Reserved1 with BinaryEncoding{Width = 2};
+    byte Response with BinaryEncoding{Width = 1};
+    byte Version with BinaryEncoding{Width = 1};
+    byte Initiator with BinaryEncoding{Width = 1};
+    byte Reserved2 with BinaryEncoding{Width = 3};
+    
+    override string ToString()
+    {
+        string flagsV2 = "";
+        bool hasOne = false;
+        if (Initiator == 1)
+        {
+            flagsV2 += "Initiator";
+            hasOne = true;
+        }
+        if (Version == 1)
+        {
+            flagsV2 += hasOne ? "|Version" : "Version";
+            hasOne = true;
+        }
+        if (Response == 1)
+        {
+            flagsV2 += hasOne ? "|Response" : "Response";
+            hasOne = true;
+        }
+        return flagsV2;
+    }
+
+}
+
+type GenericPayloadHeader
+{
+    byte NextPayload with DisplayInfo{ToText = NextPayloadToText};
+    byte RESERVED where ValidationCheck(value == 0, null, () => Format(IKE_STR_CHECK_RESERVED_IN_PAYLOAD, value));
+    ushort PayloadLength;
+}
+
+//1
+type SecurityAssociationPayloadv1:GenericPayloadHeader
+{
+    uint DomainOfInterpretation;
+    Situation Situation;
+    optional [|(PayloadLength - 12) > 0|] array<ProposalPayloadv1> ProposalPayloads with BinaryEncoding{WidthForComposedType = ((PayloadLength - 12) * 8) as int};
+}
+
+type Situation
+{
+    uint Reserved with BinaryEncoding{Width = 29};
+    uint Integrity with BinaryEncoding{Width = 1};
+    uint Secrecy with BinaryEncoding{Width = 1};
+    uint Identity with BinaryEncoding{Width = 1};
+}
+
+//2
+type ProposalPayloadv1:GenericPayloadHeader
+{
+    byte ProposalNumber;
+    ProtocolId ProtocolId;
+    byte SPISize;
+    byte NumberofTransforms;
+    optional [|SPISize > 0|] binary SPI with BinaryEncoding{Length = SPISize};
+    optional [|NumberofTransforms > 0|] array<TransformPayloadv1[ProtocolId]> TransformPayloads with BinaryEncoding{Length = NumberofTransforms};
+}
+
+pattern ProtocolId = enum byte
+{
+    RESERVED = 0x00,
+    PROTO_ISAKMP = 0x01,
+    PROTO_IPSEC_AH = 0x02,
+    PROTO_IPSEC_ESP = 0x03,
+    PROTO_IPCOMP = 0x04,
+    ...
+};
+
+//3
+type TransformPayloadv1[ProtocolId PId]:GenericPayloadHeader
+{
+    byte TransformNumber;
+    ([|PId is ProtocolId.PROTO_ISAKMP|] IPSECISAKMPTransformId
+    | [|PId is ProtocolId.PROTO_IPSEC_AH|] IPSECAHTransformId
+    | [|PId is ProtocolId.PROTO_IPSEC_ESP|] IPSECESPTransformId
+    | [|PId is ProtocolId.PROTO_IPCOMP|] IPSECIPCOMPTransformId
+    | byte) TransformId with DisplayInfo{ToText = GetToTextForTransformId(PId)};
+    ushort RESERVED2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED2", "TransformPayloadv1", value);
+    optional [|(PayloadLength - 8) > 0|] array<DataAttributes> SAAttributes with BinaryEncoding{WidthForComposedType = ((PayloadLength - 8) * 8) as int};
+}
+
+// WORKAROUND: define 2 types to handle the optional field.
+type DataAttributes
+{
+    (DataTVAttribute | DataTLVAttribute) DataAttribute;
+}
+
+type DataTVAttribute
+{
+    (ushort where value == 1) AF with BinaryEncoding{Width = 1};
+    ushort AttributeType with BinaryEncoding{Width = 15};
+    ushort AttributeValue;
+}
+
+type DataTLVAttribute
+{
+    (ushort where value == 0) AF with BinaryEncoding {Width = 1};
+    ushort AttributeType with BinaryEncoding{Width = 15};
+    ushort AttributeLength;
+    binary AttributeValue with BinaryEncoding{Length = AttributeLength};
+}
+
+pattern IPSECISAKMPTransformId = enum byte
+{
+    RESERVED = 0x00,
+    KEY_IKE = 0x01,
+    ...
+};
+
+pattern IPSECAHTransformId = enum byte
+{
+    RESERVED1 = 0x00,
+    RESERVED2 = 0x01,
+    AH_MD5 = 0x02,
+    AH_SHA = 0x03,
+    AH_DES = 0x04,
+    ...
+};
+
+pattern IPSECESPTransformId = enum byte
+{
+    RESERVED = 0x00,
+    ESP_DES_IV64 = 0x01,
+    ESP_DES = 0x02,
+    ESP_3DES = 0x03,
+    ESP_RC5 = 0x04,
+    ESP_IDEA = 0x05,
+    ESP_CAST = 0x06,
+    ESP_BLOWFISH = 0x07,
+    ESP_3IDEA = 0x08,
+    ESP_DES_IV32 = 0x09,
+    ESP_RC4 = 0x0A,
+    ESP_NULL = 0x0B,
+    ...
+};
+
+pattern IPSECIPCOMPTransformId = enum byte
+{
+    RESERVED = 0x00,
+    IPCOMP_OUI = 0x01,
+    IPCOMP_DEFLATE = 0x02,
+    IPCOMP_LZS = 0x03,
+    ...
+};
+
+string(any) GetToTextForTransformId(ProtocolId pId)
+{
+    switch(pId)
+    {
+        case ProtocolId.PROTO_ISAKMP =>
+            return (any input) => EnumToString(input, "IKE.IPSECISAKMPTransformId") + "(" + (input as byte).ToString() + ")";
+        case ProtocolId.PROTO_IPSEC_AH =>
+            return (any input) => EnumToString(input, "IKE.IPSECAHTransformId") + "(" + (input as byte).ToString() + ")";
+        case ProtocolId.PROTO_IPSEC_ESP =>
+            return (any input) => EnumToString(input, "IKE.IPSECESPTransformId") + "(" + (input as byte).ToString() + ")";
+        case ProtocolId.PROTO_IPCOMP =>
+            return (any input) => EnumToString(input, "IKE.IPSECIPCOMPTransformId") + "(" + (input as byte).ToString() + ")";
+        default =>
+            return (any input) => "Unknown Transform Identifier" + "(" + (input as byte).ToString() + ")";
+    }
+}
+
+pattern EncapsulationMode = enum ushort
+{
+    Reserved = 0x0000,
+    Tunnel = 0x0001,
+    Transport = 0x0002,
+    UDPEncapsulatedTunnel = 0x0003,
+    UDPEncapsulatedTransport = 0x0004,
+    ...
+};
+
+//4
+type KeyExchangePayloadv1:GenericPayloadHeader
+{
+    binary KeyExchangeData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+//5
+type IdentificationPayloadv1:GenericPayloadHeader
+{
+    byte IDType;
+    binary DOISpecificIDData with BinaryEncoding{Length = 3};
+    binary IdentificationData with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+//6
+type CertificatePayloadv1:GenericPayloadHeader
+{
+    byte CertEncoding with DisplayInfo{ToText = CertEncodingToText};
+    optional [|PayloadLength > 5|] (binary | RdnSequence) CertificateData with BinaryEncoding{Length = (PayloadLength - 5)},
+                                                Encoding{Decoder = CertificateDataDecoder, SourcePattern = TypeOf<binary>()};
+    
+    optional (binary | RdnSequence) CertificateDataDecoder(stream s)
+    {
+        return CertificateDataDecoderFunc(s, CertEncoding, "CertificatePayloadv1", "CertEncoding");
+    }
+}
+
+//7
+type CertificateRequestPayloadv1:GenericPayloadHeader
+{
+    byte CertType with DisplayInfo{ToText = CertEncodingToText};
+    optional [|PayloadLength > 5|] (binary | RdnSequence) CertificateData with BinaryEncoding{Length = (PayloadLength - 5)},
+                                                Encoding{Decoder = CertificateDataDecoder, SourcePattern = TypeOf<binary>()};
+    
+    optional (binary | RdnSequence) CertificateDataDecoder(stream s)
+    {
+        return CertificateDataDecoderFunc(s, CertType, "CertificateRequestPayloadv1", "CertType");
+    }
+}
+
+//8
+type HashPayloadv1:GenericPayloadHeader
+{
+    binary HashData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+//9
+type SignaturePayloadv1:GenericPayloadHeader
+{
+    binary SignatureData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+//10
+type NoncePayloadv1:GenericPayloadHeader
+{
+    binary NonceData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+//11
+type NotificationPayloadv1:GenericPayloadHeader
+{
+    uint DomainOfInterpretation;
+    byte ProtocolID;
+    byte SPISize;
+    NotifyMessageTypev1 NotifyMessageType;
+    binary SPI with BinaryEncoding{Length = SPISize};
+    optional [|(PayloadLength - SPISize - 12) > 0|] 
+        ([|NotifyMessageType is NotifyMessageTypev1.NOTIFY_STATUS|] NOTIFY_STATUS_Type
+        | [|NotifyMessageType is NotifyMessageTypev1.NOTIFY_DOS_COOKIE|] NOTIFY_DOS_COOKIE_Type
+        | [|NotifyMessageType is NotifyMessageTypev1.EXCHANGE_INFO|] EXCHANGE_INFO_Type
+        | binary) NotificationData with BinaryEncoding{WidthForComposedType = ((PayloadLength - SPISize - 12) * 8) as int};
+}
+
+pattern NotifyMessageTypev1 = enum ushort
+{
+    // RFC 2408
+    INVALID_PAYLOAD_TYPE = 0x0001,
+    DOI_NOT_SUPPORTED = 0x0002,
+    SITUATION_NOT_SUPPORTED = 0x0003,
+    INVALID_COOKIE = 0x0004,
+    INVALID_MAJOR_VERSION = 0x0005,
+    INVALID_MINOR_VERSION = 0x0006,
+    INVALID_EXCHANGE_TYPE = 0x0007,
+    INVALID_FLAGS = 0x0008,
+    INVALID_MESSAGE_ID = 0x0009,
+    INVALID_PROTOCOL_ID = 0x000A,
+    INVALID_SPI = 0x000B,
+    INVALID_TRANSFORM_ID = 0x000C,
+    ATTRIBUTES_NOT_SUPPORTED = 0x000D,
+    NO_PROPOSAL_CHOSEN = 0x000E,
+    BAD_PROPOSAL_SYNTAX = 0x000F,
+    PAYLOAD_MALFORMED = 0x0010,
+    INVALID_KEY_INFORMATION = 0x0011,
+    INVALID_ID_INFORMATION = 0x0012,
+    INVALID_CERT_ENCODING = 0x0013,
+    INVALID_CERTIFICATE = 0x0014,
+    CERT_TYPE_UNSUPPORTED = 0x0015,
+    INVALID_CERT_AUTHORITY = 0x0016,
+    INVALID_HASH_INFORMATION = 0x0017,
+    AUTHENTICATION_FAILED = 0x0018,
+    INVALID_SIGNATURE = 0x0019,
+    ADDRESS_NOTIFICATION = 0x001A,
+    NOTIFY_SA_LIFETIME = 0x001B,
+    CERTIFICATE_UNAVAILABLE = 0x001C,
+    UNSUPPORTED_EXCHANGE_TYPE = 0x001D,
+    UNEQUAL_PAYLOAD_LENGTHS = 0x001E,
+    CONNECTED = 0x4000,
+    
+    // MS_IKEE
+    NOTIFY_STATUS = 0x9C43,
+    NOTIFY_DOS_COOKIE = 0x9C44,
+    EXCHANGE_INFO = 0x9C45,
+    ...
+};
+
+type NOTIFY_STATUS_Type
+{
+    uint NOTIFY_STATUS;
+}
+
+type NOTIFY_DOS_COOKIE_Type
+{
+    ulong NOTIFY_DOS_COOKIE;
+}
+
+type EXCHANGE_INFO_Type
+{
+    EXCHANGE_INFO_Enum EXCHANGE_INFO where ValidationCheckEnumValue(InRange<EXCHANGE_INFO_Enum>(value),
+        null, true, ReferenceType.Type, "IKE", "EXCHANGE_INFO", "EXCHANGE_INFO_Type", "0x00000001, 0x00000002", value);
+}
+
+pattern EXCHANGE_INFO_Enum = enum uint
+{
+    IKE_EXCHANGE_INFO_ND_BOUNDARY = 0x00000001,
+    IKE_EXCHANGE_INFO_GUARANTEE_ENCRYPTION = 0x00000002,
+    ...
+};
+
+//12
+type DeletePayloadv1:GenericPayloadHeader
+{
+    uint DomainOfInterpretation;
+    byte ProtocolID;
+    byte SPISize;
+    ushort NumberofSPIs;
+    array<SPI[SPISize]> SecurityParameterIndex with BinaryEncoding{Length = NumberofSPIs};
+}
+
+type SPI[byte size]
+{
+    binary SPI with BinaryEncoding{Length = size};
+}
+
+//13
+type VendorIDPayloadv1:GenericPayloadHeader
+{
+    binary VendorID with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 20, RFC 3947 130, MS-IKEE
+type NATDiscoveryPayload:GenericPayloadHeader
+{
+    binary HASHofAddressAndPort with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 21, RFC 3947; 131, MS-IKEE
+type NATOriginalAddressPayload:GenericPayloadHeader
+{
+    byte IDType;
+    byte RESERVED2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED2", "NATOriginalAddressPayload", value);
+    ushort RESERVED3 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED3", "NATOriginalAddressPayload", value);
+    ([|IDType == 1|] IPv4Address | [|IDType == 5|] IPv6Address) Address;
+}
+
+type GenericPayloadHeaderv2
+{
+    byte NextPayload with DisplayInfo{ToText = NextPayloadToText};
+    bool C with BinaryEncoding{Width = 1};
+    byte RESERVED where ValidationCheck(value == 0, null, () => Format(IKE_STR_CHECK_RESERVED_IN_PAYLOAD, value)) with BinaryEncoding{Width = 7};
+    ushort PayloadLength;
+}
+
+//33
+type SecurityAssociationPayloadv2:GenericPayloadHeaderv2
+{
+    array<Proposal> Proposals with BinaryEncoding{WidthForComposedType = ((PayloadLength - 4) * 8) as int};
+}
+
+type Proposal
+{
+    ProposalLastOrMoreType LastOrMore where ValidationCheckEnumValue(InRange<ProposalLastOrMoreType>(value), null, true, ReferenceType.Type, "IKE", "LastOrMore", "Proposal", "0x00, 0x02", value);
+    byte RESERVED where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED", "Proposal", value);
+    ushort ProposalLength;
+    byte ProposalNumber;
+    ProtocolIDv2 ProtocolID;
+    byte SPISize;
+    byte NumberOfTransforms;
+    optional [|SPISize > 0|] binary SPI with BinaryEncoding{Length = SPISize};
+    array<Transform> Transforms with BinaryEncoding{Length = NumberOfTransforms};
+}
+
+pattern ProposalLastOrMoreType = enum byte
+{
+    Last = 0x00,
+    More = 0x02,
+    ...
+};
+
+pattern ProtocolIDv2 = enum byte
+{
+    RESERVED = 0x00,
+    IKE = 0x01,
+    AH = 0x02,
+    ESP = 0x03,
+    ...
+};
+
+type Transform
+{
+    TransformLastOrMoreType LastOrMore where ValidationCheckEnumValue(InRange<TransformLastOrMoreType>(value), null, true, ReferenceType.Type, "IKE", "LastOrMore", "Transform", "0x00, 0x03", value);
+    byte RESERVED where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED", "Transform", value);
+    ushort TransformLength;
+    TransformTypev2 TransformType;
+    byte RESERVED2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED2", "Transform", value);
+    ([|TransformType is TransformTypev2.ENCR|] ENCRTransformIDv2
+    | [|TransformType is TransformTypev2.PRF|] PRFTransformIDv2
+    | [|TransformType is TransformTypev2.INTEG|] INTEGTransformIDv2
+    | [|TransformType is TransformTypev2.D_H|] DHTransformIDv2
+    | [|TransformType is TransformTypev2.ESN|] ESNTransformIDv2
+    | ushort) TransformID with DisplayInfo{ToText = GetToTextForTransformIdv2(TransformType)};
+    optional [|(TransformLength - 8) > 0|] array<TransformAttributes> TransformAttributes with BinaryEncoding{WidthForComposedType = ((TransformLength - 8) * 8) as int};
+}
+
+pattern TransformLastOrMoreType = enum byte
+{
+    Last = 0x00,
+    More = 0x03,
+    ...
+};
+
+pattern TransformTypev2 = enum byte
+{
+    RESERVED = 0x00,
+    ENCR = 0x01,
+    PRF = 0x02,
+    INTEG = 0x03,
+    D_H = 0x04,
+    ESN = 0x05,
+    ...
+};
+
+pattern ENCRTransformIDv2 = enum ushort
+{
+    RESERVED1 = 0x0000,
+    ENCR_DES_IV64 = 0x0001,
+    ENCR_DES = 0x0002,
+    ENCR_3DES = 0x0003,
+    ENCR_RC5 = 0x0004,
+    ENCR_IDEA = 0x0005,
+    ENCR_CAST = 0x0006,
+    ENCR_BLOWFISH = 0x0007,
+    ENCR_3IDEA = 0x0008,
+    ENCR_DES_IV32 = 0x0009,
+    RESERVED2 = 0x000A,
+    ENCR_NULL = 0x000B,
+    ENCR_AES_CBC = 0x000C,
+    ENCR_AES_CTR = 0x000D,
+    ...
+};
+
+pattern PRFTransformIDv2 = enum ushort
+{
+    RESERVED = 0x0000,
+    PRF_HMAC_MD5 = 0x0001,
+    PRF_HMAC_SHA1 = 0x0002,
+    PRF_HMAC_TIGER = 0x0003,
+    PRF_AES128_XCBC = 0x0004,
+    ...
+};
+
+pattern INTEGTransformIDv2 = enum ushort
+{
+    RESERVED = 0x0000,
+    AUTH_HMAC_MD5_96 = 0x0001,
+    AUTH_HMAC_SHA1_96 = 0x0002,
+    AUTH_DES_MAC = 0x0003,
+    AUTH_KPDK_MD5 = 0x0004,
+    AUTH_AES_XCBC_96 = 0x0005,
+    ...
+};
+
+pattern DHTransformIDv2 = enum ushort
+{
+    // RFC 4306
+    NONE = 0x0000,
+    DH_768_Bit_MODP = 0x0001,
+    DH_1024_Bit_MODP = 0x0002,
+    
+    // RFC 3526
+    DH_1536_Bit_MODP = 0x0005,
+    DH_2048_Bit_MODP = 0x000E,
+    DH_3072_Bit_MODP = 0x000F,
+    DH_4096_Bit_MODP = 0x0010,
+    DH_6144_Bit_MODP = 0x0011,
+    DH_8192_Bit_MODP = 0x0012,
+    ...
+};
+
+pattern ESNTransformIDv2 = enum ushort
+{
+    No_Extended_Sequence_Numbers = 0x0000,
+    Extended_Sequence_Numbers = 0x0001,
+    ...
+};
+
+string(any) GetToTextForTransformIdv2(TransformTypev2 transformType)
+{
+    switch(transformType)
+    {
+        case TransformTypev2.ENCR =>
+            return (any input) => EnumToString(input, "IKE.ENCRTransformIDv2") + "(" + (input as ushort).ToString() + ")";
+        case TransformTypev2.PRF =>
+            return (any input) => EnumToString(input, "IKE.PRFTransformIDv2") + "(" + (input as ushort).ToString() + ")";
+        case TransformTypev2.INTEG =>
+            return (any input) => EnumToString(input, "IKE.INTEGTransformIDv2") + "(" + (input as ushort).ToString() + ")";
+        case TransformTypev2.D_H =>
+            return (any input) => EnumToString(input, "IKE.DHTransformIDv2") + "(" + (input as ushort).ToString() + ")";
+        case TransformTypev2.ESN =>
+            return (any input) => EnumToString(input, "IKE.ESNTransformIDv2") + "(" + (input as ushort).ToString() + ")";
+        default =>
+            return (any input) => "Unknown Transform Identifier" + "(" + (input as ushort).ToString() + ")";
+    }
+}
+
+// WORKAROUND: define 2 types to handle the optional field.
+type TransformAttributes
+{
+    (TransformTVAttribute | TransformTLVAttribute) TransformAttribute;
+}
+
+type TransformTVAttribute
+{
+    (ushort where value == 1) AF with BinaryEncoding{Width = 1};
+    ushort AttributeType with BinaryEncoding{Width = 15};
+    ushort AttributeValue;
+}
+
+type TransformTLVAttribute
+{
+    (ushort where value == 0) AF with BinaryEncoding {Width = 1};
+    ushort AttributeType with BinaryEncoding{Width = 15};
+    ushort AttributeLength;
+    binary AttributeValue with BinaryEncoding{Length = AttributeLength};
+}
+
+// 34
+type KeyExchangePayloadv2:GenericPayloadHeaderv2
+{
+    ushort DHGroupNumber;
+    ushort RESERVED2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "IKE", "RESERVED2", "KeyExchangePayloadv2", value);
+    binary KeyExchangeData with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+// 35/36
+type IdentificationPayloadsv2:GenericPayloadHeaderv2
+{
+    byte IDType;
+    binary RESERVED2 where ValidationCheckReservedZero(value == $[000000], null, true, ReferenceType.Type, "IKE", "RESERVED2", "IdentificationPayloadsv2", value) with BinaryEncoding{Length = 3};
+    ([|IDType == 1|] IPv4Address
+    | [|IDType == 5|] IPv6Address
+    | binary) IdentificationData with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+// 37
+type CertificatePayloadv2:GenericPayloadHeaderv2
+{
+    byte CertEncoding with DisplayInfo{ToText = CertEncodingToText};
+    optional [|PayloadLength > 8|] (binary | RdnSequence) CertificateData with BinaryEncoding{Length = (PayloadLength - 8)},
+                                                Encoding{Decoder = CertificateDataDecoder, SourcePattern = TypeOf<binary>()};
+    
+    optional (binary | RdnSequence) CertificateDataDecoder(stream s)
+    {
+        return CertificateDataDecoderFunc(s, CertEncoding, "CertificatePayloadv2", "CertEncoding");
+    }
+}
+
+// 38
+type CertificateRequestPayloadv2:GenericPayloadHeaderv2
+{
+    byte CertEncoding with DisplayInfo{ToText = CertEncodingToText};
+    optional [|PayloadLength > 8|] (binary | RdnSequence) CertificateData with BinaryEncoding{Length = (PayloadLength - 8)},
+                                                Encoding{Decoder = CertificateDataDecoder, SourcePattern = TypeOf<binary>()};
+    
+    optional (binary | RdnSequence) CertificateDataDecoder(stream s)
+    {
+        return CertificateDataDecoderFunc(s, CertEncoding, "CertificateRequestPayloadv2", "CertEncoding");
+    }
+}
+
+// 39
+type AuthenticationPayloadv2:GenericPayloadHeaderv2
+{
+    byte AuthMethod;
+    binary RESERVED2 where ValidationCheckReservedZero(value == $[000000], null, true, ReferenceType.Type, "IKE", "RESERVED2", "AuthenticationPayloadv2", value) with BinaryEncoding{Length = 3};
+    binary AuthenticationData with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+// 40
+type NoncePayloadv2:GenericPayloadHeaderv2
+{
+    binary NonceData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 41
+type NotifyPayloadv2:GenericPayloadHeaderv2
+{
+    byte ProtocolID;
+    byte SPISize;
+    NotifyMessageTypev2 NotifyMessageType;
+    binary SPI with BinaryEncoding{Length = SPISize};
+    optional [|(PayloadLength - 8 - SPISize) > 0|] 
+        ([|NotifyMessageType is NotifyMessageTypev2.NOTIFY_STATUS|] NOTIFY_STATUS_Type
+        | binary) NotificationData with BinaryEncoding{WidthForComposedType = ((PayloadLength - 8 - SPISize) * 8) as int};
+}
+
+pattern NotifyMessageTypev2 = enum ushort
+{
+    // RFC 4306
+    RESERVED = 0x0000,
+    UNSUPPORTED_CRITICAL_PAYLOAD = 0x0001,
+    INVALID_IKE_SPI = 0x0004,
+    INVALID_MAJOR_VERSION = 0x0005,
+    INVALID_SYNTAX = 0x0007,
+    INVALID_MESSAGE_ID = 0x0009,
+    INVALID_SPI = 0x000B,
+    NO_PROPOSAL_CHOSEN = 0x000E,
+    INVALID_KE_PAYLOAD = 0x0011,
+    AUTHENTICATION_FAILED = 0x0018,
+    SINGLE_PAIR_REQUIRED = 0x0022,
+    NO_ADDITIONAL_SAS = 0x0023,
+    INTERNAL_ADDRESS_FAILURE = 0x0024,
+    FAILED_CP_REQUIRED = 0x0025,
+    TS_UNACCEPTABLE = 0x0026,
+    INVALID_SELECTORS = 0x0027,
+    INITIAL_CONTACT = 0x4000,
+    SET_WINDOW_SIZE = 0x4001,
+    ADDITIONAL_TS_POSSIBLE = 0x4002,
+    IPCOMP_SUPPORTED = 0x4003,
+    NAT_DETECTION_SOURCE_IP = 0x4004,
+    NAT_DETECTION_DESTINATION_IP = 0x4005,
+    COOKIE = 0x4006,
+    USE_TRANSPORT_MODE = 0x4007,
+    HTTP_CERT_LOOKUP_SUPPORTED = 0x4008,
+    REKEY_SA = 0x4009,
+    ESP_TFC_PADDING_NOT_SUPPORTED = 0x400A,
+    NON_FIRST_FRAGMENTS_ALSO = 0x400B,
+    
+    // MS-IKEE
+    NOTIFY_STATUS = 0x3039,
+    ...
+};
+
+// 42
+type DeletePayloadv2:GenericPayloadHeaderv2
+{
+    byte ProtocolID;
+    byte SPISize;
+    ushort NumberofSPIs;
+    binary SPI with BinaryEncoding{Length = SPISize};
+}
+
+// 43
+type VendorIDPayloadv2:GenericPayloadHeaderv2
+{
+    binary VendorID with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 44/45
+type TrafficSelectorPayloadv2:GenericPayloadHeaderv2
+{
+    byte NumberofTSs;
+    binary RESERVED2 where ValidationCheckReservedZero(value == $[000000], null, true, ReferenceType.Type, "IKE", "RESERVED", "TrafficSelectorPayloadv2", value) with BinaryEncoding{Length = 3};
+    array<TrafficSelector> TrafficSelectors;
+}
+
+type TrafficSelector
+{
+    byte TSType;
+    byte IPProtocolID;
+    optional [|TSType == 7 || TSType == 8|] ushort SelectorLength;
+    optional [|TSType == 7 || TSType == 8|] ushort StartPort;
+    optional [|TSType == 7 || TSType == 8|] ushort EndPort;
+    optional ([|TSType == 7|] TrafficSelectorIPv4Address 
+        | [|TSType == 8|] TrafficSelectorIPv6Address) Addresses;
+}
+
+type TrafficSelectorIPv4Address
+{
+    IPv4Address StartingAddress;
+    IPv4Address EndingAddress;
+}
+
+type TrafficSelectorIPv6Address
+{
+    IPv6Address StartingAddress;
+    IPv6Address EnddingAddress;
+}
+
+// 46, Future Reference: EncryptedData should has more inside details
+type EncryptedPayloadv2:GenericPayloadHeaderv2
+{
+    binary EncryptedData with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 47
+type ConfigurationPayloadv2:GenericPayloadHeaderv2
+{
+    byte CFGType;
+    binary RESERVED2 where ValidationCheckReservedZero(value == $[000000], null, true, ReferenceType.Type, "IKE", "RESERVED2", "ConfigurationPayloadv2", value) with BinaryEncoding{Length = 3};
+    array<ConfigurationAttributes> ConfigurationAttributes with BinaryEncoding{WidthForComposedType = ((PayloadLength - 8) * 8) as int};
+}
+
+type ConfigurationAttributes
+{
+    ushort R with BinaryEncoding{Width = 1};
+    AttributeType AttributeType with BinaryEncoding{Width = 15};
+    ushort Length;
+    optional [|Length > 0|] 
+        ( [|AttributeType is AttributeType.INTERNAL_IP4_ADDRESS|] array<IPv4Address>
+        | [|AttributeType is AttributeType.INTERNAL_IP4_NETMASK|] IPv4Address
+        | [|AttributeType is AttributeType.INTERNAL_IP4_DNS|] array<IPv4Address>
+        | [|AttributeType is AttributeType.INTERNAL_IP4_NBNS|] array<IPv4Address>
+        | [|AttributeType is AttributeType.INTERNAL_ADDRESS_EXPIRY|] uint
+        | [|AttributeType is AttributeType.INTERNAL_IP4_DHCP|] array<IPv4Address>
+        | [|AttributeType is AttributeType.APPLICATION_VERSION|] string
+        | [|AttributeType is AttributeType.INTERNAL_IP6_ADDRESS|] array<IPv6AddressWithPrefix>
+        | [|AttributeType is AttributeType.INTERNAL_IP6_DNS|] array<IPv6Address>
+        | [|AttributeType is AttributeType.INTERNAL_IP6_NBNS|] array<IPv6Address>
+        | [|AttributeType is AttributeType.INTERNAL_IP6_DHCP|] array<IPv6Address>
+        | [|AttributeType is AttributeType.INTERNAL_IP4_SUBNET|] array<IPv6Address>
+        | [|AttributeType is AttributeType.SUPPORTED_ATTRIBUTES|] array<AttributeType>
+        | [|AttributeType is AttributeType.INTERNAL_IP6_SUBNET|] array<IPv6AddressWithPrefix>
+        | [|AttributeType is AttributeType.INTERNAL_IP4_SERVER|] IPv4Address
+        | [|AttributeType is AttributeType.INTERNAL_IP6_SERVER|] IPv6Address
+        | binary) Value with BinaryEncoding{WidthForComposedType = (Length * 8) as int};
+}
+
+type IPv6AddressWithPrefix
+{
+    IPv6Address IPv6Address;
+    byte Prefix;
+    
+    override string ToString()
+    {
+        return IPv6Address.ToString() + "/" + Prefix.ToString();
+    }
+}
+
+pattern AttributeType = enum ushort
+{
+    // RFC 4306
+    RESERVED1 = 0x0000,
+    INTERNAL_IP4_ADDRESS = 0x0001,
+    INTERNAL_IP4_NETMASK = 0x0002,
+    INTERNAL_IP4_DNS = 0x0003,
+    INTERNAL_IP4_NBNS = 0x0004,
+    INTERNAL_ADDRESS_EXPIRY = 0x0005,
+    INTERNAL_IP4_DHCP = 0x0006,
+    APPLICATION_VERSION = 0x0007,
+    INTERNAL_IP6_ADDRESS = 0x0008,
+    RESERVED2 = 0x0009,
+    INTERNAL_IP6_DNS = 0x000A,
+    INTERNAL_IP6_NBNS = 0x000B,
+    INTERNAL_IP6_DHCP = 0x000C,
+    INTERNAL_IP4_SUBNET = 0x000D,
+    SUPPORTED_ATTRIBUTES = 0x000E,
+    INTERNAL_IP6_SUBNET = 0x000F,
+    
+    // MS-IKEE
+    INTERNAL_IP4_SERVER = 0x5BA0,
+    INTERNAL_IP6_SERVER = 0x5BA1,
+    ...
+};
+
+// 48
+type EAPPayloadv2:GenericPayloadHeaderv2
+{
+    binary PayloadForEAP;
+}
+
+// 49~127
+type ReservedPayloadv2:GenericPayloadHeaderv2
+{
+    binary Data with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 128~255
+type PrivateUsePayloadv2:GenericPayloadHeaderv2
+{
+    binary Data with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 129 [draft-ietf-ipsec-isakmp-gss-auth-07] 3.3.3 GSS-API Token Payload (ISAKMP)
+type GssapiTokenPayload:GenericPayloadHeader
+{
+    byte Vendor;
+    optional [|PayloadLength - 5 > 0|] (binary | GssapiType) TokenData with BinaryEncoding{Length = (PayloadLength - 5)};
+}
+
+bool IsAuthIP(binary payload)
+{
+    if (payload.Count > 18)
+    {
+        byte exchangeType = payload[18];
+        if (exchangeType >= 0xF3 && exchangeType <= 0xF6)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 132, [MS-IKEE] 2.2.3 IKE Message Fragment
+type FragmentPayload:GenericPayloadHeader
+{
+    ushort Fragment_ID;
+    byte Fragment_Number;
+    FragmentPayload_Flags Flags where ValidationCheckCombinationValueIncludeZero(InRange<FragmentPayload_Flags>(value),
+         null, true, ReferenceType.Type, "IKE", "Flags", "FragmentPayload", "0x01", value);
+    binary Fragment_Data with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+pattern FragmentPayload_Flags = flags byte
+{
+    LAST_FRAGMENT = 0x01,
+};
+
+// 200, [MS-IKEE] 2.2.9 Correlation Payload (IKEv2) Packet
+type CorrelationPayload:GenericPayloadHeader
+{
+    ulong IKE_SA_Initiator_SPI where ValidationCheck(value != 0, null, DiagnosisLevel.Error, IKE_STR_CHECK_IKE_SA_INITIATOR_SPI);
+    ulong IKE_SA_Responder_SPI;
+    optional [|(PayloadLength - 20) > 0|] binary Correlation_Hash with BinaryEncoding{Length = (PayloadLength - 20)};
+}
+
+// 250, [MS-IKEE] 2.2.5 ID_IPV6_CGA Identification Type Packet
+type IDIPV6CGAIdentificationPayload:GenericPayloadHeader
+{
+    byte Identification_Type;
+    byte Protocol_ID where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "IKE", "Protocol_ID", "IDIPV6CGAIdentificationPayload", value);
+    ushort Port where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "IKE", "Port", "IDIPV6CGAIdentificationPayload", value);
+    binary Modifier with BinaryEncoding{Length = 16};
+    byte Collision_Count where ValidationCheckEnumValue(value in {0, 1, 2}, null, true, ReferenceType.Type, "IKE", "Collision_Count", "IDIPV6CGAIdentificationPayload", "0, 1, 2", value);
+    optional [|(PayloadLength - 25) > 0|] binary Extension_fields with BinaryEncoding{Length = (PayloadLength - 25)};
+}
+
+void ReassembleIKEFragment(IKEDatagram d, ref map<ushort, array<IKEDatagram>> fragments, ref map<ushort, byte> hasReceivedLastFragmentsMap, UDP.Host host)
+{    
+    var f = GetFragmentPayload(d);
+    
+    // Catch the fragment
+    if (!(f.Fragment_ID in fragments))
+    {
+        // This is the first arrived fragment
+        fragments[f.Fragment_ID] = [d];
+    }
+    else
+    {
+        // This is a follow up fragment
+        // Notice that InsertSorted function deals with fragments out of order
+        if (!IsDuplicatedFragment(fragments[f.Fragment_ID], d))
+        {
+            fragments[f.Fragment_ID] = InsertSorted(
+                fragments[f.Fragment_ID],
+                (FragmentPayload f1, FragmentPayload f2) => f1.Fragment_Number < f2.Fragment_Number,
+                d);
+        }
+        else
+        {
+            ErrorCodeIf(true, d, DiagnosisLevel.Warning, "IKE: Duplicate IKE Datagram");
+            DisplayTopLevelMessage(d);
+            return;
+        }
+    }
+    
+    // If have received the last fragment
+    if (f.Fragment_ID in hasReceivedLastFragmentsMap && 
+        (f.Flags == FragmentPayload_Flags.LAST_FRAGMENT ||
+         f.Fragment_Number > hasReceivedLastFragmentsMap[f.Fragment_ID])
+        )
+    {
+        foreach (IKEDatagram frag in fragments[f.Fragment_ID])
+        {
+            ErrorCodeIf(true, frag, DiagnosisLevel.Warning, "IKE: Invalid fragment payload sequence.");
+            DisplayTopLevelMessage(frag);
+        }
+        fragments = fragments.Remove(f.Fragment_ID);
+        hasReceivedLastFragmentsMap = hasReceivedLastFragmentsMap.Remove(f.Fragment_ID);
+        return;
+    }
+    
+    if (!(f.Fragment_ID in hasReceivedLastFragmentsMap))
+    {
+        if (f.Flags == FragmentPayload_Flags.LAST_FRAGMENT)
+        {
+            hasReceivedLastFragmentsMap[f.Fragment_ID] = f.Fragment_Number;
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    // Reassemble
+    if (fragments[f.Fragment_ID].Count == hasReceivedLastFragmentsMap[f.Fragment_ID]) // Function to get the expected next sequence token
+    {
+        // Reassemble
+        binary data = $[];
+        foreach (var frag in fragments[f.Fragment_ID])
+        {
+            data += (GetFragmentPayload(frag).Fragment_Data as binary);
+        }
+        var tmp = IKEDecoder(data);
+        if (tmp == nothing)
+        {
+            ThrowDecodingException("IKE", "IKEDatagram");
+        }
+        IKEDatagram msg = tmp as IKEDatagram;
+
+        foreach (var frag in fragments[f.Fragment_ID])
+        {
+            msg.Origins += [frag];
+        }
+        
+        // Clear buffered fragments
+        fragments = fragments.Remove(f.Fragment_ID);
+        hasReceivedLastFragmentsMap = hasReceivedLastFragmentsMap.Remove(f.Fragment_ID);
+
+        // Dispatch the reassembled message
+        var node = endpoint IKE.Node[d.InitiatorSPI] over host;
+        dispatch node accepts msg;
+    }
+}
+
+FragmentPayload GetFragmentPayload(IKEDatagram d)
+{
+    if (d.Payloads[0] is fragmentPayload:FragmentPayload)
+    {
+        return fragmentPayload;
+    }
+    else
+    {
+        throw IKE_STR_CHECK_GET_FRAGMENTPAYLOAD_FAILED;
+    }
+}
+
+bool IsDuplicatedFragment(array<IKEDatagram> cachedFragments, IKEDatagram d)
+{
+    FragmentPayload f = GetFragmentPayload(d);
+    FragmentPayload ftmp;
+    for (int i = cachedFragments.Count - 1 ; i >= 0 ; i--)
+    {
+        ftmp = GetFragmentPayload(cachedFragments[i]);
+        if (f.Fragment_Number >= ftmp.Fragment_Number)
+        {
+            break;
+        }
+    }
+    
+    return f.Fragment_Number == ftmp.Fragment_Number;
+}
+
+array<IKEDatagram> InsertSorted(
+    array<IKEDatagram> cachedFragments, // Cached FragmentPayloads
+    bool(FragmentPayload, FragmentPayload) comparer, // Comparing function to determine the order
+    IKEDatagram d)
+{
+    int i = cachedFragments.Count();
+    cachedFragments += [d];
+    FragmentPayload f = GetFragmentPayload(d);
+    while (i > 0 && comparer(f, GetFragmentPayload(cachedFragments[i-1])))
+    {
+        cachedFragments[i] = cachedFragments[i-1];
+        i--;
+    }
+
+    cachedFragments[i] = d;
+    return cachedFragments;
+}
+
+string NextPayloadToText(any input)
+{
+    string str = "";
+    if (input is val:byte)
+    {
+        switch (val)
+        {
+            case 0 => str = "NONE";
+            case 1 => str = "Security Association (SA)";
+            case 2 => str = "Proposal (P)";
+            case 3 => str = "Transform (T)";
+            case 4 => str = "Key Exchange (KE)";
+            case 5 => str = "Identification (ID)";
+            case 6 => str = "Certificate (CERT)";
+            case 7 => str = "Certificate Request (CR)";
+            case 8 => str = "Hash (HASH)";
+            case 9 => str = "Signature (SIG)";
+            case 10 => str = "Nonce (NONCE)";
+            case 11 => str = "Notification (N)";
+            case 12 => str = "Delete (D)";
+            case 13 => str = "Vendor ID (VID)";
+            case 20 => str = "NAT Discovery (NAT-D)";
+            case 21 => str = "NAT Original Address (NAT-OA)";
+            case 33 => str = "Security Association (SA)";
+            case 34 => str = "Key Exchange (KE)";
+            case 35 => str = "Identification - Initiator (IDi)";
+            case 36 => str = "Identification - Responder (IDr)";
+            case 37 => str = "Certificate (CERT)";
+            case 38 => str = "Certificate Request (CERTREQ)";
+            case 39 => str = "Authentication (AUTH)";
+            case 40 => str = "Nonce (Ni, Nr)";
+            case 41 => str = "Notify (N)";
+            case 42 => str = "Delete (D)";
+            case 43 => str = "Vendor ID (V)";
+            case 44 => str = "Traffic Selector - Initiator (TSi)";
+            case 45 => str = "Traffic Selector - Responder (TSr)";
+            case 46 => str = "Encrypted and Authenticated (SK)";
+            case 47 => str = "Configuration (CP)";
+            case 48 => str = "Extensible Authentication (EAP)";
+            case 129 => str = "GSS-API Token Payload (GSS)";
+            case 130 => str = "NAT Discovery (NAT-D)";
+            case 131 => str = "NAT Original Address (NAT-OA)";
+            case 132 => str = "IKE Message Fragment (FRAG)";
+            case 200 => str = "Correlation Payload Packet (CORRELATION)";
+            case 250 => str = "ID_IPV6_CGA Identification Type Packet (IDi)";
+            default => str = "Unknown Payload Type";
+        }
+        str = str + " (" + val.ToString() + ")";
+    }
+    return str;
+}
+
+string CertEncodingToText(any input)
+{
+    string str = "";
+    if (input is val:byte)
+    {
+        switch (val)
+        {
+            case 0 => str = "Reserved";
+            case 1 => str = "PKCS #7 wrapped X.509 certificate";
+            case 2 => str = "PGP Certificate";
+            case 3 => str = "DNS Signed Key";
+            case 4 => str = "X.509 Certificate - Signature";
+            case 5 => str = "Reserved";
+            case 6 => str = "Kerberos Token";
+            case 7 => str = "Certificate Revocation List (CRL)";
+            case 8 => str = "Authority Revocation List (ARL)";
+            case 9 => str = "SPKI Certificate";
+            case 10 => str = "X.509 Certificate - Attribute";
+            case 11 => str = "Raw RSA Key";
+            case 12 => str = "Hash and URL of X.509 certificate";
+            case 13 => str = "Hash and URL of X.509 bundle";
+            case 14 => str = "OCSP Content";
+            default => str = "Unknown Cert Encoding";
+        }
+        str = str + " (" + val.ToString() + ")";
+    }
+    return str;
+}
+
+optional (binary | RdnSequence) CertificateDataDecoderFunc(stream s, byte certEncoding, string typename, string certEncodingFieldName)
+{
+    switch (certEncoding)
+    {
+        case 4 => 
+            var rdnSequence = Asn1BerDecoder<X509RdnSequence>(s);
+            if (rdnSequence == nothing )
+            {
+                ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(IKE_STR_DECODING_CERTIFICATEDATA_FAILED, typename, certEncodingFieldName, certEncoding.ToString()));
+                return s.PeekBytes(0);
+            }
+            return (rdnSequence as X509RdnSequence).RdnSequence;
+        default => return s.PeekBytes(0);
+    }
+}
+
+// pattern RdnSequence = array<RelativeDistinguishedName>;
+type X509RdnSequence
+{
+    X509.RdnSequence RdnSequence;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};

@@ -1,0 +1,124 @@
+protocol UDP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "User Datagram Protocol",
+    ShortName = "UDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 768"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "381993", Date = "10/09/2015"}
+        ]
+};
+
+using IANA;
+using IPv4;
+using IPv6;
+using Standard;
+using Utility;
+
+annotation binary UDP.Datagram#SourceAddress;
+annotation binary UDP.Datagram#DestinationAddress;
+
+/* Host accepts datagram from IPv4 or IPv6
+ * Address1 is either SourceAddress or DestinationAddress.
+ * It depends on the comparative result of the value of ports or addresses.
+ * It's similar for other indexes.
+ */
+endpoint Host[binary Address1, binary Address2, ushort Port1, ushort Port2] accepts Datagram;
+
+message Datagram
+{
+    IANA.Port SourcePort with Visualization{AliasName = "Port"}, DisplayInfo{ToText = (any port) => IANA.PortToServiceNameForAlias(port as ushort)};
+    IANA.Port DestinationPort with Visualization{AliasName = "Port"}, DisplayInfo{ToText = (any port) => IANA.PortToServiceNameForAlias(port as ushort)};
+    ushort Length;
+    ushort Checksum;
+    // Specify Length here since field Length indicates the total length of
+    // the UDP Datagram in bytes
+    binary Payload with BinaryEncoding{MaxLength = Length > 8 ? (Length - 8) : 0};
+    
+    override string ToString()
+    {
+        string summary = "SrcPort: " + IANA.PortToServiceNameForAlias(SourcePort as ushort);
+        summary += ", DstPort: " + IANA.PortToServiceNameForAlias(DestinationPort as ushort);
+        summary += ", Length: " + (Length as string);
+        return summary;
+    }
+}
+
+string get Transport(this UDP.Datagram datagram)
+{
+    string srcPort = IANA.PortToServiceNameForAlias(datagram.SourcePort as ushort);
+    string dstPort = IANA.PortToServiceNameForAlias(datagram.DestinationPort as ushort);
+    if (datagram#SourceAddress is srcAddr:binary && datagram#DestinationAddress is dstAddr:binary)
+    {
+        if (srcAddr == dstAddr)
+        {
+            // If the source and destination address are equal(loop back scenario), then compare ports.
+            return "UDP: " + ((datagram.SourcePort > datagram.DestinationPort) ? (srcPort + " - " + dstPort) : (dstPort + " - " + srcPort));
+        }
+        else
+        {
+            // Keep direction consistent with 'Network' property: the smaller address is prior to the larger one. 
+            return "UDP: " + ((srcAddr > dstAddr) ? (dstPort + " - " + srcPort) : (srcPort + " - " + dstPort));
+        }
+    }
+    else
+    {
+        return "UDP: " + ((datagram.SourcePort > datagram.DestinationPort) ? (srcPort + " - " + dstPort) : (dstPort + " - " + srcPort));
+    }
+}
+
+int get PayloadLength(this UDP.Datagram d)
+{
+    return d.Payload.Count;
+}
+
+autostart actor UDPOverIPv4(IPv4.Node node)
+{
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.UDP
+    {
+        DecodeDatagram(d.SourceAddress.FlatAddress, d.DestinationAddress.FlatAddress, d.Payload);
+    }
+}
+
+autostart actor UDPOverIPv6(IPv6.Node node)
+{
+    process node accepts d:IPv6.Datagram where d.NextProtocol == ProtocolType.UDP
+    {
+        DecodeDatagram(d.SourceAddress.FlatAddress, d.DestinationAddress.FlatAddress, d.Payload);
+    }
+}
+
+// Decode UDP segment and dispatch to UDP layer
+void DecodeDatagram(binary sourceAddress, binary destinationAddress, binary payload)
+{
+    switch (payload)
+    {
+        case d:Datagram from BinaryDecoder<Datagram> =>
+            // Future Reference: Temporarily disable Checksum check for CTP
+            // ValidationCheck(Utility.ValidateTCPUDPChecksum(sourceAddress, destinationAddress, 17, payload, d.Checksum), d, "Validation Error. UDP Checksum is invalid.");
+            d#SourceAddress = sourceAddress;
+            d#DestinationAddress = destinationAddress;
+        
+            if ((d.SourcePort < d.DestinationPort) || (d.SourcePort == d.DestinationPort && sourceAddress < destinationAddress))
+            {
+                dispatch endpoint Host[sourceAddress, destinationAddress, d.SourcePort, d.DestinationPort] accepts d;
+            }
+            else
+            {
+                dispatch endpoint Host[destinationAddress, sourceAddress, d.DestinationPort, d.SourcePort] accepts d;
+            }
+        default => 
+            ThrowDecodingException("UDP", "Datagram");
+    }
+}
+

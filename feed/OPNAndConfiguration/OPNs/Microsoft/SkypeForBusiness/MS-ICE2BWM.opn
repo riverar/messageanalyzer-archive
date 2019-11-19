@@ -1,0 +1,193 @@
+protocol MSICE2BWM with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Interactive Connectivity Establishment (ICE) 2.0 Bandwidth Management Extensions",
+    ShortName = "MS-ICE2BWM",
+    DocumentName = "MS-ICE2BWM",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+           new Reference{Name = "MS-ICE2BWM", Version = "3.0"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "1.0.0", Date = "05/19/2015"}
+        ]
+};
+
+using Utility;
+using MSICE2;
+using MSTURNBWM;
+using MSTURN;
+using TURN;
+using TCP;
+using UDP;
+
+endpoint Server
+    over MSICE2.Server
+    accepts Message issues Message;
+
+client endpoint Client connected to Server;
+
+autostart actor ActorOverMSICE2(MSICE2.Server node)
+{
+    process node accepts msIce2Msg:MSICE2.Message where IsMsIce2bwmMsg(msIce2Msg)
+    { 
+        optional Message msg = new Message(msIce2Msg);	
+
+		if ((msg == nothing) || (msg == null))
+		{
+			ThrowDecodingException("MSICE2BWM");
+		}
+		else
+		{
+			dispatch (endpoint Server over node) accepts msg as Message;
+		}
+    } 
+	
+	process node issues msIce2Msg:MSICE2.Message where IsMsIce2bwmMsg(msIce2Msg)
+    {
+        optional Message msg = new Message(msIce2Msg);		
+
+		if ((msg == nothing) || (msg == null))
+		{
+			ThrowDecodingException("MSICE2BWM");
+		}
+		else
+		{
+			dispatch (endpoint Server over node) issues msg as Message;
+		}
+    }    
+}
+
+bool IsMsIce2bwmMsg(MSICE2.Message msIce2Msg)
+{
+	ushort messageType = msIce2Msg.MessageHeader.MessageType;
+
+	if ((messageType == null) || !((messageType == 0x0001) || (messageType == 0x0101) || (messageType == 0x0111))) // binding messages
+	{
+		return false;
+	}	
+
+	array<TURN.Attributes> attributes = msIce2Msg.Attributes;
+	
+	if ((attributes == null) || (attributes.Count == 0))
+	{
+		return false;
+	}
+	
+    foreach (TURN.Attributes attribute in attributes)
+	{
+		if (attribute is TURN.GenericAttribute)
+		{
+			if (InRange<MSTURNBWM.AttributeType>((attribute as TURN.GenericAttribute).Type))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+message Message[bool IsOverTCP]
+{
+    optional ([|IsOverTCP|] MSTURN.TCPFramingHeader) TCPFramingHeader;
+    MSTURN.MessageHeader MessageHeader;
+    array<MSTURNBWM.Attribute> Attributes with BinaryEncoding{WidthForComposedType = MessageHeader.MessageLength << 3};
+	
+	Message(MSICE2.Message msIce2Msg)
+	{
+		optional Message msIce2bwmMsg;
+		array<any message> tempOrigins = msIce2Msg.Origins;	
+	
+		if ((tempOrigins == null) || (tempOrigins.Count != 1))
+		{
+			ThrowDecodingException("MSICE2BWM", "This frame MUST have only one origin message.", null);
+		}
+		else if (tempOrigins[0] is s:TCP.Segment)
+		{
+			msIce2bwmMsg = BinaryDecoder<Message[true]>(s.Payload);
+		}
+		else if (tempOrigins[0] is m:TURN.Message)
+		{
+			array<any message> udpOrigins = m.Origins;
+
+			if (udpOrigins == null || udpOrigins.Count != 1)
+			{
+				ThrowDecodingException("MSICE2BWM", "The TURN layer of this frame MUST have only one origin message.", null);
+			}
+			else if (udpOrigins[0] is d:UDP.Datagram)
+			{
+				msIce2bwmMsg = BinaryDecoder<Message[false]>(d.Payload);
+			}
+			else 
+			{
+				ThrowDecodingException("MSICE2BWM", "The origin of TURN of this frame should be of type UDP.Datagram.", null);
+			}
+		} 
+		else
+		{
+			ThrowDecodingException("MSICE2BWM", "The MSICE2 layer of this frame should be based on top of either TCP or UDP", null);	
+		}
+		
+		if ((msIce2bwmMsg != nothing) && (msIce2bwmMsg != null))
+		{
+			Message parsedMessage = msIce2bwmMsg as Message; 
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSICE2BWM");
+		}
+	} 
+
+    override string ToString()
+    {	    
+		string summary = "Binding ";
+		
+		ushort messageType  = this.MessageHeader.MessageType;
+		ushort turnClass = (messageType & 0x0110) as ushort;
+		
+		if (turnClass in MsTurnMessageClasses)
+        {
+            summary += MsTurnMessageClasses[turnClass];
+        }
+		else
+		{
+			summary = "Unknown Message Type(" + DecToHexFormat(messageType) + ")";
+		}		
+
+		foreach (MSTURNBWM.Attribute attribute in this.Attributes)
+		{
+			if (attribute is BandwidthAdmissionControlMessage)
+			{
+				MessageTypeEnum bwmMessageType = (attribute as BandwidthAdmissionControlMessage).MessageType;
+				
+				if (bwmMessageType == null)
+				{
+					summary += "Invalid Message Format: Missing MessageType for Attribute BandwidthAdmissionControlMessage";
+				}
+				else if (bwmMessageType == 0x0000)
+				{
+					summary += ", Bandwidth Admission Control Check Message";
+				}
+				else if (bwmMessageType == 0x0001)
+				{
+					summary += ", Bandwidth Admission Control Commit Message";
+				}
+				else if (bwmMessageType == 0x0002)
+				{
+					summary += ", Bandwidth Admission Control Update Message";
+				}
+			}
+		}
+        return summary;
+    }
+}

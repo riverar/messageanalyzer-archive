@@ -1,0 +1,507 @@
+protocol SOAP with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Simple Object Access Protocol",
+    ShortName = "SOAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+    new Reference{Name = "SOAP", Link = "http://www.w3.org/TR/soap/"},
+    ],
+    RevisionSummary = 
+    [
+    new Revision{Class=RevisionClass.Major, Version="375901", Date="03/30/2015"}
+    ]
+};
+
+using HTTP;
+using Utility;
+using IANA;
+using UDP;
+using MIME;
+using MicrosoftCommonResources;
+using Diagnostics;
+
+// Endpoint
+endpoint Server 
+    over HTTP.Server | over UDP.Host | over MIME.Server
+    accepts SoapMessage
+    issues SoapMessage;
+
+client endpoint Client connected to Server;
+
+// Actor
+autostart actor SoapOverHTTP(HTTP.Server server)
+{
+    xml xmlValue;
+    // SOAPAction for both SoapRequest/Response Message, set its value when accepts HTTP Request
+    string soapAction = "";
+    
+    process server accepts req:HttpContract.Request where req.Payload.Count > 0 && 
+        IsValidSoapFormat(req.HTTPContentType, req.Payload, out xmlValue)
+    {
+        soapAction = GetSoapActionFromHttpRequest(req);
+        DecodeSoapFromXml(xmlValue, soapAction, AcceptDispatcher);
+    }
+    
+    process server issues res:HttpContract.Response where res.Payload.Count > 0 && 
+        IsValidSoapFormat(res.HTTPContentType, res.Payload, out xmlValue)
+    {
+        DecodeSoapFromXml(xmlValue, soapAction, IssueDispatcher);
+        soapAction = "";
+    }
+    
+    process server accepts req:HttpContract.Request where (req.MimePayload is mimeBody:MIME.MultipartBody)
+    {
+        soapAction = GetSoapActionFromHttpRequest(req);
+        if (!TryParseAndDispatchSoapMessageFromMimeBody(mimeBody.MIMEBodies, soapAction, AcceptDispatcher))
+        {
+            reject;
+        }
+    }
+
+    process server issues res:HttpContract.Response where (res.MimePayload is mimeBody:MIME.MultipartBody)
+    {
+        if (!TryParseAndDispatchSoapMessageFromMimeBody(mimeBody.MIMEBodies, soapAction, IssueDispatcher))
+        {
+            reject;
+        }
+        soapAction = "";
+    }
+    
+    void AcceptDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over server accepts m;
+    }
+    
+    void IssueDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over server issues m;
+    }
+}
+
+autostart actor SoapOverUdp(UDP.Host host)
+{
+    string soapAction = "";
+    process host accepts p:Datagram where p.Payload.Count > 0 && p.SourcePort == IANA.Port.WSDiscovery 
+    {
+        xml xmlValue = BuildXml(p.Payload);
+        if (xmlValue != null)
+        {
+            DecodeSoapFromXml(xmlValue, soapAction, IssueDispatcher);
+        }
+        else 
+        {
+            ThrowDecodingException("SOAP");
+        }
+    }
+    process host accepts p:Datagram where p.Payload.Count > 0 && p.DestinationPort == IANA.Port.WSDiscovery
+    {
+        xml xmlValue = BuildXml(p.Payload);
+        if (xmlValue != null)
+        {
+            DecodeSoapFromXml(xmlValue, soapAction, AcceptDispatcher);
+        }
+        else 
+        {
+            ThrowDecodingException("SOAP");
+        }
+    }
+    
+    void AcceptDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over host accepts m;
+    }
+    
+    void IssueDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over host issues m;
+    }
+}
+
+autostart actor SoapServerOverMIME(MIME.Server server)
+{
+    string soapAction = "";
+    process server accepts p:MIME.Mime where (p.Bodies is multipartBodies:array<MultipartBodyType>)
+    {
+        if (!TryParseAndDispatchSoapMessageFromMimeBody(multipartBodies, soapAction, AcceptDispatcher))
+        {
+            reject;
+        }
+    }
+    process server issues p:MIME.Mime where (p.Bodies is multipartBodies:array<MultipartBodyType>)
+    {
+        if (!TryParseAndDispatchSoapMessageFromMimeBody(multipartBodies, soapAction, IssueDispatcher))
+        {
+            reject;
+        }
+    }
+    
+    void AcceptDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over server accepts m;
+    }
+    
+    void IssueDispatcher(SoapMessage m)
+    {
+        dispatch endpoint Server over server issues m;
+    }
+}
+
+// Soap Message
+message SoapMessage
+{
+    optional xml Header;
+    xml Body;
+    
+    override string ToString()
+    {
+        string summary = "";
+        if (this.ContainsFault)
+        {
+            summary += "Fault";
+            if (this#FaultCode is code:string)
+            {
+                summary += ", FaultCode: " + code;
+            }
+        }
+        else
+        {
+            if (this.WsaAction is wsaAction:string && wsaAction != "")
+            {
+                summary += "WsaAction: " + wsaAction;
+            }
+            else if (this.SoapAction is soapAction:string && soapAction != "")
+            {
+                summary += "SoapAction: " + soapAction;
+            }
+        }
+
+        summary += (summary.Count > 0 ? ", " : "") + "Version: " + this.Version;
+        return summary;
+    }
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Store action carried by HTTP header.
+annotation string SoapMessage#SoapActionFromHttp;
+annotation string SoapMessage#WsaActionFromWsaHeader;
+// Below annotations are used to update message's summary line and value of properties.
+annotation bool SoapMessage#IsFault;
+annotation string SoapMessage#SoapVersion;
+annotation string SoapMessage#FaultCode;
+annotation string SoapMessage#FaultReason;
+
+// Soap action carried by underlying HTTP.
+string get SoapAction(this SoapMessage soap)
+{
+    if (soap#SoapActionFromHttp is action:string where value != null)
+    {
+        return action;
+    }
+    else
+    {
+        return "";
+    }
+}
+
+// WSA action located in SOAP header.
+string get WsaAction(this SoapMessage soap)
+{
+    if (soap#WsaActionFromWsaHeader is wsaAction:string)
+    {
+        return wsaAction;
+    }
+    else if (soap.Header is header:xml && GetChildElementFromXml(header, "Action") is action:string)
+    {
+        // Trim possible leading and trailing white spaces.
+        var trimmedAction = action.Trim();
+        soap#WsaActionFromWsaHeader = trimmedAction;
+        return trimmedAction;
+    }
+    else
+    {
+        return "";
+    }
+}
+
+bool get ContainsFault(this SoapMessage soap)
+{
+    if (soap#IsFault is isFault:bool)
+    {
+        return isFault;
+    }
+    bool isFaultMsg = !(GetChildElementFromXml(soap.Body, "Fault") is nothing);
+    soap#IsFault = isFaultMsg;
+    return isFaultMsg;
+}
+
+xml get FaultDetail(this SoapMessage soap)
+{
+    if (!soap.ContainsFault)
+    {
+        return null;
+    }
+    if (soap.Version == "1.1")
+    {
+        // "detail" in SOAP 1.1 doesn't have namespace prefix.
+        if (soap.Body.GetDescendant(new XmlName{LocalName = "detail", NamespaceUri = ""}) is fault11:xml)
+        {
+            return fault11;
+        }
+    }
+    else if (soap.Version == "1.2")
+    {
+        if (soap.Body.GetDescendant(new XmlName{LocalName = "Detail", NamespaceUri = Soap12Namespace}) is fault12:xml)
+        {
+            return fault12;
+        }
+    }
+    return null;
+}
+
+string get Version(this SoapMessage soap)
+{
+    if (soap#SoapVersion is v:string)
+    {
+        return v;
+    }
+    string ns = soap.Body.NamespaceUri as string;
+    switch (ns)
+    {
+        case Soap11Namespace => 
+            soap#SoapVersion = "1.1";
+            return "1.1";
+        case Soap12Namespace => 
+            soap#SoapVersion = "1.2";
+            return "1.2";
+        default => return "";
+    }
+}
+
+// Functions
+// Uniform function provided for upper layer protocol to identify what message is contained in Soap body.
+// If it is not sure whether upper layer protocol has to use WS-Addressing, this function can be used in actor to identify message to decode to. 
+bool MatchActions(this SoapMessage soap, string action, string replyAction)
+{
+    // Match WSA action.
+    if (soap.WsaAction is wsaAction:(string where value.Count > 0))
+    {
+        if (wsaAction == action || wsaAction == replyAction)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    // Match underlying Soap action if soap header doesn't contains WSA action.
+    else if (soap.SoapAction == action)
+    {
+        return true;
+    }
+    return false;
+}
+
+void DecodeSoapFromXml(xml xmlValue, string soapAction, void(SoapMessage) dispatcher)
+{
+    switch (xmlValue)
+    {
+        case soap:SoapMessage from XmlDecoder<SoapMessage> =>
+            soap#SoapActionFromHttp = soapAction;
+            if (soap.ContainsFault)
+            {
+                soap.SetFaultAnnotationAndReportSoapFault();
+            }
+            dispatcher(soap);
+        default =>
+            ThrowDecodingException("SOAP");
+    }
+}
+
+bool TryParseAndDispatchSoapMessageFromMimeBody(array<MultipartBodyType> multipartBodies, string soapAction, void(SoapMessage) dispatcher)
+{   
+    bool hasMimeDecoded = false;
+    foreach (MultipartBodyType body in multipartBodies)
+    {
+        if (body.Headers is headers:map<string, any> && 
+            // http://www.w3.org/TR/soap12-mtom/#xop-serialization
+            (headers.ContentTypeContains("text/xml") || headers.ContentTypeContains("application/xop+xml")) && 
+            body.Body is bin:binary)
+        {
+            xml xmlValue = BuildXml(bin);
+            if (xmlValue != null)
+            {
+                switch (xmlValue)
+                {
+                    case soap:SoapMessage from XmlDecoder<SoapMessage> =>
+                        soap#SoapActionFromHttp = soapAction;
+                        if (soap.ContainsFault)
+                        {
+                            soap.SetFaultAnnotationAndReportSoapFault();
+                        }
+                        dispatcher(soap);
+                        hasMimeDecoded = true;
+                    default =>;
+                }
+            }
+        }
+    }
+    return hasMimeDecoded;
+}
+
+optional string GetChildElementFromXml(xml x, string localName)
+{
+    foreach (xml e in x.Children)
+    {
+        if (e is (xml where value.Kind == XmlKind.Element && (value.Name as XmlName).LocalName == localName))
+        {
+            return e.Text;
+        }
+    }
+    return nothing;
+}
+
+bool IsValidSoapFormat(HeaderFieldType conType, binary bin, out xml xmlValue)
+{
+    // In SOAP 1.1, the "Content-Type" header should be "text/xml"
+    // In SOAP 1.2, the "Content-Type" header should be "application/soap+xml"
+    if (conType == null || conType.Value.Contains("text/xml") || conType.Value.Contains("application/soap+xml"))
+    {
+        xmlValue = BuildXml(bin);
+        if (xmlValue != null)
+        {
+            // There may be an XML declaration node before "Envelope" node.
+            var envelope = (xmlValue.Children).Filter(e => e is (xml where value.Kind == XmlKind.Element && (value.Name as XmlName).LocalName == "Envelope"));
+            if (envelope.Count > 0)
+            {
+                xmlValue = envelope[0];
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+string GetSoapActionFromHttpRequest(HttpContract.Request req)
+{
+    any action;
+    // for SOAP 1.1, there's "SOAPAction" field in underlying HTTP header.
+    if ("SOAPAction" in req.Headers.Keys)
+    {   
+        action = req.Headers["SOAPAction"];
+    }
+    else if ("soapaction" in req.Headers.Keys)
+    {   
+        action = req.Headers["soapaction"];
+    }
+    // for SOAP 1.2, SoapAction is in parameter part of "Content-Type" field in underlying HTTP header.
+    else if ("Content-Type" in req.Headers && 
+        req.Headers["Content-Type"] is conType:HeaderFieldType &&
+        conType.Parameters is m:map<string, optional string> &&
+        "action" in m.Keys)
+    {
+        action = m["action"];
+    }
+    return action == null ? "" : SOAPAction(action as string) as string;
+}
+
+// Remove leading and trailing space and quotation.
+syntax SOAPAction = HTTP.SP? HTTP.Quote? uri:regex{[^\" ]*} HTTP.Quote? HTTP.SP? => uri;
+
+/* Soap 1.2 fault
++--Fault
+    +--Code
+    |   +--Value
+    |   +--Subcode
+    |       +--Value
+    |       +--Subcode
+    +--Reason
+    |   +--Text
+    |   +--...
+    +--Node?
+    +--Role?
+    +--Detail?
+*/
+
+/* Soap 1.1 fault
++--Fault
+          // faultcode, faultstring don't have namespace prefix.
+    +--faultcode
+    +--faultstring
+    +--faultactor?
+    +--detail?
+ */
+void SetFaultAnnotationAndReportSoapFault(this SoapMessage soap)
+{
+    xml body = soap.Body;
+    switch (soap.Version)
+    {
+        case "1.1" =>
+            // faultcode, faultstring don't have namespace prefix.
+            if (body.GetDescendant(new XmlName{LocalName = "faultcode", NamespaceUri = ""}) is x1:xml && x1.Text is t1:string)
+            {
+                soap#FaultCode = t1;
+            }
+            if (body.GetDescendant(new XmlName{LocalName = "faultstring", NamespaceUri = ""}) is x2:xml && x2.Text is t2:string)
+            {
+                soap#FaultReason = t2;
+            }
+        case "1.2" =>
+            if (body.GetDescendant(new XmlName{LocalName = "Subcode", NamespaceUri = Soap12Namespace}) is x3:xml)
+            {
+                if (x3.ChildCount == 1 && x3.Children[0] is code:xml && code.Text is codeText:string)
+                {
+                    soap#FaultCode = codeText;
+                }
+            }
+            if (body.GetDescendant(new XmlName{LocalName = "Text", NamespaceUri = Soap12Namespace}) is x4:xml &&
+                 x4.Text is t4:string)
+            {
+                soap#FaultReason = t4;
+            }
+        default =>;
+    }
+    if (soap#FaultCode is faultCode:string && soap#FaultReason is faultReason:string)
+    {
+        ErrorCodeIf(true, soap, DiagnosisLevel.Error, Format(SOAP_ERROR_DETAIL, faultCode, faultReason));
+    }
+    else
+    {
+        ErrorCodeIf(true, soap, DiagnosisLevel.Error, SOAP_ERROR);
+    }
+}
+
+// Get longer summary prefix from request and response to show on operation's summary line. 
+// For example, request is extended by WSMan and WSMV, response is extended by WSMan, then in operation, longer summary prefix will be added.
+string GetExtendingSummaryFromSoapOperation(any message req, any message res)
+{
+    if (GetSoapExtensionPrefix(req) is ex1:string && GetSoapExtensionPrefix(res) is ex2:string)
+    {
+        return ex1.Count > ex2.Count ? ex1 : ex2;
+    }
+    return "";
+}
+
+// Content of #SummaryPrefix will be "WSManagement, WSMV".
+string GetSoapExtensionPrefix(any message m)
+{
+    if (m#SummaryPrefix is summary:string)
+    {
+        return "[Extended by " + summary + "] ";
+    }
+    else
+    {
+        return "";
+    }
+}
+
+// SOAP 1.1
+const string Soap11Namespace = "http://schemas.xmlsoap.org/soap/envelope/";
+// SOAP 1.2
+const string Soap12Namespace = "http://www.w3.org/2003/05/soap-envelope";

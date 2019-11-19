@@ -1,0 +1,682 @@
+protocol Radiotap with 
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Radiotap",
+    ShortName = "Radiotap",
+    Description = "Radiotap is a de facto standard for 802.11 frame injection and reception"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Link = "http://www.radiotap.org/Radiotap"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "369414", Date = "10/22/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using WiFi;
+using CoreNetworkingResources;
+using Diagnostics;
+
+endpoint Node accepts ieee80211_radiotap
+{
+    process this accepts ir:ieee80211_radiotap
+    {
+        WiFi.HasFCS hasFCS = WiFi.HasFCS.Yes;
+        if (ir.rtapdata.Flags is f:Flags && ((f.$"flags" & Flags_Flag.FCS) == 0))
+        {
+            hasFCS = WiFi.HasFCS.No;
+        }
+        WiFi.DecodeWiFiMessageAndDispatch(ir.data, true, hasFCS);
+    }
+}
+
+message ieee80211_radiotap
+{
+    ieee80211_radiotap_header header;
+    rtapdataType rtapdata with Encoding{Decoder = rtapdataTypeDecoder, SourcePattern = TypeOf<binary>()}, BinaryEncoding{Length = header.it_len - 8 - (header.it_present_extend != nothing ? ((header.it_present_extend as array<uint>).Count * 4) : 0)};
+    binary data;
+    
+    override string ToString()
+    {
+        return "ieee80211_radiotap, it_len: " + header.it_len.ToString();
+    }
+    
+    optional rtapdataType rtapdataTypeDecoder(binary bin)
+    {
+        rtapdataType rd = new rtapdataType{};
+        
+        uint mask = 0x01;
+        stream s = bin;
+        int sPos;
+        long padlen;
+        
+        // Only decode the data structures which associate with the first it_present in header.
+        for (int i = 0; i < 31; i++)
+        {
+            if ((header.it_present & (mask << i)) > 0)
+            {
+                // Consume the padding following each RtapData
+                padlen = (s.BytePosition % rtapdataTypePaddingLength[i]);
+                if (padlen != 0)
+                {
+                    padlen = rtapdataTypePaddingLength[i] - padlen;
+                    if (BinaryDecoder<Blob[padlen as uint]>(s) == nothing)
+                    {
+                        ValidationCheck(false, null, DiagnosisLevel.Error, () => Format(RADIOTAP_DECODING_RTAPDATA_FAILED, rtapdataTypeName[i]));
+                        break;
+                    }
+                }
+                
+                sPos = s.BitPosition;
+                switch (i)
+                {
+                    case 0  => rd.TSFT = BinaryDecoder<TSFT>(s);
+                    case 1  => rd.Flags = BinaryDecoder<Flags>(s);
+                    case 2  => rd.Rate = BinaryDecoder<Rate>(s);
+                    case 3  => rd.Channel = BinaryDecoder<Channel>(s);
+                    case 4  => rd.FHSS = BinaryDecoder<FHSS>(s);
+                    case 5  => rd.AntennaSignal = BinaryDecoder<AntennaSignal>(s);
+                    case 6  => rd.AntennaNoise = BinaryDecoder<AntennaNoise>(s);
+                    case 7  => rd.LockQuality = BinaryDecoder<LockQuality>(s);
+                    case 8  => rd.TXAttenuation = BinaryDecoder<TXAttenuation>(s);
+                    case 9  => rd.dBTXAttenuation = BinaryDecoder<dBTXAttenuation>(s);
+                    case 10 => rd.dBmTXPower = BinaryDecoder<dBmTXPower>(s);
+                    case 11 => rd.Antenna = BinaryDecoder<Antenna>(s);
+                    case 12 => rd.dBAntennaSignal = BinaryDecoder<dBAntennaSignal>(s);
+                    case 13 => rd.dBAntennaNoise = BinaryDecoder<dBAntennaNoise>(s);
+                    case 14 => rd.RXFlags = BinaryDecoder<RXFlags>(s);
+                    case 15 => rd.TXFlags = BinaryDecoder<TXFlags>(s);
+                    case 16 => rd.RtsRetries = BinaryDecoder<RtsRetries>(s);
+                    case 17 => rd.DataRetries = BinaryDecoder<DataRetries>(s);
+                    case 18 => rd.XChannel = BinaryDecoder<XChannel>(s);
+                    case 19 => rd.MCS = BinaryDecoder<MCS>(s);
+                    case 20 => rd.AMPDUStatus = BinaryDecoder<AMPDUStatus>(s);
+                    case 21 => rd.VHT = BinaryDecoder<VHT>(s);
+                    default =>;
+                }
+                
+                // Handle the decoding failure
+                if (s.BitPosition == sPos)
+                {
+                    ValidationCheck(false, null, DiagnosisLevel.Error, () => Format(RADIOTAP_DECODING_RTAPDATA_FAILED, rtapdataTypeName[i]));
+                    break;
+                }
+                
+                AssociateFieldPosition(rd, rtapdataTypeName[i], s, sPos);
+            }
+        }
+        
+        return rd;
+    }
+}
+
+type ieee80211_radiotap_header
+{
+    byte it_version where ValidationCheckValue(value == 0, null, false, ReferenceType.Type, "Radiotap", "it_version", "ieee80211_radiotap_header", "0", value);
+    byte it_pad;
+    ushort it_len;
+    PresentFlags it_present;
+    optional [|(it_present & PresentFlags.EXT) > 0|] array<uint> it_present_extend with Encoding{Decoder = it_present_extendDecoder};
+    
+    optional array<uint> it_present_extendDecoder(stream s)
+    {
+        array<uint> it_present_extend = [];
+        int index = -1;
+        do
+        {
+            if (BinaryDecoder<uint>(s) is val:uint)
+            {
+                it_present_extend += [val];
+            }
+            else
+            {
+                ThrowDecodingException("Radiotap", "ieee80211_radiotap_header");
+            }
+            index++;
+        } while ((it_present_extend[index] & PresentFlags.EXT) > 0);
+        
+        return it_present_extend;
+    }
+}
+
+pattern PresentFlags = flags uint
+{
+    TSFT                = 0x00000001,   // bit 0
+    FLAGS               = 0x00000002,   // bit 1
+    RATE                = 0x00000004,   // bit 2
+    CHANNEL             = 0x00000008,   // bit 3
+    FHSS                = 0x00000010,   // bit 4
+    DBM_ANTSIGNAL       = 0x00000020,   // bit 5
+    DBM_ANTNOISE        = 0x00000040,   // bit 6
+    LOCK_QUALITY        = 0x00000080,   // bit 7
+    TX_ATTENUATION      = 0x00000100,   // bit 8
+    DB_TX_ATTENUATION   = 0x00000200,   // bit 9
+    DBM_TX_POWER        = 0x00000400,   // bit 10
+    ANTENNA             = 0x00000800,   // bit 11
+    DB_ANTSIGNAL        = 0x00001000,   // bit 12
+    DB_ANTNOISE         = 0x00002000,   // bit 13
+    RX_FLAGS            = 0x00004000,   // bit 14
+    TX_FLAGS            = 0x00008000,   // bit 15
+    RTS_RETRIES         = 0x00010000,   // bit 16
+    DATA_RETRIES        = 0x00020000,   // bit 17
+    XCHANNEL            = 0x00040000,   // bit 18
+    MCS                 = 0x00080000,   // bit 19
+    AMPDU_STATUS        = 0x00100000,   // bit 20
+    VHT                 = 0x00200000,   // bit 21
+    RADIOTAP_NAMESPACE  = 0x20000000,   // bit 29
+    VENDOR_NAMESPACE    = 0x40000000,   // bit 30
+    EXT                 = 0x80000000    // bit 31
+};
+
+// Array of the length of alignment for Rtapdata
+array<long> rtapdataTypePaddingLength = 
+[
+    8, // TSFT
+    1, // FLAGS
+    1, // RATE
+    2, // CHANNEL
+    1, // FHSS
+    1, // DBM_ANTSIGNAL
+    1, // DBM_ANTNOISE
+    2, // LOCK_QUALITY
+    2, // TX_ATTENUATION
+    2, // DB_TX_ATTENUATION
+    1, // DBM_TX_POWER
+    1, // ANTENNA
+    1, // DB_ANTSIGNAL
+    1, // DB_ANTNOISE
+    2, // RX_FLAGS
+    2, // TX_FLAGS
+    1, // RTS_RETRIES
+    1, // DATA_RETRIES
+    4, // XCHANNEL
+    1, // MCS
+    4, // AMPDU_STATUS
+    2  // VHT
+];
+
+// Type defined for decoding the rtapdata manually
+// The field name is the same as its type name
+type rtapdataType
+{
+    optional TSFT TSFT;
+    optional Flags Flags;
+    optional Rate Rate;
+    optional Channel Channel;
+    optional FHSS FHSS;
+    optional AntennaSignal AntennaSignal;
+    optional AntennaNoise AntennaNoise;
+    optional LockQuality LockQuality;
+    optional TXAttenuation TXAttenuation;
+    optional dBTXAttenuation dBTXAttenuation;
+    optional dBmTXPower dBmTXPower;
+    optional Antenna Antenna;
+    optional dBAntennaSignal dBAntennaSignal;
+    optional dBAntennaNoise dBAntennaNoise;
+    optional RXFlags RXFlags;
+    optional TXFlags TXFlags;
+    optional RtsRetries RtsRetries;
+    optional DataRetries DataRetries;
+    optional XChannel XChannel;
+    optional MCS MCS;
+    optional AMPDUStatus AMPDUStatus;
+    optional VHT VHT;
+}
+
+// string of the field name in rtapdataType
+const array<string> rtapdataTypeName =
+[
+    "TSFT",
+    "Flags",
+    "Rate",
+    "Channel",
+    "FHSS",
+    "AntennaSignal",
+    "AntennaNoise",
+    "LockQuality",
+    "TXAttenuation",
+    "dBTXAttenuation",
+    "dBmTXPower",
+    "Antenna",
+    "dBAntennaSignal",
+    "dBAntennaNoise",
+    "RXFlags",
+    "TXFlags",
+    "RtsRetries",
+    "DataRetries",
+    "XChannel",
+    "MCS",
+    "AMPDUStatus",
+    "VHT"
+];
+
+/*
+ * Bit Number 0 
+ * Structureu 64 mactime 
+ * Required Alignment 8 
+ * Unit microseconds 
+ */ 
+type TSFT
+{
+    ulong mactime;
+    override string ToString()
+    {
+        return mactime.ToString() + " microseconds ";
+    }
+}
+/*
+ * Bit Number 1 
+ * Structureu 8 flags 
+ * Unit bitmap 
+ */
+ type Flags
+ {
+     Flags_Flag $"flags";
+     override string ToString()
+     {
+         return EnumToString($"flags", "Radiotap.Flags_Flag");
+     }
+ }
+ 
+ pattern Flags_Flag = flags byte
+ {
+     CFP                = 0x01,
+     Preamble           = 0x02,
+     WEP                = 0x04,
+     Fragmentation      = 0x08,
+     FCS                = 0x10,
+     Pad                = 0x20,
+     BadFCS             = 0x40,
+     ShortGuardInterval = 0x80,
+ };
+ 
+/*
+* Bit Number 2 
+* Structureu 8 
+* Unit 500 Kbps 
+*/
+type Rate
+{
+    byte Rate;
+    override string ToString()
+    {
+        return (Rate * 500 as string) + " Kb/s";
+    }
+}
+ 
+/*
+ * Bit Number3 
+ * Structureu16 frequency, u16 flags 
+ * Required Alignment2 
+ * UnitsMHz, bitmap 
+ */
+type Channel
+{
+    ushort frequency;
+    Channel_flags $"flags";
+    
+    override string ToString()
+    {
+        return "frequency: " + frequency.ToString() + " MHz, flags: " + EnumToString($"flags", "Radiotap.Channel_flags");
+    }
+}
+
+pattern Channel_flags = flags ushort
+{
+    Turbo           = 0x0010,
+    CCK             = 0x0020,
+    OFDM            = 0x0040,
+    $"2GHz"         = 0x0080,
+    $"5GHz"         = 0x0100,
+    PassiveScan     = 0x0200,
+    DynamicCCKOFDM  = 0x0400,
+    GFSK            = 0x0800,
+};
+
+/*
+ * Bit Number 4 
+ * Structure u8 hop set, u8 hop pattern*/
+type FHSS
+{
+    byte HopSet;
+    byte HopPattern;
+}
+
+/*
+ * Bit Number 5 
+ * Structure s8 
+ * Unit dBm */
+type AntennaSignal
+{
+    sbyte signal;
+    override string ToString()
+    {
+        return signal.ToString() + " dBm";
+    }
+}
+
+/*
+ * Bit Number 6 
+ * Structure s8 
+ * Unit dBm */
+type AntennaNoise
+{
+    sbyte noise;
+    override string ToString()
+    {
+        return noise.ToString() + " dBm";
+    }    
+}
+
+/*
+ * Bit Number 7 
+ * Structure u16 
+ * Required Alignment 2 */
+type LockQuality
+{
+    ushort quality;
+    override string ToString()
+    {
+        return quality.ToString();
+    }
+}
+
+/*
+ * Bit Number 8 
+ * Structure u16 
+ * Required Alignment 2 */
+type TXAttenuation
+{
+    ushort attenuation;
+    override string ToString()
+    {
+        return attenuation.ToString();
+    }
+}
+
+/*
+ * Bit Number 9 
+ * Structure u16 
+ * Required Alignment 2 
+ * Unit dB */
+type dBTXAttenuation
+{
+    ushort attenuation;
+    override string ToString()
+    {
+        return attenuation.ToString() + " dB";
+    }
+}
+
+/*
+ * Bit Number 10 
+ * Structure s8 
+ * Required Alignment 1 
+ * Unit dBm */
+type dBmTXPower
+{
+    sbyte power;
+    override string ToString()
+    {
+        return power.ToString() + " dBm";
+    }
+}
+
+/*
+ * Bit Number 11 
+ * Structure u8  */
+type Antenna
+{
+    byte Antenna;
+    override string ToString()
+    {
+        return "antenna index: " + Antenna.ToString();
+    }
+}
+
+/*
+ *Bit Number 12 
+ * Structure u8 
+ * Unit dB */
+type dBAntennaSignal
+{
+    byte signal;
+    override string ToString()
+    {
+        return signal.ToString() + " dB";
+    }
+}
+
+/*Bit Number 13 
+ * Structure u8 
+ * Unit dB */
+type dBAntennaNoise
+{
+    byte noise;
+    override string ToString()
+    {
+        return noise.ToString() + " dB";
+    }
+}
+
+/*Bit Number 14 
+ * Structure u16 
+ * Required Alignment 2 */
+type RXFlags
+{
+    (flags ushort
+     {
+         Reserved = 0x0001,
+         BadPLCPCRC = 0x0002,
+     }) $"flags";
+}
+
+/*
+ * Bit Number 15 
+ * Structure u16 flags 
+ * Required Alignment 2 
+ * Unit bitmap */
+type TXFlags 
+{
+    (flags ushort
+     {
+         ExcessiveRetries    = 0x0001,
+         CTSToSelfProtection = 0x0002,
+         RTSOrCTSHandshake   = 0x0004,
+         NotExpectAck        = 0x0008,
+         NotchangeSeqNo      = 0x0010,
+     }) $"flags";
+}
+
+/*
+ * Bit Number 16 
+ * Structure u8 retries*/
+type RtsRetries
+{
+    byte retries;
+}
+
+/*
+ * Bit Number 17 
+ * Structure u8 retries*/
+type DataRetries
+{
+    byte retries;
+}
+
+/*Bit Number 18 
+ * Structure u32 flags, u16 freq, u8 channel, u8 maxpower 
+ * Required Alignment 4 
+ * Unit(s) none, MHz, 802.11 channel number, unknown */
+type XChannel
+{
+    XChannelFlag $"flags";
+    ushort freq;
+    byte channel;
+    byte maxpower;
+}
+
+pattern XChannelFlag = flags uint
+{
+    Trubo           = 0x00000010,
+    CCK             = 0x00000020,
+    OFDM            = 0x00000040,
+    $"2GHZ"         = 0x00000080,
+    $"5GHZ"         = 0x00000100,
+    Passive         = 0x00000200,
+    Dynamic         = 0x00000400,
+    GFSK            = 0x00000800,
+    GSM             = 0x00001000,
+    StatusTurbo     = 0x00000200,
+    HalfRate        = 0x00000400,
+    QuarterRate     = 0x00000800,
+    HT20            = 0x00010000,
+    HT40Above       = 0x00020000,
+    HT40Below       = 0x00040000,
+    ...
+};
+
+/*
+ * Bit Number 19 
+ * Structure u8 known, u8 flags, u8 mcs 
+ * Required Alignment 1 */
+type MCS
+{
+    MCS_KnownFlag known;
+    MCSFlag $"flags";
+    byte mcs;
+}
+
+pattern MCS_KnownFlag = flags byte
+{
+    Bandwidth       = 0x01,
+    MCSIndexKnown   = 0x02,
+    GuardInterval   = 0x04,
+    HTFormat        = 0x08,
+    FECType         = 0x10,
+    STBCKnown       = 0x20,
+    NessKnown       = 0x40,
+    NessData        = 0x80
+};
+
+type MCSFlag 
+{
+    byte Ness with BinaryEncoding{Width = 1};
+    byte NumberOfSTBCStreams with BinaryEncoding{Width = 2};
+    MCSFlag_FECType FECType with BinaryEncoding{Width = 1};
+    MCSFlag_HTFormat HTFormat with BinaryEncoding{Width = 1};
+    MCSFlag_GuardInterval GuardInterval with BinaryEncoding{Width = 1};
+    MCSFlag_Bandwidth Bandwidth with BinaryEncoding{Width = 2};
+};
+
+pattern MCSFlag_FECType = enum byte
+{
+    BCC  = 0x00,
+    LDPC = 0x01,
+    ...
+};
+
+pattern MCSFlag_HTFormat = enum byte
+{
+    mixed      = 0x00,
+    greenfield = 0x01,
+    ...
+};
+
+pattern MCSFlag_GuardInterval = enum byte
+{
+    $"long GI"  = 0x00,
+    $"short GI" = 0x01,
+    ...
+};
+
+pattern MCSFlag_Bandwidth = enum byte
+{
+    $"20 MHz"       = 0x00,
+    $"40 MHz"       = 0x01,
+    $"20 MHz lower" = 0x02,
+    $"20 MHz upper" = 0x03,
+    ...
+};
+
+/*
+ * Bit Number 20 
+ * Structure u32 reference number, u16 flags, u8 delimiter CRC value, u8 reserved 
+ * Required Alignment 4 bytes */
+type AMPDUStatus
+{
+    uint ReferenceNumber;
+    AMPDUStatusFlag $"flags";
+    byte DelimiterCRC;
+    byte Reserved;
+}
+
+pattern AMPDUStatusFlag = flags ushort
+{
+    DriveReportsZeroLengthSubframe = 0x0001,
+    ZeroLengthSubframe = 0x0002,
+    LastSubframeIsKnown = 0x0004,
+    LastSubframe = 0x0008,
+    WrongDelimiterCRC = 0x0010,
+    DelemiterCRCIsKnown = 0x0020,
+    ...
+};
+
+/*
+ * Bit Number 21 
+ * Structureu 16 known, u8 flags, u8 bandwidth, u8 mcs_nss[4], u8 coding, u8 group_id, u16 partial_aid
+ * Required Alignment 2 
+ */
+type VHT
+{
+    VHT_KnownFlag known;
+    VHTFlag $"flags";
+    byte bandwidth;
+    array<byte> mcs_nss with BinaryEncoding{Length = 4};
+    Coding coding;
+    byte group_id;
+    ushort partial_aid;
+}
+
+pattern VHT_KnownFlag = flags ushort
+{
+    STBC = 0x0001,
+    TXOP_PS_NOT_ALLOWED = 0x00002,
+    GuardInterval = 0x0004,
+    ShortGINSYMDisambiguation  = 0x0008,
+    LDPCExtraOFDMSymbol = 0x0010,
+    Beamformed = 0x0020,
+    Bandwidth = 0x0040,
+    GroupID = 0x0080,
+    PartialAID = 0x0100,
+    ...
+};
+
+pattern VHTFlag = flags byte
+{
+    STBC = 0x0001,
+    TXOP_PS_NOT_ALLOWED = 0x00002,
+    GuardInterval = 0x0004,
+    ShortGINSYMDisambiguation  = 0x0008,
+    LDPCExtraOFDMSymbol = 0x0010,
+    Beamformed = 0x0020,
+    ...
+};
+
+pattern Coding = flags byte
+{
+    User0 = 0x01,
+    User1 = 0x02,
+    User2 = 0x04,
+    User3 = 0x08,
+    ...
+};
+

@@ -1,0 +1,394 @@
+protocol PPTP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Point-to-Point Tunneling Protocol",
+    ShortName = "PPTP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2637"},
+            new Reference{Name = "PPTP", Link = "http://www.networksorcery.com/enp/protocol/pptp.htm"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "363368", Date = "05/05/2014"}
+        ]
+};
+
+using Utility;
+using Standard;
+using IANA;
+using TCP;
+
+endpoint Server over TCP.Server accepts Datagram issues Datagram;
+client endpoint Client connected to Server;
+
+autostart actor PPTPOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+
+    process server issues s:TCP.Segment where s.SourcePort == Port.PPTP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "PPTP", endpoint Server over server, 
+                                    IsPPTP, 
+                                    IsSufficientForPPTP,
+                                    (stream s) => BinaryDecoder<Datagram>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<PartialPPTP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.PPTP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "PPTP", endpoint Server over server, 
+                                    IsPPTP, 
+                                    IsSufficientForPPTP,
+                                    (stream s) => BinaryDecoder<Datagram>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<PartialPPTP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && s.SourcePort == Port.PPTP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "PPTP", endpoint Server over server, 
+                                    IsPPTP, 
+                                    IsSufficientForPPTP,
+                                    (stream s) => BinaryDecoder<Datagram>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<PartialPPTP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && s.DestinationPort == Port.PPTP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "PPTP", endpoint Server over server, 
+                                    IsPPTP, 
+                                    IsSufficientForPPTP,
+                                    (stream s) => BinaryDecoder<Datagram>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<PartialPPTP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+bool? IsPPTP(binary b)
+{
+    if (b.Count < 8)
+        return null;
+
+    if (b[4] == 0x1A && b[5] == 0x2B && b[6] == 0x3C && b[7] == 0x4D) // RFC 2637 section 1.4: The Magic Cookie is always sent as the constant 0x1A2B3C4D.
+        return true;
+    else
+        return false;
+}
+
+uint? IsSufficientForPPTP(binary b)
+{
+    if (b.Count < 2)
+        return null;
+    var length = (((b[0] as ushort) << 8) + b[1]) as uint;
+
+    if (length <= b.Count)
+        return 0;
+    else
+        return length;
+}
+
+message Datagram
+{
+    PPTPHead PPTPHead;
+    ([|PPTPHead.MessageType == 1|] ControlMessage
+        | [|PPTPHead.MessageType == 2|] ManagementMessage[PPTPHead.Length - 8 as ushort]
+        | Blob[PPTPHead.Length - 8 as uint]) Message;
+    
+    override string ToString()
+    {
+        string displayStr = "";
+        switch (PPTPHead.MessageType)
+        {
+            case 1 => 
+                var msg = Message as ControlMessage;
+                displayStr += ((InRange<ControlMessagePattern>(msg.ControlMessageType)) ? "Control Message: " : "Unknown Control Message Type: ") + EnumToString<PPTP.ControlMessagePattern>(msg.ControlMessageType, false);
+            case 2 => displayStr += "Management Message";
+            default => 
+                displayStr += "Unknown Message Type(" + (PPTPHead.MessageType as string) + ")";
+        }
+        displayStr += ", Length: " + (PPTPHead.Length.ToString());
+        return displayStr;
+    }
+};
+
+pattern ControlMessagePattern = enum ushort
+{
+    $"Start-Control-Connection-Request" = 1,
+    $"Start-Control-Connection-Reply" = 2,
+    $"Stop-Control-Connection-Request" = 3,
+    $"Stop-Control-Connections-Reply" = 4,
+    $"Echo-Request" = 5,
+    $"Echo-Reply" = 6,
+    $"Outgoing-Call-Request" = 7,
+    $"Outgoing-Call-Reply" = 8,
+    $"Incoming-Call-Request" = 9,
+    $"Incoming-Call-Reply" = 10,
+    $"Incoming-Call-Connected" = 11,
+    $"Call-Clear-Request" = 12,
+    $"Call-Disconnect-Notify" = 13,
+    $"WAN-Error-Notify" = 14,
+    $"Set-Link-Info" = 15,
+    ...
+};
+
+// Only define to handle partial message parsing.
+message PartialPPTP
+{
+    PPTPHead PPTPHead;
+    binary IncompleteData;
+    
+    override string ToString()
+    {
+        string displayStr = "[Incomplete Message] ";
+        switch (PPTPHead.MessageType)
+        {
+            case 1 => displayStr += "Control Message";
+            case 2 => displayStr += "Management Message";
+            default => 
+                displayStr += "Unknown Message Type(" + (PPTPHead.MessageType as string) + ")";
+        }
+        displayStr += ", Length: " + (PPTPHead.Length as string);
+        return displayStr;
+    }
+};
+
+type PPTPHead
+{
+    ushort Length;
+    ushort MessageType;
+    uint MagicCookie;
+}
+
+type ManagementMessage[ushort Len]
+{
+    string Message with BinaryEncoding{Length = Len, TextEncoding = TextEncoding.ASCII};
+}
+
+type ControlMessage
+{
+    ControlMessagePattern ControlMessageType;
+    ushort Reserved0 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved0 in type ControlMessage must be zero.");
+    ([|ControlMessageType == 1|] StartControlConnectionRequest
+        | [|ControlMessageType == 2|] StartControlConnectionReply
+        | [|ControlMessageType == 3|] StopControlConnectionRequest
+        | [|ControlMessageType == 4|] StopControlConnectionsReply
+        | [|ControlMessageType == 5|] EchoRequest
+        | [|ControlMessageType == 6|] EchoReply
+        | [|ControlMessageType == 7|] OutgoingCallRequest
+        | [|ControlMessageType == 8|] OutgoingCallReply
+        | [|ControlMessageType == 9|] IncomingCallRequest
+        | [|ControlMessageType == 10|] IncomingCallReply
+        | [|ControlMessageType == 11|] IncomingCallConnected
+        | [|ControlMessageType == 12|] CallClearRequest
+        | [|ControlMessageType == 13|] CallDisconnectNotify
+        | [|ControlMessageType == 14|] WANErrorNotify
+        | [|ControlMessageType == 15|] SetLinkInfo
+        | UnknownMessage) MessageBody;
+}
+
+type UnknownMessage
+{
+    binary Data;
+}
+
+type StartControlConnectionRequest
+{
+    ushort ProtocolVersion;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type StartControlConnectionRequest must be zero.");
+    FramingCapabilities FramingCapabilities;
+    BearerCapabilities BearerCapabilities;
+    ushort MaximumChannels;
+    ushort FirmwareRevision;
+    string HostName with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+    string VendorString with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+}
+
+type StartControlConnectionReply
+{
+    ushort ProtocolVersion;
+    byte ResultCode;
+    byte ErrorCode;
+    FramingCapabilities FramingCapabilities;
+    BearerCapabilities BearerCapabilities;
+    ushort MaximumChannels;
+    ushort FirmwareRevision;
+    string HostName with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+    string VendorString with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+}
+
+type StopControlConnectionRequest
+{
+    byte Reason;
+    byte Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type StopControlConnectionRequest must be zero.");
+    ushort Reserved2 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved2 in type StopControlConnectionRequest must be zero.");
+}
+
+type StopControlConnectionsReply
+{
+    byte ResultCode;
+    byte ErrorCode;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type StopControlConnectionsReply must be zero.");
+}
+
+type EchoRequest
+{
+    uint Identifier;
+}
+
+type EchoReply
+{
+    uint Identifier;
+    byte ResultCode;
+    byte ErrorCode;
+    ushort  Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type EchoReply must be zero.");
+}
+
+type OutgoingCallRequest
+{
+    ushort CallID;
+    ushort CallSerialNumber;
+    uint MinimumBPS;
+    uint MaximumBPS;
+    uint BearerType;
+    uint FramingType;
+    ushort PacketRecvWindowSize;
+    ushort PacketProcessingDelay;
+    ushort PhoneNumberLength;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type OutgoingCallRequest must be zero.");
+    string PhoneNumber with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+    string Subaddress with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+}
+
+type OutgoingCallReply
+{
+    ushort CallID;
+    ushort PeersCallID;
+    byte ResultCode;
+    byte ErrorCode;
+    ushort CauseCode;
+    uint ConnectSpeed;
+    ushort PacketRecvWindowSize;
+    ushort PacketProcessingDelay;
+    uint PhysicalChannelID;
+}
+
+type IncomingCallRequest
+{
+    ushort CallID;
+    ushort CallSerialNumber;
+    uint CallBearerType;
+    uint PhysicalChannelID;
+    ushort DialedNumberLength;
+    ushort DialingNumberLength;
+    string DialedNumber with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+    string DialingNumber with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+    string Subaddress with BinaryEncoding{Length = 64, TextEncoding = TextEncoding.ASCII};
+}
+
+type IncomingCallReply
+{
+    ushort CallID;
+    ushort PeersCallID;
+    byte ResultCode;
+    byte ErrorCode;
+    ushort PacketRecvWindowSize;
+    ushort PacketTransmitDelay;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type IncomingCallReply must be zero.");
+}
+
+type IncomingCallConnected
+{
+    ushort PeersCallID;
+    ushort Reserved1;
+    uint ConnectSpeed;
+    ushort PacketRecvWindowSize;
+    ushort PacketTransmitDelay;
+    uint FramingType;
+}
+
+type CallClearRequest
+{
+    ushort CallID;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type CallClearRequest must be zero.");
+}
+
+type CallDisconnectNotify
+{
+    ushort CallID;
+    byte ResultCode;
+    byte ErrorCode;
+    ushort  CauseCode;
+    ushort Reserved1;
+    string CallStatistics with BinaryEncoding{Length = 128, TextEncoding = TextEncoding.ASCII};
+}
+
+type WANErrorNotify
+{
+    ushort PeersCallID;
+    ushort Reserved1;
+    uint CRCErrors;
+    uint FramingErrors;
+    uint HardwareOverruns;
+    uint BufferOverruns;
+    uint TimeOutErrors;
+    uint AlignmentErrors;
+}
+
+type SetLinkInfo
+{
+    ushort PeersCallID;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "PPTP: Reserved1 in type SetLinkInfo must be zero.");
+    uint SendACCM;
+    uint ReceiveACCM;
+}
+
+type FramingCapabilities
+{
+    uint Reserved with BinaryEncoding{Width = 30};
+    byte SynchronousFramingSupported with BinaryEncoding{Width = 1};
+    byte AsynchronousFramingSupported with BinaryEncoding{Width = 1};
+}
+
+type BearerCapabilities
+{
+    uint Reserved with BinaryEncoding{Width = 30};
+    byte DigitalAccessSupported with BinaryEncoding{Width = 1};
+    byte AnalogAccessSupported with BinaryEncoding{Width = 1};
+}

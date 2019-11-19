@@ -1,0 +1,454 @@
+protocol CHAP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "PPP Challenge Handshake Authentication Protocol ",
+    ShortName = "CHAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1994"},
+            new Reference{Name = "RFC 2759"},
+            new Reference{Name = "MS-CHAP", Version = "16.0", Date = "06/30/2015"},
+        ],
+    RevisionSummary = 
+        [
+             new Revision{Class = RevisionClass.Major, Version = "381977", Date = "10/03/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using PPP;
+using EAP;
+
+endpoint Server over PPP.Node | over EAP.Server
+    accepts Challenge_Request issues Challenge_Response issues Challenge_ResponseV2
+    accepts Success_Request issues Success_Response
+    accepts Failure_Request issues Failure_Response
+    issues Change_Password_Response;
+
+client endpoint Client connected to Server;
+
+autostart actor CHAPOverEAP(EAP.Server server)
+{
+    process server accepts p:EAP.Packet where (p.Type == EAP.MethodType.EAP_MSCHAPv2 && 
+        p.Type_Data is chapData:EAP.EAP_MSCHAPv2 && chapData.MSCHAPv2Data is chapBin:binary && chapBin.Count > 0)
+    {
+        switch (chapBin[0])
+        {
+            case Code.Challenge =>
+                if (BinaryDecoder<Challenge_Request>(chapBin) is msg:Challenge_Request)
+                {
+                    dispatch (endpoint Server over server) accepts msg;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Challenge_Request");
+                }
+            case Code.Success =>
+                if (BinaryDecoder<SuccessOrFailure_Request>(chapBin) is request:SuccessOrFailure_Request)
+                {
+                    Success_Request req = new Success_Request
+                                        {
+                                            Code = request.Code,
+                                            Identifier = request.Identifier,
+                                            Length = request.Length,
+                                            Message = nothing,
+                                        };
+                    if (request.Message is msg:string)
+                    {
+                        var arr = msg.Split([' ']);
+                        map<string, string> msgs = {};
+                        foreach (var ele in arr)
+                        {
+                            if (KeyValuePairSyntax(ele) is pair:KeyValuePair)
+                            {
+                                msgs[pair.Key] = pair.Value;
+                            }
+                        }
+                        req.Message = msgs;
+                    }
+                    dispatch (endpoint Server over server) accepts req;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Success_Request");
+                }
+            case Code.Failure =>
+                if (BinaryDecoder<SuccessOrFailure_Request>(chapBin) is request:SuccessOrFailure_Request)
+                {
+                    Failure_Request req = new Failure_Request
+                                        {
+                                            Code = request.Code,
+                                            Identifier = request.Identifier,
+                                            Length = request.Length,
+                                            Message = nothing,
+                                        };
+                    if (request.Message is msg:string)
+                    {
+                        var arr = msg.Split([' ']);
+                        map<string, string> msgs = {};
+                        foreach (var ele in arr)
+                        {
+                            if (KeyValuePairSyntax(ele) is pair:KeyValuePair)
+                            {
+                                msgs[pair.Key] = pair.Value;
+                            }
+                        }
+                        req.Message = msgs;
+                    }
+                    dispatch (endpoint Server over server) accepts req;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Failure_Request");
+                }
+            default => 
+                ThrowDecodingException("CHAP");
+        }
+    }
+
+    process server issues p:EAP.Packet where (p.Type == EAP.MethodType.EAP_MSCHAPv2 && 
+        p.Type_Data is chapData:EAP.EAP_MSCHAPv2 && chapData.MSCHAPv2Data is chapBin:binary && chapBin.Count > 0)
+    {
+        optional any message chapMsg;
+        switch (chapBin[0])
+        {
+            case Code.Response =>
+                if (BinaryDecoder<Challenge_ResponseV2>(chapBin) is m:Challenge_ResponseV2)
+                {
+                    chapMsg = m;
+                }
+                else
+                {
+                    chapMsg = BinaryDecoder<Challenge_Response>(chapBin);
+                }
+            case Code.Success =>
+                chapMsg = BinaryDecoder<Success_Response>(chapBin);
+            case Code.Failure =>
+                chapMsg = BinaryDecoder<Failure_Response>(chapBin);
+            case Code.ChangePassword =>
+                chapMsg = BinaryDecoder<Change_Password_Response>(chapBin);
+            default => 
+                ThrowDecodingException("CHAP");
+        }
+        if (chapMsg is msg:any message)
+        {
+            dispatch (endpoint Server over server) issues msg;
+        }
+        else
+        {
+            ThrowDecodingException("CHAP");
+        }
+    }
+}
+
+autostart actor CHAPOverPPP(PPP.Node node)
+{
+    process node accepts f:PPP.Frame where (GetPacketTypeValue(f.PacketType) == 0xC223 && 
+        f.Payload is pppBin:binary && pppBin.Count > 0)
+    {
+        switch (pppBin[0])
+        {
+            case Code.Challenge =>
+                if (BinaryDecoder<Challenge_Request>(pppBin) is msg:Challenge_Request)
+                {
+                    dispatch (endpoint Server over node) accepts msg;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Challenge_Request");
+                }
+            case Code.Response =>
+                if (BinaryDecoder<Challenge_ResponseV2>(pppBin) is msg:Challenge_ResponseV2)
+                {
+                    dispatch (endpoint Server over node) issues msg;
+                }
+                else if (BinaryDecoder<Challenge_Response>(pppBin) is msg2:Challenge_Response)
+                {
+                    dispatch (endpoint Server over node) issues msg2;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Challenge_Response");
+                }
+            case Code.Success =>
+                if (BinaryDecoder<SuccessOrFailure_Request>(pppBin) is request:SuccessOrFailure_Request)
+                {
+                    Success_Request req = new Success_Request
+                                        {
+                                            Code = request.Code,
+                                            Identifier = request.Identifier,
+                                            Length = request.Length,
+                                            Message = nothing,
+                                        };
+                    if (request.Message is msg:string)
+                    {
+                        var arr = msg.Split([' ']);
+                        map<string, string> msgs = {};
+                        foreach (var ele in arr)
+                        {
+                            if (KeyValuePairSyntax(ele) is pair:KeyValuePair)
+                            {
+                                msgs[pair.Key] = pair.Value;
+                            }
+                        }
+                        req.Message = msgs;
+                    }
+                    dispatch (endpoint Server over node) accepts req;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Success_Request");
+                }
+            case Code.Failure =>
+                if (BinaryDecoder<SuccessOrFailure_Request>(pppBin) is request:SuccessOrFailure_Request)
+                {
+                    Failure_Request req = new Failure_Request
+                                        {
+                                            Code = request.Code,
+                                            Identifier = request.Identifier,
+                                            Length = request.Length,
+                                            Message = nothing,
+                                        };
+                    if (request.Message is msg:string)
+                    {
+                        var arr = msg.Split([' ']);
+                        map<string, string> msgs = {};
+                        foreach (var ele in arr)
+                        {
+                            if (KeyValuePairSyntax(ele) is pair:KeyValuePair)
+                            {
+                                msgs[pair.Key] = pair.Value;
+                            }
+                        }
+                        req.Message = msgs;
+                    }
+                    dispatch (endpoint Server over node) accepts req;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Failure_Request");
+                }
+            case Code.ChangePassword =>
+                if (BinaryDecoder<Change_Password_Response>(pppBin) is msg:Change_Password_Response)
+                {
+                    dispatch (endpoint Server over node) issues msg;
+                }
+                else
+                {
+                    ThrowDecodingException("CHAP", "Change_Password_Response");
+                }
+            default => 
+                ThrowDecodingException("CHAP");
+        }
+    }
+}
+
+message Packet
+{
+    Code Code;
+    byte Identifier;
+    ushort Length;
+    override string ToString()
+    {
+        return EnumToStringInSummary<CHAP.Code>(Code);
+    }
+}
+
+pattern Code = enum byte
+{
+    Challenge     = 1,
+    Response      = 2,
+    Success       = 3,
+    Failure       = 4,
+    ChangePassword = 7,
+    ...
+};
+
+// RFC 2759 chap 3, RFC 1994 4.1
+message Challenge_Request: Packet
+{
+    byte Value_Size;
+    binary Value with BinaryEncoding{Length = Value_Size};
+    optional [|Length - Value_Size - 5 > 0|] string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        string summary= "Challenge_Request";
+        if (Name is name:string)
+        {
+            summary += ", Name: " + name;
+        }
+        return summary;
+    }
+}
+
+// RFC 1994 4.1
+message Challenge_Response: Packet
+{
+    byte Value_Size;
+    binary Value with BinaryEncoding{Length = Value_Size};
+    optional [|Length - Value_Size - 5 > 0|] string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        string summary= "Challenge_Response";
+        if (Name is name:string)
+        {
+            summary += ", Name: " + name;
+        }
+        return summary;
+    }
+}
+
+// RFC 2759 chap 5, RFC 1994 4.2
+message Success_Request : Packet
+{
+    optional [|Length > 4|]map <string, string> Message;
+    override string ToString()
+    {
+        string summary = "Success_Request";
+        if (Message is msgs:map<string, string> && ("M" in msgs))
+        {
+            summary += ", Message: " + msgs["M"];
+        }
+        return summary;
+    }
+}
+
+// RFC 2759 chap 6, RFC 1994 4.2
+message Failure_Request : Packet
+{
+    optional [|Length > 4|] map<string, string> Message with DisplayInfo{ToText = FailureMessageToText};
+    override string ToString()
+    {
+        string summary = "Failure_Request";
+        if (Message is msgs:map<string, string>)
+        {
+            if ("E" in msgs)
+            {
+                summary += ", ErrorCode: " + EnumToStringInSummary<CHAP.FailureErrorCode>(msgs["E"] as uint);
+            }
+            if ("R" in msgs)
+            {
+                summary += ", " + EnumToStringInSummary<CHAP.FailureRetry>(msgs["R"] as byte);
+            }
+        }
+        return summary;
+    }
+
+    static string FailureMessageToText(any msg)
+    {
+        string text = "";
+        if (msg is m:map<string, string>)
+        {
+            if ("E" in m)
+            {
+                text += "E: " + EnumToStringInSummary<CHAP.FailureErrorCode>(m["E"] as uint) + ", ";
+            }
+            if ("R" in m)
+            {
+                text += "R: " + EnumToStringInSummary<CHAP.FailureRetry>(m["R"] as byte) + ", ";
+            }
+        }
+        if (text.Count > 2)
+        {
+            text = text.Segment(0, text.Count - 2);
+        }
+        return text;
+    }
+}
+
+pattern FailureErrorCode = enum uint
+{
+    ERROR_RESTRICTED_LOGON_HOURS = 646,
+    ERROR_ACCT_DISABLED = 647,
+    ERROR_PASSWD_EXPIRED = 648,
+    ERROR_NO_DIALIN_PERMISSION = 649,
+    ERROR_AUTHENTICATION_FAILURE = 691,
+    ERROR_CHANGING_PASSWORD = 709,
+    ...
+};
+
+pattern FailureRetry = enum byte
+{
+    RetryAllowed= 1,
+    RetryDisallowed = 0,
+    ...
+};
+
+message SuccessOrFailure_Request : Packet
+{
+    optional [|Length - 4 > 0|] string Message with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        return "SuccessOrFailure_Request";
+    }
+}
+
+// RFC 2759 chap 4, MS-CHAP-V2 Response
+message Challenge_ResponseV2 : Packet
+{
+    byte Value_Size;
+    binary Peer_Challenge with BinaryEncoding{Length = 16};
+    binary Reserved with BinaryEncoding{Length = 8};
+    binary NT_Response with BinaryEncoding{Length = 24};
+    byte Flags where ValidationCheckReservedZero(value == 0, this, true, 
+        ReferenceType.Message, "CHAP", "Flags", "Response", value);
+    optional [|Length - 54 > 0|] string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        string summary= "Challenge_ResponseV2";
+        if (Name is name:string)
+        {
+            summary += ", Name: " + name;
+        }
+        return summary;
+    }
+}
+
+message Success_Response
+{
+    Code Code;
+    override string ToString()
+    {
+        return "Success_Response";
+    }
+}
+
+message Failure_Response
+{
+    Code Code;
+    override string ToString()
+    {
+        return "Failure_Response";
+    }
+}
+
+// RFC 2759 chap 7
+message Change_Password_Response : Packet
+{
+    binary Encrypted_Password with BinaryEncoding{Length = 516};
+    binary Encrypted_Hash with BinaryEncoding{Length = 16};
+    binary Peer_Challenge with BinaryEncoding{Length = 16};
+    binary Reserved with BinaryEncoding{Length = 8};
+    binary NT_Response with BinaryEncoding{Length = 24};
+    ushort Flags where ValidationCheckReservedZero(value == 0, this, true, 
+        ReferenceType.Message, "CHAP", "Flags", "Change_Password", value);
+    override string ToString()
+    {
+        return "Change_Password_Response";
+    }
+}
+
+type KeyValuePair
+{
+    string Key;
+    string Value;
+}
+
+syntax KeyValuePairSyntax = s1:regex{[^=]+} "=" s2:regex{.+} => new KeyValuePair{Key = s1, Value = s2};

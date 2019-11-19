@@ -1,0 +1,583 @@
+protocol HGSA 
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Host Guardian Service: Attestation Protocol",
+    ShortName = "HGSA",
+    DocumentName = "MS-HGSA",
+    Description = "The Host Guardian Service provides secure services such as the Attestation Service and the Key Protection Service."
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+        new Reference {Name = "MS-HGSA", Version = "5.0", Date = "09/12/2018", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary =
+    [
+        new Revision {Class = RevisionClass.Major, Version = "", Date = ""}
+    ]
+};
+
+using HTTP;
+using Standard;
+using Utility;
+using XSD;
+using X509;
+using InfrastructureResources;
+
+const string HGSAAttestUri = "/attest";
+const string HGSADomainAttestUri = "/domainattest";
+const string HGSAHostKeyAttestUri = "/hostkeyattest";
+const string HGSAGetinfoUri = "/Getinfo";
+
+endpoint Server over HTTP.Server 
+    accepts TpmRequestInitial
+    issues UnauthorizedErrorReply issues TpmReplyContinue
+    accepts TpmRequestContinue 
+    issues UnauthorizedErrorReply issues TpmReplyContinue issues HealthCertificateReply issues PolicyEvaluationErrorReply issues PayloadErrorReply
+    accepts AttestationRequest
+    issues UnauthorizedErrorReply issues TpmReplyContinue issues HealthCertificateReply issues PolicyEvaluationErrorReply issues PayloadErrorReply
+    accepts ADRequest
+    issues HealthCertificateReply issues ErrorReply issues UnauthorizedErrorReply issues VirtualSecureModeErrorReply 
+    accepts ReceivingGetInfo
+    issues ReceivingGetInfoResponse;
+
+autostart actor HGSAOverHTTP(HTTP.Server server)
+{
+    string eventName;
+    string typeValue;
+    process server accepts req:HttpContract.Request where IsHGSARequest(req, out eventName, out typeValue)
+    {
+        if (eventName != null)
+        {
+            switch (typeValue)
+            {
+                case "AttestationRequest:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(req.Payload)
+                     {
+                          case m:AttestationRequest from JsonDecoder<AttestationRequest> =>
+                          dispatch (endpoint Server over server) accepts m;
+                     }
+                case "TpmRequestInitial:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(req.Payload)
+                     {
+                          case m:TpmRequestInitial from JsonDecoder<TpmRequestInitial> =>
+                          dispatch (endpoint Server over server) accepts m;
+                     }
+                case "TpmRequestContinue:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(req.Payload)
+                     {
+                          case m:TpmRequestContinue from JsonDecoder<TpmRequestContinue> =>
+                          dispatch (endpoint Server over server) accepts m;
+                     }
+                case "ADRequest:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(req.Payload)
+                     {
+                          case m:ADRequest from JsonDecoder<ADRequest> =>
+                          dispatch (endpoint Server over server) accepts m;
+                     }
+                default => 
+                     ThrowDecodingException("HGSA", "Mismatching type of request.");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("HGSA", "Null event name");
+        }
+    }
+    
+    process server issues res:HttpContract.Response where IsHGSAResponse(res, out eventName, out typeValue)
+    {
+        if (eventName != null)
+        {
+            switch (typeValue)
+            {
+                case "TpmReplyContinue:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:TpmReplyContinue from JsonDecoder<TpmReplyContinue> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "HealthCertificateReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:HealthCertificateReply from JsonDecoder<HealthCertificateReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "ErrorReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:ErrorReply from JsonDecoder<ErrorReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "UnauthorizedErrorReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:UnauthorizedErrorReply from JsonDecoder<UnauthorizedErrorReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "PolicyEvaluationErrorReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:PolicyEvaluationErrorReply from JsonDecoder<PolicyEvaluationErrorReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "PayloadErrorReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:PayloadErrorReply from JsonDecoder<PayloadErrorReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                case "VirtualSecureModeErrorReply:#Microsoft.Windows.RemoteAttestation.Core" =>
+                     switch(res.Payload)
+                     {
+                          case m:VirtualSecureModeErrorReply from JsonDecoder<VirtualSecureModeErrorReply> =>
+                          dispatch (endpoint Server over server) issues m;
+                     }
+                default => 
+                     ThrowDecodingException("HGSA", "Mismatching type of Response.");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("HGSA", "Null event name");
+        }
+    }
+}
+
+pattern MessageTypePattern = regex{[^"]+};
+syntax MessageType = "\\s*{\\s*\"__type\"\\s*:\\s*\"" t:MessageTypePattern => t;
+
+pattern Digits = regex{[0-9]+};
+syntax Version = "/v" major:Digits "." minor:Digits;
+syntax HGSAUri = "/Attestation" Version? s:(HGSAAttestUri | HGSADomainAttestUri | HGSAHostKeyAttestUri | HGSAGetinfoUri) => s;
+
+bool IsHGSARequest(HttpContract.Request request, out string eventName, out string messageType)
+{
+    eventName = "";
+
+    if (request.Uri.AbsPath is absPath:string)
+    {
+        return IsHGSAUri(absPath, out eventName);
+       if(IsHGSAUri(absPath, out eventName))
+       {
+           messageType = MessageType(request.Payload) as string;
+           return true;
+       }
+    }
+    return false;
+}
+
+bool IsHGSAResponse(HttpContract.Response response, out string eventName, out string messageType)
+{
+    eventName = "";
+    if (response#Uri != nothing)
+    {
+        var uriType = response#Uri as UriType;
+        if (uriType.AbsPath != nothing)
+        {
+            if(IsHGSAUri(uriType.AbsPath as string, out eventName))
+            {
+                 messageType = MessageType(response.Payload) as string;
+                 return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool IsHGSAUri(string absPath, out string eventName)
+{
+    eventName = "";
+    var result = HGSAUri(absPath);
+    if (result != nothing)
+    {
+        eventName = result as string;
+        return true;
+    }
+    return false;
+}
+
+message ReceivingGetInfo
+{
+    // no request body
+}
+
+message ReceivingGetInfoResponse
+{
+    ServiceInfoReply properties;
+}
+
+// 2.2.1 Enumerations
+// ------------------
+// 2.2.1.1 AttestationOperationMode
+pattern AttestationOperationMode = enum uint
+{
+    Unknown = 0x00000000,
+    PlatformTPM_Based = 0x00000001,
+    ActiveDirectoryBased = 0x00000002,
+    HostKeyBased = 0x00000003,
+    ...
+};
+
+// 2.2.1.2 AttestationProvidedContentType
+pattern AttestationProvidedContentType = enum uint
+{
+    VirtualSecureModeIdentityKey = 0x1,
+    RtpmContext = 0x2,
+    HealthCertificate = 0x3,
+    EndorsementKeyCertificate = 0x4,
+    CaTrustletUserData = 0x5,
+    CaTrustletVsmReport = 0x6,
+    CaTrustletReportSignature = 0x7,
+    HostKeyPublicKey = 0x8,
+    HostKeySignature = 0x9,
+    ...
+};
+
+// 2.2.1.3 AttestationResultType
+pattern AttestationResultType = enum uint
+{
+    VSMIdentityEncryptionKeyCertificate = 0x00000001,
+    VSMIdentitySigningKeyCertificate = 0x00000002,
+    VSMCAIntermediateCertificate = 0x00000003,
+    ...
+};
+
+// 2.2.1.4 TPMVersion
+pattern TPMVersion = enum uint
+{
+    TPM_VERSION_UNKOWN = 0x00000000,
+    TPM_VERSION_12 = 0x00000001,
+    TPM_VERSION_20 = 0x00000002,
+    ...
+};
+
+// 2.2.1.5 TpmInterfaceType
+pattern TpmInterfaceType = enum uint
+{
+    TPM_IFTYPE_UNKNOWN = 0x00000000,
+    TPM_IFTYPE_1 = 0x00000001,
+    TPM_IFTYPE_TRUSTZONE = 0x00000002,
+    TPM_IFTYPE_HW = 0x00000003,
+    TPM_IFTYPE_EMULATOR = 0x00000004,
+    ...
+};
+
+// 2.2.2 Common Data Structures
+// ----------------------------
+// 2.2.2.1 AttestationRequest
+message AttestationRequest : ProtocolRequestBase
+{
+    array<AttestationResultType> RequestedContent;
+    array<TupleOfAttestationProvidedContentTypebase64Binary> TupleOfAttestationProvidedContentTypebase64Binaries;
+}
+
+// 2.2.2.2 TpmRequest
+message TpmRequest : ProtocolRequestBase
+{
+    array<AttestationResultType> RequestedContent;
+    EndorsementKey RtpmPublicEndorsementKey with Encoding{
+         Decoder = AttestationProvidedContentTypeDecoder,
+         SourceConverter = Base64StringToBinary,
+         SourcePattern = TypeOf<string>()},
+     BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+
+     optional EndorsementKey AttestationProvidedContentTypeDecoder(binary bin)
+     {
+         return JsonDecoder<EndorsementKey>(bin);
+     }
+}
+
+// 2.2.2.3 TpmRequestInitial
+message TpmRequestInitial : TpmRequest
+{
+    string __type where value == "TpmRequestInitial:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.4 TpmRequestContinue
+message TpmRequestContinue : TpmRequest
+{
+    string __type where value == "TpmRequestContinue:#Microsoft.Windows.RemoteAttestation.Core";
+    Context RtpmNewContext with Encoding{Decoder = BinaryDecoder<Context>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+}
+
+// 2.2.2.5 ADRequest
+message ADRequest : ProtocolRequestBase
+{
+    string __type where value == "ADRequest:#Microsoft.Windows.RemoteAttestation.Core";
+    array<TupleOfAttestationResultTypebase64Binary> RequestedContent;
+}
+
+// 2.2.2.6 TpmReplyContinue
+message TpmReplyContinue : ProtocolReplyBase
+{
+    string __type where value == "TpmReplyContinue:#Microsoft.Windows.RemoteAttestation.Core";
+    Context RtpmActiveContext with Encoding{Decoder = BinaryDecoder<Context>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+}
+
+// 2.2.2.7 HealthCertificateReply
+message HealthCertificateReply : ProtocolReplyBase
+{
+    string __type where value == "HealthCertificateReply:#Microsoft.Windows.RemoteAttestation.Core";
+    array<TupleOfAttestationResultTypebase64Binary> Content;
+}
+
+// 2.2.2.8 TupleOfAttestationProvidedContentTypebase64Binary
+type TupleOfAttestationProvidedContentTypebase64Binary
+{
+    AttestationProvidedContentType m_Item1;
+    (EndorsementKey | Context | binary) m_Item2 with Encoding{Decoder = AttestationProvidedContentTypeDecoder,SourceConverter = Base64StringToBinary,SourcePattern = TypeOf<string>()},BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "AttestationProvidedContentType: " + m_Item1.ToString();
+    }
+
+    optional (EndorsementKey | Context | X509.Certificate | VsmReportValidationErrorReply | binary) AttestationProvidedContentTypeDecoder(binary bin)
+    {
+        switch(m_Item1)
+            {
+                // The EndorsementKey data type.
+                case AttestationProvidedContentType.VirtualSecureModeIdentityKey =>
+                      return BinaryDecoder<EndorsementKey>(bin);
+                case AttestationProvidedContentType.RtpmContext =>
+                      return BinaryDecoder<Context>(bin);
+                case AttestationProvidedContentType.HealthCertificate =>
+                      return Asn1BerDecoder<X509.Certificate>(bin);
+                case AttestationProvidedContentType.CaTrustletUserData =>
+                      return Asn1BerDecoder<X509.Certificate>(bin);
+                case AttestationProvidedContentType.CaTrustletVsmReport =>
+                      return BinaryDecoder<binary>(bin);
+                case AttestationProvidedContentType.CaTrustletReportSignature =>
+                      return BinaryDecoder<VsmReportValidationErrorReply>(bin);
+                case AttestationProvidedContentType.HostKeyPublicKey =>
+                      return BinaryDecoder<binary>(bin);
+                case AttestationProvidedContentType.HostKeySignature =>
+                      return BinaryDecoder<binary>(bin);
+                default =>
+                    ThrowDecodingException("HGSA", UTILITY_UNKNOWN_DATA, ["Attestation Provided Content Type."]);
+            }
+
+        return bin;
+    }
+}
+
+// 2.2.2.9 TupleOfAttestationResultTypebase64Binary
+type TupleOfAttestationResultTypebase64Binary
+{
+    AttestationResultType m_Item1;
+    X509.Certificate m_Item2 with Encoding{
+         Decoder = Asn1BerDecoder<X509.Certificate>,
+         SourceConverter = Base64StringToBinary,
+         SourcePattern = TypeOf<string>()},
+     BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+
+     override string ToString()
+    {
+        return "AttestationResultType : " + m_Item1.ToString();
+    }
+}
+
+
+
+// 2.2.2.10 ServiceInfoReply
+message ServiceInfoReply : ProtocolReplyBase
+{
+    string __type where value == "ServiceInfoReply:#Microsoft.Windows.RemoteAttestation.Core";
+    int FunctionalLevel 
+        where ValidationCheckValueInRange(value >= 0 && value <= 4294967295, null, true, ReferenceType.Type, "HGSA", "FunctionalLevel", "ServiceInfoReply", 0, 4294967295, value);
+    AttestationOperationMode OperationMode;
+    array<int> SupportedFunctionalLevels;
+}
+
+// 2.2.2.11 ErrorReply
+message ErrorReply : ProtocolReplyBase
+{
+    bool Retryable;
+}
+
+// 2.2.2.12 EndorsementKey
+type EndorsementKey
+{
+    string Key with Encoding{
+         Decoder = BinaryDecoder<string>,
+         SourceConverter = Base64StringToBinary,
+         SourcePattern = TypeOf<string>()},
+     BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 2.2.2.13 EvaluationLog
+type EvaluationLog
+{
+    bool Result;
+    guid Reason with Encoding{
+         Decoder = BinaryDecoder<guid>,
+         SourceConverter = Base64StringToBinary,
+         SourcePattern = TypeOf<string>()},
+     BinaryEncoding{TextEncoding = TextEncoding.ASCII} with DisplayInfo{ToText = EvaluationLogReasonToText};
+
+    override string ToString()
+    {
+        return "EvaluationLog, Reason: " + EvaluationLogReasonToText(Reason);
+    }
+}
+
+// A base64Binary string representing policy evaluation failure reasons. 
+map<guid, string> EvaluationLogReasonStringMap = 
+{
+    {6a460ee1-62ea-416f-ae6c-04e29634506d} -> "SecureBootEnabledGuid",
+    {756dc455-9528-479a-a86a-c646417316c9} -> "SecureBootSettingsGuid",
+    {20188fda-d40b-460d-b078-2e7898a42ae9} -> "DebugModeUefiGuid",
+    {81f110ba-53c5-4064-9d64-51029fa24f49} -> "SystemIntegrityCiKnownGoodGuid",
+    {75ad09c9-7254-4d00-96f3-3b09d0aaac54} -> "FullBootGuid",
+    {75d595de-12f5-41e9-a61e-469d3205ecca} -> "VsmIdkPresent",
+    {6c0a6d29-5bcb-4f28-bafb-f71eb60fdae0} -> "VsmRunning",
+    {da0776e5-6570-44b3-9a17-7e95b4fc7779} -> "IommuEnabled",
+    {347da547-d266-4939-bf3d-9ec73a90bdbc} -> "BitLockerEnabled",
+    {12df0ee9-b38e-4086-90f8-703d9e7cb878} -> "PagefileEncryptionEnabled",
+    {5408BD30-3250-4AC1-A150-C410AF756699} -> "HypervisorEnforcedCiPolicy",
+    {A32022C6-DCCD-4BF5-BE76-3B5CA1542559} -> "NoHibernation",
+    {2A796E36-E918-454F-B610-60F086E8D334} -> "NoDumps",
+    {6F390A71-753C-43AA-A326-74E30AEDCD9D} -> "DumpEncryption",
+    {85DAC0A4-8BA9-4A7F-A342-211862CE0BE8} -> "DumpEncryptionKey",
+};
+
+string EvaluationLogReasonToText(any data)
+{
+    guid ObjectGuid = data as guid;
+    if (ObjectGuid in EvaluationLogReasonStringMap)
+    {
+        return EvaluationLogReasonStringMap[ObjectGuid];
+    }
+    else
+    {
+        return ObjectGuid.ToString();
+    }
+}
+
+// 2.2.2.14 OperationModeErrorReply
+message OperationModeErrorReply : ErrorReply
+{
+    string __type where value == "OperationModeErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+    AttestationOperationMode ExpectedOperationMode;
+}
+
+// 2.2.2.15 PayloadErrorReply
+message PayloadErrorReply : ErrorReply
+{
+    string __type where value == "PayloadErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+    array<json> tags with JsonEncoding{IsAny = true};
+}
+
+// 2.2.2.16 PolicyEvaluationErrorReply
+message PolicyEvaluationErrorReply : ErrorReply
+{
+    string __type where value == "PolicyEvaluationErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+    array<EvaluationLog> Reasons;
+}
+
+// 2.2.2.17 ProtocolReplyBase
+message ProtocolReplyBase
+{}
+
+// 2.2.2.18 ProtocolRequestBase
+message ProtocolRequestBase
+{
+    guid SessionId with Encoding{
+         Decoder = BinaryDecoder<guid>,
+         SourceConverter = Base64StringToBinary,
+         SourcePattern = TypeOf<string>()},
+     BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 2.2.2.19 RtpmErrorReply
+message RtpmErrorReply : ErrorReply
+{
+    string __type where value == "RtpmErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.20 TcgLogValidationErrorReply
+message TcgLogValidationErrorReply : ErrorReply
+{
+    string __type where value == "TcgLogValidationErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.21 UnauthorizedErrorReply
+message UnauthorizedErrorReply : ErrorReply
+{
+    string __type where value == "UnauthorizedErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.22 UnavailableErrorReply
+message UnavailableErrorReply : ErrorReply
+{
+    string __type where value == "UnavailableErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.23 VirtualSecureModeErrorReply
+message VirtualSecureModeErrorReply : ErrorReply
+{
+    string __type where value == "VirtualSecureModeErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.24 VsmReportValidationErrorReply
+message VsmReportValidationErrorReply : ErrorReply
+{
+    string __type where value == "VsmReportValidationErrorReply:#Microsoft.Windows.RemoteAttestation.Core";
+}
+
+// 2.2.2.25 Context Todo: this is not very match TD discription.
+type Context
+{
+    uint Size;
+    uint Version where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "HGSA", "Version", "Context", "1", value);
+    uint DataBlobCount;
+    uint Reserved;
+    EncryptedStateObject[Size] EncStateObject;
+    array<DataBlob> Payloads with Encoding{Decoder = DataBlobCount};
+}
+
+// 2.2.2.26 EncryptedStateObject
+type EncryptedStateObject[uint contextSize, array<DataBlob> Payloads]
+{
+    binary EncContext with BinaryEncoding{Length = 32};
+    binary EncryptedBuffer with BinaryEncoding{Length = contextSize - 48};
+}
+
+// 2.2.2.27 Data Blob
+type DataBlob
+{
+    ([|stream.PeekBytes(stream.BitPosition, 4) == $[00000001]|]TPM_DEVICE_INFO |
+    [|stream.PeekBytes(stream.BitPosition, 4) in [$[00000131], $[00000153], $[00000173], $[00000176], $[0000017E]]|]TPM_COMMAND |
+    WBCL_INFO) Payload;
+}
+
+// 2.2.2.27.1 WBCL_INFO
+type WBCL_INFO
+{
+    uint Size;
+    binary Data with BinaryEncoding{Length = 4};
+}
+
+// 2.2.2.27.2 TPM_DEVICE_INFO
+type TPM_DEVICE_INFO
+{
+    uint StructVersion;
+    TPMVersion TpmVersion;
+    TpmInterfaceType TpmInterfaceType;
+    uint TpmImplVersion;
+}
+
+// 2.2.2.27.3 TPM_COMMAND
+pattern TPM_COMMAND = enum uint
+{
+    TPM_CC_CreatePrimary    = 0x00000131,
+    TPM_CC_Create           = 0x00000153,
+    TPM_CC_ReadPublic       = 0x00000173,
+    TPM_CC_StartAuthSession = 0x00000176,
+    TPM_CC_PCR_Read         = 0x0000017E,
+    ...
+};

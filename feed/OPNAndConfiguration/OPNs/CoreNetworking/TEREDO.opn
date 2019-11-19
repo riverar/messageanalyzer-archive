@@ -1,0 +1,345 @@
+protocol TEREDO with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = " Teredo - Tunneling IPv6 over UDP through NATs",
+    ShortName = "TEREDO",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 4380"},
+            new Reference{Name = "RFC 6081"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "370439", Date = "11/03/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using UDP;
+using IPv6;
+
+// WORKAROUND: Using global variable to keep TEREDO message's IPv4 address, UDP port and Random Port.
+string AddressAndPort;
+string AddressAndRandomPort;
+    
+// When IPv6 address(src & dst) is begin with "2001:0000:/32" or "3FFE:831F::/32", the IPv6 address shoud be display as follow:
+//   +-------------+-------------+-------+------+-------------+
+//   | Prefix      | Server IPv4 | Flags | Port | Client IPv4 |
+//   +-------------+-------------+-------+------+-------------+
+endpoint Node
+    accepts Packet
+{
+    process this accepts p:Packet where p.TunnelingIPv6 !=$[]
+    {
+        switch (p.TunnelingIPv6)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+               DispatchIPv6DatagramToReassemblyNode(d, this);
+            default => 
+                ThrowDecodingException("TEREDO", "IPv6.Datagram");
+        }
+    }
+}
+
+autostart actor NodeOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && ((d.SourcePort == Port.TEREDO || d.DestinationPort == Port.TEREDO) || 
+                                                (AddressAndPort != null && ((((d#DestinationAddress as string) + (d.DestinationPort as string) == AddressAndPort) && (GetPrefix(d.Payload, true) == $[3FFE831F] || GetPrefix(d.Payload, true) == $[20010000])) || (((d#SourceAddress as string) + (d.SourcePort as string) == AddressAndPort) && (GetPrefix(d.Payload, false) == $[3FFE831F] || GetPrefix(d.Payload, false) == $[20010000])))) || 
+                                                (AddressAndRandomPort != null && (((d#SourceAddress as string) + (d.SourcePort as string)) == AddressAndRandomPort || ((d#DestinationAddress as string) + (d.DestinationPort as string)) == AddressAndRandomPort)))
+    {
+        switch (d.Payload)
+        {
+            case p:Packet from TEREDODecoder =>
+                if (d.SourcePort == Port.TEREDO && (p.TunnelingIPv6.Segment(24, 4) == $[3FFE831F] || p.TunnelingIPv6.Segment(24, 4) == $[20010000]))
+                {
+                      AddressAndPort = (d#DestinationAddress as string) + (d.DestinationPort as string); 
+                    if (p.Trailers != nothing)
+                    {
+                        if (GetRandomPortValue(p.Trailers as array<TrailerType>) != 0)
+                        {
+                            AddressAndRandomPort = (d#DestinationAddress as string) + (GetRandomPortValue(p.Trailers as array<TrailerType>) as string);
+                        }
+                    }
+                }
+                else if (d.DestinationPort == Port.TEREDO && (p.TunnelingIPv6.Segment(8, 4) == $[3FFE831F] || p.TunnelingIPv6.Segment(8, 4) == $[20010000]))
+                {
+                      AddressAndPort = (d#SourceAddress as string) + (d.SourcePort as string);
+                    if (p.Trailers != nothing)
+                    {
+                        if (GetRandomPortValue(p.Trailers as array<TrailerType>) != 0)
+                        {
+                            AddressAndRandomPort = (d#SourceAddress as string) + (GetRandomPortValue(p.Trailers as array<TrailerType>) as string);
+                        }
+                    }
+                }
+                dispatch (endpoint Node over host) accepts p;
+            default => 
+                ThrowDecodingException("TEREDO", "Packet");
+        }
+    }
+} 
+
+message Packet
+{
+    optional Authentication Authentication;
+    optional Origin Origin;
+    binary TunnelingIPv6 with Encoding{Ignore = true};
+    optional array<TrailerType> Trailers with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string summary = "Tunneling IPv6 over UDP through NATs";
+        if (Authentication != nothing)
+        {
+            summary = summary + ((Authentication as Authentication).IDLen > 0 ? ", Authentication exists" : ", No Authentication");
+        }
+        if (Origin != nothing)
+        {
+            summary = summary + ", OriginIPv4Address: " + GetOriginAddress((Origin as Origin).OriginIPv4Address.Octets) + ", OriginPort: " + (((Origin as Origin).OriginPort ^ 0xFFFF) as string);
+        }
+        return summary;
+    }
+}
+
+optional Packet TEREDODecoder(stream s)
+{
+    optional Packet p1 = BinaryDecoder<Packet>(s);
+    if (p1 == nothing)
+    {
+        return nothing;
+    }
+
+    Packet p = new Packet{Authentication = (p1 as Packet).Authentication, Origin = (p1 as Packet).Origin};
+    optional DecoderType bb1 = BinaryDecoder<DecoderType>(s.PeekBits(s.BitPosition, 8));
+    if (bb1 == nothing)
+    {
+        return nothing;
+    }
+        
+    uint length = (40 + (s.PeekByte(s.BitPosition + 32) << 8) + s.PeekByte(s.BitPosition + 40)) as uint;
+    p.AssignFieldEncodingInfo("TunnelingIPv6", s.BitPosition, length * 8 as int);
+    optional Blob b1 = BinaryDecoder<Blob[length]>(s);
+    if (b1 == nothing)
+    {
+        return nothing;
+    }
+        
+    Blob b = b1 as Blob;
+    p.TunnelingIPv6 = b.Data;
+    p.Trailers = [];
+    while (s.BytePosition < s.ByteLength)
+    {
+        optional TrailerType tr1 = BinaryDecoder<TrailerType>(s);
+        if (tr1 == nothing)
+        {
+            break;
+        }
+        
+        TrailerType tr = tr1 as TrailerType;
+        p.Trailers = (p.Trailers as array<TrailerType>) + [tr];
+    }
+    if ((p.Trailers as array<TrailerType>).Count == 0)
+    {
+        p.Trailers = nothing;
+    }
+    p.SourceData = s.PeekBytes(0);
+    return p;
+}
+
+// RFC 4380, 5.1.1.  Teredo IPv6 Packet Encapsulation
+type Origin
+{
+    (ushort where value == 0X0000) OriginIndicator;
+    ushort OriginPort; 
+    IPv4Address OriginIPv4Address;
+}
+
+// RFC 4380, 5.1.1.  Teredo IPv6 Packet Encapsulation
+type Authentication
+{
+    (ushort where value == 0X0001) AuthenticationIndicator;
+    byte IDLen;
+    byte AULen;
+    optional binary ClientIdentifier with BinaryEncoding{Length = (IDLen)};
+    optional binary AuthenticationValue with BinaryEncoding{Length = (AULen)};
+    binary NonceValue with BinaryEncoding{Length = 8};
+    byte Confirmation;
+}
+
+type TrailerType
+{
+    (NonceTrailer 
+    | AlternateAddressTrailer 
+    | NeighborDiscoveryOptionTrailer 
+    | RandomPortTrailer
+    | Trailer) Trailer;
+}
+
+// RFC 6081, 4.1.  Trailers
+type Trailer
+{
+    byte Type;
+    byte Length;
+    binary NonceValue with BinaryEncoding{Length = (Length)};
+}
+
+// RFC 6081, 4.2.  Nonce Trailer
+type NonceTrailer
+{
+    (byte where value == 0x01) Type;
+    (byte where value == 0x04) Length;
+    uint Nonce;
+}
+
+// RFC 6081, 4.3.  Alternate Address Trailer
+type AlternateAddressTrailer
+{
+    (byte where value == 0x03) Type;
+    (byte where ((value >= 0x08) && (value <= 0x1A))) Length;
+    (ushort where value == 0x0000) Reserved;
+    array<AlternateAddressPort> AlternateAddressPortList with BinaryEncoding{Length = ((Length - 2)/6)};
+}
+
+type AlternateAddressPort
+{
+    IPv4Address IPv4Address;
+    (ushort where value != 0x0000) Port;
+}
+
+// RFC 6081, 4.4.  Neighbor Discovery Option Trailer
+type NeighborDiscoveryOptionTrailer
+{
+    (byte where value == 0x04) Type;
+    (byte where value == 0x04) Length;
+    (byte where (value in {0, 1})) DiscoveryType;
+    (uint where value == 0x000000) Reserved with BinaryEncoding{Width = 24};
+}
+
+// RFC 6081, 4.5.  Random Port Trailer
+type RandomPortTrailer
+{
+    (byte where value == 0x05) Type;
+    (byte where value == 0x02) Length;
+    ushort RandomPort;
+}
+
+// Define DecoderType for manual decoder
+type DecoderType
+{
+    (byte where value == 6) Value with BinaryEncoding{Width = 4}; 
+}
+
+// Get Origin IPv4 Address, RFC 4380, 4.  Teredo Addresses
+string GetOriginAddress(binary address)
+{
+    array<byte> adds = address as array<byte>;
+    int counter = 0;
+    string ip;
+    foreach (byte b in adds)
+    {
+        counter += 1;
+        ip = ip + ((b ^ 0xFF) as string);
+        if (counter < adds.Count)
+        {
+            ip = ip + ".";
+        }
+    }
+    
+    return ip;
+}
+
+// Get RandomPort from Random Port Trailer
+ushort GetRandomPortValue(array<TrailerType> trailers)
+{
+    ushort port;
+    int count = trailers.Count;
+    while (count > 0)
+    {
+        count = count - 1;
+        if (trailers[count].Trailer is RandomPortTrailer)
+        {
+            RandomPortTrailer tra = trailers[count].Trailer as RandomPortTrailer;
+            if (tra == nothing)
+            {
+                break;
+            }
+            
+            if (tra.Type == 0x05)
+            {
+                port = tra.RandomPort;
+            }
+        }
+    }
+    return port;
+}
+
+binary GetPrefix(binary s, bool isdst)// isdst: dst == true
+{
+    if (s.Count < 4)
+        return $[];
+    binary prefix;
+    binary h = s.Segment(0,2);
+    int len;
+    if (h == $[0001]) // Authentication
+    {
+        binary s1 = s.Segment(2, 2);
+        array<byte> b = s1 as array<byte>;
+        len = (b[0] << 8) + b[1];
+        if (s.Count < 15 + len)
+            return $[];
+        h = s.Segment(((13 + len) as int), 2);
+        if (h == $[0000]) // Authentication && Origin
+        {
+            if (isdst)
+            {
+                prefix = (s.Count < 49 + len) ? $[] : s.Segment(((45 + len) as int), 4); // dst: Authentication(13 + len) + Origin(8) + ipv6 data(24)
+            }
+            else
+            {
+                prefix = (s.Count < 33 + len) ? $[] : s.Segment(((29 + len) as int), 4); // src: Authentication(13 + len) + Origin(8) + ipv6 data(8)
+            }
+        }
+        else
+        {
+            if (isdst)
+            {
+                prefix = (s.Count < 41 + len) ? $[] : s.Segment(((37 + len) as int), 4); // dst: Authentication(13 + len) + ipv6 data(24)
+            }
+            else
+            {
+                prefix = (s.Count < 25 + len) ? $[] : s.Segment(((21 + len) as int), 4); // src: Authentication(13 + len) + ipv6 data(8)
+            }
+        }
+    }
+    else if (h == $[0000]) // Origin
+    {
+        if (isdst)
+        {
+            prefix = (s.Count < 36) ? $[] : s.Segment(32, 4); // dst: Origin(8)+ ipv6 data(24)
+        }
+        else
+        {
+            prefix = (s.Count < 20) ? $[] : s.Segment(16, 4); // src: Origin(8) + ipv6 data(8)
+        }
+    }
+    else // Don't have Authentication && Origin
+    {
+        if (isdst)
+        {
+            prefix = (s.Count < 28) ? $[] : s.Segment(24, 4); // dst: ipv6 data(24)
+        }
+        else
+        {
+            prefix = (s.Count < 12) ? $[] : s.Segment(8, 4); // src: ipv6 data(8)
+        }
+    }
+    return prefix;
+}

@@ -1,0 +1,933 @@
+protocol CDP
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Connected Devices Platform Protocol Version 3",
+    ShortName = "CDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-CDP", Version = "4.0", Date = "09/12/2018"}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "10/18/2016"}
+        ]
+};
+
+using Standard;
+using UDP;
+using Utility;
+using InfrastructureResources;
+using X509;
+using Diagnostics;
+using IANA;
+using DTYP;
+using ERREF;
+
+const binary Signature = $[3030];
+const int HMAC_LENGTH = 32;
+const int V3_MESSAGE_HEADER_SIZE = 42;
+
+endpoint Server over UDP.Host
+    accepts CommonHeader issues CommonHeader;
+
+/*
+    All messages after the initial connection message exchange are encrypted.
+*/
+autostart actor CDPOverUDP(UDP.Host host)
+{
+    // In real data, both client and server could use port 5050, so it's impossible to decide CDP request vs response based on port number.
+    // So we simply decode CDP messages and dispatch according to type of decoded message.
+    process host accepts d:UDP.Datagram where d.DestinationPort == IANA.Port.CDP || d.SourcePort == IANA.Port.CDP
+        && d.Payload.Count > V3_MESSAGE_HEADER_SIZE && d.Payload.Segment(0, 2) == Signature
+    {
+        // Check if encrypted message.
+        ushort flagsValue = ((d.Payload[6] as ushort) << 8) + d.Payload[7] as ushort;
+        if ((flagsValue & CDP.Flags.SessionEncrypted) > 0)
+        {
+            // Encrypted message.
+            DecodeDispatchMessageOrException<EncryptedMessage>(d.Payload, DispatchMessage, d.DestinationPort == IANA.Port.CDP /*isRequest*/, "EncryptedMessage", host);
+        }
+        else
+        {
+            MessageType messageType = d.Payload[5];
+            int headerLength = CalculateHeaderLengthFromRawData(d.Payload);
+            switch (messageType)
+            {
+                case MessageType.Discovery =>
+                    if (d.Payload.Count < headerLength + 1) 
+                    {
+                        ThrowDecodingException("CDP");
+                    }
+                    DiscoveryTypePattern discoveryType = d.Payload[headerLength];
+                    if (discoveryType == DiscoveryTypePattern.PresentRequest)
+                    {
+                        DecodeDispatchMessageOrException<PresentRequest>(d.Payload, DispatchMessage, true, "PresentRequest", host);
+                    }
+                    else if (discoveryType == DiscoveryTypePattern.PresentResponse)
+                    {
+                        DecodeDispatchMessageOrException<PresentResponse>(d.Payload, DispatchMessage, false, "PresentResponse", host);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("CDP");
+                    }
+                case MessageType.Connect => 
+                    if (d.Payload.Count < headerLength + 3) 
+                    {
+                        ThrowDecodingException("CDP");
+                    }
+                    ConnectionMessageType connType = d.Payload[headerLength + 2];
+                    switch (connType)
+                    {
+                        case ConnectionMessageType.ConnectRequest=>
+                            DecodeDispatchMessageOrException<ConnectionRequest>(d.Payload, DispatchMessage, true, "ConnectionRequest", host);
+                        case ConnectionMessageType.ConnectResponse=>
+                            DecodeDispatchMessageOrException<ConnectionResponse>(d.Payload, DispatchMessage, false, "ConnectionResponse", host);
+                        case ConnectionMessageType.DeviceAuthRequest=>
+                            DecodeDispatchMessageOrException<DeviceAuthenticationRequest>(d.Payload, DispatchMessage, true, "DeviceAuthenticationRequest", host);
+                        case ConnectionMessageType.DeviceAuthResponse=>
+                            DecodeDispatchMessageOrException<DeviceAuthenticationResponse>(d.Payload, DispatchMessage, false, "DeviceAuthenticationResponse", host);
+                        case ConnectionMessageType.UserDeviceAuthRequest=>
+                            DecodeDispatchMessageOrException<UserDeviceAuthenticationRequest>(d.Payload, DispatchMessage, true, "UserDeviceAuthenticationRequest", host);
+                        case ConnectionMessageType.UserDeviceAuthResponse=>
+                            DecodeDispatchMessageOrException<UserDeviceAuthenticationResponse>(d.Payload, DispatchMessage, false, "UserDeviceAuthenticationResponse", host);
+                        case ConnectionMessageType.AuthDoneRequest=>
+                            DecodeDispatchMessageOrException<AuthenticationDoneRequest>(d.Payload, DispatchMessage, true, "AuthenticationDoneRequest", host);
+                        case ConnectionMessageType.AuthDoneRespone=>
+                            DecodeDispatchMessageOrException<AuthenticationDoneResponse>(d.Payload, DispatchMessage, false, "AuthenticationDoneResponse", host);
+                        case ConnectionMessageType.ConnectFailure =>
+                            DecodeDispatchMessageOrException<AuthenticationFailure>(d.Payload, DispatchMessage, false, "AuthenticationFailure", host);
+                        case ConnectionMessageType.UpgradeRequest =>
+                            DecodeDispatchMessageOrException<UpgradeRequest>(d.Payload, DispatchMessage, true, "UpgradeRequest", host);
+                        case ConnectionMessageType.UpgradeResponse =>
+                            DecodeDispatchMessageOrException<UpgradeResponse>(d.Payload, DispatchMessage, false, "UpgradeResponse", host);
+                        case ConnectionMessageType.UpgradeFinalization =>
+                            DecodeDispatchMessageOrException<UpgradeFinalization>(d.Payload, DispatchMessage, true, "UpgradeFinalization", host);
+                        case ConnectionMessageType.UpgradeFinalizationResponse =>
+                            DecodeDispatchMessageOrException<UpgradeFinalizationResponse>(d.Payload, DispatchMessage, false, "UpgradeFinalizationResponse", host);
+                        case ConnectionMessageType.TransportRequest =>
+                            DecodeDispatchMessageOrException<TransportRequest>(d.Payload, DispatchMessage, true, "TransportRequest", host);
+                        case ConnectionMessageType.TransportConfirmation =>
+                            DecodeDispatchMessageOrException<TransportConfirmation>(d.Payload, DispatchMessage, false, "TransportConfirmation", host);
+                        case ConnectionMessageType.UpgradeFailure =>
+                            DecodeDispatchMessageOrException<UpgradeFailure>(d.Payload, DispatchMessage, false, "UpgradeFailure", host);
+                        case ConnectionMessageType.DeviceInfoMessage =>
+                            DecodeDispatchMessageOrException<DeviceInfoMessage>(d.Payload, DispatchMessage, true, "DeviceInfoMessage", host);
+                        case ConnectionMessageType.DeviceInfoResponseMessage =>
+                            DecodeDispatchMessageOrException<DeviceInfoResponseMessage>(d.Payload, DispatchMessage, false, "DeviceInfoResponseMessage", host);
+                        default =>  
+                            ThrowDecodingException("CDP");
+                    }
+                case MessageType.Ack =>
+                    DecodeDispatchMessageOrException<Ack>(d.Payload, DispatchMessage, false, "Ack", host);
+                case MessageType.Control =>
+                    AppControlMessageTypePattern controlType = d.Payload[headerLength];
+                    switch (controlType)
+                    {
+                        case AppControlMessageTypePattern.LaunchURI => 
+                            DecodeDispatchMessageOrException<LaunchURIMessage>(d.Payload, DispatchMessage, true, "LaunchURIMessage", host);
+                        case AppControlMessageTypePattern.LaunchURIForTarget => 
+                            DecodeDispatchMessageOrException<LaunchURIForTargetMessage>(d.Payload, DispatchMessage, true, "LaunchURIForTarget", host);
+                        case AppControlMessageTypePattern.LaunchURIResult =>
+                            DecodeDispatchMessageOrException<LaunchURIResult>(d.Payload, DispatchMessage, false, "LaunchURIResult", host);
+                        case AppControlMessageTypePattern.CallAppService =>
+                            DecodeDispatchMessageOrException<AppServiceMessages>(d.Payload, DispatchMessage, true, "AppServiceMessages", host);
+                        case AppControlMessageTypePattern.CallAppServiceResponse =>
+                            DecodeDispatchMessageOrException<AppServicesResult>(d.Payload, DispatchMessage, false, "AppServicesResult", host);
+                        case AppControlMessageTypePattern.GetResource =>
+                            DecodeDispatchMessageOrException<GetResource>(d.Payload, DispatchMessage, true, "GetResource", host);
+                        case AppControlMessageTypePattern.GetResourceResponse =>
+                            DecodeDispatchMessageOrException<GetResourceResponse>(d.Payload, DispatchMessage, false, "GetResourceResponse", host);
+                        case AppControlMessageTypePattern.SetResource =>
+                            DecodeDispatchMessageOrException<SetResource>(d.Payload, DispatchMessage, true, "SetResource", host);
+                        case AppControlMessageTypePattern.SetResourceResponse =>
+                            DecodeDispatchMessageOrException<SetResourceResponse>(d.Payload, DispatchMessage, false, "SetResourceResponse", host);
+                        default => 
+                            ThrowDecodingException("CDP");
+                    }
+                default =>
+                    ThrowDecodingException("CDP");
+            }
+        }
+    }
+
+    void DispatchMessage(CommonHeader msg, bool isReq, UDP.Host host)
+    {
+        Server serverEPT = endpoint Server over host;
+        if (isReq)
+        {
+            dispatch serverEPT accepts msg;
+        }
+        else
+        {
+            dispatch serverEPT issues msg;
+        }
+    }
+}
+
+void DecodeDispatchMessageOrException<T>(binary data, void(T, bool, UDP.Host) dispatcher, bool isReq, string msgName, UDP.Host host)
+{
+    switch (data)
+    {
+        case m:T from BinaryDecoder<T> =>
+            dispatcher(m, isReq, host);
+        default => 
+            ThrowDecodingException("CDP", msgName);
+    }
+}
+
+message CommonHeader
+{
+    ushort Signature where value == 0x3030;
+    ushort MessageLength;
+    byte Version;
+    MessageType MessageType;
+    Flags Flags;
+    uint SequenceNumber;
+    ulong RequestID;
+    ushort FragmentIndex;
+    ushort FragmentCount;
+    ulong SessionID;
+    ulong ChannelID where ValidationCheck(SessionID == 0 && value == 0 || SessionID > 0 && value >= 0, this, 
+        () => (Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["CDP", "ChannelID", ReferenceType.Message, "CommonHeader", INFRASTRUCTURE_STR_MUST, 0, value]) + " when Session is zero"));
+    array<AdditionalHeader> AdditionalHeaders with Encoding{Decoder = AdditionalHeadersDecoder};
+
+    string CommonHeaderToString(string msgName)
+    {
+        return msgName + ", Version: " + Version.ToString() + 
+            ", SessionID: " + SessionID.ToString() + ", SequenceNumber: " + SequenceNumber.ToString() + 
+            ", RequestID: " + RequestID.ToString();
+    }
+
+    int GetPaylodSize()
+    {
+        int headerLength = V3_MESSAGE_HEADER_SIZE;
+        foreach (AdditionalHeader header in AdditionalHeaders)
+        {
+            headerLength += header.GetSize();
+        }
+        int payloadLength = ((this.Flags & CDP.Flags.HasHMAC) > 0) ? (MessageLength - headerLength - HMAC_LENGTH) : (MessageLength - headerLength);
+        return payloadLength;
+    }
+}
+
+int CalculateHeaderLengthFromRawData(binary data)
+{
+    int offset = V3_MESSAGE_HEADER_SIZE; // already include size of end additional header (2 bytes)
+    while (data.Count > offset + 2 && data[offset] > 0 && data[offset + 1] > 0)
+    {
+        offset += data[offset + 1] + 2;
+    }
+    return offset;
+}
+
+type AdditionalHeader
+{
+    byte NextHeader;
+    byte NextHeaderSize;
+    optional [|NextHeaderSize > 0|] binary Data with BinaryEncoding{Length = NextHeaderSize};
+
+    int GetSize()
+    {
+        return NextHeaderSize + 2;
+    }
+}
+
+optional array<AdditionalHeader> AdditionalHeadersDecoder(stream s)
+{
+    array<AdditionalHeader> headers = [];
+    while (s.RemainingByteLength > 2 && s.PeekByte(s.BitPosition) != 0 && s.PeekByte(s.BitPosition + 8) != 0)
+    {
+        if (BinaryDecoder<AdditionalHeader>(s) is header:AdditionalHeader)
+        {
+            headers += [header];
+        }
+        else
+        {
+            ThrowDecodingException("CDP", "AdditionalHeader fails decoding", []);
+        }
+    } 
+    // End Additional Headers
+    if (s.RemainingByteLength > 2)
+    {
+        if (BinaryDecoder<AdditionalHeader>(s) is endHeader:AdditionalHeader)
+        {
+            headers += [endHeader]; // NextHeader:0, NextHeaderSize: 0
+            ValidationCheck(endHeader.NextHeader == 0 && endHeader.NextHeaderSize == 0, null, "CDP: NextHeaderSize should be zero when NextHeader is zero.");
+        }
+        else
+        {
+            ThrowDecodingException("CDP", "AdditionalHeader fails decoding", []);
+        }
+    }
+    return headers;
+}
+
+pattern MessageType = enum byte
+{
+    Discovery   = 1,
+    Connect     = 2,
+    Control     = 3,
+    Session     = 4,
+    Ack         = 5,
+    ...
+};
+
+pattern Flags = flags ushort
+{
+    ShouldAck           = 0x1,
+    HasHMAC             = 0x2,
+    SessionEncrypted    = 0x4,
+    WakeTarget          = 0x8,
+    // ChannelEncrypted,
+    ...
+};
+
+// 2.2.2.2.1    UDP: Presence Request
+message PresentRequest : CommonHeader
+{
+    DiscoveryTypePattern DiscoveryType where value == DiscoveryTypePattern.PresentRequest;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("PresentRequest");
+    }
+}
+
+pattern DiscoveryTypePattern = enum byte
+{
+    PresentRequest = 0,
+    PresentResponse = 1,
+    ...
+};
+
+// 2.2.2.2.2    UDP: Presence Response
+message PresentResponse : CommonHeader
+{
+    DiscoveryTypePattern DiscoveryType where value == DiscoveryTypePattern.PresentResponse;
+    ConnectMode ConnectMode where ValidationCheckEnumValue(InRange<ConnectMode>(value), this, true, ReferenceType.Message, 
+        "CDP", "ConnectMode", "PresentResponse", "0, 1, 2", value);
+    DeviceType DeviceType where ValidationCheckEnumValue(InRange<DeviceType>(value), this, true, ReferenceType.Message, 
+        "CDP", "DeviceType", "PresentResponse", "1, 9, 11", value);
+    ushort DeviceNameLength;
+    string DeviceName with BinaryEncoding{Length = DeviceNameLength, TextEncoding = TextEncoding.ASCII};
+    binary DeviceIdSalt with BinaryEncoding{Length = 4};
+    binary DeviceId with BinaryEncoding{Length = 32};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("PresentResponse") + ", DeviceName: " + DeviceName + 
+            ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(this.ConnectMode);
+    }
+}
+
+pattern ConnectMode = enum ushort 
+{
+    None        = 0,
+    Proximal    = 1,
+    Legacy      = 2,
+    ...
+};
+
+pattern DeviceType = enum ushort
+{
+    $"Xbox One"             = 1,
+    $"Windows 10 Desktop"   = 9,
+    $"Windows 10 Phone"     = 11,
+    ...
+};
+
+// 2.2.2.2.3 Bluetooth: Advertising Beacon
+message AdvertisingBeacon
+{
+    byte Length where value == 31;
+    byte $"0xFF" where value == 0xFF;
+    ushort MicrosoftID where value == 6;
+    BeaconDataType BeaconData; // 24 bytes.
+
+    override string ToString()
+    {
+        return "AdvertisingBeacon";
+    }
+}
+
+type BeaconDataType
+{
+    byte ScenarioType where value == 1;
+    byte VersionAndDeviceType where ValidationCheck(value == 1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["CDP", "VersionAndDeviceType", INFRASTRUCTURE_STR_TYPE, "BeaconDataType", INFRASTRUCTURE_STR_MUST, "1", value]));
+    byte VersionAndFlags where ValidationCheck(value == 0, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["CDP", "VersionAndFlags", INFRASTRUCTURE_STR_TYPE, "BeaconDataType", INFRASTRUCTURE_STR_MUST, "0", value]));
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["CDP", "Reserved", INFRASTRUCTURE_STR_TYPE, "BeaconDataType", INFRASTRUCTURE_STR_MUST, "0", value]));
+    uint Salt;
+    binary DeviceHash with BinaryEncoding{Length = 16}; // 16 byte
+}
+
+type ConnectionHeader
+{
+    ConnectMode ConnectMode;
+    ConnectionMessageType ConnectionMessageType where ValidationCheckEnumValue(InRange<CDP.ConnectionMessageType>(value), null, true, ReferenceType.Type, 
+        "CDP", "ConnectionMessageType", "ConnectionHeader", "0 ~ 17", value);
+
+    override string ToString()
+    {
+        return "Type: " + EnumToStringInSummary<CDP.ConnectionMessageType>(this.ConnectionMessageType) + 
+            ", Mode: " + EnumToStringInSummary<CDP.ConnectMode>(this.ConnectMode);
+    }
+}
+
+pattern ConnectionMessageType = enum byte
+{
+    ConnectRequest               = 0,
+    ConnectResponse              = 1,
+    DeviceAuthRequest            = 2,
+    DeviceAuthResponse           = 3,
+    UserDeviceAuthRequest        = 4,
+    UserDeviceAuthResponse       = 5,
+    AuthDoneRequest              = 6,
+    AuthDoneRespone              = 7,
+    ConnectFailure               = 8,
+    UpgradeRequest               = 9,
+    UpgradeResponse              = 10,
+    UpgradeFinalization          = 11,
+    UpgradeFinalizationResponse  = 12,
+    TransportRequest             = 13,
+    TransportConfirmation        = 14,
+    UpgradeFailure               = 15,
+    DeviceInfoMessage            = 16,
+    DeviceInfoResponseMessage    = 17,
+    ...
+};
+
+message EncryptedMessage : CommonHeader
+{
+    binary Payload with BinaryEncoding{Length = GetPaylodSize()};
+    optional [|(Flags & CDP.Flags.HasHMAC) > 0|] binary HMAC with BinaryEncoding{Length = HMAC_LENGTH};
+
+    override string ToString()
+    {
+        return "[Encrypted] " + EnumToStringInSummary<CDP.MessageType>(MessageType) + " message";
+    }
+}
+
+// 2.2.2.3.2    Connection Request
+message ConnectionRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.ConnectRequest;
+    CurveType CurveType where ValidationCheckEnumValue(InRange<CurveType>(value), this, true, ReferenceType.Message, 
+        "CDP", "CurveType", "ConnectionRequest", "0", value);
+    ushort HMACSize;
+    binary Nonce with BinaryEncoding{Length = 8};
+    uint MessageFragmentSize where ValidationCheck(value == 16384, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["CDP", "MessageFragmentSize", INFRASTRUCTURE_STR_MESSAGE, "ConnectionRequest", INFRASTRUCTURE_STR_MUST, "16384", value]));
+    ushort PublicKeyXLength;
+    binary PulbicKeyX with BinaryEncoding{Length = PublicKeyXLength};
+    ushort PublicKeyYLength;
+    binary PulbicKeyY with BinaryEncoding{Length = PublicKeyYLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("ConnectionRequest") + ", ConnectMode: " + EnumToStringInSummary<ConnectMode>(ConnectionHeader.ConnectMode) + 
+            ", CurveType: " + EnumToStringInSummary<CurveType>(CurveType);
+    }
+}
+
+pattern CurveType = enum byte
+{
+    CT_NIST_P256_KDF_SHA512 = 0,
+    ...
+};
+
+// 2.2.2.3.3    Connection Response
+message ConnectionResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.ConnectResponse;
+    Result Result where ValidationCheckEnumValue(InRange<Result>(value), this, true, ReferenceType.Message, 
+        "CDP", "Result", "ConnectionResponse", "0, 1, 2, 3", value);
+    ushort HMACSize;
+    binary Nonce with BinaryEncoding{Length = 8};
+    uint MessageFragmentSize where ValidationCheckValue(value == 16384, this, true, ReferenceType.Message, 
+        "CDP", "MessageFragmentSize" , "ConnectionRequest", "16384", value);
+    ushort PublicKeyXLength;
+    binary PulbicKeyX with BinaryEncoding{Length = PublicKeyXLength};
+    ushort PublicKeyYLength;
+    binary PulbicKeyY with BinaryEncoding{Length = PublicKeyYLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("ConnectionResponse") + ", Result: " + EnumToStringInSummary<Result>(Result) + 
+            ", ConnectMode: " +  EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+pattern Result = enum byte
+{
+    Success                  = 0,
+    Pending                  = 1,
+    Failure_Authentication   = 2,
+    Failure_NotAllowed       = 3,
+    ...
+};
+
+// 2.2.2.3.4    Device Authentication Request
+message DeviceAuthenticationRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.DeviceAuthRequest;
+    ushort DeviceCertLength;
+    X509.Certificate DeviceCert
+        with Encoding{SourcePattern = TypeOf<binary>(), Decoder = Asn1BerDecoder<X509.Certificate>}
+        with BinaryEncoding{Length = DeviceCertLength};
+    ushort SignedThumbprintLength;
+    binary SignedThumbprint with BinaryEncoding{Length = SignedThumbprintLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("DeviceAuthenticationRequest") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.5    Device Authentication Response
+message DeviceAuthenticationResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.DeviceAuthResponse;
+    ushort DeviceCertLength;
+    X509.Certificate DeviceCert
+        with BinaryEncoding{Length = DeviceCertLength}
+        with Encoding{SourcePattern = TypeOf<binary>(), Decoder = Asn1BerDecoder<X509.Certificate>};
+    ushort SignedThumbprintLength;
+    binary SignedThumbprint with BinaryEncoding{Length = SignedThumbprintLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("DeviceAuthenticationResponse") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.6    User-Device Authentication Request
+message UserDeviceAuthenticationRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UserDeviceAuthRequest;
+    ushort CertLength;
+    X509.Certificate Cert
+        with BinaryEncoding{Length = CertLength}
+        with Encoding{SourcePattern = TypeOf<binary>(), Decoder = Asn1BerDecoder<X509.Certificate>};
+    ushort SignedThumbprintLength;
+    binary SignedThumbprint with BinaryEncoding{Length = SignedThumbprintLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UserDeviceAuthenticationRequest") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.7    User-Device Authentication Response
+message UserDeviceAuthenticationResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UserDeviceAuthResponse;
+    ushort CertLength;
+    X509.Certificate Cert 
+        with BinaryEncoding{Length = CertLength}
+        with Encoding{SourcePattern = TypeOf<binary>(), Decoder = Asn1BerDecoder<X509.Certificate>};
+    ushort SignedThumbprintLength;
+    binary SignedThumbprint with BinaryEncoding{Length = SignedThumbprintLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UserDeviceAuthenticationResponse") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.8    Authentication Done Request
+message AuthenticationDoneRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.AuthDoneRequest;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("AuthenticationDoneRequest") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.9    Authentication Done Response
+message AuthenticationDoneResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.AuthDoneRespone;
+    AuthenticationDoneResponse_Status Status where ValidationCheckEnumValue(InRange<AuthenticationDoneResponse_Status>(value), this, true, ReferenceType.Message, 
+        "CDP", "Status", "AuthenticationDoneResponse", "0, 1, 2, 3, 4", value);
+
+    override string ToString()
+    {
+        return CommonHeaderToString("AuthenticationDoneResponse") + ", Status: " + EnumToStringInSummary<AuthenticationDoneResponse_Status>(Status) + 
+            ", ConnectMode: " +  EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+pattern AuthenticationDoneResponse_Status = enum byte
+{
+    Success                      = 0,
+    Pending                      = 1,
+    Failure_Authentication       = 2,
+    Failure_NotAllowed           = 3,
+    Failure_Unknown              = 4,
+    ...
+};
+
+// 2.2.2.3.10    Authentication Failure
+message AuthenticationFailure : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.ConnectFailure;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("AuthenticationFailure") + ", ConnectMode: " + EnumToStringInSummary<CDP.ConnectMode>(ConnectionHeader.ConnectMode);
+    }
+}
+
+// 2.2.2.3.11 Upgrade Request
+message UpgradeRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UpgradeRequest;
+    guid UpgradeId;
+    ushort EndpointsLength;
+    array<EndpointTypeData> Endpoints with BinaryEncoding{Length = EndpointsLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UpgradeRequest") + ", UpgradeId: " + UpgradeId.ToString();
+    }
+}
+
+pattern EndpointType = enum ushort
+{
+    Unknown = 0,
+    Udp = 1,
+    Tcp = 2,
+    Cloud = 3,
+    Ble = 4,
+    Rfcomm = 5,
+    WifiDirect = 6,
+    ...
+};
+
+type EndpointTypeData
+{
+    EndpointType EndpointType;
+    uint DataLength;
+    EndpointMetadata Data with BinaryEncoding{WidthForComposedType = DataLength * 8};
+}
+
+type EndpointMetadata
+{
+    ushort HostDataLength;
+    string Host with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = HostDataLength * 8};
+    ushort ServiceDataLength;
+    string Service with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ServiceDataLength * 8};
+    EndpointType EndpointType;
+}
+
+// 2.2.2.3.12 Upgrade Response
+message UpgradeResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UpgradeResponse;
+    ushort EndpointsLength;
+    array<EndpointTypeData> Endpoints with BinaryEncoding{Length = EndpointsLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UpgradeResponse");
+    }
+}
+
+// 2.2.2.3.13 Upgrade Finalization
+message UpgradeFinalization : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UpgradeFinalization;
+    ushort EndpointsLength;
+    array<EndpointTypeData> Endpoints with BinaryEncoding{Length = EndpointsLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UpgradeFinalization");
+    }
+}
+
+// 2.2.2.3.14 Upgrade Finalization Response
+message UpgradeFinalizationResponse : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UpgradeFinalizationResponse;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UpgradeFinalizationResponse");
+    }
+}
+
+// 2.2.2.3.15 Transport Request
+message TransportRequest : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.TransportRequest;
+    guid UpgradeId;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("TransportRequest") + ", UpgradeId: " + UpgradeId.ToString();
+    }
+}
+
+// 2.2.2.3.16 Transport Confirmation
+message TransportConfirmation : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.TransportConfirmation;
+    guid UpgradeId;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("TransportConfirmation") + ", UpgradeId: " + UpgradeId.ToString();
+    }
+}
+
+// 2.2.2.3.17 Upgrade Failure
+message UpgradeFailure : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.UpgradeFailure;
+    uint FailureReason; // A value of zero indicates success.
+
+    override string ToString()
+    {
+        return CommonHeaderToString("UpgradeFailure");
+    }
+}
+
+// 2.2.2.3.18 Device Info Message
+message DeviceInfoMessage : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.DeviceInfoMessage;
+    binary DeviceInfo; // variable length
+
+    override string ToString()
+    {
+        return CommonHeaderToString("DeviceInfoMessage");
+    }
+}
+
+// 2.2.2.3.19 Device Info Response Message
+message DeviceInfoResponseMessage : CommonHeader
+{
+    ConnectionHeader ConnectionHeader where value.ConnectionMessageType == ConnectionMessageType.DeviceInfoResponseMessage;
+
+    override string ToString()
+    {
+        return CommonHeaderToString("DeviceInfoResponseMessage");
+    }
+}
+
+// 2.2.2.4.1 Ack Messages
+message Ack : CommonHeader
+{
+    uint LowWatermark;
+    ushort ProcessedCount;
+    array<uint> Processed with BinaryEncoding{Length = ProcessedCount};
+    ushort RejectedCount;
+    array<uint> Rejected with BinaryEncoding{Length = RejectedCount};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("Ack") + ", LowWatermark: " + LowWatermark.ToString() + ", ProcessedListLength: " + ProcessedCount.ToString() + 
+            ", RejectedListLength: " + RejectedCount.ToString();
+    }
+}
+
+// 2.2.2.4.2    App Control Messages
+pattern AppControlMessageTypePattern = enum byte
+{
+    LaunchURI                   = 0,
+    LaunchURIResult             = 1,
+    LaunchURIForTarget          = 2,
+    CallAppService              = 6,
+    CallAppServiceResponse      = 7,
+    GetResource                 = 8,
+    GetResourceResponse         = 9,
+    SetResource                 = 10,
+    SetResourceResponse         = 11,
+    ...
+};
+
+// 2.2.2.4.2.1    Launch URI Messages
+message LaunchURIMessage : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.LaunchURI;
+    ushort URILength;
+    string URI with BinaryEncoding{Length = URILength, TextEncoding = TextEncoding.ASCII};
+    LaunchLocation LaunchLocation;
+    ulong LaunchURIRequestID;
+    uint InputDataLength;
+    binary InputData with BinaryEncoding{Length = InputDataLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("LaunchURIMessage") + ", URI: " + URI;
+    }
+}
+
+pattern LaunchLocation = enum ushort
+{
+    Full = 0,
+    Fill = 1,
+    Snapped = 2,
+    StartView = 3,
+    SystemUI = 4,
+    Default = 5,
+    ...
+};
+
+//// 2.2.2.4.2.2    Launch Uri for Target Messages
+message LaunchURIForTargetMessage : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.LaunchURIForTarget;
+    ushort URILength;
+    string URI with BinaryEncoding{Length = URILength, TextEncoding = TextEncoding.ASCII};
+    LaunchLocation LaunchLocation;
+    ulong LaunchURIRequestID;
+    ushort PackageIdLength;
+    binary PackageId with BinaryEncoding{Length = PackageIdLength};
+    ushort InstanceId;
+    ushort AlternateIdLength;
+    binary AlternateId with BinaryEncoding{Length = AlternateIdLength};
+    uint TitleId;
+    ushort FacadeNameLength;
+    binary FacadeName with BinaryEncoding{Length = FacadeNameLength};
+    uint InputDataLength;
+    binary InputData with BinaryEncoding{Length = InputDataLength};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("LaunchURIForTargetMessage") + ", URI: " + URI;
+    }
+}
+
+// 2.2.2.4.2.3    Launch URI Result
+message LaunchURIResult : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.LaunchURIResult;
+    uint LaunchURIResult;
+    long ResponseID;
+    uint InputDataLength;
+    binary InputData with BinaryEncoding{Length = InputDataLength};
+
+
+    override string ToString()
+    {
+        return CommonHeaderToString("LaunchURIResult") + ", Result: " + (LaunchURIResult as string);
+    }
+}
+
+// 2.2.2.4.2.4    App Service Messages
+message AppServiceMessages : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.CallAppService;
+    ushort PackageNameLength;
+    string PackageName with BinaryEncoding{Length = PackageNameLength, TextEncoding = TextEncoding.ASCII};
+    ushort AppServiceNameLength;
+    string AppServiceName with BinaryEncoding{Length = AppServiceNameLength, TextEncoding = TextEncoding.ASCII};
+    uint InputDataLength;
+    binary InputData with BinaryEncoding{Length = InputDataLength};
+    InputMessageFormat InputMessageFormat;
+
+
+    override string ToString()
+    {
+        return CommonHeaderToString("AppServiceMessages") + ", PackageName: " + PackageName + ", AppServiceName: " + AppServiceName;
+    }
+}
+
+pattern InputMessageFormat = enum byte
+{
+    JSON = 0,
+    ValueSet = 1,
+    ...
+};
+
+
+// 2.2.2.4.2.5    App Services Result
+message AppServicesResult : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.CallAppServiceResponse;
+    uint AppServicesResult;
+    uint ReturnDataSize;
+    binary ReturnData with BinaryEncoding{Length = ReturnDataSize};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("AppServicesResult");
+    }
+}
+
+// 2.2.2.4.2.6 Get Resource
+message GetResource : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.GetResource;
+    ushort ResourceUrlSize;
+    string ResourceUrl with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ResourceUrlSize * 8};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("GetResource") + ", ResourceUrl: " + ResourceUrl;
+    }
+}
+
+// 2.2.2.4.2.7 Get Resource Response
+message GetResourceResponse : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.GetResourceResponse;
+    DTYP.HRESULT Result with DisplayInfo{ToText = GetStatusString};
+    uint ResourceDataSize;
+    string ResourceData with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ResourceDataSize * 8};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("GetResourceResponse") + ", Result: " + HResultValuesToText(Result as uint) + ", ResourceData: " + ResourceData;
+    }
+}
+
+// 2.2.2.4.2.8 Set Resource
+message SetResource : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.SetResource;
+    ushort ResourceUrlSize;
+    string ResourceUrl with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ResourceUrlSize * 8};
+    uint ResourceDataSize;
+    string ResourceData with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ResourceDataSize * 8};
+
+    override string ToString()
+    {
+        return CommonHeaderToString("SetResource") + ", ResourceUrl: " + ResourceUrl + ", ResourceData: " + ResourceData;
+    }
+}
+
+// 2.2.2.4.2.9 Set Resource Response
+message SetResourceResponse : CommonHeader
+{
+    AppControlMessageTypePattern AppControlMessageType where value == AppControlMessageTypePattern.SetResourceResponse;
+    DTYP.HRESULT Result with DisplayInfo{ToText = GetStatusString};
+    uint ResourceDataSize;
+    optional binary ResourceData with BinaryEncoding{Length = ResourceDataSize};
+
+
+    override string ToString()
+    {
+        return CommonHeaderToString("SetResourceResponse") + ", Result: " + HResultValuesToText(Result as uint);
+    }
+}
+
+string GetStatusString(any data)
+{
+    DTYP.HRESULT status = data as DTYP.HRESULT;
+    return HResultValuesToText(status as uint);
+}

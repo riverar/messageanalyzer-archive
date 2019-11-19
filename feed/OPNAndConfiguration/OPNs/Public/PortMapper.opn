@@ -1,0 +1,765 @@
+protocol PortMapper with 
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Port Mapper Program Protocol",
+    ShortName = "PortMapper",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1833"},
+            new Reference{Name = "RFC 5665"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376713", Date = "04/09/2015"}
+        ]
+};
+
+using Utility;
+using SunRPC;
+using UDP;
+using IANA;
+using XDR;
+using TCP;
+
+endpoint Server over IntermediateServer provides OperationContract consumes OperationContract;
+client endpoint Client connected to Server;
+
+endpoint IntermediateServer over SunRPC.Node provides MessageContract consumes MessageContract;
+client endpoint IntermediateClient connected to IntermediateServer;
+
+// Record the Mappings replied by GetPort for following frames to be parsed to SunRPC for multiple connections
+// The index is the combination of the LocalAddress and RemoteAddress of transport endpoints 
+map<binary, array<Mapping>> GetPortMappings = {};
+
+void InsertPortMapping(binary addr, Mapping mapping)
+{
+    if (addr in GetPortMappings)
+    {
+        GetPortMappings[addr] += [mapping];
+    }
+    else
+    {
+        GetPortMappings[addr] = [mapping];
+    }
+}
+
+bool IsPortRepliedByGetPort(binary index, uint port)
+{
+    if (index in GetPortMappings)
+    {
+        foreach (var mapping in GetPortMappings[index])
+        {
+            if (port == mapping.Port)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+any endpoint GetTransportEndpoint(any endpoint ep)
+{
+    var transport = ep.GetTransport();
+    while (transport != null && !(transport is TCP.Server) && !(transport is UDP.Host))
+    {
+        transport = transport.GetTransport();
+    }
+    if (transport != null)
+    {
+        if (transport is server:TCP.Server)
+        {
+            return server as any endpoint;
+        }
+        else if (transport is host:UDP.Host)
+        {
+            return host as any endpoint;
+        }
+    }
+    return null;
+}
+
+// SunRPC Over TCP actor
+autostart actor SunRPCOverTCP(TCP.Server server)
+{
+    binary Addr = server.ServerAddress + server.ClientAddress;
+    bool IsSunRPCAssist= false; // Set and used only when port is SunRPC
+
+    process server accepts s:TCP.Segment where ((s.DestinationPort == Port.SunRPC && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || 
+        IsPortRepliedByGetPort(Addr, s.DestinationPort))
+    { 
+        var ept = endpoint SunRPC.RecordMarking over server;
+        if (s.DestinationPort == Port.SunRPC)
+        {
+            ept.ExpectedProgram = PMAP_PROGRAM;
+            // both of PortMapper and RPCBIND use the same Program Number(100000) and port(SunRPC), 
+            // message may processed by either PortMapper or RPCBIND
+            ept.VerSet = RpcBindPortMapperVersSet;
+        }
+        else
+        {
+            ept.ExpectedProgram = null;
+        }
+        dispatch ept accepts s;
+    }
+    
+    process server issues s:TCP.Segment where ((s.SourcePort == Port.SunRPC && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || 
+        IsPortRepliedByGetPort(Addr, s.SourcePort))
+    {
+        dispatch (endpoint SunRPC.RecordMarking over server) issues s;
+    }
+    
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        ((s.DestinationPort == Port.SunRPC && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || IsPortRepliedByGetPort(Addr, s.DestinationPort))
+    { 
+        var ept = endpoint SunRPC.RecordMarking over server;
+        if (s.DestinationPort == Port.SunRPC)
+        {
+            ept.ExpectedProgram = PMAP_PROGRAM;
+            // both of PortMapper and RPCBIND use the same Program Number(100000) and port(SunRPC), 
+            // message may processed by either PortMapper or RPCBIND
+            ept.VerSet = RpcBindPortMapperVersSet;
+        }
+        else
+        {
+            ept.ExpectedProgram = null;
+        }
+        dispatch ept accepts s;
+    }
+    
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        ((s.SourcePort == Port.SunRPC && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || IsPortRepliedByGetPort(Addr, s.SourcePort))
+    {
+        dispatch (endpoint SunRPC.RecordMarking over server) issues s;
+    }
+    
+    ~endpoint(TCP.Server server)
+    {
+        if (Addr in GetPortMappings)
+        {
+            GetPortMappings = GetPortMappings.Remove(Addr);
+        }
+    }
+}
+
+const uint PMAP_PROGRAM = 100000;
+const set<uint> RpcBindPortMapperVersSet = {2, 3, 4}; // 2 is PortMapper, 3 or 4 is RPCBIND
+
+// SunRPC Over UDP actor
+autostart actor SunRPCOverUDP(UDP.Host host)
+{
+    binary Addr1 = host.Address1 + host.Address2;
+    binary Addr2 = host.Address2 + host.Address1;
+
+    process host accepts d:UDP.Datagram where (d.Payload.Count > 0 && 
+        ((d.DestinationPort == Port.SunRPC || d.SourcePort == Port.SunRPC) && IsSunRPC(d.Payload)) 
+        || IsPortRepliedByGetPort(Addr1, d.DestinationPort) || IsPortRepliedByGetPort(Addr1, d.SourcePort))
+    {
+        dispatch (endpoint SunRPC.RecordMarking over host) accepts d;
+    }
+    
+    ~endpoint(UDP.Host host)
+    {
+        if (Addr1 in GetPortMappings)
+        {
+            GetPortMappings = GetPortMappings.Remove(Addr1);
+        }
+        if (Addr2 in GetPortMappings)
+        {
+            GetPortMappings = GetPortMappings.Remove(Addr2);
+        }
+    }
+}
+
+// Port Mapper Over SunRPC
+autostart actor PortMapperOverSunRPC(SunRPC.Node sunRPCNode)
+{
+    // mapProcedureByXID recodes the Procedure number, and its key is RpcMsg.Xid.
+    // Xid  -- ProcedureID
+    map<uint, uint> mapProcedureByXID = {};
+    // Xid --- Request message
+    map<uint, any message> requestsMap = {};
+    
+    ~endpoint(SunRPC.Node sunRPCNode)
+    {
+        foreach (var msg in requestsMap.Values)
+        {
+            DisplayTopLevelMessage(msg);
+        }
+        requestsMap = {};
+    }
+    
+    // Server request/response
+    // The second parameter "false/true" is to denote the lower layer bellow SunRPC is UDP or not.
+    process sunRPCNode accepts r:RpcMsg where (r.MType == MsgType.Call && (r.Body as CallBody).Prog == 100000 && (r.Body as CallBody).Vers == 2)
+    {
+        mapProcedureByXID[r.Xid] = (r.Body as CallBody).Proc;
+        PortMapperMessageProcessing(mapProcedureByXID[r.Xid], r, ref requestsMap, AcceptsDispatcher);
+    }
+    // accepts Reply from UDP, reverse accept/issues direction for operation set up.
+    process sunRPCNode accepts r:RpcMsg where ((r.MType == MsgType.Reply) && (r.Xid in mapProcedureByXID) && (r.Body as ReplyBody).Stat == ReplyStat.MsgAccepted)
+    {
+        PortMapperMessageProcessing(mapProcedureByXID[r.Xid], r, ref requestsMap, IssuesDispatcher);
+    }
+    process sunRPCNode issues r:RpcMsg where ((r.MType == MsgType.Reply) && (r.Xid in mapProcedureByXID) && (r.Body as ReplyBody).Stat == ReplyStat.MsgAccepted)
+    {
+        PortMapperMessageProcessing(mapProcedureByXID[r.Xid], r, ref requestsMap, IssuesDispatcher);
+    }
+
+    void AcceptsDispatcher(any message m)
+    {
+        dispatch (endpoint IntermediateServer over sunRPCNode) accepts m;
+    }
+    
+    void IssuesDispatcher(any message m)
+    {
+        dispatch (endpoint IntermediateServer over sunRPCNode) issues m;
+    }
+}
+
+void PortMapperMessageProcessing(uint procedureNumber, SunRPC.RpcMsg r, ref map<uint, any message> requests, void(any message) dispatcher)
+{
+    if (r.MType == MsgType.Call) // request
+    {
+        binary binCallVal = ((r.Body as CallBody).CallData as BinaryCallDataType).Data;
+        switch (procedureNumber)
+        {
+            case 1 =>
+                switch (binCallVal)
+                {
+                    case m:MessageContract.SetRequest from BinaryDecoder<MessageContract.SetRequest> =>
+                       dispatcher(m);
+                       requests[r.Xid] = m;
+
+                    default =>
+                        ThrowDecodingException("PortMapper", "SetRequest");
+                }
+            case 2 =>
+                switch (binCallVal)
+                {
+                    case m:MessageContract.UnsetRequest from BinaryDecoder<MessageContract.UnsetRequest> =>
+                       dispatcher(m);
+                       requests[r.Xid] = m;
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "UnsetRequest");
+                }
+            case 3 =>
+                switch (binCallVal)
+                {
+                    case m:MessageContract.GetPortRequest from BinaryDecoder<MessageContract.GetPortRequest> =>
+                       dispatcher(m);
+                       requests[r.Xid] = m;
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "GetPortRequest");
+                }
+            case 4 =>
+                // reqeusts[r.Xid] = null;
+                break;
+            case 5 =>
+                switch (binCallVal)
+                {
+                    case m:MessageContract.CallItRequest from BinaryDecoder<MessageContract.CallItRequest> =>
+                        dispatcher(m);
+                        requests[r.Xid] = m;
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "CallItRequest");
+                }
+            default =>
+                ThrowDecodingException("PortMapper");
+        }
+    }
+    
+    else // response
+    {
+        binary binReplyVal = ((r.Body as ReplyBody).Reply as AcceptedReply).ReplyData as binary;
+        
+        switch (procedureNumber)
+        {
+            case 1 =>
+                switch (binReplyVal)
+                {
+                    case response:MessageContract.SetResponse from BinaryDecoder<MessageContract.SetResponse> =>
+                        requests = requests.Remove(r.Xid);
+                        dispatcher(response);
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "SetResponse");
+                }
+            case 2 =>
+                switch (binReplyVal)
+                {
+                    case response:MessageContract.UnsetResponse from BinaryDecoder<MessageContract.UnsetResponse> =>
+                        requests = requests.Remove(r.Xid);
+                        dispatcher(response);
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "UnsetResponse");
+                }
+            case 3 =>
+                switch (binReplyVal)
+                {
+                    case response:MessageContract.GetPortResponse from BinaryDecoder<MessageContract.GetPortResponse> =>
+                        if (r.Xid in requests)
+                        {
+                            requests = requests.Remove(r.Xid);
+                        }
+                        dispatcher(response);
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "GetPortResponse");
+                }
+            case 4 =>
+                switch (binReplyVal)
+                {
+                    case response:MessageContract.DumpResponse from BinaryDecoder<MessageContract.DumpResponse> =>
+                        if (r.Xid in requests)
+                        {
+                            requests = requests.Remove(r.Xid);
+                        }
+                        dispatcher(response);
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "DumpResponse");
+                }
+            case 5 =>
+                switch (binReplyVal)
+                {
+                    case response:MessageContract.CallItResponse from BinaryDecoder<MessageContract.CallItResponse> =>
+                        if (r.Xid in requests)
+                        {
+                            requests = requests.Remove(r.Xid);
+                        }
+                        dispatcher(response);
+                        
+                    default =>
+                        ThrowDecodingException("PortMapper", "CallItResponse");
+                }
+            default =>
+                ThrowDecodingException("PortMapper");
+        }
+    }
+}
+
+contract OperationContract
+{
+    accepts operation PMAPPROC_SET
+    {
+        in Call Call;
+        out Reply Reply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_SET";
+        }
+    }
+    
+    accepts operation PMAPPROC_UNSET
+    {
+        in Call Call;
+        out Reply Reply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_UNSET";
+        }
+    }
+     
+    accepts operation PMAPPROC_GETPORT
+    {
+        in Call Call;
+        out XdrUnsignedInt MappedPort;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_GETPORT";
+        }
+    }
+   
+    accepts operation PMAPPROC_DUMP
+    {
+        out DumpReply DumpReply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_DUMP";
+        }
+    }
+    
+    accepts operation PMAPPROC_CALLIT
+    {
+        in CallArguments CallArguments;
+        out CallResults CallResults;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_CALLIT";
+        }
+    }
+}
+
+contract MessageContract
+{
+    accepts message SetRequest
+    {
+        Call Call;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_SET Request";
+        }
+    }
+    
+    issues message SetResponse
+    {
+        Reply Reply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_SET Response";
+        }
+    }
+    
+    accepts message UnsetRequest
+    {
+        Call Call;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_UNSET Request";
+        }
+    }
+    
+    issues message UnsetResponse
+    {
+        Reply Reply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_UNSET Response";
+        }
+    }
+    
+    accepts message GetPortRequest
+    {
+        Call Call;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_GETPORT Request";
+        }
+    }
+    
+    issues message GetPortResponse
+    {
+        XdrUnsignedInt MappedPort;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_GETPORT Response";
+        }
+    }
+    
+    issues message DumpResponse
+    {
+        DumpReply DumpReply;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_DUMP Response";
+        }
+    }
+    
+    accepts message CallItRequest
+    { 
+        CallArguments CallArguments;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_CALLIT Request";
+        }
+    }
+    
+    issues message CallItResponse
+    {
+        CallResults CallResults;
+        
+        override string ToString()
+        {
+            return "V2 PMAPPROC_CALLIT Response";
+        }
+    }
+}
+
+autostart actor OperationContractActor(IntermediateServer node)
+{
+    MessageContract.SetRequest setRequest = null;
+    MessageContract.UnsetRequest unsetRequest = null;
+    MessageContract.GetPortRequest getPortRequest = null;
+    MessageContract.CallItRequest callItRequest = null;
+
+    ~endpoint(IntermediateServer ep)
+    {
+        if (setRequest != null)
+        {
+            ReportInsufficientOperation(setRequest, "PortMapper", "PMAPPROC_SET", false);
+            release setRequest;
+        }
+        if (unsetRequest != null)
+        {
+            ReportInsufficientOperation(unsetRequest, "PortMapper", "PMAPPROC_UNSET", false);
+            release unsetRequest;
+        }
+        if (getPortRequest != null)
+        {
+            ReportInsufficientOperation(getPortRequest, "PortMapper", "PMAPPROC_GETPORT", false);
+            release getPortRequest;
+        }
+        if (callItRequest != null)
+        {
+            ReportInsufficientOperation(callItRequest, "PortMapper", "PMAPPROC_CALLIT", false);
+            release callItRequest;
+        }
+
+        setRequest = null;
+        unsetRequest = null;
+        getPortRequest = null;
+        callItRequest = null;
+    }
+
+    // Set request
+    process node accepts req:MessageContract.SetRequest
+    {
+        if (setRequest == null)
+        {
+            setRequest = req;
+        }
+        else
+        {
+            ValidationCheck(false, setRequest, "PortMapper: Incomplete Set operation due to missing Set response.");
+            DisplayTopLevelMessage(setRequest);
+            setRequest = req;
+        }
+    }
+    
+    // response
+    process node issues res:MessageContract.SetResponse
+    {
+        if (setRequest == null)
+        {
+            ValidationCheck(false, res, "PortMapper: Incomplete Set operation due to missing Set request.");
+            reject;
+        }
+        else
+        {
+            var setOp = new OperationContract.PMAPPROC_SET
+            {
+                Call = setRequest.Call,
+                Reply = res.Reply
+            };
+            setOp.Origins = [setRequest as any message, res as any message];
+            setRequest = null;
+            dispatch (endpoint Server over node) accepts setOp;
+        }
+    }
+    
+    // Unset Request
+    process node accepts req:MessageContract.UnsetRequest
+    {
+        if (unsetRequest == null)
+        {
+            unsetRequest = req;
+        }
+        else
+        {
+            ValidationCheck(false, unsetRequest, "PortMapper: Incomplete Unset operation due to missing UnSet response.");
+            DisplayTopLevelMessage(unsetRequest);
+            unsetRequest = req;
+        }
+    }
+    
+    // response
+    process node issues res:MessageContract.UnsetResponse
+    {
+        if (unsetRequest == null)
+        {
+            ValidationCheck(false, res, "PortMapper: Incomplete UnSet operation due to missing UnSet request.");
+            reject;
+        }
+        else
+        {
+            var unsetOp = new OperationContract.PMAPPROC_UNSET
+            {
+                Call = unsetRequest.Call,
+                Reply = res.Reply
+            };
+            unsetOp.Origins = [unsetRequest as any message, res as any message];
+            unsetRequest = null;
+            dispatch (endpoint Server over node) accepts unsetOp;
+        }
+    }
+    
+    // GetPort Request
+    process node accepts req:MessageContract.GetPortRequest
+    {
+        if (getPortRequest == null)
+        {
+            getPortRequest = req;
+        }
+        else
+        {
+            ValidationCheck(false, getPortRequest, "PortMapper: Incomplete GetPort operation due to missing GetPort response.");
+            DisplayTopLevelMessage(getPortRequest);
+            getPortRequest = req;
+        }
+    }
+    
+    // response
+    process node issues res:MessageContract.GetPortResponse
+    {
+        if (getPortRequest == null)
+        {
+            ValidationCheck(false, res, "PortMapper: Incomplete GetPort operation due to missing GetPort request.");
+            reject;
+        }
+        else
+        {
+            var getPortOp = new OperationContract.PMAPPROC_GETPORT
+            {
+                Call = getPortRequest.Call,
+                MappedPort = res.MappedPort,
+            };
+            // added for following frames using the replied port
+            Mapping mapping = new Mapping();
+            mapping.ProgramNumber = getPortRequest.Call.Mapping.ProgramNumber;
+            mapping.ProgramVersion = getPortRequest.Call.Mapping.ProgramVersion;
+            mapping.ProtocolType = getPortRequest.Call.Mapping.ProtocolType;
+            mapping.Port = res.MappedPort;
+            var ep = GetTransportEndpoint(node);
+            if (ep is server:TCP.Server)
+            {
+                binary addr = server.ServerAddress + server.ClientAddress;
+                InsertPortMapping(addr, mapping);
+            }
+            else if (ep is host:UDP.Host)
+            {
+                // Record the two-way addresses, as there's only one direction in UDP endpoint
+                binary addr1 = host.Address1 + host.Address2;
+                binary addr2 = host.Address2 + host.Address1;
+                InsertPortMapping(addr1, mapping);
+                InsertPortMapping(addr2, mapping);
+            }
+            getPortOp.Origins = [getPortRequest as any message, res as any message];
+            getPortRequest = null;
+            dispatch (endpoint Server over node) accepts getPortOp;
+        }
+    }
+    
+    // Dump response
+    process node issues res:MessageContract.DumpResponse
+    {
+        var dumpOp = new OperationContract.PMAPPROC_DUMP
+        {
+            DumpReply = res.DumpReply
+        };
+        dumpOp.Origins = [res as any message];
+        dispatch (endpoint Server over node) accepts dumpOp;
+    }
+    
+    // CallIt Request
+    process node accepts req:MessageContract.CallItRequest
+    {
+        if (callItRequest == null)
+        {
+            callItRequest = req;
+        }
+        else
+        {
+            ValidationCheck(false, callItRequest, "PortMapper: Incomplete CallIt operation due to missing CallIt response.");
+            DisplayTopLevelMessage(callItRequest);
+            callItRequest = req;
+        }
+    }
+    
+    // response
+    process node issues res:MessageContract.CallItResponse
+    {
+        if (callItRequest == null)
+        {
+            ValidationCheck(false, res, "PortMapper: Incomplete CallIt operation due to missing CallIt request.");
+            reject;
+        }
+        else
+        {
+            var callItOp = new OperationContract.PMAPPROC_CALLIT
+            {
+                CallArguments = callItRequest.CallArguments,
+                CallResults = res.CallResults
+            };
+            callItOp.Origins = [callItRequest as any message, res as any message];
+            callItRequest = null;
+            dispatch (endpoint Server over node) accepts callItOp;
+        }
+    }
+}
+
+type Call
+{
+    Mapping Mapping;
+}
+
+type Reply
+{
+    XDRBool ReturnValue;
+}
+
+type Mapping
+{
+    XdrUnsignedInt ProgramNumber;
+    XdrUnsignedInt ProgramVersion;
+    ProType ProtocolType;
+    XdrUnsignedInt Port;
+}
+
+pattern ProType = enum uint
+{
+    TCP = 6,
+    UDP = 17
+};
+
+type DumpReply
+{
+    XDRBool Pointer;
+    optional [|Pointer == XDRBool.TRUE|] MappingList MappingList;
+}
+
+type MappingList
+{
+    Mapping Map;
+    XDRBool Next;
+    optional [|Next == XDRBool.TRUE|] MappingList NextMap;
+}
+
+type CallArguments
+{
+    XdrUnsignedInt ProgramNumber;
+    XdrUnsignedInt ProgramVersion;
+    XdrUnsignedInt Procedure;
+    XdrOpaqueVariable Arguments;
+}
+
+type CallResults
+{
+    XdrUnsignedInt Port;
+    XdrOpaqueVariable Results;
+}
+

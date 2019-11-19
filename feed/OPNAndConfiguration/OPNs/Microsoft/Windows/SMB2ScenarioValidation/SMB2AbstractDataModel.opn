@@ -1,0 +1,593 @@
+protocol SMB2ScenarioValidation;
+
+using Diagnostics;
+using Utility;
+using Standard;
+using DTYP;
+using ERREF;
+using SMB2;
+using SMBTransport;
+using NBTSS;
+using TCP;
+using HTTP;
+
+// ---------------------------------------------Configurations--------------------------------------------- //
+// SMB Scenario Validation Configurations
+type SMBScenarioValidationConfiguration
+{
+    bool EnableSMB2ScenarioValidation = false with Configurable {Description = "A Boolean that, if set, indicates that the SMB2 Scenario Validation is enabled"};
+    string ServerMaxDialect = "Unknown" with Configurable {Description = "The max SMB2 dialect that server support. Eg: 2.02, 2.1, 3.0, 3.0.2, 3.1.1"};
+
+    // WORKAROUND for Pef Bug 3669624: [UI] In Options->Parsing, we need to support a nullable configuration (bool?)
+    int RequireMessageSigning = -1 with Configurable {Description = "A Boolean that, if set, indicates that this node requires that messages MUST be signed if the message is sent with a user security context that is neither anonymous nor guest. If not set, this node does not require that any messages be signed, but can still choose to do so if the other node requires it."};
+    int IsDfsCapable = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server supports the Distributed File System."};
+    int IsMultiChannelCapable = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server supports the multichannel capability."};
+    int EncryptData = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server requires messages to be encrypted after session establishment."};
+    int RejectUnencryptedAccess = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server will reject any unencrypted messages. This flag is applicable only if EncryptData is TRUE or if Share.EncryptData (as defined in section 3.3.1.6) is TRUE."};
+    string ServerHashLevel = "Unknown" with Configurable {Description = "A state that indicates the caching level configured on the server. Eg: HashEnableAll, HashDisableAll, HashEnableShare"};
+
+    // not in global
+    int IsDirectoryLeasingCapable = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server supports the directory Leasing."};
+    int IsPersistentHandleCapable = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server supports the presistent handle."};
+    int IsEncryptionCapable = -1 with Configurable {Description = "A Boolean that, if set, indicates that the server supports the encryption."};
+} with Configurable{Category = "SMB2 Scenario Validation"};
+
+ushort DialectStringToUShort(string dialect)
+{
+    switch (dialect)
+    {
+        case "2.0.2" =>
+            return SMB2NegotiateRequestDialects.SMB2002DialectRevisionNumber;
+        case "2.1" =>
+            return SMB2NegotiateRequestDialects.SMB21DialectRevisionNumber;
+        case "3.0" =>
+            return SMB2NegotiateRequestDialects.SMB30DialectRevisionNumber;
+        case "3.0.2" =>
+            return SMB2NegotiateRequestDialects.SMB302DialectRevisionNumber;
+        case "3.1.1" =>
+            return SMB2NegotiateRequestDialects.SMB311DialectRevisionNumber;
+        default =>
+            return SMB2InitialDialect;
+    }
+}
+// ---------------------------------------------ADM: Abstract Data Model--------------------------------------------- //
+// The key is ServerGuid
+map<GUID, Global> globalMap = {};
+
+// 3.3.1.5 Global
+type Global
+{
+    map<binary, TransportConnection> ConnectionList = {};
+    map<ulong, Session> GlobalSessionTable = {};
+    map<string, Share> ShareList = {};
+    GUID ServerGuid;
+    FILETIME ServerStartTime;
+
+    // ---------------We will set this configuration when Negotiate---------------------
+    bool? RequireMessageSigning = null;
+    bool? IsDfsCapable = null;
+    bool? IsMultiChannelCapable = null;
+    string ServerHashLevel = null;
+
+    // not in global
+    bool? IsDirectoryLeasingCapable = null;
+    bool? IsPersistentHandleCapable = null;
+    bool? IsEncryptionCapable = null;
+    bool? IsLeaseCapable = null;
+    bool? EncryptData = null;
+    // ---------------------------------------------------------------------------------
+
+    Global()
+    {
+    }
+}
+
+// 3.3.1.6 Per Share
+type Share
+{
+    string Index = "";
+    string ServerName = "";
+    string Name = "";
+    SMB2ShareflagCachingType? CscFlags = null;
+    bool? IsDfs = null;
+    bool? EncryptData = null;
+    bool? DoAccessBasedDirectoryEnumeration = null;
+    bool? AllowNamespaceCaching = null;
+    bool? ForceSharedDelete = null;
+    bool? RestrictExclusiveOpens = null;
+    bool? HashEnabled = null;
+    bool? ForceLevel2Oplock = null;
+    uint? Type = null;
+    bool? IsCA = null;
+}
+
+type UNC
+{
+    string HostName;
+    string ShareName;
+}
+syntax UNCSyntax         = "\\\\" s1:HostName "\\" s2:ShareName ("\\" ObjectName)? 
+                            => new UNC
+                                {
+                                    HostName = s1,
+                                    ShareName = s2
+                                };
+syntax HostName          = (s11:"[" s12:HTTP.IPv6Address s13:"]" => (s11 + s12 + s13)) | HTTP.IPv4Address | HTTP.RegName; // IPv6Address, IPv4address, and reg-name as specified in [RFC3986] 
+syntax ShareName         = regex{[\x21-\x21\x23-\x29\x2D-\x2E\x30-\x39\x40-\x5A\x5E-\x7B\x7D-\xFF]+};
+syntax ObjectName        = PathName* ("\\" FileName)?;
+syntax PathName          = regex{[\x21-\x21\x23-\x29\x2D-\x2E\x30-\x39\x40-\x5A\x5E-\x7B\x7D-\xFF]+};
+syntax FileName          = regex{[\x20-\x21\x23-\x29\x2B-\x2E\x30-\x39\x3B\x3D\x40-\x5B\x5D-\x7B\x7D-\xFF]+} (":" StreamName (":" StreamType)?)?;
+syntax StreamName        = regex{[\x01-\x2E\x30-\x39\x3B-\x5B\x5D-\xFF]*};
+syntax StreamType        = regex{[\x01-\x2E\x30-\x39\x3B-\x5B\x5D-\xFF]+};
+
+const ushort SMB2InitialDialect = 0xFFFF;
+// 3.3.1.7 Per Transport Connection
+type TransportConnection
+{
+    set<ulong> CommandSequenceWindow = {0};
+    ulong currentMaxSequenceNumber = 0;
+
+    map<ulong, Request> RequestList = {};
+    map<ulong, Session> SessionTable = {};
+    map<ulong, PreauthSession> PreauthSessionTable = {};
+    SMB2NegotiateRequestCapabilities ClientCapabilities = 0;
+    ushort NegotiateDialect = SMB2InitialDialect;
+    map<ulong, any message> AsyncCommandList = {};
+    ushort Dialect = SMB2InitialDialect;
+    bool ShouldSign = false;
+    string ClientName;
+    uint MaxTransactSize = 0;
+    uint MaxReadSize = 0;
+    uint MaxWriteSize = 0;
+    bool SupportsMultiCredit = false;
+    string TransportName;
+    bool ConstrainedConnection = true;
+    GUID ClientGuid;
+    SMB2NegotiateRequestCapabilities ServerCapabilities = 0;
+    SMB2.SMB2NegotiateResponseCapabilities ServerSecurityMode = 0;
+    SMB2NegotiateRequestSecurityMode ClientSecurityMode = 0;
+    array<SMB2NegotiateRequestDialects> ClientDialects = [];
+    ushort PreauthIntegrityHashId = 0;
+    ushort CipherId = 0;
+
+    // Not a SMB2 Server ADM variable, added for sequence validation. Used to store previous request for future squence validation.
+    //any message preRequest;
+    // Not a SMB2 Server ADM variable, added for sequence validation. Used to enable/disable sequence validation.
+    bool ValidationEnabled =  false;
+    // Not a SMB2 Server ADM variable, added for sequence validation. Used to store all the unanswered request.
+    map<ulong, any message> PendingRequestList = {};
+    // ConnectionList: A list of all open connections on the server, indexed by the connection endpoint addresses.
+    binary ConnectionEndpointAddress = $[];
+    ushort ServerPort = 0;
+    GUID ServerGuid;
+    // the key is MessageNumber
+    map<uint, SMB2.SMB2Response> PreviousCompoundedMessageResponse = {};
+    map<uint, SMB2.SMB2Request> PreviousCompoundedMessageRequest = {};
+    set<uint> CompoundedRelatedMessageNumber = {};
+
+    TransportConnection()
+    {
+    }
+
+    // Check if a pending request exists in the global.ConnectionList.PendingRequestList for this response
+    bool ExistRequest(SMB2.SMB2Response response)
+    {
+        return (response.Header.MessageId in PendingRequestList);
+    }
+    
+    // Return the related pending request of a response according to MessageId
+    any message GetRequest(SMB2Response response)
+    {
+        return PendingRequestList[response.Header.MessageId];
+    }
+    
+    // Remove a request according to the MessageId of the response
+    void RemoveRequest(SMB2Response response)
+    {
+        PendingRequestList = PendingRequestList.Remove(response.Header.MessageId);
+    }
+}
+
+const ulong SMB2InitialSessionId = 0;
+// 3.3.1.8 Per Session
+type Session
+{
+    ulong SessionId = SMB2InitialSessionId;
+    TransportConnection Connection = null;
+    map<ulong, Open> OpenTable = {};
+    map<uint, TreeConnect> TreeConnectTable = {};
+    
+    array<Channel> ChannelList = [];
+    bool IsAnonymous = false;
+    bool IsGuest = false;
+    bool SigningRequired = false;
+    bool? EncryptData = null;
+
+    override string ToString()
+    {
+        return "SessionId: " + SessionId.ToString() +
+            "Connection Endpoint Address: " + Connection.ConnectionEndpointAddress.ToString() +
+            "OpenTable: " + OpenTable.ToString() +
+            "TreeConnectTable: " + TreeConnectTable.ToString() +
+            "ChannelList: " + ChannelList.ToString() +
+            "IsAnonymous: " + IsAnonymous.ToString() +
+            "IsGuest: " + IsGuest.ToString() +
+            "SigningRequired: " + SigningRequired.ToString() +
+            "EncryptData: " + EncryptData.ToString();
+    }
+}
+
+const uint InvalidTreeId = 0xFFFFFFFF;
+const uint SMB2InitialTreeId = 0;
+// 3.3.1.9 Per Tree Connect
+type TreeConnect
+{
+    uint TreeId = SMB2InitialTreeId;
+    Session Session;
+    Share Share = null;
+    uint OpenCount = 0;
+    (SMB2.DirectoryAccessMask | SMB2.FilePipePrinterAccessMask) MaximalAccess = 0;
+
+    override string ToString()
+    {
+        return "TreeId: " + TreeId.ToString() +
+            "SessionId: " + Session.SessionId.ToString() +
+            "Share: " + Share.ToString() +
+            "OpenCount: " + OpenCount.ToString() +
+            "MaximalAccess: " + MaximalAccess.ToString();
+    }
+}
+
+// 3.3.1.10 Per Open
+type Open
+{
+    // Future Reference: implement this type for future use(eg. SMB2 CREATE sequence validation)
+}
+
+// 3.3.1.13 Per Request
+type Request
+{
+    ulong MessageId;
+    ulong AsyncId;
+    Open Open;
+    bool IsEncrypted;
+    ulong TransformSessionId;
+
+    Request(ulong _MessageId, ulong _AsyncId)
+    {
+        MessageId = _MessageId;
+        AsyncId = _AsyncId;
+        Open = null;
+        IsEncrypted = false;
+        TransformSessionId = 0;
+    }
+}
+
+// 3.3.1.14 Per Channel
+type Channel
+{
+    TransportConnection Connection;
+
+    override string ToString()
+    {
+        return "Connection Endpoint Address: " + Connection.ConnectionEndpointAddress.ToString();
+    }
+}
+
+// 3.3.1.15 Per PreauthSession
+type PreauthSession
+{
+    ulong SessionId;
+}
+
+void DiableValidationForTransportConnection(any arg)
+{
+    if (arg is transportconnection:TransportConnection)
+        transportconnection.ValidationEnabled = false;
+}
+
+TransportConnection InitialConnection(SMB2.Server server)
+{
+    TCP.Server tcp = null;
+    SMBTransport.Server transportServer = server.GetTransport<SMBTransport.Server>();
+    NBTSS.Server nbtssServer = server.GetTransport<NBTSS.Server>();
+    if (transportServer != null &&
+        transportServer.GetTransport<TCP.Server>() is tcp1:TCP.Server && tcp1 != null)
+    {
+        tcp = tcp1;
+    }
+    else if (nbtssServer != null &&
+        nbtssServer.GetTransport<TCP.Server>() is tcp2:TCP.Server && tcp2 != null)
+    {
+        tcp = tcp2;
+    }
+
+    TransportConnection transportConnection = null;
+    if (tcp != null)
+    {
+        transportConnection = new TransportConnection();
+        transportConnection.ValidationEnabled = true;
+        var index = MakeBinary(tcp.ClientAddress, tcp.ServerAddress, tcp.ClientPort, tcp.ServerPort);
+        transportConnection.ConnectionEndpointAddress = index;
+        transportConnection.ServerPort = tcp.ServerPort;
+
+        var e = new Event{Handler = DecodeOnTcpConnClose, Arguments = [transportConnection]};
+        tcp.RegisterEventOnConnClose(e);
+    }
+    else // disable the validation if it's not over TCP or NBTSS, because we can't get endpoint index under the other scenarios
+    {
+        transportConnection = new TransportConnection();
+        transportConnection.ValidationEnabled = false;
+    }
+    return transportConnection;
+}
+
+// Invoke when underlying TCP connection closes.
+void DecodeOnTcpConnClose(array<any> args)
+{
+    if (args.Count > 0 && args[0] is transportConnection:TransportConnection)
+    {
+        if (transportConnection.ServerGuid in globalMap)
+        {
+            // session
+            foreach (var session in transportConnection.SessionTable.Values)
+            {
+                bool canSessionBeDeleted = true;
+
+                if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+                {
+                    session.ChannelList = session.ChannelList.Filter<Channel>((Channel x) => (x.Connection.ConnectionEndpointAddress != transportConnection.ConnectionEndpointAddress));
+                    if (session.ChannelList.Count > 0)
+                    {
+                        session.Connection = session.ChannelList[0].Connection;
+                        canSessionBeDeleted = false;
+                    }
+                }
+
+                if (canSessionBeDeleted)
+                {
+                    session.Connection = null;
+                    foreach (var treeConnect in session.TreeConnectTable.Values)
+                    {
+                        if (treeConnect.Share.Index in globalMap[transportConnection.ServerGuid].ShareList.Keys)
+                            globalMap[transportConnection.ServerGuid].ShareList = globalMap[transportConnection.ServerGuid].ShareList.Remove(treeConnect.Share.Index);
+                    }
+                    session.TreeConnectTable = {};
+                    if (session.SessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys)
+                    {
+                        globalMap[transportConnection.ServerGuid].GlobalSessionTable = globalMap[transportConnection.ServerGuid].GlobalSessionTable.Remove(session.SessionId);
+                    }
+                }
+            }
+
+            // TODO: open and treeconnect
+            // Connection
+            transportConnection.SessionTable = {};
+            transportConnection.PreauthSessionTable = {};
+            transportConnection.RequestList = {};
+            transportConnection.PendingRequestList = {};
+            globalMap[transportConnection.ServerGuid].ConnectionList  = globalMap[transportConnection.ServerGuid].ConnectionList.Remove(transportConnection.ConnectionEndpointAddress);
+        }
+    }
+}
+
+// WORKAROUND for pef bug 3705427: [Compiler/Runtime] When there is cross reference in opn, MMA will crash and we can't use visual studio to debug the generated C# file
+// Use LogADM to observe the ADM value
+void LogADM(any adm)
+{
+    ValidationCheck(false, null, adm.ToString());
+}
+
+// To deal with open capture files for multi servers
+void InitialGlobal(ref TransportConnection transportConnection, SMB2.Messages.NegotiateResponse negRes)
+{
+    if (transportConnection != null)
+    {
+        if (negRes.Response.ServerGuid in globalMap.Keys)
+        {
+            globalMap[negRes.Response.ServerGuid].ConnectionList[transportConnection.ConnectionEndpointAddress] = transportConnection;
+            transportConnection.ServerGuid = negRes.Response.ServerGuid;
+        }
+        else
+        {
+            Global global = new Global();
+            global.ConnectionList[transportConnection.ConnectionEndpointAddress] = transportConnection;
+            globalMap[negRes.Response.ServerGuid] = global;
+            transportConnection.ServerGuid = negRes.Response.ServerGuid;
+        }
+    }
+}
+
+// Joins the source/destination address and the source/destination port values as one binary value
+binary MakeBinary(binary sourceAddress, binary destinationAddress, ushort sourcePort, ushort destinationPort)
+{
+    return sourceAddress + destinationAddress + sourcePort.ToBinary() + destinationPort.ToBinary();
+}
+
+bool IsAnInterimResponse(SMB2Response response)
+{
+    return response is errorRes:SMB2.Messages.ErrorResponse && errorRes.Header.Status is sta:ERREF.NTSTATUS && sta.Value == Smb2StatusValue.STATUS_PENDING;
+}
+
+bool IsBitSetInFlag(uint flag, uint bit)
+{
+    return (flag & bit) != 0;
+}
+
+bool IsBitNotSetInFlag(uint flag, uint bit)
+{
+    return (flag & bit) == 0;
+}
+
+// The server MUST handle each individual request that is described in the chain in order. For the first request, 
+// the identifiers for FileId, SessionId, and TreeId MUST be taken from the received request. 
+// For every subsequent request, the values used for FileId, SessionId, and TreeId MUST be 
+// the ones used in processing the previous request or generated for the previous resulting response.
+annotation ulong SMB2.SMB2Request#SessionID;
+annotation uint SMB2.SMB2Request#TreeID;
+annotation SMB2.SMB2Fileid SMB2.SMB2Request#FileID;
+void SetIDsForCompoundedRequest(ref SMB2.SMB2Request currRequest, SMB2.SMB2Request preRequest, SMB2.SMB2Response preResponse)
+{
+    currRequest#SessionID = GetSMB2RequestSessionID(preRequest);
+    if (currRequest#SessionID == nothing || currRequest#SessionID == SMB2InitialSessionId)
+    {
+        currRequest#SessionID = preResponse.Header.SessionId;
+    }
+
+    currRequest#TreeID = GetSMB2RequestTreeID(preRequest);
+    if (currRequest#TreeID == nothing || currRequest#TreeID == SMB2InitialTreeId)
+    {
+        currRequest#TreeID = preResponse.Header.TreeId;
+    }
+
+    currRequest#FileID = GetSMB2RequestFileID(preRequest);
+    if (currRequest#FileID == nothing)
+    {
+        currRequest#FileID = GetSMB2ResponseFileID(preResponse);
+    }
+}
+
+ulong GetSMB2RequestSessionID(SMB2.SMB2Request smb2Request)
+{
+    return (smb2Request#SessionID == nothing) ? smb2Request.Header.SessionId : smb2Request#SessionID as ulong;
+}
+
+optional uint GetSMB2RequestTreeID(SMB2.SMB2Request smb2Request)
+{
+    return (smb2Request#TreeID == nothing) ? smb2Request.Header.TreeId : smb2Request#TreeID;
+}
+
+optional SMB2.SMB2Fileid GetSMB2RequestFileID(SMB2.SMB2Request smb2Request)
+{
+    return (smb2Request#FileID == nothing) ? GetFileIDForRequest(smb2Request) : smb2Request#FileID;
+}
+
+optional SMB2.SMB2Fileid GetFileIDForRequest(SMB2.SMB2Request smb2Request)
+{
+    optional SMB2.SMB2Fileid fid = nothing;
+
+    switch (smb2Request.Header.Command)
+    {
+        case SMB2.SMB2PacketHeaderCommand.SMB2Create =>
+            if (smb2Request is createReq:SMB2.Messages.CreateRequest && createReq.Request.Buffer is reqBuffer:SMB2.SMB2CreateRequestBuffer
+                && reqBuffer.CreateContextList is contextArr:array<SMB2CreateContextRequest>)
+            {
+                foreach (var context in contextArr)
+                {
+                    if (context.Buffer is contextReqBuffer:SMB2CreateContextRequestBuffer)
+                    {
+                        if (contextReqBuffer.Data is durableRecon:SMB2CreateDurableHandleReconnect)
+                        {
+                            fid = durableRecon.Data;
+                            break;
+                        }
+                        else if (contextReqBuffer.Data is durableReconV2:SMB2CreateDurableHandleReconnectV2)
+                        {
+                            fid = durableReconV2.FileId;
+                            break;
+                        }
+                    }
+                }
+            }
+        case SMB2.SMB2PacketHeaderCommand.SMB2Close =>
+            fid = (smb2Request as SMB2.Messages.CloseRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Flush =>
+            fid = (smb2Request as SMB2.Messages.FlushRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Read =>
+            fid = (smb2Request as SMB2.Messages.ReadRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Write =>
+            fid = (smb2Request as SMB2.Messages.WriteRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2OplockBreak =>
+            if (smb2Request is oplockAck:SMB2.Messages.OplockBreakAcknowledgment)
+            {
+                fid = oplockAck.Acknowledgment.FileId;
+            }
+        case SMB2.SMB2PacketHeaderCommand.SMB2Lock =>
+            fid = (smb2Request as SMB2.Messages.LockRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Ioctl =>
+            fid = (smb2Request as SMB2.Messages.IoctlRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2QueryDirectory =>
+            fid = (smb2Request as SMB2.Messages.QueryDirectoryRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2ChangeNotify =>
+            fid = (smb2Request as SMB2.Messages.ChangeNotifyRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2QueryInfo =>
+            fid = (smb2Request as SMB2.Messages.QueryInfoRequest).Request.FileId;
+        case SMB2.SMB2PacketHeaderCommand.SMB2SetInfo =>
+            fid = (smb2Request as SMB2.Messages.SetInfoRequest).Request.FileId;
+        default =>;
+    }
+    return fid;
+}
+
+optional SMB2.SMB2Fileid GetSMB2ResponseFileID(SMB2.SMB2Response smb2Response)
+{
+    optional SMB2.SMB2Fileid fid = nothing;
+    if (!(smb2Response is SMB2.Messages.ErrorResponse))
+    {
+        switch (smb2Response.Header.Command)
+        {
+            case SMB2.SMB2PacketHeaderCommand.SMB2Create =>
+                fid = (smb2Response as SMB2.Messages.CreateResponse).Response.FileId;
+            case SMB2.SMB2PacketHeaderCommand.SMB2OplockBreak =>
+                if (smb2Response is oplockNot:SMB2.Messages.OplockBreakNotification)
+                {
+                    fid = oplockNot.Notification.FileId;
+                }
+                else if (smb2Response is oplockRes:SMB2.Messages.OplockBreakResponse)
+                {
+                    fid = oplockRes.Response.FileId;
+                }
+            case SMB2.SMB2PacketHeaderCommand.SMB2Ioctl =>
+                fid = (smb2Response as SMB2.Messages.IoctlResponse).Response.FileId;
+            default =>;
+        }
+    }
+    return fid;
+}
+
+bool IsErrorResponseWithSpecailStatusCode(any message msg, uint status)
+{
+    if (msg is errRes:SMB2.Messages.ErrorResponse && errRes.Header.Status is errStatus:ERREF.NTSTATUS && errStatus.Value == status)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+bool IsErrorResponseWithSpecailStatusCode(any message msg, set<uint> statuses)
+{
+    if (msg is errRes:SMB2.Messages.ErrorResponse && errRes.Header.Status is errStatus:ERREF.NTSTATUS && errStatus.Value in statuses)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+int GetSMB2MessageLength(any message msg)
+{
+    assert ((msg.Origins).Count > 0);
+    return (msg.SourceData as binary).Count;
+}
+
+const uint STATUS_SUCCESS = 0x00000000;
+const uint STATUS_NOT_SUPPORTED = 0xC00000BB;
+const uint STATUS_INVALID_PARAMETER = 0xC000000D;
+const uint STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP = 0xC05D0000;
+const uint STATUS_INSUFFICIENT_RESOURCES = 0xC000009A;
+const uint STATUS_ACCESS_DENIED = 0xC0000022;
+const uint STATUS_USER_SESSION_DELETED = 0xC0000203;
+const uint STATUS_REQUEST_NOT_ACCEPTED = 0xC00000D0;
+const uint STATUS_NETWORK_SESSION_EXPIRED = 0xC000035C;
+const uint STATUS_MORE_PROCESSING_REQUIRED = 0xC0000016;
+const uint STATUS_SERVER_UNAVAILABLE = 0xC0000466;
+const uint STATUS_FILE_NOT_AVAILABLE = 0xC0000467;
+const uint STATUS_SHARE_UNAVAILABLE = 0xC0000468;
+const uint STATUS_BAD_NETWORK_NAME = 0xC00000CC;
+const uint STATUS_SMB_BAD_CLUSTER_DIALECT = 0xC05D0001;
+const uint STATUS_NETWORK_NAME_DELETED = 0xC00000C9;

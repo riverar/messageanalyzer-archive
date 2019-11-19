@@ -1,0 +1,318 @@
+module RDPDecompression with
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RDPEGFX", Version = "10.0", Date = "07/14/2016", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "383234", Date = "12/23/2015"}
+        ]
+};
+
+using Standard;
+using RemoteDesktopResources;
+
+// refer to [MS-RDPEGFX] 4.2.1.2 Sample Code
+type Rdp8Decompressor
+{
+    // input buffer
+    binary inputBinary = $[];       // input bytes
+    int inputCurByteOffset = 0;     // byte offset
+    int inputBinaryCount;           // byte count
+    int bitsRemaining;              // # bits input remaining
+    int vByteBitsRemaining;         // remainder of most-recent byte
+    int byteBitsRemaining;          // number of bits in vByteBitsRemaining
+
+    // decompression history
+    HistoryBuffer history = null;
+
+    Rdp8Decompressor(int historyBufferSize)
+    {
+        history = new HistoryBuffer(historyBufferSize);
+    }
+
+    // entry function.
+    optional binary Decompress(binary bin, bool isCompressed)
+    {
+        if (isCompressed)
+        {
+            return OutputFromCompressed(bin);
+        }
+        else
+        {
+            return OutputFromNotCompressed(bin);
+        }
+    }
+
+    optional binary OutputFromNotCompressed(binary bin)
+    {
+        // Not compressed data needs to save to history buffer.
+        for (int i = 0; i < bin.Count; i++)
+        {
+            history.AppendElement(bin[i]);
+        }
+        return bin;
+    }
+
+    optional binary OutputFromCompressed(binary bin)
+    {
+        inputBinary = bin;
+        inputCurByteOffset = 0;
+        inputBinaryCount = bin.Count;
+        bitsRemaining = (bin.Count - 1) * 8 - bin[bin.Count - 1];
+        vByteBitsRemaining = 0;
+        byteBitsRemaining = 0;
+        array<byte> result = [];
+
+        while (bitsRemaining > 0)
+        {
+            int haveBits = 0;
+            int inPrefix = 0;
+
+            byte c;
+            uint count;
+            uint distance;
+
+            // Scan the token table, considering more bits as needed,
+            // until the resulting token is found.
+            int opIndex;
+            for (opIndex = 0; TokenTable[opIndex].prefixLength != 0; opIndex++)
+            {
+                // get more bits if needed
+                while (haveBits < TokenTable[opIndex].prefixLength)
+                {
+                    inPrefix = ((inPrefix << 1) + GetBits(1)) as int;
+                    haveBits++;
+                }
+
+                if (inPrefix == TokenTable[opIndex].prefixCode)
+                {
+                    if (TokenTable[opIndex].tokenType == 0)
+                    {
+                        c = (TokenTable[opIndex].valueBase +
+                            GetBits(TokenTable[opIndex].valueBits)) as byte;
+
+                        // Add one byte 'c' to output and history
+                        history.AppendElement(c);
+                        result += [c];
+                        break;
+                    }
+                    else
+                    {
+                        distance = TokenTable[opIndex].valueBase +
+                            GetBits(TokenTable[opIndex].valueBits);
+                        if (distance != 0)
+                        {
+                            if (GetBits(1) == 0)
+                            {
+                                count = 3;
+                            }
+                            else
+                            {
+                                count = 4;
+                                int extra = 2;
+                                while (GetBits(1) == 1)
+                                {
+                                    count = count * 2;
+                                    extra++;
+                                }
+                                count += GetBits(extra);
+                            }
+                            if (history.GetElementsFromPosition(distance, count) is arrBytes:array<byte>)
+                            {
+                                result += arrBytes;
+                            }
+                            else
+                            {
+                                return result as binary;
+                            }
+                            break;
+                        }
+                        else // match distance == 0 is special case
+                        {
+                            count = GetBits(15);
+
+                            // discard remaining bits
+                            bitsRemaining -= byteBitsRemaining;
+                            byteBitsRemaining = 0;
+                            vByteBitsRemaining = 0;
+
+                            while (count > 0)
+                            {
+                                count--;
+                                c = inputBinary[inputCurByteOffset];
+                                inputCurByteOffset++;
+                                bitsRemaining -= 8;
+                                history.AppendElement(c);
+                                result += [c];
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // Error handling 
+            if (TokenTable[opIndex].prefixLength == 0)
+            {
+                ValidationCheck(false, null, RDPDECOMPRESSION_FAILED_INVALID_PREFIX);
+                return result as binary;
+            }
+        }
+
+        return result as binary;
+    }
+    //  Return the value of the next 'bitCount' bits as unsigned.
+    uint GetBits(int bitCount)
+    {
+        while (byteBitsRemaining < bitCount)
+        {
+            vByteBitsRemaining = vByteBitsRemaining << 8;
+            if (inputCurByteOffset < inputBinaryCount)
+            {
+                vByteBitsRemaining += inputBinary[inputCurByteOffset];
+                inputCurByteOffset++;
+            }
+            byteBitsRemaining += 8;
+        }
+
+        bitsRemaining = bitsRemaining - bitCount;
+        byteBitsRemaining -= bitCount;
+        uint result = (vByteBitsRemaining >> byteBitsRemaining) as uint;
+        vByteBitsRemaining = (vByteBitsRemaining & ((1 << byteBitsRemaining) - 1)) as int;
+        return result;
+    }
+}
+
+type Token
+{
+    int     prefixLength;     // number of bits in the prefix
+    int     prefixCode;       // bit pattern of this prefix
+    int     valueBits;        // number of value bits to read
+    int     tokenType;        // 0=literal, 1=match
+    uint  valueBase;        // added to the value bits
+
+    Token(int len, int code, int vbits, int t, uint vbase)
+    {
+        prefixLength = len;
+        prefixCode = code;
+        valueBits = vbits;
+        tokenType = t;
+        valueBase = vbase;
+    }
+}
+
+const array<Token> TokenTable = 
+    [
+        // len code vbits type  vbase
+        new Token(1, 0, 8, 0, 0),    // 0
+        new Token(5, 17, 5, 1, 0),    // 10001
+        new Token(5, 18, 7, 1, 32),    // 10010
+        new Token(5, 19, 9, 1, 160),    // 10011
+        new Token(5, 20, 10, 1, 672),    // 10100
+        new Token(5, 21, 12, 1, 1696),    // 10101
+        new Token(5, 24, 0, 0, 0x00),    // 11000
+        new Token(5, 25, 0, 0, 0x01),    // 11001
+        new Token(6, 44, 14, 1, 5792),    // 101100
+        new Token(6, 45, 15, 1, 22176),    // 101101
+        new Token(6, 52, 0, 0, 0x02),    // 110100
+        new Token(6, 53, 0, 0, 0x03),    // 110101
+        new Token(6, 54, 0, 0, 0xFF),    // 110110
+        new Token(7, 92, 18, 1, 54944),    // 1011100
+        new Token(7, 93, 20, 1, 317088),    // 1011101
+        new Token(7, 110, 0, 0, 0x04),    // 1101110
+        new Token(7, 111, 0, 0, 0x05),    // 1101111
+        new Token(7, 112, 0, 0, 0x06),    // 1110000
+        new Token(7, 113, 0, 0, 0x07),    // 1110001
+        new Token(7, 114, 0, 0, 0x08),    // 1110010
+        new Token(7, 115, 0, 0, 0x09),    // 1110011
+        new Token(7, 116, 0, 0, 0x0A),    // 1110100
+        new Token(7, 117, 0, 0, 0x0B),    // 1110101
+        new Token(7, 118, 0, 0, 0x3A),    // 1110110
+        new Token(7, 119, 0, 0, 0x3B),    // 1110111
+        new Token(7, 120, 0, 0, 0x3C),    // 1111000
+        new Token(7, 121, 0, 0, 0x3D),    // 1111001
+        new Token(7, 122, 0, 0, 0x3E),    // 1111010
+        new Token(7, 123, 0, 0, 0x3F),    // 1111011
+        new Token(7, 124, 0, 0, 0x40),    // 1111100
+        new Token(7, 125, 0, 0, 0x80),    // 1111101
+        new Token(8, 188, 20, 1, 1365664),    // 10111100
+        new Token(8, 189, 21, 1, 2414240),    // 10111101
+        new Token(8, 252, 0, 0, 0x0C),    // 11111100
+        new Token(8, 253, 0, 0, 0x38),    // 11111101
+        new Token(8, 254, 0, 0, 0x39),    // 11111110
+        new Token(8, 255, 0, 0, 0x66),    // 11111111
+        new Token(9, 380, 22, 1, 4511392),    // 101111100
+        new Token(9, 381, 23, 1, 8705696),    // 101111101
+        new Token(9, 382, 24, 1, 17094304),    // 101111110
+        new Token(0, 0, 0, 0, 0)
+    ];
+
+type HistoryBuffer
+{
+    int bufferSize = 2500000; // byte, default buffer size.
+    int historyIndex = 0;
+    bool hasLoopback = false; // Indicate if array has exceeds limit and re-start from position 0.
+    array<byte> buffer = [];
+
+    HistoryBuffer(int size)
+    {
+        bufferSize = size;
+    }
+
+    void AppendElement(byte b)
+    {
+        if (hasLoopback)
+        {
+            buffer[historyIndex] = b;
+        }
+        else
+        {
+            buffer += [b];
+        }
+        historyIndex++;
+        if (historyIndex == bufferSize)
+        {
+            historyIndex = 0;
+            hasLoopback = true;
+        }
+    }
+
+    optional array<byte> GetElementsFromPosition(uint distance, uint count)
+    {
+        int prevIndex = (historyIndex + bufferSize - distance) as int;
+        prevIndex = (prevIndex % bufferSize) as int;
+
+        array<byte> results = [];
+        byte ele;
+        
+        /* 
+            validate prevIndex:
+                if hasLoopback == true, then prevIndex can be any value in range from (0 ~ bufferSize-1)
+                if hasLoopback == false, then prevIndex must be less than(or equal to) historyIndex. 
+        */
+        if ((prevIndex < 0) || (!hasLoopback && prevIndex > historyIndex))
+        {
+            ValidationCheck(false, null, RDPDECOMPRESSION_FAILED_INVALID_HISTROY_INDEX);
+            return nothing;
+        }
+
+        while (count > 0)
+        {
+            count--;
+            ele = buffer[prevIndex];
+            prevIndex++;
+            if (prevIndex == bufferSize)
+            {
+                prevIndex = 0;
+            }
+
+            // add to history buffer again.
+            AppendElement(ele);
+            results += [ele];
+        }
+        return results;
+    }
+}

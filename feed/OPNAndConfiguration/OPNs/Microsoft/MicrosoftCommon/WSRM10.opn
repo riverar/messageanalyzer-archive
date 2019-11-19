@@ -1,0 +1,425 @@
+protocol WSRM10 
+    with Standard.Documentation
+            {
+                DocumentName = "Web Services Reliable Messaging Protocol Version 1.0",
+                ProtocolName = "WSRM10",
+                ProtocolType = "soap"
+            },
+        XmlEncodingDefaults{Namespace = WSRM10Namespace};
+using Technologies.WCF;
+using Technologies.WSDL;
+using Technologies.SOAP;
+using SOAP;
+using TCP;
+using NMF;
+using Utility;
+using InfrastructureResources;
+using Configurations;
+
+endpoint WSRM10Endpoint over SOAP.Server
+    accepts CreateSequence_Request issues CreateSequence_Response
+    accepts AckRequested_Message issues AckRequested_Message
+    accepts TerminateSequence_Message issues TerminateSequence_Message
+    accepts SequenceAcknowledgement_Message issues SequenceAcknowledgement_Message
+    accepts LastMessage_Message issues LastMessage_Message
+    provides SequenceAbsractPortType
+    consumes SequenceAbsractPortType;
+
+contract SequenceAbsractPortType
+{
+    accepts operation CreateSequence
+    {
+        in CreateSequenceType CreateSequence;
+        out CreateSequenceResponseType CreateSequenceResponse;
+        
+        override string ToString()
+        {
+            string summary =  "CreateSequence{AcksTo: " + 
+                (CreateSequence.AcksTo.Address.Value == nothing ? "" : (CreateSequence.AcksTo.Address.Value as string));
+            if (CreateSequence.Offer != nothing)
+            {
+                Identifier id = (CreateSequence.Offer as OfferType).Identifier;
+                if (id.Value != nothing)
+                    summary += ", Offer Identifier: " + (id.Value as string);
+            }
+            summary += "}";
+            string summaryRes = "";
+            if (CreateSequenceResponse.Identifier.Value != nothing)
+            {
+                summaryRes += ", Response {Identifier: " + (CreateSequenceResponse.Identifier.Value as string);
+            }
+            if (CreateSequenceResponse.Accept != nothing)
+            {
+                AttributedURI address = (CreateSequenceResponse.Accept as AcceptType).AcksTo.Address;
+                if (address.Value != nothing)
+                    summaryRes += ", Accept AcksTo Address: " + (address.Value as string);
+            }
+            if (summaryRes != "")
+                summaryRes += "}";
+            return summary + summaryRes;
+        }
+    }
+}
+with Standard.XmlEncoding{Namespace = WSRM10Namespace};
+
+message CreateSequence_Request
+{
+    CreateSequenceType CreateSequence;
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+message CreateSequence_Response
+{
+    CreateSequenceResponseType CreateSequenceResponse;
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+message LastMessage_Message
+{
+    SequenceType Sequence;
+    // SequenceAcknowledgement and AckRequested may be sent in header block at any time, they need to be manually decoded.
+    optional SequenceAcknowledgementType SequenceAcknowledgement with Encoding{Ignore = true};
+    optional AckRequestedType AckRequested with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        string id = "";
+        if (Sequence.Identifier.Value != nothing)
+            id = Sequence.Identifier.Value as string;
+        return "Last message, MessageNumber: " + Sequence.MessageNumber.ToString() + 
+            ", Identifier: " + id;
+    }
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+message SequenceAcknowledgement_Message
+{
+    SequenceAcknowledgementType SequenceAcknowledgement;
+        
+    override string ToString()
+    {
+        return "SequenceAcknowledgement, Identifier: " + (SequenceAcknowledgement.Identifier.Value as string);
+    }
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+message TerminateSequence_Message
+{
+    TerminateSequenceType TerminateSequence;
+    // SequenceAcknowledgement is present in header block, need to be manually decoded.
+    optional SequenceAcknowledgementType SequenceAcknowledgement with Encoding{Ignore = true};
+        
+    override string ToString()
+    {
+        return "TerminateSequence, Identifier: " + (TerminateSequence.Identifier.Value as string);
+    }
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+message AckRequested_Message
+{
+    AckRequestedType AckRequested;
+}
+with Standard.XmlEncoding{AnonymousType = true, Order = XmlOrderIndicator.All};
+
+autostart actor _WSRM10Endpoint_WSHttpBinding_Actor
+    (SOAP.Server soapEndpoint)
+{
+    any message cached_header;
+    any message cached_body;
+        
+    ~endpoint(SOAP.Server soapEndpoint)
+    {
+        ClearCachedRequestMessage(ref cached_body);
+    }
+    
+    process soapEndpoint accepts soap:SOAP.SoapMessage 
+        where (soap.WsaAction in [CreateSequenceAction, CreateSequenceResponseAction, 
+                                  SequenceAcknowledgementAction, TerminateSequenceAction, LastMessageAction])
+              && !soap.ContainsFault
+    {
+        switch (soap.WsaAction)
+        {
+            case $ CreateSequenceAction =>
+                ClearCachedRequestMessage(ref cached_body);
+                cached_body =
+                    DecodeSoapMessage<CreateSequence_Request>(soap.Body,
+                                                              soap,
+                                                              "CreateSequence_Request: Message cannot be decoded successfully.");
+                dispatch endpoint WSRM10Endpoint over soapEndpoint accepts cached_body;
+            // response is possible to be parsed in "accept" direction
+            case $ CreateSequenceResponseAction =>
+                CreateSequence_Response out_body;
+                out_body =
+                    DecodeSoapMessage<CreateSequence_Response>(soap.Body,
+                                                               soap,
+                                                               "CreateSequence_Response: Message cannot be decoded successfully.");
+                dispatch endpoint WSRM10Endpoint over soapEndpoint issues out_body;
+            case $ SequenceAcknowledgementAction =>
+                var msg = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml);
+                if (msg != nothing)
+                    dispatch endpoint WSRM10Endpoint over soapEndpoint accepts (msg as SequenceAcknowledgement_Message);
+                else
+                    ThrowDecodingException("WSRM10", "SequenceAcknowledgement");
+            case $ TerminateSequenceAction =>
+                var msg =
+                    DecodeSoapMessage<TerminateSequence_Message>(soap.Body,
+                                                                 soap,
+                                                                 "TerminateSequence_Message: Message cannot be decoded successfully.");
+                var terminateSequence = msg as TerminateSequence_Message;
+                var result = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml); // in header block
+                if (result != nothing)
+                    terminateSequence.SequenceAcknowledgement = (result as SequenceAcknowledgement_Message).SequenceAcknowledgement;
+
+                dispatch endpoint WSRM10Endpoint over soapEndpoint accepts terminateSequence;
+            case $ LastMessageAction =>
+                var msg =
+                    DecodeSoapMessage<LastMessage_Message>(soap.Header as xml, // in header block
+                                                           soap,
+                                                           "LastMessage_Message: Message cannot be decoded successfully.");
+                var lastMessage = msg as LastMessage_Message;
+
+                var result = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml);
+                if (result != nothing)
+                    lastMessage.SequenceAcknowledgement = (result as SequenceAcknowledgement_Message).SequenceAcknowledgement;
+
+                var result2 = XmlDecoder<AckRequested_Message>(soap.Header as xml);
+                if (result2 != nothing)
+                    lastMessage.AckRequested = (result2 as AckRequested_Message).AckRequested;
+                dispatch endpoint WSRM10Endpoint over soapEndpoint accepts lastMessage;
+            default =>;
+        }
+    }
+    
+    process soapEndpoint issues soap:SOAP.SoapMessage 
+        where soap.WsaAction in [CreateSequenceResponseAction, SequenceAcknowledgementAction, LastMessageAction, TerminateSequenceAction] 
+            && !soap.ContainsFault
+    {
+        switch (soap.WsaAction)
+        {
+            case $ CreateSequenceResponseAction =>
+                CreateSequence_Response out_body;
+                out_body =
+                    DecodeSoapMessage<CreateSequence_Response>(soap.Body,
+                                                               soap,
+                                                               "CreateSequence_Response: Message cannot be decoded successfully.");
+                var in_body_checked =
+                    CheckCachedRequestMessage<CreateSequence_Request>(ref cached_body);
+                if (!in_body_checked)
+                {
+                    ReportAndDiscardMessage(out_body,
+                                            DiagnosisLevel.Warning,
+                                            "CreateSequence: Incomplete operation due to missing request message.");
+                    return;
+                }
+                dispatch endpoint WSRM10Endpoint over soapEndpoint issues out_body;
+                var in_body = cached_body as CreateSequence_Request;
+                var op = new SequenceAbsractPortType.CreateSequence
+                            {
+                                CreateSequence = in_body.CreateSequence,
+                                CreateSequenceResponse = out_body.CreateSequenceResponse
+                            };
+                op.Origins = [in_body as any message, out_body as any message];
+                cached_body = null;
+                dispatch endpoint WSRM10Endpoint over soapEndpoint issues op;
+            case $ SequenceAcknowledgementAction =>
+                var msg = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml);
+                if (msg != nothing)
+                    dispatch endpoint WSRM10Endpoint over soapEndpoint issues (msg as SequenceAcknowledgement_Message);
+                else
+                    ThrowDecodingException("WSRM10", "SequenceAcknowledgement");
+            case $ LastMessageAction =>
+                var msg =
+                    DecodeSoapMessage<LastMessage_Message>(soap.Header as xml, // in header block
+                                                           soap,
+                                                           "LastMessage_Message: Message cannot be decoded successfully.");
+                var lastMessage = msg as LastMessage_Message;
+
+                var result = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml);
+                if (result != nothing)
+                    lastMessage.SequenceAcknowledgement = (result as SequenceAcknowledgement_Message).SequenceAcknowledgement;
+
+                var result2 = XmlDecoder<AckRequested_Message>(soap.Header as xml);
+                if (result2 != nothing)
+                    lastMessage.AckRequested = (result2 as AckRequested_Message).AckRequested;
+
+                dispatch endpoint WSRM10Endpoint over soapEndpoint issues lastMessage;
+            case $ TerminateSequenceAction =>
+                var msg =
+                    DecodeSoapMessage<TerminateSequence_Message>(soap.Body,
+                                                                 soap,
+                                                                 "TerminateSequence_Message: Message cannot be decoded successfully.");
+                var terminateSequence = msg as TerminateSequence_Message;
+                var result = XmlDecoder<SequenceAcknowledgement_Message>(soap.Header as xml); // in header block
+                if (result != nothing)
+                    terminateSequence.SequenceAcknowledgement = (result as SequenceAcknowledgement_Message).SequenceAcknowledgement;
+
+                dispatch endpoint WSRM10Endpoint over soapEndpoint issues terminateSequence;
+            default =>;
+        }
+    }
+}
+
+// The .NET Message Framing Protocol ([MC-NMF]) is used to frame the SOAP messages over TCP.
+// Defined in [MS-NETOD].pdf, section 3.3.
+autostart actor NMFOverTCP(TCP.Server server)
+{
+    WSRMConfiguration NMFPorts = GetConfigurableValue<WSRMConfiguration>();
+    // All NMF message length is bigger than 2
+    process server issues seg:TCP.Segment where seg.SourcePort in NMFPorts.Ports
+    {
+        dispatch endpoint NMF.LowestServer over server issues seg;
+    }
+    
+    process server accepts seg:TCP.Segment where seg.DestinationPort in NMFPorts.Ports
+    {
+        dispatch endpoint NMF.LowestServer over server accepts seg;
+    }
+    
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    process server accepts seg:TCP.Segment where server.isMissingThreeWayHandshake && seg.SourcePort in NMFPorts.Ports
+    {
+        dispatch endpoint NMF.LowestServer over server issues seg;
+    }
+    
+    process server issues seg:TCP.Segment where server.isMissingThreeWayHandshake && seg.DestinationPort in NMFPorts.Ports
+    {
+        dispatch endpoint NMF.LowestServer over server accepts seg;
+    }
+}
+
+type CreateSequenceType
+{
+    EndpointReferenceType AcksTo;
+    optional Expires Expires;
+    optional OfferType Offer;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type EndpointReferenceType
+{
+    AttributedURI Address with Standard.XmlEncoding{Namespace = XmlNamespaceIndicator.Any};
+    optional ReferenceParametersType ReferenceParameters;
+    optional ReferencePropertiesType ReferenceProperties;
+    optional AttributedQName PortType;
+    optional ServiceNameType ServiceName;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+with Standard.XmlEncoding{Namespace = WSANamespace};
+
+type AttributedURI
+{
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type AttributedQName
+{
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+with Standard.XmlEncoding{Namespace = WSANamespace};
+
+type ReferenceParametersType
+{
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+with Standard.XmlEncoding{Namespace = WSANamespace};
+
+type ReferencePropertiesType
+{
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+with Standard.XmlEncoding{Namespace = WSANamespace};
+
+type ServiceNameType
+{
+    optional string PortName with XmlEncoding{Kind = XmlKind.Attribute};
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+with Standard.XmlEncoding{Namespace = WSANamespace};
+
+type Expires
+{
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type OfferType
+{
+    Identifier Identifier;
+    optional Expires Expires;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type Identifier
+{
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type CreateSequenceResponseType
+{
+    Identifier Identifier;
+    optional Expires Expires;
+    optional AcceptType Accept;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type AcceptType
+{
+    EndpointReferenceType AcksTo;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type SequenceAcknowledgementType
+{
+    Identifier Identifier;
+    optional array<AcknowledgementRangeType> AcknowledgementRange with XmlEncoding{Name = "AcknowledgementRange", Kind = XmlKind.Element};
+    optional array<ulong> Nack with XmlEncoding{Name = "Nack", Kind = XmlKind.Element};
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncodingDefaults{Order = XmlOrderIndicator.Sequence};
+
+type AcknowledgementRangeType
+{
+    ulong Upper with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    ulong Lower with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type TerminateSequenceType
+{
+    Identifier Identifier;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+};
+
+type SequenceType
+{
+    Identifier Identifier;
+    ulong MessageNumber;
+    optional string LastMessage with XmlEncoding{Kind = XmlKind.Element};
+}
+
+type AckRequestedType
+{
+    Identifier Identifier;
+    optional ulong MaxMessageNumberUsed;
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+
+const string WSRM10Namespace = "http://schemas.xmlsoap.org/ws/2005/02/rm";
+const string WSANamespace = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
+const string CreateSequenceAction = WSRM10Namespace + "/CreateSequence";
+const string CreateSequenceResponseAction = WSRM10Namespace + "/CreateSequenceResponse";
+const string SequenceAcknowledgementAction = WSRM10Namespace + "/SequenceAcknowledgement";
+const string TerminateSequenceAction = WSRM10Namespace + "/TerminateSequence";
+const string LastMessageAction = WSRM10Namespace + "/LastMessage";

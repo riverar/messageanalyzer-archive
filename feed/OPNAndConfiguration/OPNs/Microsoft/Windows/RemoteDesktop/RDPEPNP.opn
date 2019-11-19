@@ -1,0 +1,655 @@
+protocol RDPEPNP with
+    BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: Plug and Play Devices Virtual Channel Extension",
+    DocumentName = "MS-RDPEPNP",
+    ShortName = "RDPEPNP",
+    ProtocolType = "block",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RDPEPNP", Version = "16.0", Date = "6/30/2015", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "383234", Date = "12/23/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using InfrastructureResources;
+using RDPEDYC;
+using RemoteDesktopResources;
+using ERREF;
+
+endpoint Server over RDPEDYC.Server 
+    issues ServerVersionMessage accepts ClientVersionMessage
+    issues AuthenticatedClientMessage
+    accepts ClientDeviceAdditionMessage
+    accepts ClientDeviceRemovalMessage
+    issues ServerCapabilitiesRequestMessage accepts ClientCapabilitiesReplyMessage
+    issues CreateFileRequestMessage accepts CreateFileReplyMessage
+    issues ReadRequestMessage accepts ReadReplyMessage
+    issues WriteRequestMessage accepts WriteReplyMessage
+    issues IOControlRequestMessage accepts IOControlReplyMessage
+    issues SpecificIoCancelRequestMessage 
+    accepts ClientDeviceCustomEventMessage;
+
+client endpoint Client connected to Server;
+
+autostart actor RDPEPNPOverRDPEDYC(RDPEDYC.Server dycServer)
+{
+    RDPEPNP.Server ept = null;
+    map<uint, uint> requestId_FunctionId = {};
+
+    process dycServer issues s:RDPEDYC.DVCDataPDU where (s#EDYCChannelName != nothing && 
+        s#EDYCChannelName == "PNPDR" && s.Data.Count >= 4)
+    {
+        if (ept == null)
+        {
+            ept = endpoint RDPEPNP.Server over dycServer;
+        }
+        uint packetId = PeekUInt(s.Data, 32, Endian.Little);
+        switch (packetId)
+        {
+            case m:PNP_INFO_HEADER_PacketId.IRPDR_ID_VERSION =>
+                DecodeMessage<ServerVersionMessage>(IssueDispatcher, s.Data, "ServerVersionMessage");
+            case m:PNP_INFO_HEADER_PacketId.IRPDR_ID_SERVER_LOGON =>
+                DecodeMessage<AuthenticatedClientMessage>(IssueDispatcher, s.Data, "AuthenticatedClientMessage");
+            default =>
+                ThrowDecodingException("RDPEPNP", UTILITY_INVALID_DATA_WITH_VALUE, ["PacketId", packetId.ToString()]);
+        }
+    }
+    
+    process dycServer accepts s:RDPEDYC.DVCDataPDU where (s#EDYCChannelName != nothing && 
+        (s#EDYCChannelName as string) == "PNPDR" && s.Data.Count >= 4)
+    {
+        if (ept == null)
+        {
+            ept = endpoint RDPEPNP.Server over dycServer;
+        }
+        uint packetId = PeekUInt(s.Data, 32, Endian.Little);
+        switch (packetId)
+        {
+            case m:PNP_INFO_HEADER_PacketId.IRPDR_ID_VERSION =>
+                DecodeMessage<ClientVersionMessage>(AcceptDispatcher, s.Data, "ClientVersionMessage");
+            case m:PNP_INFO_HEADER_PacketId.IRPDR_ID_REDIRECT_DEVICES =>
+                DecodeMessage<ClientDeviceAdditionMessage>(AcceptDispatcher, s.Data, "ClientDeviceAdditionMessage");
+            case m:PNP_INFO_HEADER_PacketId.IRPDR_ID_UNREDIRECT_DEVICE =>
+                DecodeMessage<ClientDeviceRemovalMessage>(AcceptDispatcher, s.Data, "ClientDeviceRemovalMessage");
+            default =>
+                ThrowDecodingException("RDPEPNP", UTILITY_INVALID_DATA_WITH_VALUE, ["PacketId", packetId.ToString()]);
+        }
+    }
+
+    process dycServer issues s:RDPEDYC.DVCDataPDU where (s#EDYCChannelName != nothing && 
+        (s#EDYCChannelName as string) == "FileRedirectorChannel" && s.Data.Count >= 4)
+    {
+        if (ept == null)
+        {
+            ept = endpoint RDPEPNP.Server over dycServer;
+        }
+        uint functionId = PeekUInt(s.Data, 32, Endian.Little);
+        uint requestId;
+        switch (functionId)
+        {
+            case m:SERVER_IO_HEADER_FunctionId.CAPABILITIES_REQUEST =>
+                requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+                requestId_FunctionId[requestId] = functionId;
+                DecodeMessage<ServerCapabilitiesRequestMessage>(IssueDispatcher, s.Data, "ServerCapabilitiesRequestMessage");
+            case m:SERVER_IO_HEADER_FunctionId.CREATE_FILE_REQUEST =>
+                requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+                requestId_FunctionId[requestId] = functionId;
+                DecodeMessage<CreateFileRequestMessage>(IssueDispatcher, s.Data, "CreateFileRequestMessage");
+            case m:SERVER_IO_HEADER_FunctionId.READ_REQUEST =>
+                requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+                requestId_FunctionId[requestId] = functionId;
+                DecodeMessage<ReadRequestMessage>(IssueDispatcher, s.Data, "ReadRequestMessage");
+            case m:SERVER_IO_HEADER_FunctionId.WRITE_REQUEST =>
+                requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+                requestId_FunctionId[requestId] = functionId;
+                DecodeMessage<WriteRequestMessage>(IssueDispatcher, s.Data, "WriteRequestMessage");
+            case m:SERVER_IO_HEADER_FunctionId.IOCONTROL_REQUEST =>
+                requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+                requestId_FunctionId[requestId] = functionId;
+                DecodeMessage<IOControlRequestMessage>(IssueDispatcher, s.Data, "IOControlRequestMessage");
+            case m:SERVER_IO_HEADER_FunctionId.SPECIFIC_IOCANCEL_REQUEST =>
+                DecodeMessage<SpecificIoCancelRequestMessage>(IssueDispatcher, s.Data, "SpecificIoCancelRequestMessage");
+            default =>
+                ThrowDecodingException("RDPEPNP", UTILITY_INVALID_DATA_WITH_VALUE, ["FunctionId", functionId.ToString()]);
+        }
+    }
+    
+    process dycServer accepts s:RDPEDYC.DVCDataPDU where (s#EDYCChannelName != nothing && 
+        (s#EDYCChannelName as string) == "FileRedirectorChannel" && s.Data.Count >= 4)
+    {
+        if (ept == null)
+        {
+            ept = endpoint RDPEPNP.Server over dycServer;
+        }
+        uint requestId = ((s.Data[2] << 16) + (s.Data[1] << 8) + s.Data[0]) as uint;
+        if (s.Data[3] == CLIENT_IO_HEADER_PacketType.CUSTOM_EVENT_PACKET)
+        {
+            DecodeMessage<ClientDeviceCustomEventMessage>(AcceptDispatcher, s.Data, "ClientDeviceCustomEventMessage");
+        }
+        else if (requestId in requestId_FunctionId.Keys)
+        {
+            switch (requestId_FunctionId[requestId])
+            {
+                case m:SERVER_IO_HEADER_FunctionId.CAPABILITIES_REQUEST =>
+                    DecodeMessage<ClientCapabilitiesReplyMessage>(AcceptDispatcher, s.Data, "ClientCapabilitiesReplyMessage");
+                case m:SERVER_IO_HEADER_FunctionId.CREATE_FILE_REQUEST =>
+                    DecodeMessage<CreateFileReplyMessage>(AcceptDispatcher, s.Data, "CreateFileReplyMessage");
+                case m:SERVER_IO_HEADER_FunctionId.READ_REQUEST =>
+                    DecodeMessage<ReadReplyMessage>(AcceptDispatcher, s.Data, "ReadReplyMessage");
+                case m:SERVER_IO_HEADER_FunctionId.WRITE_REQUEST =>
+                    DecodeMessage<WriteReplyMessage>(AcceptDispatcher, s.Data, "WriteReplyMessage");
+                case m:SERVER_IO_HEADER_FunctionId.IOCONTROL_REQUEST =>
+                    DecodeMessage<IOControlReplyMessage>(AcceptDispatcher, s.Data, "IOControlReplyMessage");
+                default =>
+                    ThrowDecodingException("RDPEPNP", UTILITY_INVALID_DATA_WITH_VALUE, ["FunctionId", requestId_FunctionId[requestId].ToString()]);
+            }
+            requestId_FunctionId = requestId_FunctionId.Remove(requestId);
+        }
+        else
+        {
+            ThrowDecodingException("RDPEPNP", RDPEPNP_InvalidRequestIdFunctionId, []);
+        }
+    }
+
+    void AcceptDispatcher(any message msg)
+    {
+        dispatch ept accepts msg;
+    }
+    void IssueDispatcher(any message msg)
+    {
+        dispatch ept issues msg;
+    }
+
+    void DecodeMessage<T>(void(T) dispatcher, binary bin, string messageName)
+    {
+        if (BinaryDecoder<T>(bin) is msg:T)
+        {
+            dispatcher(msg);
+        }
+        else
+        {
+            ThrowDecodingException("RDPEPNP", messageName);
+        }
+    }
+
+    ~endpoint(RDPEDYC.Server server)
+    {
+        requestId_FunctionId = {};
+    }
+}
+
+// 2.2.1.1 Shared Message Header (PNP_INFO_HEADER)
+type PNP_INFO_HEADER
+{
+    uint Size;
+    PNP_INFO_HEADER_PacketId PacketId where ValidationCheckEnumValue(InRange<PNP_INFO_HEADER_PacketId>(value), 
+        null, true, ReferenceType.Type, "RDPEPNP", "PacketId", "PNP_INFO_HEADER", 
+        "0x00000065, 0x00000066, 0x00000067, 0x00000068", value);
+}
+
+pattern PNP_INFO_HEADER_PacketId  = enum uint
+{
+    IRPDR_ID_VERSION = 0x00000065,
+    IRPDR_ID_REDIRECT_DEVICES = 0x00000066,
+    IRPDR_ID_SERVER_LOGON = 0x00000067,
+    IRPDR_ID_UNREDIRECT_DEVICE = 0x00000068,
+    ...
+};
+
+// 2.2.1.2.1 Server Version Message
+message ServerVersionMessage
+{
+    PNP_INFO_HEADER Header where ValidationCheckValue(value.PacketId == PNP_INFO_HEADER_PacketId.IRPDR_ID_VERSION, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.PacketId", "ServerVersionMessage", "0x00000065", value.PacketId);
+    uint MajorVersion;
+    uint MinorVersion;
+    ServerVersionMessage_Capabilities Capabilities;
+
+    override string ToString()
+    {
+        return "ServerVersionMessage";
+    }
+}
+
+pattern ServerVersionMessage_Capabilities = flags uint
+{
+    DynamicAdditionOfDevicesSupported = 0x00000001
+        with Documentation
+            {Description = "The server supports dynamic addition of devices."},
+    ...
+};
+
+// 2.2.1.2.2 Client Version Message
+message ClientVersionMessage
+{
+    PNP_INFO_HEADER Header where ValidationCheckValue(value.PacketId == PNP_INFO_HEADER_PacketId.IRPDR_ID_VERSION, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.PacketId", "ClientVersionMessage", "0x00000065", value.PacketId);
+    uint MajorVersion;
+    uint MinorVersion;
+    ClientVersionMessage_Capabilities Capabilities
+        where ValidationCheckCombinationValue(InRange<ClientVersionMessage_Capabilities>(value), this, true, 
+        ReferenceType.Message, "RDPEPNP", "Capabilities", "ClientVersionMessage", "0x00000001", value);
+
+    override string ToString()
+    {
+        return "ClientVersionMessage";
+    }
+}
+
+pattern ClientVersionMessage_Capabilities = flags uint
+{
+    DynamicAdditionOfDevicesSupported = 0x00000001
+        with Documentation
+            {Description = "The client supports dynamic addition of devices."},
+    ...
+};
+
+// 2.2.1.2.3 Authenticated Client Message
+message AuthenticatedClientMessage
+{
+    PNP_INFO_HEADER Header where ValidationCheckValue(value.PacketId == PNP_INFO_HEADER_PacketId.IRPDR_ID_SERVER_LOGON, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.PacketId", "AuthenticatedClientMessage", "0x00000067", value.PacketId);
+
+    override string ToString()
+    {
+        return "AuthenticatedClientMessage";
+    }
+}
+
+// 2.2.1.3.1 Client Device Addition Message
+message ClientDeviceAdditionMessage
+{
+    PNP_INFO_HEADER Header where ValidationCheckValue(value.PacketId == PNP_INFO_HEADER_PacketId.IRPDR_ID_REDIRECT_DEVICES, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.PacketId", "ClientDeviceAdditionMessage", "0x00000066", value.PacketId);
+    uint DeviceCount;
+    array<PNP_DEVICE_DESCRIPTION> DeviceDescriptions with BinaryEncoding{Length = DeviceCount};
+
+    override string ToString()
+    {
+        return "ClientDeviceAdditionMessage, DeviceCount: " + DeviceCount.ToString();
+    }
+}
+
+// 2.2.1.3.1.1 PNP_DEVICE_DESCRIPTION
+type PNP_DEVICE_DESCRIPTION
+{
+    uint ClientDeviceID;
+    uint DataSize;
+    uint cbInterfaceLength;
+    optional [|cbInterfaceLength > 0|] array<guid> InterfaceGUIDArray with BinaryEncoding{Length= cbInterfaceLength / 16};
+    uint cbHardwareIdLength;
+    optional [|cbHardwareIdLength > 0|] string HardwareId 
+        with Encoding{SourcePattern = TypeOf<array<string> >(), Decoder = MultiszStringDecoder},
+        BinaryEncoding{TextEncoding = TextEncoding.Unicode, WidthForComposedType = cbHardwareIdLength * 8};
+    uint cbCompatIdLength;
+    optional [|cbCompatIdLength > 0|] string CompatibilityID 
+        with Encoding{SourcePattern = TypeOf<array<string> >(), Decoder = MultiszStringDecoder}, 
+        BinaryEncoding{TextEncoding = TextEncoding.Unicode, WidthForComposedType = cbCompatIdLength * 8};
+    uint cbDeviceDescriptionLength;
+    optional [|cbDeviceDescriptionLength > 0|] string DeviceDescription 
+        with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length= cbDeviceDescriptionLength / 2};
+    uint CustomFlagLength where ValidationCheckValue(value == 0x00000004, null, true, ReferenceType.Type, 
+        "RDPEPNP", "CustomFlagLength", "PNP_DEVICE_DESCRIPTION", "0x00000004", value);
+    PNP_DEVICE_DESCRIPTION_CustomFlag CustomFlag;
+    optional [|value == 0x00000010|] uint cbContainerId;
+    optional [|cbContainerId != nothing|] guid ContainerId;
+    optional [|value == 0x00000004|] uint cbDeviceCaps;
+    optional [|cbDeviceCaps != nothing|] PNP_DEVICE_DESCRIPTION_DeviceCaps DeviceCaps;
+
+    optional string MultiszStringDecoder(array<string> arr)
+    {
+        string result = "";
+        foreach (string ele in arr)
+        {
+            result += ele + " ";
+        }
+        if (result.Count > 0)
+        {
+            result = result.Segment(0, result.Count - 1);
+        }
+        return result;
+    }
+
+    override string ToString()
+    {
+        return "ClientDeviceID: " + ClientDeviceID.ToString() + "";
+    }
+}
+
+pattern PNP_DEVICE_DESCRIPTION_CustomFlag = enum uint
+{
+    redirectable = 0x00000000,
+    redirectable_2 = 0x00000002,
+    optionallyRedirectable = 0x00000001,
+    ...
+};
+
+pattern PNP_DEVICE_DESCRIPTION_DeviceCaps = flags uint
+{
+    PNP_DEVCAPS_LOCKSUPPORTED = 0x00000001
+        with Documentation
+            {Description = "The device supports locking."},
+    PNP_DEVCAPS_EJECTSUPPORTED = 0x00000002
+        with Documentation
+            {Description = "The device supports ejecting."},
+    PNP_DEVCAPS_REMOVABLE = 0x00000004
+        with Documentation
+            {Description = "The device is removable."},
+    PNP_DEVCAPS_SURPRISEREMOVALOK = 0x00000008
+        with Documentation
+            {Description = "The device can be removed unexpectedly."},
+    ...
+};
+
+// 2.2.1.3.2 Client Device Removal Message
+message ClientDeviceRemovalMessage
+{
+    PNP_INFO_HEADER Header where ValidationCheckValue(value.PacketId == PNP_INFO_HEADER_PacketId.IRPDR_ID_UNREDIRECT_DEVICE, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.PacketId", "ClientDeviceRemovalMessage", "0x00000068", value.PacketId);
+    uint ClientDeviceID;
+
+    override string ToString()
+    {
+        return "ClientDeviceRemovalMessage, ClientDeviceID: " + ClientDeviceID.ToString();
+    }
+}
+
+// 2.2.2.1.1 Server Message Header (SERVER_IO_HEADER)
+type SERVER_IO_HEADER
+{
+    uint RequestId with BinaryEncoding{Width = 24};
+    byte UnusedBits where ValidationCheckReservedZero(value == 0, null, false, 
+        ReferenceType.Type, "RDPEPNP", "UnusedBits", "SERVER_IO_HEADER", value); // will file TDI
+    SERVER_IO_HEADER_FunctionId FunctionId where ValidationCheckEnumValueTooManyItems(InRange<SERVER_IO_HEADER_FunctionId>(value), 
+        null, true, ReferenceType.Type, "RDPEPNP", "FunctionId", "SERVER_IO_HEADER", "SERVER_IO_HEADER", "[MS-RDPEPNP]");
+}
+
+pattern SERVER_IO_HEADER_FunctionId = enum uint
+{
+    READ_REQUEST = 0x00000000,
+    WRITE_REQUEST = 0x00000001,
+    IOCONTROL_REQUEST = 0x00000002,
+    CREATE_FILE_REQUEST = 0x00000004,
+    CAPABILITIES_REQUEST = 0x00000005,
+    SPECIFIC_IOCANCEL_REQUEST = 0x00000006,
+    ...
+};
+
+// 2.2.2.1.2 Client Message Header (CLIENT_IO_HEADER)
+type CLIENT_IO_HEADER
+{
+    uint RequestId with BinaryEncoding{Width = 24};
+    CLIENT_IO_HEADER_PacketType PacketType where ValidationCheckEnumValue(InRange<CLIENT_IO_HEADER_PacketType>(value), 
+        null, true, ReferenceType.Type, "RDPEPNP", "PacketType", "CLIENT_IO_HEADER", "0x00, 0x01", value);
+}
+
+pattern CLIENT_IO_HEADER_PacketType = enum byte
+{
+    RESPONSE_PACKET = 0x00,
+    CUSTOM_EVENT_PACKET = 0x01,
+    ...
+};
+
+// 2.2.2.2.1 Server Capabilities Request Message
+message ServerCapabilitiesRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.CAPABILITIES_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "ServerCapabilitiesRequestMessage", "0x00000005", value.FunctionId);
+    ServerCapabilitiesRequestMessage_Version Version;
+
+    override string ToString()
+    {
+        return "ServerCapabilitiesRequestMessage";
+    }
+}
+
+pattern ServerCapabilitiesRequestMessage_Version = enum ushort
+{
+    NotSupportCustomEventRedirection = 0x0004,
+    SupportCustomEventRedirection = 0x0006,
+    ...
+};
+
+// 2.2.2.2.2 Client Capabilities Reply Message
+message ClientCapabilitiesReplyMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.PacketType == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.PacketType", "ClientCapabilitiesReplyMessage", value.PacketType);
+    ClientCapabilitiesReplyMessage_Version Version;
+
+    override string ToString()
+    {
+        return "ClientCapabilitiesReplyMessage";
+    }
+}
+
+pattern ClientCapabilitiesReplyMessage_Version = enum ushort
+{
+    NotSupportCustomEventRedirection = 0x0004,
+    SupportCustomEventRedirection = 0x0006,
+    ...
+};
+
+// 2.2.2.3.1 CreateFile Request Message
+message CreateFileRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.CREATE_FILE_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "CreateFileRequestMessage", "0x00000004", value.FunctionId);
+    uint DeviceId;
+    uint dwDesiredAccess where ValidationCheckValue(value == 0xC0000000, this, false, ReferenceType.Message, 
+        "RDPEPNP", "dwDesiredAccess", "CreateFileRequestMessage", "0xC0000000", value);
+    CreateFileRequestMessage_dwShareMode dwShareMode
+        where ValidationCheckCombinationValue(InRange<CreateFileRequestMessage_dwShareMode>(value), this, false, 
+        ReferenceType.Message, "RDPEFS", "dwShareMode", "CreateFileRequestMessage", "0x00000001, 0x00000002", value);
+    CreateFileRequestMessage_dwCreationDisposition dwCreationDisposition 
+        where ValidationCheckEnumValueTooManyItems(InRange<CreateFileRequestMessage_dwCreationDisposition>(value), 
+        this, false, ReferenceType.Message, "RDPEPNP", "dwCreationDisposition", 
+        "CreateFileRequestMessage", "CreateFileRequestMessage", "[MS-RDPEPNP]");
+    CreateFileRequestMessage_dwFlagsAndAttributes dwFlagsAndAttributes 
+        where ValidationCheckCombinationValueTooManyItems(InRange<CreateFileRequestMessage_dwFlagsAndAttributes>(value), this, true, 
+        ReferenceType.Message, "RDPEPNP", "dwFlagsAndAttributes", "CreateFileRequestMessage", "CreateFileRequestMessage", "[MS-RDPEPNP]");
+
+    override string ToString()
+    {
+        return "CreateFileRequestMessage, DeviceId: " + DeviceId.ToString() + 
+            ", dwShareMode: " + EnumToStringInSummary<CreateFileRequestMessage_dwShareMode>(dwShareMode) + 
+            ", dwCreationDisposition: " + EnumToStringInSummary<CreateFileRequestMessage_dwCreationDisposition>(dwCreationDisposition) + 
+            ", dwFlagsAndAttributes: " + EnumToStringInSummary<CreateFileRequestMessage_dwFlagsAndAttributes>(dwFlagsAndAttributes);
+    }
+}
+
+// No flag meaning description in TD
+pattern CreateFileRequestMessage_dwShareMode = flags uint
+{
+    FILE_SHARE_READ = 0x00000001,
+    FILE_SHARE_WRITE = 0x00000002,
+    ...
+};
+
+pattern CreateFileRequestMessage_dwCreationDisposition = enum uint
+{
+    CREATE_NEW = 0x00000001,
+    CREATE_ALWAYS = 0x00000002,
+    OPEN_EXISTING = 0x00000003,
+    OPEN_ALWAYS = 0x00000004,
+    TRUNCATE_EXISTING = 0x00000005,
+    ...
+};
+
+// No flag meaning description in TD
+pattern CreateFileRequestMessage_dwFlagsAndAttributes = flags uint
+{
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010,
+    FILE_ATTRIBUTE_ARCHIVE = 0x00000020,
+    FILE_ATTRIBUTE_DEVICE = 0x00000040,
+    FILE_ATTRIBUTE_NORMAL = 0x00000080,
+    FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000,
+    FILE_FLAG_OPEN_NO_RECALL = 0x00100000,
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000,
+    FILE_FLAG_POSIX_SEMANTICS = 0x01000000,
+    FILE_FLAG_BACKUP_SEMANTICS = 0x02000000,
+    FILE_FLAG_DELETE_ON_CLOSE = 0x04000000,
+    FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000,
+    FILE_FLAG_RANDOM_ACCESS = 0x10000000,
+    FILE_FLAG_NO_BUFFERING = 0x20000000,
+    FILE_FLAG_OVERLAPPED = 0x40000000,
+    FILE_FLAG_WRITE_THROUGH = 0x80000000,
+    ...
+};
+
+// 2.2.2.3.2 CreateFile Reply Message
+message CreateFileReplyMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.PacketType == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.PacketType", "CreateFileReplyMessage", value.PacketType);
+    HRESULT Result;
+
+    override string ToString()
+    {
+        return "CreateFileReplyMessage, Result: " + Result.ToString();
+    }
+}
+
+// 2.2.2.3.3 Read Request Message
+message ReadRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.READ_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "ReadRequestMessage", "0x00000000", value.FunctionId);
+    uint cbBytesToRead;
+    uint OffsetHigh;
+    uint OffsetLow;
+
+    override string ToString()
+    {
+        return "ReadRequestMessage, cbBytesToRead: " + cbBytesToRead.ToString() + 
+            ", OffsetHigh: " + OffsetHigh.ToString() + ", OffsetLow: " + OffsetLow.ToString();
+    }
+}
+
+// 2.2.2.3.4 Read Reply Message
+message ReadReplyMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.PacketType == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.PacketType", "ReadReplyMessage", value.PacketType);
+    HRESULT Result;
+    uint cbBytesRead;
+    binary Data with BinaryEncoding{Length = cbBytesRead};
+    byte UnusedByte;
+
+    override string ToString()
+    {
+        return "ReadReplyMessage, Result: " + Result.ToString() + ", cbBytesRead: " + cbBytesRead.ToString();
+    }
+}
+
+// 2.2.2.3.5 Write Request Message
+message WriteRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.WRITE_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "WriteRequestMessage", "0x00000001", value.FunctionId);
+    uint cbWrite;
+    uint OffsetHigh;
+    uint OffsetLow;
+    binary Data with BinaryEncoding{Length = cbWrite};
+    byte UnusedByte;
+
+    override string ToString()
+    {
+        return "WriteRequestMessage, cbWrite: " + cbWrite.ToString() + 
+            ", OffsetHigh: " + OffsetHigh.ToString() + ", OffsetLow: " + OffsetLow.ToString();
+    }
+}
+
+// 2.2.2.3.6 Write Reply Message
+message WriteReplyMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.PacketType == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.PacketType", "WriteReplyMessage", value.PacketType);
+    HRESULT Result;
+    uint cbBytesWritten;
+
+    override string ToString()
+    {
+        return "WriteReplyMessage, Result: " + Result.ToString();
+    }
+}
+
+// 2.2.2.3.7 IOControl Request Message
+message IOControlRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.IOCONTROL_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "IOControlRequestMessage", "0x00000002", value.FunctionId);
+    uint IoCode;
+    uint cbIn;
+    uint cbOut;
+    optional [|cbIn > 0|] binary DataIn with BinaryEncoding{Length = cbIn};
+    //optional [|cbOut > 0|] binary DataOut with BinaryEncoding{Length = cbOut}; // will file TDI
+    byte UnusedByte;
+
+    override string ToString()
+    {
+        return "IOControlRequestMessage, IoCode: " + IoCode.ToString() + ", cbIn: " + cbIn.ToString() + 
+            ", cbOut: " + cbOut.ToString();
+    }
+}
+
+// 2.2.2.3.8 IOControl Reply Message
+message IOControlReplyMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.PacketType == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.PacketType", "IOControlReplyMessage", value.PacketType);
+    HRESULT Result;
+    uint cbBytesReadReturned;
+    binary Data with BinaryEncoding{Length = cbBytesReadReturned};
+    byte UnusedByte;
+
+    override string ToString()
+    {
+        return "IOControlReplyMessage, Result: " + Result.ToString() + 
+            ", cbBytesReadReturned: " + cbBytesReadReturned.ToString();
+    }
+}
+
+// 2.2.2.3.9 Specific IoCancel Request Message
+message SpecificIoCancelRequestMessage
+{
+    SERVER_IO_HEADER Header where ValidationCheckValue(value.FunctionId == SERVER_IO_HEADER_FunctionId.SPECIFIC_IOCANCEL_REQUEST, 
+        this, true, ReferenceType.Message, "RDPEPNP", "Header.FunctionId", "SpecificIoCancelRequestMessage", "0x00000006", value.FunctionId);
+    byte UnusedBits where ValidationCheckReservedZero(value == 0, this, false, 
+        ReferenceType.Message, "RDPEPNP", "UnusedBits", "SpecificIoCancelRequestMessage", value);
+    uint idToCancel with BinaryEncoding{Width = 24};
+
+    override string ToString()
+    {
+        return "SpecificIoCancelRequestMessage, idToCancel: " + idToCancel.ToString();
+    }
+}
+
+// 2.2.2.3.10 Client Device Custom Event Message
+message ClientDeviceCustomEventMessage
+{
+    CLIENT_IO_HEADER Header where ValidationCheckZero(value.RequestId == 0, this, true, ReferenceType.Message, 
+        "RDPEPNP", "Header.RequestId", "ClientDeviceCustomEventMessage", value.RequestId);
+    guid CustomEventGUID;
+    uint cbData;
+    binary Data with BinaryEncoding{Length = cbData};
+    byte UnusedByte;
+
+    override string ToString()
+    {
+        return "ClientDeviceCustomEventMessage, CustomEventGUID: " + CustomEventGUID.ToString() + 
+            ", cbData: " + cbData.ToString();
+    }
+}

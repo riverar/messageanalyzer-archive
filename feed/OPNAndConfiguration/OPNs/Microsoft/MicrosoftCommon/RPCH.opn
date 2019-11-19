@@ -1,0 +1,1869 @@
+protocol RPCH with 
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Remote Procedure Call over HTTP Protocol",
+    ShortName = "RPCH",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+    new Reference{Name = "MS-RPCH", Version = "14.0", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+    ],
+    RevisionSummary =
+    [
+    new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+    ]
+};
+
+using IANA;
+using HTTP;
+using TCP;
+using DecodingUtility;
+using Utility;
+using Diagnostics;
+using MicrosoftCommonResources;
+
+endpoint Proxy[guid VirtualConnectionCookie, bool ProxyToServer]
+    // MSRPCE message
+    accepts RPCHPayload issues RPCHPayload
+    // over TCP
+    issues CONN_A2
+    issues CONN_B2
+    accepts CONN_B3
+    accepts CONN_C1
+    issues IN_R1A2
+    accepts IN_R1A3
+    issues IN_R1A6_R2A2_Or_OUT_R2A4
+    issues IN_R1B1
+    accepts IN_R1B2
+    accepts IN_R2A3
+    accepts OUT_R1A1_R2A1
+    issues OUT_R1A4
+    accepts OUT_R1A5
+    issues OUT_R1A8_R2A8
+    accepts OUT_R1A9_R2B1 
+    accepts OUT_R2A5
+    accepts OUT_R2B2
+    issues PingTrafficSentNotifyPDU
+    issues LegacyServerResponse
+    // over HTTP
+    accepts CONN_A1
+    issues CONN_A3
+    accepts CONN_B1
+    issues CONN_C2
+    accepts IN_R1A1_R2A1
+    issues IN_R1A4
+    accepts IN_R1A5_R2A5
+    issues IN_R2A4
+    issues OUT_R1A2_R2A2
+    accepts OUT_R1A3_R2A3
+    issues OUT_R1A6
+    accepts OUT_R1A7
+    accepts OUT_R1A10_R1A11 issues OUT_R1A10_R1A11
+    issues OUT_R2A6
+    accepts OUT_R2A7
+    issues OUT_R2B3
+    accepts OUT_R2C1
+    accepts EchoRequest
+    issues EchoResponse
+    accepts Ping issues Ping
+    // over TCP or HTTP
+    accepts KeepAlive issues KeepAlive
+    accepts FlowControlAckPDU issues FlowControlAckPDU
+    accepts FlowControlAckWithDestination issues FlowControlAckWithDestination;
+
+client endpoint Client connected to Proxy;
+
+pattern ConnectionKind = enum
+{
+    // The TCP connection is transferring RPCH message.
+    RPCH,
+    // It doesn't know whether the TCP connection is transferring RPCH message.
+    // In this state, pre-check TCP payload to see if RPCH message.
+    NotDetermined
+};
+
+const binary legacyServerResponse = $[6E6361636E5F687474702F312E30]; // ncacn_http/1.0
+const set<ushort> HTTPPorts = {IANA.Port.HTTP, IANA.Port.HTTPS};
+const guid GUID_NULL = {00000000-0000-0000-0000-000000000000};
+type SessionContext
+{
+    RPCH.Proxy Proxy;
+}
+
+type RPCHOverTCPDecodingHelper : TCP.TCPDecodingHelper
+{
+    SessionContext SessionContext = null; // Shared by requestCache and responseCache
+
+    void InitializeRPCHOverTCPDecodingHelper()
+    {
+        SessionContext = new SessionContext{Proxy = endpoint Proxy[GUID_NULL, true]};
+        RPCHOverTCPDecodingCache acceptsCache = new RPCHOverTCPDecodingCache();
+        acceptsCache.InitializeRPCHCache(MessageDirection.Accepts, SessionContext);
+        AcceptsCache = acceptsCache;
+
+        RPCHOverTCPDecodingCache issuesCache = new RPCHOverTCPDecodingCache();
+        issuesCache.InitializeRPCHCache(MessageDirection.Issues, SessionContext);
+        IssuesCache = issuesCache;
+    }
+}
+
+type RPCHOverTCPDecodingCache : TCP.TCPDecodingCache
+{
+    // Overide TCPDecodingCache's implement, need change direction and endpoint during decoding
+    MessageDirection proxyDirection;
+    SessionContext sessionContext;
+
+    void InitializeRPCHCache(MessageDirection direction, SessionContext context)
+    {
+        sessionContext = context;
+        base.Initialize("RPCH", sessionContext.Proxy , direction, IsRPCHOrMSRPCEMessage, IsDataSufficient, DecodeRPCHOrMSRPCEMessage, DecodeIncompleteRPCHMessage);
+    }
+
+    override void TryDecodeAndDispatchMessage()
+    {
+        stream s = Buffer;
+        // 2.1.2.2.1   Legacy Server Response
+        if (RemainingByteLength(s) >= 14 && s.PeekBytes(0, 14) == legacyServerResponse)
+        {
+            LegacyServerResponse response = BinaryDecoder<LegacyServerResponse>(s) as LegacyServerResponse;
+
+            response.Origins = Origins;
+            DispatchMessage(response);
+            CompleteMessages.Add(response, BufferStartSequenceNumber, BufferEndSequenceNumber);
+            ResetAfterSucceed(null);
+        }
+        else
+        {
+            base.TryDecodeAndDispatchMessage();
+        }
+    }
+
+    optional any message DecodeRPCHOrMSRPCEMessage(stream s)
+    {
+        // RPCH message section 2.2.3.6 RTS PDU Structure and 2.2.4 RTS PDUs
+        if (IsRPCHMessage(Buffer))
+        {
+            var result = ProcessTCPPayload(s);
+            if (result is anyMessage:any message)
+            {
+                guid virtualConnectionCookie = GUID_NULL;
+                if (anyMessage is conn_A2:CONN_A2)
+                {
+                    virtualConnectionCookie = conn_A2.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is conn_B2:CONN_B2)
+                {
+                    virtualConnectionCookie = conn_B2.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is in_R1A2:IN_R1A2)
+                {
+                    virtualConnectionCookie = in_R1A2.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is in_R1A6_R2A2_Or_OUT_R2A4:IN_R1A6_R2A2_Or_OUT_R2A4)
+                {
+                    virtualConnectionCookie = in_R1A6_R2A2_Or_OUT_R2A4.SuccessorChannelCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is out_R1A4:OUT_R1A4)
+                {
+                    virtualConnectionCookie = out_R1A4.SuccessorChannelCookie.Cookie.Cookie;
+                }
+                if (virtualConnectionCookie != GUID_NULL)
+                {
+                    sessionContext.Proxy = endpoint Proxy[virtualConnectionCookie, true];
+                }
+            }
+            return result;
+        }
+        // MSRPCE message
+        else
+        {
+            return DecodeRPCHMessage<RPCHPayload>(s, "RPCHPayload");
+        }
+    }
+
+    override void DispatchMessage(any message msg)
+    {
+        if (msg is RPCHPayload | KeepAlive | FlowControlAckPDU | FlowControlAckWithDestination)
+        {
+            if (proxyDirection is MessageDirection.Accepts)
+            {
+                dispatch sessionContext.Proxy accepts msg;
+            }
+            else
+            {
+                dispatch sessionContext.Proxy issues msg;
+            }
+        }
+        else if (msg is CONN_A2 | CONN_B2 | IN_R1A2 | IN_R1A6_R2A2_Or_OUT_R2A4 | IN_R1B1 | OUT_R1A4 | OUT_R1A8_R2A8 | PingTrafficSentNotifyPDU | LegacyServerResponse)
+        {
+            proxyDirection = MessageDirection.Issues;
+            dispatch sessionContext.Proxy issues msg;
+        }
+        else
+        {
+            proxyDirection = MessageDirection.Accepts;
+            dispatch sessionContext.Proxy accepts msg;
+        }
+    }
+
+    override void ClearInDestructor()
+    {
+        sessionContext = null;
+        base.ClearInDestructor();
+    }
+}
+
+optional any message ProcessTCPPayload(stream payloadStream)
+{
+    PDUHeader_Flags headerFlags = (payloadStream.PeekByte(payloadStream.BitPosition + 16 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 17 * 8) << 8)) as PDUHeader_Flags;
+    ushort numberOfCommands = (payloadStream.PeekByte(payloadStream.BitPosition + 18 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 19 * 8) << 8)) as ushort;
+    optional uint commandType = nothing;
+    if (RemainingByteLength(payloadStream) >= 24)
+        commandType = (payloadStream.PeekByte(payloadStream.BitPosition + 20 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 21 * 8) << 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 22 * 8) << 16) + (payloadStream.PeekByte(payloadStream.BitPosition + 23 * 8) << 24)) as uint;
+
+    optional any message result;
+    // 2.2.4.3   CONN/A2 RTS PDU
+    if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 5)
+    {
+        result = DecodeRPCHMessage<CONN_A2>(payloadStream, "CONN_A2");
+    }
+    // 2.2.4.6   CONN/B2 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_IN_CHANNEL && numberOfCommands == 7)
+    {
+        result = DecodeRPCHMessage<CONN_B2>(payloadStream, "CONN_B2");
+    }
+    // 2.2.4.11   IN_R1/A2 RTS PDU
+    else if (headerFlags == (PDUHeader_Flags.RTS_FLAG_IN_CHANNEL | PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL) && numberOfCommands == 6)
+    {
+        result = DecodeRPCHMessage<IN_R1A2>(payloadStream, "IN_R1A2");
+    }
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 1 && commandType != nothing)
+    {
+        switch (commandType)
+        {
+            // 2.2.4.15   IN_R1/A6 RTS PDU
+            // 2.2.4.19   IN_R2/A2 RTS PDU
+            // 2.2.4.37   OUT_R2/A4 RTS PDU
+            case 0x00000003 =>
+                result = DecodeRPCHMessage<IN_R1A6_R2A2_Or_OUT_R2A4>(payloadStream, "IN_R1A6_R2A2_Or_OUT_R2A4");
+            // 2.2.4.16   IN_R1/B1 RTS PDU
+            case 0x00000007 =>
+                result = DecodeRPCHMessage<IN_R1B1>(payloadStream, "IN_R1B1");
+            // 2.2.4.43   OUT_R2/B2 RTS PDU
+            case 0x00000009 =>
+                result = DecodeRPCHMessage<OUT_R2B2>(payloadStream, "OUT_R2B2");
+            // 2.2.4.31   OUT_R1/A9 RTS PDU
+            // 2.2.4.42   OUT_R2/B1 RTS PDU
+            case 0x0000000A =>
+                result = DecodeRPCHMessage<OUT_R1A9_R2B1>(payloadStream, "OUT_R1A9_R2B1");
+            // 2.2.4.17   IN_R1/B2 RTS PDU
+            case 0x00000000 =>
+                result = DecodeRPCHMessage<IN_R1B2>(payloadStream, "IN_R1B2");
+            // 2.2.4.20   IN_R2/A3 RTS PDU
+            case 0x0000000D =>
+                result = DecodeRPCHMessage<IN_R2A3>(payloadStream, "IN_R2A3");
+            default =>
+                result = nothing;
+        }
+    }
+    // 2.2.4.26   OUT_R1/A4 RTS PDU
+    else if (headerFlags == (PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL | PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && numberOfCommands == 7)
+    {
+        result = DecodeRPCHMessage<OUT_R1A4>(payloadStream, "OUT_R1A4");
+    }
+    // 2.2.4.30   OUT_R1/A8 RTS PDU
+    // 2.2.4.41   OUT_R2/A8 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 2)
+    {
+        result = DecodeRPCHMessage<OUT_R1A8_R2A8>(payloadStream, "OUT_R1A8_R2A8");
+    }
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD && numberOfCommands == 1 && commandType != nothing)
+    {
+        switch (commandType)
+        {
+            // 2.2.4.46   Keep-Alive RTS PDU
+            case 0x00000005 =>
+                result = DecodeRPCHMessage<KeepAlive>(payloadStream, "KeepAlive");
+            // 2.2.4.47   Ping Traffic Sent Notify RTS PDU
+            case 0x0000000E =>
+                result = DecodeRPCHMessage<PingTrafficSentNotifyPDU>(payloadStream, "PingTrafficSentNotifyPDU");
+            // 2.2.4.50   FlowControlAck RTS PDU
+            case 0x00000001 =>
+                result = DecodeRPCHMessage<FlowControlAckPDU>(payloadStream, "FlowControlAckPDU");
+            default =>
+                result = nothing;
+        }
+    }
+    // 2.2.4.7   CONN/B3 RTS 
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 2 && commandType != nothing && commandType == 0x00000000)
+    {
+        result = DecodeRPCHMessage<CONN_B3>(payloadStream, "CONN_B3");
+    }
+    // 2.2.4.38   OUT_R2/A5 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 2 && commandType != nothing && commandType == 0x0000000D)
+    {
+        result = DecodeRPCHMessage<OUT_R2A5>(payloadStream, "OUT_R2A5");
+    }
+    // 2.2.4.8   CONN/C1 RTS PDU 
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 3)
+    {
+        result = DecodeRPCHMessage<CONN_C1>(payloadStream, "CONN_C1");
+    }
+    // 2.2.4.12   IN_R1/A3 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 4)
+    {
+        result = DecodeRPCHMessage<IN_R1A3>(payloadStream, "IN_R1A3");
+    }
+    // 2.2.4.23   OUT_R1/A1 RTS PDU
+    // 2.2.4.34   OUT_R2/A1 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL && numberOfCommands == 1)
+    {
+        result = DecodeRPCHMessage<OUT_R1A1_R2A1>(payloadStream, "OUT_R1A1_R2A1");
+    }
+    // 2.2.4.27   OUT_R1/A5 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 3)
+    {
+        result = DecodeRPCHMessage<OUT_R1A5>(payloadStream, "OUT_R1A5");
+    }
+    // 2.2.4.51   FlowControlAckWithDestination RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD && numberOfCommands == 2)
+    {
+        result = DecodeRPCHMessage<FlowControlAckWithDestination>(payloadStream, "FlowControlAckWithDestination");
+    }
+    else
+    {
+        result = nothing;
+    }
+    return result;
+}
+
+autostart actor RPCHOverHTTPServer(HTTP.Server server)
+{
+    SessionContext sessionContext = null; // Shared by requestCache and responseCache
+    RPCHOverHTTPDecodingCache requestCache = null;
+    RPCHOverHTTPDecodingCache responseCache = null;
+    // Record the state of current HTTP connection.
+    ConnectionKind conKind = ConnectionKind.NotDetermined;
+
+    process server issues s:HttpContract.Response where s.Payload.Count > 0 && IsHTTPMessageForRPCH(s)
+    {
+        if (sessionContext == null)
+        {
+            sessionContext = new SessionContext{Proxy = endpoint Proxy[GUID_NULL, false]};
+        }
+        if (responseCache == null)
+        {
+            responseCache = new RPCHOverHTTPDecodingCache();
+            responseCache.InitializeRPCHCache(MessageDirection.Issues, sessionContext);
+        }
+
+        if (GetContentLength(s.Headers) == 20)
+        {
+            // section 2.1.2.1.6   Echo Response
+            DecodeMessage<EchoResponse>(IssueDispatcher, sessionContext.Proxy, s.Payload, "EchoResponse");
+        }
+        else
+        {
+            responseCache.AddMessage(s, IsSegmentLost, (any message httpRes) => (httpRes as HttpContract.Response).Payload);
+            responseCache.TryDecodeAndDispatchMessage();
+        }
+    }
+    
+    process server accepts s:HttpContract.Request where s.Payload.Count > 0 && IsHTTPMessageForRPCH(s)
+    {
+        if (sessionContext == null)
+        {
+            sessionContext = new SessionContext{Proxy = endpoint Proxy[GUID_NULL, false]};
+        }
+        if (requestCache == null)
+        {
+            requestCache = new RPCHOverHTTPDecodingCache();
+            requestCache.InitializeRPCHCache(MessageDirection.Accepts, sessionContext);
+        }
+        if (GetContentLength(s.Headers) == 4)
+        {
+            // section 2.1.2.1.5   Echo Request
+            switch (s.Payload)
+            {
+                case echoReq:EchoRequest from BinaryDecoder<EchoRequest> =>
+                    dispatch sessionContext.Proxy accepts echoReq;
+                default => 
+                    ThrowDecodingException("RPCH", "Echo Request");
+            }
+        }
+        else
+        {
+            requestCache.AddMessage(s, IsSegmentLost, (any message httpReq) => (httpReq as HttpContract.Request).Payload);
+            requestCache.TryDecodeAndDispatchMessage();
+        }
+    }
+
+    bool IsHTTPMessageForRPCH((HttpContract.Request | HttpContract.Response) s)
+    {
+        bool result = false;
+        // We have known current HTTP connection is transferring RPCH message.
+        if (conKind == ConnectionKind.RPCH)
+        {
+            result = true;
+        }
+        // Check first HTTP message of connection which we have not detected yet.
+        else
+        {
+            if (s is req:HttpContract.Request)
+            {
+                if (req.Method == "RPC_IN_DATA" || req.Method == "RPC_OUT_DATA") // Echo request or OUT Channel Request
+                {
+                    conKind = ConnectionKind.RPCH;
+                    result = true;
+                }
+            }
+            else if (s is res:HttpContract.Response)
+            {
+                if ((res#HttpMethod == "RPC_OUT_DATA" || res#HttpMethod == "RPC_IN_DATA") && res.Headers.ContentTypeContains(CONTENT_TYPE_RPC)) // Echo response
+                {
+                    conKind = ConnectionKind.RPCH;
+                    result = true;
+                }
+                // if HTTP request is missing, res#HttpMethod is empty
+                else if (IsRPCHMessage(res.Payload) || IsMSRPCEMessage(res.Payload)) // HTTP chunk for RPCH
+                {
+                    conKind = ConnectionKind.RPCH;
+                    result = true;
+                }
+            }
+        }
+        return result;
+    }
+
+    process server issues s:HttpContract.HTTPPayload where s.Payload.Count > 0 && IsHTTPPayloadMessageForRPCH(s)
+    {
+        if (sessionContext == null)
+        {
+            sessionContext = new SessionContext{Proxy = endpoint Proxy[GUID_NULL, false]};
+        }
+        if (responseCache == null)
+        {
+            responseCache = new RPCHOverHTTPDecodingCache();
+            responseCache.InitializeRPCHCache(MessageDirection.Issues, sessionContext);
+        }
+        responseCache.AddMessage(s, IsSegmentLost, (any message httpPayload) => (httpPayload as HttpContract.HTTPPayload).Payload);
+        responseCache.TryDecodeAndDispatchMessage();
+    }
+
+    process server accepts s:HttpContract.HTTPPayload where s.Payload.Count > 0 && IsHTTPPayloadMessageForRPCH(s)
+    {
+        if (sessionContext == null)
+        {
+            sessionContext = new SessionContext{Proxy = endpoint Proxy[GUID_NULL, false]};
+        }
+        if (requestCache == null)
+        {
+            requestCache = new RPCHOverHTTPDecodingCache();
+            requestCache.InitializeRPCHCache(MessageDirection.Accepts, sessionContext);
+        }
+        requestCache.AddMessage(s, IsSegmentLost, (any message httpPayload) => (httpPayload as HttpContract.HTTPPayload).Payload);
+        requestCache.TryDecodeAndDispatchMessage();
+    }
+
+    bool IsHTTPPayloadMessageForRPCH(HttpContract.HTTPPayload s)
+    {
+        bool result = false;
+        // We have known current HTTP connection is transferring RPCH message.
+        if (conKind == ConnectionKind.RPCH)
+        {
+            result = true;
+        }
+        // Check first HTTP message of connection which we have not detected yet.
+        else
+        {
+            if (s#UpperProtocol == UpperProtocolType.RPCH)
+            {
+                conKind = ConnectionKind.RPCH;
+                result = true;
+            }
+            if (IsRPCHMessage(s.Payload) || IsMSRPCEMessage(s.Payload))
+            {
+                conKind = ConnectionKind.RPCH;
+                result = true;
+            }
+        }
+        return result;
+    }
+   
+    ~endpoint(HTTP.Server server)
+    {
+        sessionContext = null;
+        conKind = ConnectionKind.NotDetermined;
+    }
+}
+
+optional any message DecodeIncompleteRPCHMessage(binary buffer)
+{
+    if (buffer != null && IsRPCHOrMSRPCEMessage(buffer) == true)
+    {
+        if (BinaryDecoder<IncompleteRPCHMessage>(buffer) is m:IncompleteRPCHMessage)
+        {
+            return m as any message;
+        }
+    }
+    return nothing;
+}
+
+bool? IsRPCHOrMSRPCEMessage(binary data)
+{
+    return IsRPCHMessage(data) || IsMSRPCEMessage(data);
+}
+
+const set<byte> RPC_Minor_Version = {0, 1};
+/* IsRPCHMessage will check whether header is RPCHMessageIdentifier
+type RPCHMessageIdentifier[int Count]
+{
+    byte rpc_vers where (value == 5);
+    optional [|Count >= 2|] byte rpc_vers_minor where (value == nothing) || (value == 0 || value == 1);
+    optional [|Count >= 3|] byte PTYPE where (value == nothing) || (value == 20); //packet type
+    optional [|Count >= 4|] RpcCoPfcFlags pfc_flags where (value == nothing) || (value == (RpcCoPfcFlags.PfcFirstFrag | RpcCoPfcFlags.PfcLastFrag));
+    optional [|Count >= 8|] array<byte> packed_drep with BinaryEncoding{Length = 4};
+    optional [|Count >= 10|] ushort frag_length where (value == nothing) || (value >= 20);
+    optional [|Count >= 12|] ushort auth_length where (value == nothing) || (value == 0);
+    optional [|Count >= 16|] uint call_id where (value == nothing) || (value == 0);
+}
+ */
+bool IsRPCHMessage(binary data)
+{
+    bool result = false;
+    int count = data.Count;
+    if (count >= 16)
+    {
+        result = ((data[0] == 5) && (data[1] in RPC_Minor_Version) && (data[2] == 20) && (data[3] == 3) && ((data[8] + (data[9] << 8)) >= 20) && (data[10] == 0) && (data[11] == 0) && (data[12] == 0) && (data[13] == 0) && (data[14] == 0) && (data[15] == 0));
+    }
+    else if (count >= 1)
+    {
+        result = (data[0] == 5);
+        if (count >= 2)
+        {
+            result = result && (data[1] in RPC_Minor_Version);
+            if (count >= 3)
+            {
+                result = result && (data[2] == 20);
+                if (count >= 4)
+                {
+                    result = result && (data[3] == 3);
+                    if (count >= 10)
+                    {
+                        result = result && ((data[8] + (data[9] << 8)) >= 20);
+                        if (count >= 11)
+                        {
+                            result = result && (data[10] == 0);
+                            if (count >= 12)
+                            {
+                                result = result && (data[11] == 0);
+                                if (count >= 13)
+                                {
+                                    result = result && (data[12] == 0);
+                                    if (count >= 14)
+                                    {
+                                        result = result && (data[13] == 0);
+                                        if (count >= 15)
+                                        {
+                                            result = result && (data[14] == 0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        result = false;
+    }
+    return result;
+}
+
+/* IsMSRPCEMessage will check whether header is CoMessageIdentifier
+type CoMessageIdentifier[int Count] // Identifier for Connection-Oriented DCERPC, Pre-check and if successfully decode then parse the whole payload according to PDUType
+{
+    byte RpcVers where (value == 5);// 00:01 RPC version
+    optional [|Count >= 2|] byte RpcVersMinor where (value == nothing) || (value == 0 || value == 1); // 01:01 minor version
+    optional [|Count >= 3|] byte PTYPE where (value == nothing) || (value == 0 || value == 2 || value == 3 || (value >= 11 && value <= 19)); // 02:01 packet type
+    optional [|Count >= 4|] RpcCoPfcFlags PfcFlags; // 03:01 flags (see PFC_... )
+    // invariant ((PackedDrep[0] & 0xEE) == 0) && (PackedDrep[1] < 4) && (PackedDrep[2] == 0) && (PackedDrep[3] == 0);
+    optional [|Count >= 5|] byte PackedDrep0 where (value == nothing) || ((value & 0xEE) == 0);
+    optional [|Count >= 6|] byte PackedDrep1 where (value == nothing) || (value < 4);
+    optional [|Count >= 7|] byte PackedDrep2 where (value == nothing) || (value == 0);
+    optional [|Count >= 8|] byte PackedDrep3 where (value == nothing) || (value == 0);
+    optional [|Count >= 10|]ushort FragLength where (value == nothing) || (value >= 16);
+}
+*/
+const set<byte> PTYPE = {0, 2, 3};
+bool IsMSRPCEMessage(binary data)
+{
+    bool result = false;
+    int count = data.Count;
+    if (count >= 10)
+    {
+        result = ((data[0] == 5) && (data[1] in RPC_Minor_Version) && ((data[2] in PTYPE) || (data[2] >= 11 && data[2] <= 19)) && ((data[4] & 0xEE) == 0) && (data[5] < 4) && (data[6] == 0) && (data[7] == 0) && ((data[8] + (data[9] << 8)) >= 16));
+    }
+    else if (count >= 1)
+    {
+        result = (data[0] == 5);
+        if (count >= 2)
+        {
+            result = result && (data[1] in RPC_Minor_Version);
+            if (count >= 3)
+            {
+                result = result && ((data[2] in PTYPE) || (data[2] >= 11 && data[2] <= 19));
+                if (count >= 5)
+                {
+                    result = result && ((data[4] & 0xEE) == 0);
+                    if (count >= 6)
+                    {
+                        result = result && (data[5] < 4);
+                        if (count >= 7)
+                        {
+                            result = result && (data[6] == 0);
+                            if (count >= 8)
+                            {
+                                result = result && (data[7] == 0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        result = false;
+    }
+    return result;
+}
+
+bool IsSegmentLost(any message httpMessage)
+{
+    TCP.Segment seg = null;
+    if ((httpMessage.Origins).Count > 0
+        && (httpMessage.Origins)[0] is v:TCP.Segment)
+    {
+        seg = v;
+    }
+    return seg != null && IsTrue(seg#SegmentLost);
+}
+
+type RPCHOverHTTPDecodingCache : StreamDecodingCache
+{
+    SessionContext sessionContext;
+    
+    void InitializeRPCHCache(MessageDirection direction, SessionContext context)
+    {
+        sessionContext = context;
+        base.Initialize("RPCH", sessionContext.Proxy, direction, IsRPCHOrMSRPCEMessage, IsDataSufficient, DecodeRPCHOrMSRPCEMessage, DecodeIncompleteRPCHMessage);
+    }
+
+    optional any message DecodeRPCHOrMSRPCEMessage(stream s)
+    {
+        // RPCH message section 2.2.3.6 RTS PDU Structure and 2.2.4 RTS PDUs
+        if (IsRPCHMessage(Buffer))
+        {
+            var result = ProcessHTTPMessage(s);
+            if (result is anyMessage:any message)
+            {
+                guid virtualConnectionCookie = GUID_NULL;
+                if (anyMessage is conn_A1:CONN_A1)
+                {
+                    virtualConnectionCookie = conn_A1.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is conn_B1:CONN_B1)
+                {
+                    virtualConnectionCookie = conn_B1.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is in_R1A1_R2A1:IN_R1A1_R2A1)
+                {
+                    virtualConnectionCookie = in_R1A1_R2A1.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                else if (anyMessage is out_R1A3_R2A3:OUT_R1A3_R2A3)
+                {
+                    virtualConnectionCookie = out_R1A3_R2A3.VirtualConnectionCookie.Cookie.Cookie;
+                }
+                if (virtualConnectionCookie != GUID_NULL)
+                {
+                    sessionContext.Proxy = endpoint Proxy[virtualConnectionCookie, false];
+                }
+            }
+            return result;
+        }
+        // MSRPCE message
+        else
+        {
+            return DecodeRPCHMessage<RPCHPayload>(s, "RPCHPayload");
+        }
+    }
+
+    override void DispatchMessage(any message msg)
+    {
+        if (Direction is MessageDirection.Accepts)
+        {
+            dispatch sessionContext.Proxy accepts msg;
+        }
+        else
+        {
+            dispatch sessionContext.Proxy issues msg;
+        }
+    }
+}
+
+optional any message ProcessHTTPMessage(stream payloadStream)
+{
+    PDUHeader_Flags headerFlags = (payloadStream.PeekByte(payloadStream.BitPosition + 16 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 17 * 8) << 8)) as PDUHeader_Flags;
+    ushort numberOfCommands = (payloadStream.PeekByte(payloadStream.BitPosition + 18 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 19 * 8) << 8)) as ushort;
+    optional uint commandType = nothing;
+    if (RemainingByteLength(payloadStream) >= 24)
+        commandType = (payloadStream.PeekByte(payloadStream.BitPosition + 20 * 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 21 * 8) << 8) + (payloadStream.PeekByte(payloadStream.BitPosition + 22 * 8) << 16) + (payloadStream.PeekByte(payloadStream.BitPosition + 23 * 8) << 24)) as uint;
+
+    optional any message result;
+    // 2.2.4.2   CONN/A1 RTS PDU
+    if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 4 && commandType != nothing && commandType == 0x00000006)
+    {
+        result = DecodeRPCHMessage<CONN_A1>(payloadStream, "CONN_A1");
+    }
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 1 && commandType != nothing)
+    {
+        switch (commandType)
+        {
+            // 2.2.4.4   CONN/A3 RTS PDU
+            case 0x00000002 =>
+            {
+                result = DecodeRPCHMessage<CONN_A3>(payloadStream, "CONN_A3");
+            }
+            // 2.2.4.14   IN_R1/A5 RTS PDU
+            // 2.2.4.22   IN_R2/A5 RTS PDU
+            case 0x00000003 =>
+                result = DecodeRPCHMessage<IN_R1A5_R2A5>(payloadStream, "IN_R1A5_R2A5");
+            // 2.2.4.32   OUT_R1/A10 RTS PDU
+            // 2.2.4.33   OUT_R1/A11 RTS PDU
+            case 0x0000000A=>
+                result = DecodeRPCHMessage<OUT_R1A10_R1A11>(payloadStream, "OUT_R1A10_R1A11");
+            // 2.2.4.21   IN_R2/A4 RTS PDU
+            case 0x0000000D =>
+                result = DecodeRPCHMessage<IN_R2A4>(payloadStream, "IN_R2A4");
+            default =>
+                result = nothing;
+        }
+    }
+    // 2.2.4.5   CONN/B1 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 6)
+    {
+        result = DecodeRPCHMessage<CONN_B1>(payloadStream, "CONN_B1");
+    }
+    // 2.2.4.9   CONN/C2 RTS PDU 
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 3)
+    {
+        result = DecodeRPCHMessage<CONN_C2>(payloadStream, "CONN_C2");
+    }
+    // 2.2.4.10   IN_R1/A1 RTS PDU 
+    // 2.2.4.18   IN_R2/A1 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL && numberOfCommands == 4)
+    {
+        result = DecodeRPCHMessage<IN_R1A1_R2A1>(payloadStream, "IN_R1A1_R2A1");
+    }
+    // 2.2.4.13   IN_R1/A4 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 4 && commandType != nothing && commandType == 0x0000000D)
+    {
+        result = DecodeRPCHMessage<IN_R1A4>(payloadStream, "IN_R1A4");
+    }
+    // 2.2.4.24   OUT_R1/A2 RTS PDU
+    // 2.2.4.35   OUT_R2/A2 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL && numberOfCommands == 1)
+    {
+        result = DecodeRPCHMessage<OUT_R1A2_R2A2>(payloadStream, "OUT_R1A2_R2A2");
+    }
+    // 2.2.4.25   OUT_R1/A3 RTS PDU
+    // 2.2.4.36   OUT_R2/A3 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL && numberOfCommands == 5)
+    {
+        result = DecodeRPCHMessage<OUT_R1A3_R2A3>(payloadStream, "OUT_R1A3_R2A3");
+    }
+    // 2.2.4.28   OUT_R1/A6 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 3 && (RemainingBitLength(payloadStream) >= 32 * 8) && PeekByteCompare(payloadStream, payloadStream.BitPosition + 28 * 8, [0x06, 0x00, 0x00, 0x00]))
+    {
+        result = DecodeRPCHMessage<OUT_R1A6>(payloadStream, "OUT_R1A6");
+    }
+    // 2.2.4.29   OUT_R1/A7 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 2)
+    {
+        result = DecodeRPCHMessage<OUT_R1A7>(payloadStream, "OUT_R1A7");
+    }
+    // 2.2.4.39   OUT_R2/A6 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_NONE && numberOfCommands == 2)
+    {
+        result = DecodeRPCHMessage<OUT_R2A6>(payloadStream, "OUT_R2A6");
+    }
+    // 2.2.4.40   OUT_R2/A7 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL && numberOfCommands == 3 && (RemainingBitLength(payloadStream) >= 32 * 8) && PeekByteCompare(payloadStream, payloadStream.BitPosition + 28 * 8, [0x03, 0x00, 0x00, 0x00]))
+    {
+        result = DecodeRPCHMessage<OUT_R2A7>(payloadStream, "OUT_R2A7");
+    }
+    // 2.2.4.44   OUT_R2/B3 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_EOF && numberOfCommands == 1)
+    {
+        result = DecodeRPCHMessage<OUT_R2B3>(payloadStream, "OUT_R2B3");
+    }
+    // 2.2.4.45   OUT_R2/C1 RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_PING && numberOfCommands == 1)
+    {
+        result = DecodeRPCHMessage<OUT_R2C1>(payloadStream, "OUT_R2C1");
+    }
+    // 2.2.4.49   Ping RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_PING && numberOfCommands == 0)
+    {
+        result = DecodeRPCHMessage<Ping>(payloadStream, "Ping");
+    }
+    // 2.2.4.46   Keep-Alive RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD && numberOfCommands == 1 && commandType != nothing && commandType == 0x00000005)
+    {
+        result = DecodeRPCHMessage<KeepAlive>(payloadStream, "KeepAlive");
+    }
+    // 2.2.4.50   FlowControlAck RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD && numberOfCommands == 1 && commandType != nothing && commandType == 0x00000001)
+    {
+        result = DecodeRPCHMessage<FlowControlAckPDU>(payloadStream, "FlowControlAckPDU");
+    }
+    // 2.2.4.51   FlowControlAckWithDestination RTS PDU
+    else if (headerFlags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD && numberOfCommands == 2)
+    {
+        result = DecodeRPCHMessage<FlowControlAckWithDestination>(payloadStream, "FlowControlAckWithDestination");
+    }
+    else
+    {
+        result = nothing;
+    }
+    return result;
+}
+
+void AcceptDispatcher(RPCH.Proxy proxy, PDUHeader pdu)
+{
+    dispatch proxy accepts pdu;
+}
+
+void IssueDispatcher(RPCH.Proxy proxy, PDUHeader pdu)
+{
+    dispatch proxy issues pdu;
+}
+
+optional T DecodeRPCHMessage<T>(stream payloadStream, string messageName)
+{
+    if (BinaryDecoder<T>(payloadStream) is pdu:T)
+    {
+        return pdu;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+void DecodeMessage<T>(void(RPCH.Proxy, T) dispatcher, RPCH.Proxy proxy, stream payloadStream, string messageName)
+{
+    optional T optionalPdu = BinaryDecoder<T>(payloadStream);
+    if (optionalPdu != nothing)
+    {
+        T pdu = optionalPdu as T;
+        dispatcher(proxy, pdu);
+    }
+    else
+    {
+        ThrowDecodingException("RPCH", messageName);
+    }
+}
+
+// MSRPCE message
+message RPCHPayload
+{
+    binary Payload;
+
+    override string ToString()
+    {
+        return "RPCH Message Body";
+    }
+}
+
+message IncompleteRPCHMessage
+{
+    byte rpc_vers where value == 5;
+    byte rpc_vers_minor where (value == 0 || value == 1);
+    byte PTYPE;
+    RpcCoPfcFlags pfc_flags;
+    CoDrepFormatLabel packed_drep;
+    ushort frag_length;
+    ushort auth_length;
+    uint call_id;
+    binary payload;
+
+    override string ToString()
+    {
+        return "IncompleteRPCHMessage";
+    }
+}
+
+// 2.1.2.2.1   Legacy Server Response
+message LegacyServerResponse
+{
+    binary legacyServerResponse;
+
+    override string ToString()
+    {
+        return "Legacy Server Response";
+    }
+}
+
+// 2.2.3.6.1 RTS PDU Header 
+message PDUHeader
+{
+    byte rpc_vers where value == 5;
+    byte rpc_vers_minor where (value == 0 || value == 1);
+    byte PTYPE where (value == 20); /*packet type */
+    RpcCoPfcFlags pfc_flags where (value == (RpcCoPfcFlags.PfcFirstFrag | RpcCoPfcFlags.PfcLastFrag));
+    CoDrepFormatLabel packed_drep;
+    ushort frag_length where value >= 20;
+    ushort auth_length where value == 0;
+    uint call_id where value == 0;
+    PDUHeader_Flags Flags;
+    ushort NumberOfCommands;
+}
+
+// 2.2.4 RTS PDUs
+// 2.2.4.2   CONN/A1 RTS PDU
+message CONN_A1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 4);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie OUTChannelCookie;
+    ReceiveWindowSize ReceiveWindowSize;
+
+    override string ToString()
+    {
+        return "CONN/A1, Version: " + Version.ToString() + 
+            ", ReceiveWindowSize: " + ReceiveWindowSize.ToString();
+    }
+}
+
+// 2.2.4.12   IN_R1/A3 RTS PDU
+message IN_R1A3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 4);
+    Destination Destination;
+    Version Version;
+    ReceiveWindowSize InboundProxyReceiveWindowSize;
+    ConnectionTimeout InboundProxyConnectionTimeout;
+
+    override string ToString()
+    {
+        return "IN_R1/A3, Destination: " + Destination.ToString() + 
+            ", Version: " + Version.ToString() + 
+            ", InboundProxyReceiveWindowSize: " + InboundProxyReceiveWindowSize.ToString() +
+            ", InboundProxyConnectionTimeout: " + InboundProxyConnectionTimeout.ToString();
+    }
+}
+// 2.2.4.13   IN_R1/A4 RTS PDU
+message IN_R1A4 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 4);
+    Destination Destination;
+    Version Version;
+    ReceiveWindowSize InboundProxyReceiveWindowSize;
+    ConnectionTimeout InboundProxyConnectionTimeout;
+    
+    override string ToString()
+    {
+        return "IN_R1/A4, Destination: " + Destination.ToString() + 
+            ", Version: " + Version.ToString() + 
+            ", InboundProxyReceiveWindowSize: " + InboundProxyReceiveWindowSize.ToString() +
+            ", InboundProxyConnectionTimeout: " + InboundProxyConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.3   CONN/A2 RTS PDU
+message CONN_A2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 5);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie OUTChannelCookie;
+    ChannelLifetime ChannelLifetime;
+    ReceiveWindowSize ReceiveWindowSize;
+
+    override string ToString()
+    {
+        return "CONN/A2, Version: " + Version.ToString() + 
+            ", ChannelLifetime: " + ChannelLifetime.ToString() +
+            ", ReceiveWindowSize: " + ReceiveWindowSize.ToString();
+    }
+}
+
+// 2.2.4.4   CONN/A3 RTS PDU
+message CONN_A3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    ConnectionTimeout ConnectionTimeout;
+
+    override string ToString()
+    {
+        return "CONN/A3, ConnectionTimeout: " + ConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.17   IN_R1/B2 RTS PDU
+message IN_R1B2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    ReceiveWindowSize ServerReceiveWindowSize;
+
+    override string ToString()
+    {
+        return "IN_R1/B2, ReceiveWindowSize: " + ServerReceiveWindowSize.ToString();
+    }
+}
+
+// 2.2.4.20   IN_R2/A3 RTS PDU
+message IN_R2A3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    Destination Destination;
+
+    override string ToString()
+    {
+        return "IN_R2/A3, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.21   IN_R2/A4 RTS PDU
+message IN_R2A4 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    Destination Destination;
+
+    override string ToString()
+    {
+        return "IN_R2/A4, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.5   CONN/B1 RTS PDU
+message CONN_B1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 6);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie INChannelCookie;
+    ChannelLifetime ChannelLifetime;
+    ClientKeepalive ClientKeepalive;
+    AssociationGroupId AssociationGroupId;
+
+    override string ToString()
+    {
+        return "CONN/B1, Version: " + Version.ToString() + 
+            ", ChannelLifetime: " + ChannelLifetime.ToString() +
+            ", ClientKeepalive: " + ClientKeepalive.ToString();
+    }
+}
+
+// 2.2.4.6   CONN/B2 RTS PDU
+message CONN_B2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_IN_CHANNEL) && (NumberOfCommands == 7);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie INChannelCookie;
+    ReceiveWindowSize ReceiveWindowSize;
+    ConnectionTimeout ConnectionTimeout;
+    AssociationGroupId AssociationGroupId;
+    ClientAddress ClientAddress;
+
+    override string ToString()
+    {
+        return "CONN/B2, Version: " + Version.ToString() + 
+            ", ReceiveWindowSize: " + ReceiveWindowSize.ToString() +
+            ", ConnectionTimeout: " + ConnectionTimeout.ToString() +
+            ", ClientAddress: " + ClientAddress.ToString();
+    }
+}
+
+// 2.2.4.7   CONN/B3 RTS 
+message CONN_B3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 2);
+    ReceiveWindowSize ReceiveWindowSize;
+    Version Version;
+
+    override string ToString()
+    {
+        return "CONN/B3, ReceiveWindowSize: " + ReceiveWindowSize.ToString() +
+            ", Version: " + Version.ToString();
+    }
+}
+
+// 2.2.4.38   OUT_R2/A5 RTS PDU
+message OUT_R2A5 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 2);
+    Destination Destination;
+    ANCE ANCE;
+
+    override string ToString()
+    {
+        return "OUT_R2/A5, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.39   OUT_R2/A6 RTS PDU
+message OUT_R2A6 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 2);
+    Destination Destination;
+    ANCE ANCE;
+
+    override string ToString()
+    {
+        return "OUT_R2/A6, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.8   CONN/C1 RTS PDU 
+message CONN_C1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 3);
+
+    Version Version;
+    ReceiveWindowSize ReceiveWindowSize;
+    ConnectionTimeout ConnectionTimeout;
+
+    override string ToString()
+    {
+        return "CONN/C1, Version: " + Version.ToString() +
+            ", ReceiveWindowSize: " + ReceiveWindowSize.ToString() +
+            ", ConnectionTimeout: " + ConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.9   CONN/C2 RTS PDU 
+message CONN_C2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 3);
+
+    Version Version;
+    ReceiveWindowSize ReceiveWindowSize;
+    ConnectionTimeout ConnectionTimeout;
+
+    override string ToString()
+    {
+        return "CONN/C2, Version: " + Version.ToString() +
+            ", ReceiveWindowSize: " + ReceiveWindowSize.ToString() +
+            ", ConnectionTimeout: " + ConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.10   IN_R1/A1 RTS PDU 
+// 2.2.4.18   IN_R2/A1 RTS PDU
+message IN_R1A1_R2A1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL) && (NumberOfCommands == 4);
+
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie PredecessorChannelCookie;
+    Cookie SuccessorChannelCookie;
+
+    override string ToString()
+    {
+        return "IN_R1/A1 or IN_R2/A1, Version: " + Version.ToString();
+    }
+}
+
+// 2.2.4.11   IN_R1/A2 RTS PDU
+message IN_R1A2 : PDUHeader
+{
+    invariant (Flags == (PDUHeader_Flags.RTS_FLAG_IN_CHANNEL | PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL)) && (NumberOfCommands == 6);
+
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie PredecessorChannelCookie;
+    Cookie SuccessorChannelCookie;
+    ReceiveWindowSize InboundProxyReceiveWindowSize;
+    ConnectionTimeout InboundProxyConnectionTimeout;
+
+    override string ToString()
+    {
+        return "IN_R1/A2, Version: " + Version.ToString() +
+            ", InboundProxyReceiveWindowSize: " + InboundProxyReceiveWindowSize.ToString() +
+            ", InboundProxyConnectionTimeout: " + InboundProxyConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.14   IN_R1/A5 RTS PDU
+// 2.2.4.22   IN_R2/A5 RTS PDU
+message IN_R1A5_R2A5 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    Cookie SuccessorINChannelCookie;
+
+    override string ToString()
+    {
+        return "IN_R1/A5 or IN_R2/A5, SuccessorINChannelCookie: " + SuccessorINChannelCookie.ToString();
+    }
+}
+
+// 2.2.4.15   IN_R1/A6 RTS PDU
+// 2.2.4.19   IN_R2/A2 RTS PDU
+// 2.2.4.37   OUT_R2/A4 RTS PDU
+message IN_R1A6_R2A2_Or_OUT_R2A4 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    Cookie SuccessorChannelCookie;
+    
+    override string ToString()
+    {
+        return "IN_R1/A6, IN_R2/A2 or OUT_R2/A4, SuccessorChannelCookie: " + SuccessorChannelCookie.ToString();
+    }
+}
+
+// 2.2.4.16   IN_R1/B1 RTS PDU
+message IN_R1B1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    Empty Empty;
+
+    override string ToString()
+    {
+        return "IN_R1/B1, Empty";
+    }
+}
+
+// 2.2.4.43   OUT_R2/B2 RTS PDU
+message OUT_R2B2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    NegativeANCE NANCE;
+
+    override string ToString()
+    {
+        return "OUT_R2/B2, NegativeANCE";
+    }
+}
+
+// 2.2.4.32   OUT_R1/A10 RTS PDU
+// 2.2.4.33   OUT_R1/A11 RTS PDU
+message OUT_R1A10_R1A11 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    ANCE ANCE;
+
+    override string ToString()
+    {
+        return "OUT_R1/A10 or OUT_R1/A11, ANCE";
+    }
+}
+
+// 2.2.4.31   OUT_R1/A9 RTS PDU
+// 2.2.4.42   OUT_R2/B1 RTS PDU
+message OUT_R1A9_R2B1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_NONE) && (NumberOfCommands == 1);
+    ANCE ANCE;
+
+    override string ToString()
+    {
+        return "OUT_R1/A9 or OUT_R2/B1, ANCE";
+    }
+}
+
+// 2.2.4.23   OUT_R1/A1 RTS PDU
+// 2.2.4.34   OUT_R2/A1 RTS PDU
+message OUT_R1A1_R2A1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL) && (NumberOfCommands == 1);
+    Destination Destination;
+
+    override string ToString()
+    {
+        return "OUT_R1/A1 or OUT_R2/A1, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.24   OUT_R1/A2 RTS PDU
+// 2.2.4.35   OUT_R2/A2 RTS PDU
+message OUT_R1A2_R2A2 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL) && (NumberOfCommands == 1);
+    Destination Destination;
+
+    override string ToString()
+    {
+        return "OUT_R1/A2 or OUT_R2/A2, Destination: " + Destination.ToString();
+    }
+}
+
+// 2.2.4.25   OUT_R1/A3 RTS PDU
+// 2.2.4.36   OUT_R2/A3 RTS PDU
+message OUT_R1A3_R2A3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL) && (NumberOfCommands == 5);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie PredecessorChannelCookie;
+    Cookie SuccessorChannelCookie;
+    ReceiveWindowSize OutboundProxyReceiveWindowSize_Or_ClientReceiveWindowSize;
+
+    override string ToString()
+    {
+        return "OUT_R1/A3 or OUT_R2/A3, Version: " + Version.ToString() +
+            ", OutboundProxyReceiveWindowSize_Or_ClientReceiveWindowSize: " + OutboundProxyReceiveWindowSize_Or_ClientReceiveWindowSize.ToString();
+    }
+}
+
+// 2.2.4.26   OUT_R1/A4 RTS PDU
+message OUT_R1A4 : PDUHeader
+{
+    invariant (Flags == (PDUHeader_Flags.RTS_FLAG_RECYCLE_CHANNEL | PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL)) && (NumberOfCommands == 7);
+    Version Version;
+    Cookie VirtualConnectionCookie;
+    Cookie PredecessorChannelCookie;
+    Cookie SuccessorChannelCookie;
+    ChannelLifetime ChannelLifetime;
+    ReceiveWindowSize OutboundProxyReceiveWindowSize;
+    ConnectionTimeout OutboundProxyConnectionTimeout;
+
+    override string ToString()
+    {
+        return "OUT_R1/A4, Version: " + Version.ToString() +
+            ", ChannelLifetime: " + ChannelLifetime.ToString() +
+            ", OutboundProxyReceiveWindowSize: " + OutboundProxyReceiveWindowSize.ToString() +
+            ", OutboundProxyConnectionTimeout: " + OutboundProxyConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.27   OUT_R1/A5 RTS PDU
+message OUT_R1A5 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 3);
+    Destination Destination;
+    Version Version;
+    ConnectionTimeout OutboundProxyConnectionTimeout;
+
+    override string ToString()
+    {
+        return "OUT_R1/A5, Destination: " + Destination.ToString() +
+            ", Version: " + Version.ToString() +
+            ", OutboundProxyConnectionTimeout: " + OutboundProxyConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.28   OUT_R1/A6 RTS PDU
+message OUT_R1A6 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 3);
+    Destination Destination;
+    Version Version;
+    ConnectionTimeout OutboundProxyConnectionTimeout;
+
+    override string ToString()
+    {
+        return "OUT_R1/A6, Destination: " + Destination.ToString() +
+            ", Version: " + Version.ToString() +
+            ", OutboundProxyConnectionTimeout: " + OutboundProxyConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.4.40   OUT_R2/A7 RTS PDU
+message OUT_R2A7 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 3);
+    Destination Destination;
+    Cookie SuccessorChannelCookie;
+    Version Version;
+
+    override string ToString()
+    {
+        return "OUT_R2/A7, Destination: " + Destination.ToString() +
+            ", Version: " + Version.ToString() +
+            ", SuccessorChannelCookie: " + SuccessorChannelCookie.ToString();
+    }
+}
+
+// 2.2.4.29   OUT_R1/A7 RTS PDU
+message OUT_R1A7 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 2);
+    Destination Destination;
+    Cookie SuccessorChannelCookie;
+
+    override string ToString()
+    {
+        return "OUT_R1/A7, Destination: " + Destination.ToString() +
+            ", SuccessorChannelCookie: " + SuccessorChannelCookie.ToString();
+    }
+}
+
+// 2.2.4.30   OUT_R1/A8 RTS PDU
+// 2.2.4.41   OUT_R2/A8 RTS PDU
+message OUT_R1A8_R2A8 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OUT_CHANNEL) && (NumberOfCommands == 2);
+    Destination Destination;
+    Cookie SuccessorChannelCookie;
+
+    override string ToString()
+    {
+        return "OUT_R1/A8 or OUT_R2/A8, Destination: " + Destination.ToString() +
+            ", SuccessorChannelCookie: " + SuccessorChannelCookie.ToString();
+    }
+}
+
+// 2.2.4.44   OUT_R2/B3 RTS PDU
+message OUT_R2B3 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_EOF) && (NumberOfCommands == 1);
+    ANCE ANCE;
+
+    override string ToString()
+    {
+        return "OUT_R2/B3, ANCE";
+    }
+}
+
+// 2.2.4.45   OUT_R2/C1 RTS PDU
+message OUT_R2C1 : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_PING) && (NumberOfCommands == 1);
+    (Empty | Padding) EmptyOrPadding;
+
+    override string ToString()
+    {
+        return "OUT_R2/C1" + ((EmptyOrPadding is Empty) ? "" : ("Padding ConformanceCount: " + (EmptyOrPadding as Padding).ConformanceCount.ToString()));
+    }
+}
+
+// 2.2.4.46   Keep-Alive RTS PDU
+message KeepAlive : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD) && (NumberOfCommands == 1);
+    ClientKeepalive ClientKeepalive;
+
+    override string ToString()
+    {
+        return "Keep-Alive, ClientKeepalive: " + ClientKeepalive.ToString();
+    }
+}
+
+// 2.2.4.47   Ping Traffic Sent Notify RTS PDU
+message PingTrafficSentNotifyPDU : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD) && (NumberOfCommands == 1);
+    PingTrafficSentNotify PingTrafficSentNotify;
+
+    override string ToString()
+    {
+        return "Ping Traffic Sent Notify, PingTrafficSentNotify: " + PingTrafficSentNotify.ToString();
+    }
+}
+
+// 2.2.4.50   FlowControlAck RTS PDU
+message FlowControlAckPDU : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD) && (NumberOfCommands == 1);
+    FlowControlAck FlowControlAck;
+
+    override string ToString()
+    {
+        return "FlowControlAck, " + FlowControlAck.ToString();
+    }
+}
+// 2.1.2.1.5   Echo Request
+message EchoRequest
+{
+    // Content-Length: Clients MUST set this header field to a value in the inclusive range of 0 to 0x10.
+    // Windows clients will set this value to 4.
+    binary Data with BinaryEncoding{Length = 4};
+
+    override string ToString()
+    {
+        return "Echo Request";
+    }
+}
+// 2.2.4.48   Echo RTS PDU and 2.1.2.1.6   Echo Response
+message EchoResponse : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_ECHO) && (NumberOfCommands == 0);
+
+    override string ToString()
+    {
+        return "Echo Response";
+    }
+}
+
+// 2.2.4.49   Ping RTS PDU
+message Ping : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_PING) && (NumberOfCommands == 0);
+
+    override string ToString()
+    {
+        return "Ping";
+    }
+}
+
+// 2.2.4.51   FlowControlAckWithDestination RTS PDU
+message FlowControlAckWithDestination : PDUHeader
+{
+    invariant (Flags == PDUHeader_Flags.RTS_FLAG_OTHER_CMD) && (NumberOfCommands == 2);
+    Destination Destination;
+    FlowControlAck FlowControlAck;
+
+    override string ToString()
+    {
+        return "FlowControlAckWithDestination, Destination: " + Destination.ToString() +
+            ", BytesReceived: " + FlowControlAck.Ack.BytesReceived.ToString() +
+            ", AvailableWindow: " + FlowControlAck.Ack.AvailableWindow.ToString() +
+            ", ChannelCookie: " + FlowControlAck.Ack.ChannelCookie.ToString();
+    }
+}
+
+// 2.2.3.1   RTS Cookie
+type RTSCookie
+{
+    guid Cookie;
+
+    override string ToString()
+    {
+        return UuidToText(Cookie);
+    }
+}
+
+string UuidToText(guid u)
+{
+    return "{" + u.ToString() + "}";
+}
+
+// 2.2.3.2.1   Client Address - IPv4
+type ClientIPv4Address
+{
+    uint AddressType where value == 0;
+    IPv4Address ClientAddress with BinaryEncoding{Endian = Endian.Little}, DisplayInfo{ToText = IPv4AddressLittleEndianToText};
+    array<byte> Padding with BinaryEncoding{Length = 12};
+    
+    static string IPv4AddressLittleEndianToText(any address)
+    {
+        binary octets = (address as IPv4Address).Octets;
+        // Memo: Using array index may fail if encounter trucated messages.
+        string ip = "";
+        for (int i = octets.Count - 1; i >= 0; i--)
+        {
+            ip = ip + (octets[i] as string);
+            if (i > 0)
+            {
+                ip = ip + ".";
+            }
+        }
+        return ip;
+    }
+}
+
+// 2.2.3.2.2   Client Address - IPv6
+type ClientIPv6Address
+{
+    uint AddressType where value == 1;
+    IPv6Address ClientAddress with BinaryEncoding{Endian = Endian.Little}, DisplayInfo{ToText = IPv6AddressLittleEndianToText};
+    array<byte> Padding with BinaryEncoding{Length = 12};
+    
+    static string IPv6AddressLittleEndianToText(any address)
+    {
+        // Memo: Using array index may fail if encounter trucated messages.
+        array<byte> bytes = (address as IPv6Address).Octets as array<byte>;
+        string ip = "";
+        for (int i = bytes.Count - 1; i >= 0; i -= 2)
+        {
+            int b = (bytes[i - 1]) + (bytes[i] << 8);
+            ip += (b == 0) ? "0:" : (Format("{0:X}", b) + ":");
+        }
+        return ip.Segment(0, ip.Count - 1);
+    }
+}
+
+// 2.2.3.3   Forward Destinations
+pattern ForwardDestinations = enum uint
+{
+    FDClient   = 0x00000000,
+    FDInProxy  = 0x00000001,
+    FDServer   = 0x00000002,
+    FDOutProxy = 0x00000003,
+};
+
+// 2.2.3.4   Flow Control Acknowledgment
+type FlowControlAcknowledgment
+{
+    uint BytesReceived;
+    uint AvailableWindow;
+    RTSCookie ChannelCookie;
+
+    override string ToString()
+    {
+        return "BytesReceived: " + BytesReceived.ToString() + 
+            ", AvailableWindow: " + AvailableWindow.ToString() +
+            ", ChannelCookie: " + ChannelCookie.ToString();
+    }
+}
+
+// 2.2.3.5   RTS Commands
+// 2.2.3.5.1   ReceiveWindowSize
+type ReceiveWindowSize
+{
+    uint CommandType where value == 0x00000000;
+    uint ReceiveWindowSize where ValidationCheck(value >= 8192 && value <= 262144, null, DiagnosisLevel.Error, Format(RPCH_STR_ReceiveWindowSize, value.ToString()));
+    
+    override string ToString()
+    {
+        return ReceiveWindowSize.ToString();
+    }
+}
+
+// 2.2.3.5.2   FlowControlAck
+type FlowControlAck
+{
+    uint CommandType where value == 0x00000001;
+    FlowControlAcknowledgment Ack;
+
+    override string ToString()
+    {
+        return Ack.ToString();
+    }
+}
+
+// 2.2.3.5.3   ConnectionTimeout 
+type ConnectionTimeout
+{
+    uint CommandType where value == 0x00000002;
+    uint ConnectionTimeout where ValidationCheck(value >= 120000 && value <= 14400000 , null, DiagnosisLevel.Error, Format(RPCH_STR_ConnectionTimeout, value.ToString()));
+
+    override string ToString()
+    {
+        return ConnectionTimeout.ToString();
+    }
+}
+
+// 2.2.3.5.4   Cookie  
+type Cookie
+{
+    uint CommandType where value == 0x00000003;
+    RTSCookie Cookie;
+
+    override string ToString()
+    {
+        return Cookie.ToString();
+    }
+}
+
+// 2.2.3.5.5   ChannelLifetime  
+type ChannelLifetime
+{
+    uint CommandType where value == 0x00000004;
+    uint ChannelLifetime where ValidationCheck(value >= 131072 && value <= 2147483648, null, DiagnosisLevel.Error, Format(RPCH_STR_ChannelLifetime, ChannelLifetime, value.ToString()));
+
+    override string ToString()
+    {
+        return ChannelLifetime.ToString();
+    }
+}
+
+// 2.2.3.5.6   ClientKeepalive   
+type ClientKeepalive
+{
+    uint CommandType where value == 0x00000005;
+    uint ClientKeepalive where ValidationCheck((value == 0) || (value >= 60000 && value <= 4294967295), null, DiagnosisLevel.Error, Format(RPCH_STR_ClientKeepalive, value.ToString()));
+
+    override string ToString()
+    {
+        return ClientKeepalive.ToString();
+    }
+}
+
+// 2.2.3.5.7   Version   
+type Version
+{
+    uint CommandType where value == 0x00000006;
+    uint Version where ValidationCheck(value == 1, null, DiagnosisLevel.Warning, Format(RPCH_STR_Version, value.ToString()));
+
+    override string ToString()
+    {
+        return Utility.DecToHexFormat(Version);
+    }
+}
+
+// 2.2.3.5.8   Empty   
+type Empty
+{
+    uint CommandType where value == 0x00000007;
+}
+
+// 2.2.3.5.9   Padding   
+type Padding
+{
+    uint CommandType where value == 0x00000008;
+    uint ConformanceCount where ValidationCheck(value >= 0 && value <= 0xFFFF, null, DiagnosisLevel.Error, Format(RPCH_STR_ConformanceCount, value.ToString()));
+    array<byte> Padding with BinaryEncoding{Length = ConformanceCount};
+    
+    override string ToString()
+    {
+        return ConformanceCount.ToString();
+    }
+}
+
+// 2.2.3.5.10   NegativeANCE    
+type NegativeANCE 
+{
+    uint CommandType where value == 0x00000009;
+}
+
+// 2.2.3.5.11   ANCE     
+type ANCE  
+{
+    uint CommandType where value == 0x0000000A;
+}
+
+// 2.2.3.5.12   ClientAddress     
+type ClientAddress  
+{
+    uint CommandType where value == 0x0000000B;
+    (ClientIPv4Address | ClientIPv6Address) ClientAddress;
+
+    override string ToString()
+    {
+        return (ClientAddress is ClientIPv4Address) ? (ClientAddress as ClientIPv4Address).ClientAddress.ToString() : (ClientAddress as ClientIPv6Address).ClientAddress.ToString();
+    }
+}
+
+// 2.2.3.5.13   AssociationGroupId     
+type AssociationGroupId  
+{
+    uint CommandType where value == 0x0000000C;
+    RTSCookie AssociationGroupId;
+
+    override string ToString()
+    {
+        return AssociationGroupId.ToString();
+    }
+}
+
+// 2.2.3.5.14   Destination     
+type Destination  
+{
+    uint CommandType where value == 0x0000000D;
+    ForwardDestinations Destination where ValidationCheck(value is ForwardDestinations, null, DiagnosisLevel.Error, Format(RPCH_STR_ForwardDestinations, DecToHexFormat(value)));
+
+    override string ToString()
+    {
+        return EnumToString(Destination, "RPCH.ForwardDestinations");
+    }
+}
+
+// 2.2.3.5.15   PingTrafficSentNotify     
+type PingTrafficSentNotify  
+{
+    uint CommandType where value == 0x0000000E;
+    uint PingTrafficSent;
+
+    override string ToString()
+    {
+        return PingTrafficSent.ToString();
+    }
+}
+
+type CoDrepFormatLabel
+{
+    IntergerFloatingPointByteOrder IntegerRepresentation with BinaryEncoding{Width = 4};
+    CharacterRepresentation CharacterRepresentation with BinaryEncoding{Width = 4};
+    FloatingPointRepresentation FloatingPointRepresentation;
+    byte Reserved;
+    byte Reserved2;
+}
+
+pattern IntergerFloatingPointByteOrder = enum byte
+{
+    BigEndian = 0,
+    LittleEndian = 1,
+};
+
+pattern CharacterRepresentation = enum byte
+{
+    Ascii   = 0,
+    Ebcdic  = 1,
+};
+
+pattern FloatingPointRepresentation = enum byte
+{
+    Ieee    = 0,
+    Vax     = 1,
+    Cray    = 2,
+    Ibm     = 3,
+};
+
+pattern PDUHeader_Flags = flags ushort
+{
+    RTS_FLAG_NONE                = 0x0000,
+    RTS_FLAG_PING                = 0x0001,
+    RTS_FLAG_OTHER_CMD           = 0x0002,
+    RTS_FLAG_RECYCLE_CHANNEL     = 0x0004,
+    RTS_FLAG_IN_CHANNEL          = 0x0008,
+    RTS_FLAG_OUT_CHANNEL         = 0x0010,
+    RTS_FLAG_EOF                 = 0x0020,
+    RTS_FLAG_ECHO                = 0x0040,
+};
+
+// Keep IsDataSufficient, because RPCHOverHTTP and MSRPCEOverRPCH will use these function
+uint? IsDataSufficient(binary b)
+{
+    if (b.Count < 10)
+    {
+        return null;
+    }
+    else
+    {
+        var temp = (b[8] + (b[9] << 8)) as uint;
+        return (temp <= b.Count) ? 0 : temp;
+    }
+}
+
+//type RPCHMessageIdentifier
+//{
+    //byte rpc_vers where value == 5;
+    //byte rpc_vers_minor where (value == 0 || value == 1);
+    //byte PTYPE where (value == 20); /*packet type */
+    //RpcCoPfcFlags pfc_flags where (value == (RpcCoPfcFlags.PfcFirstFrag | RpcCoPfcFlags.PfcLastFrag));
+    //array<byte> packed_drep with BinaryEncoding{Length = 4};
+    //ushort frag_length where value >= 20;
+    //ushort auth_length where value == 0;
+    //uint call_id where value == 0;
+//}
+//
+pattern RpcCoPfcFlags = flags byte
+{
+    PfcFirstFrag          = 0x01,/* First fragment */
+    PfcLastFrag           = 0x02,/* Last fragment */
+    $"PfcPendingCancel | PfcSupportHeaderSign"      = 0x04,/* Cancel was pending at sender */
+    PfcReserved1          = 0x08,
+    PfcConcMpx            = 0x10,/* supports concurrent multiplexing  of a single connection. */
+    PfcDidNotExecute      = 0x20,/* only meaningful on ‘fault’ packet; if true, guaranteed call did not execute. */
+    PfcMaybe              = 0x40,/* ‘maybe’ call semantics requested */
+    PfcObjectUuid         = 0x80,/* if true, a non-nil object UUID
+                                  * was specified in the handle, and
+                                  * is present in the optional object
+                                  * field. If false, the object field
+                                  * is omitted. */
+};

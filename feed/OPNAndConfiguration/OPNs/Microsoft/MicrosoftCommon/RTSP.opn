@@ -1,0 +1,493 @@
+protocol RTSP with 
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Real Time Streaming Protocol (RTSP)",
+    ShortName = "RTSP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2326"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "379652", Date = "07/09/2015"}
+        ]
+};
+
+using HTTP;
+using TCP;
+using Utility;
+using IANA;
+
+const binary RTSPResponseInitial = $[52545350];
+const binary CRLFBinary = $[0D0A];
+
+annotation string Response#RTSPMethod;
+
+endpoint Server over TCP.Server
+    accepts Request accepts Response
+    issues Request issues Response
+{
+    map<uint, string> sourceMethods = {};
+    map<uint, string> issuesMethods = {};
+
+    observe this accepts req:Request
+    {
+        if (req.Headers.Keys["CSeq"])
+        {
+            sourceMethods += {(req.Headers["CSeq"] as uint) -> req.RequestLine.Method};
+        }
+    }
+
+    observe this issues res:Response
+    {
+        if (res.Headers.Keys["CSeq"])
+        {
+            uint cseq = res.Headers["CSeq"] as uint;
+            if (sourceMethods.Keys[cseq])
+            {
+                res#RTSPMethod = sourceMethods[cseq];
+                sourceMethods = sourceMethods.Remove(cseq);
+            }
+        }
+    }
+
+    observe this issues req:Request
+    {
+        if (req.Headers.Keys["CSeq"])
+        {
+            issuesMethods += {(req.Headers["CSeq"] as uint) -> req.RequestLine.Method};
+        }
+    }
+
+    observe this accepts res:Response
+    {
+        if (res.Headers.Keys["CSeq"])
+        {
+            uint cseq = res.Headers["CSeq"] as uint;
+            if (issuesMethods.Keys[cseq])
+            {
+                res#RTSPMethod = issuesMethods[cseq];
+                issuesMethods = issuesMethods.Remove(cseq);
+            }
+        }
+    }
+}
+
+autostart actor RtspOverTcp(TCP.Server server)
+{
+    RtspOverTCPDecodingHelper decodingHelper = null;
+
+    process server accepts seg:TCP.Segment where seg.DestinationPort == IANA.Port.RTSP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server issues seg:TCP.Segment where seg.SourcePort == IANA.Port.RTSP
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+// section 6 Request
+message Request
+{
+    RequestLineType RequestLine;
+    HttpHeadersType Headers;
+    optional binary MessageBody;
+
+    override string ToString()
+    {
+        string summaryLine = "Request, " + RequestLine.Method + " " + RequestLine.RequestURI.ToString() +
+            ", Version: " + RequestLine.RTSPVersion.ToString();
+
+        if (Headers.Keys["CSeq"])
+        {
+            summaryLine += ", CSeq: " + Headers["CSeq"].ToString();
+        }
+
+        return summaryLine;
+    }
+};
+
+// section 7 Response
+message Response
+{
+    StatusLineType StatusLine;
+    HttpHeadersType Headers;
+    optional binary MessageBody;
+
+    override string ToString()
+    {
+        string summaryLine = "Response, Status: " + StatusLine.Reason + " (" + StatusLine.Status.ToString() +
+            ") , Version: " + StatusLine.RTSPVersion.ToString();
+        
+        if (Headers.Keys["CSeq"])
+        {
+            summaryLine += ", CSeq: " + Headers["CSeq"].ToString();
+        }
+
+        return summaryLine;
+    }
+};
+// ----------------------------------------- syntax -----------------------------------------------
+// section 6 Request
+syntax RequestHeader = line:RequestLine headers:(header:HTTP.MessageHeader CRLF => header)* HTTP.CRLF =>
+    new Request
+    {
+        RequestLine = line,
+        Headers = HTTP.MergeHeaders(headers),
+    };
+
+// section 6.1 Request Line
+syntax RequestLine = method:HTTP.Method HTTP.SP uri:RequestURI HTTP.SP version:RTSPVersion HTTP.CRLF =>
+    new RequestLineType
+    {
+        Method = method,
+        RequestURI = uri,
+        RTSPVersion = version,
+    };
+type RequestLineType
+{
+    string Method;
+    UriType RequestURI;
+    RtspVersionType RTSPVersion;
+}
+syntax RequestURI = s:(ss:"*" => HTTP.ParseUri(ss) | HTTP.AbsoluteUri) => s;
+syntax RTSPVersion = "RTSP/" major:HTTP.Digits "." minor:HTTP.Digits =>
+    new RtspVersionType
+    {
+        Major = major as uint,
+        Minor = minor as uint
+    };
+type RtspVersionType
+{
+    uint Major;
+    uint Minor;
+
+    override string ToString()
+    {
+        return "RTSP/" + Major.ToString() + "." + Minor.ToString();
+    }
+}
+// section 7 Response
+syntax ResponseHeader = line:StatusLine headers:(header:HTTP.MessageHeader HTTP.CRLF => header)* HTTP.CRLF
+    => new Response
+        {
+            StatusLine = line,
+            Headers = MergeHeaders(headers),
+        };
+syntax StatusLine = version:RTSPVersion HTTP.SP status:HTTP.StatusCode HTTP.SP reason:HTTP.ReasonPhrase HTTP.CRLF =>
+    new StatusLineType
+    {
+        RTSPVersion = version,
+        Status = status,
+        Reason = reason
+    };
+type StatusLineType
+{
+    RtspVersionType RTSPVersion;
+    uint Status;
+    string Reason;
+}
+// section 12.17 CSeq
+syntax CSeqNumber    = s:Digits => (s as uint);
+// ----------------------------------------- Decoding Methods -----------------------------------------------
+type RtspOverTCPDecodingHelper : TCP.TCPDecodingHelper
+{
+    void InitializeRtspOverTCPDecodingHelper(TCP.Server server)
+    {
+        RtspOverTCPDecodingCache acceptsCache = new RtspOverTCPDecodingCache();
+        acceptsCache.InitializeRtspOverTCPDecodingCache(MessageDirection.Accepts, server);
+        AcceptsCache = acceptsCache;
+
+        RtspOverTCPDecodingCache issuesCache = new RtspOverTCPDecodingCache();
+        issuesCache.InitializeRtspOverTCPDecodingCache(MessageDirection.Issues, server);
+        IssuesCache = issuesCache;
+    }
+}
+
+type RtspOverTCPDecodingCache: TCP.TCPDecodingCache
+{
+    // Server can send Request of "Notify" method. Its direction is contrary with normal messages, which means server issues request and accecpts respones.
+    // To support this scenario, we have two header in each direction's cache
+    optional RTSP.Request Request = nothing;
+    optional RTSP.Response Response = nothing;
+    uint HeaderLength = 0;
+    uint BodyLength = 0;
+
+    void ResetContext()
+    {
+        Request = nothing;
+        Response = nothing;
+        HeaderLength = 0;
+        BodyLength = 0;
+    }
+
+    void InitializeRtspOverTCPDecodingCache(MessageDirection messageDirection, TCP.Server server)
+    {
+        base.Initialize(
+            "RTSP",
+            endpoint RTSP.Server over server,
+            messageDirection,
+            IsRtsp,
+            IsSufficientForRtsp,
+            DecodeRtspMessage,
+            DecodeRtspIncompleteMessage);
+    }
+
+    bool? IsRtsp(binary buffer)
+    {
+        // not sure request or response. Try response first
+        stream s = buffer;
+
+        if (buffer.Count <= 4)
+        {
+            return null;
+        }
+
+        if (buffer.Segment(0, 4) == RTSPResponseInitial)
+        {
+            return true;
+        }
+        // Then it must not be Response.
+        else if (RequestLine(buffer) != nothing)
+        {
+            return true;
+        }
+
+        // check whether it has enough data to check it is request
+        // check already received a line
+        if (buffer.IndexOf(CRLFBinary) < 0)
+        {
+            return null;
+        }
+
+        return false;
+    }
+
+    uint? IsSufficientForRtsp(binary buffer)
+    {
+        stream s = buffer;
+
+        if (buffer.Segment(0, 4) != RTSPResponseInitial)
+        {
+            // request
+            if (Request is request1:RTSP.Request) // header is ready
+            {
+                return IsSufficientForRtspBody(request1.Headers); // HeaderLength > 0
+            }
+            else // header is not ready, decode header firstly
+            {
+                Request = RTSP.RequestHeader(s);
+                if (Request is request2:RTSP.Request) // if decoding header succeed
+                {
+                    request2.Headers = RTSP.ParseHeaderFields(request2.Headers);
+                    HeaderLength = s.BytePosition as uint; // set HeaderLength
+                    return IsSufficientForRtspBody(request2.Headers);
+                }
+                else // if decoding header fail, wait enough data to decode header
+                {
+                    return null;
+                }
+            }
+        }
+        else // response
+        {
+            if (Response is response1:RTSP.Response) // header is ready, check length
+            {
+                return IsSufficientForRtspBody(response1.Headers); // HeaderLength > 0
+            }
+            else // header is not ready, decode header firstly
+            {
+                Response = RTSP.ResponseHeader(s);
+                if (Response is response2:RTSP.Response) // if decoding header succeed
+                {
+                    response2.Headers = RTSP.ParseHeaderFields(response2.Headers);
+                    HeaderLength = s.BytePosition as uint; // set HeaderLength
+                    return IsSufficientForRtspBody(response2.Headers);
+                }
+                else // if decoding header fail, wait enough data to decode header
+                {
+                    return null;
+                }
+            }
+        }
+    }
+
+    uint? IsSufficientForRtspBody(map<string, any> headers)
+    {
+        BodyLength = GetRtspBodyLength(headers);
+        uint length = BodyLength + HeaderLength;
+        return length <= BufferCount() ? 0 : length;
+    }
+
+    optional any message DecodeRtspMessage(stream s)
+    {
+        optional any message result = nothing;
+        if (Request is request:RTSP.Request) // for request
+        {
+            result = TryDecodeRequestBody(request, s, HeaderLength as int, BodyLength as int, false);
+        }
+        else if (Response is response:RTSP.Response) // for response
+        {
+            result = TryDecodeResponseBody(response, s, HeaderLength as int, BodyLength as int, false);
+        }
+        return result;
+    }
+
+    optional any message DecodeRtspIncompleteMessage(binary buffer)
+    {
+        optional any message result = nothing;
+        if (Request is request:RTSP.Request) // for request
+        {
+            result  = TryDecodeRequestBody(request, buffer, HeaderLength as int, BodyLength as int, true);
+        }
+        else if (Response is response:RTSP.Response) // for response
+        {
+            result  = TryDecodeResponseBody(response, buffer, HeaderLength as int, BodyLength as int, true);
+        }
+        return result;
+    }
+
+    override void ClearExceptionally()
+    {
+        base.ClearExceptionally();
+        ResetContext();
+    }
+
+    override void ResetAfterSucceed(stream s)
+    {
+        assert Initliazed == true;
+        if (s == null || Buffer.Count == HeaderLength + BodyLength)
+        {
+            Buffer = $[];
+            Origins = [];
+            BufferStartSequenceNumber = BufferEndSequenceNumber;
+        }
+        else // Buffer has data, keep the last origin.
+        {
+            Buffer = Buffer.Segment((HeaderLength + BodyLength) as int);
+            BufferStartSequenceNumber += HeaderLength + BodyLength;
+            Origins = Origins.Segment(Origins.Count - 1);
+        }
+        IsCurProtocol = null;
+        BufferLengthNeeded = null;
+
+        ResetContext();
+    }
+}
+
+uint GetRtspBodyLength(map<string, any> headers)
+{
+    return ("Content-Length" in headers) ? 
+        headers["Content-Length"] as uint : 0;
+}
+
+optional RTSP.Request TryDecodeRequestBody(RTSP.Request request, stream s, int headerLength, int bodyLength, bool dealWithIncompleteMessage)
+{
+    var remainingLength = RemainingByteLength(s) - headerLength;
+    if (dealWithIncompleteMessage)
+    {
+        bodyLength = remainingLength;
+    }
+
+    if (bodyLength > 0)
+    {
+        if (remainingLength < bodyLength)
+        {
+            return nothing;
+        }
+        request.MessageBody = s.PeekBytes(headerLength * 8, bodyLength);
+    }
+
+    // assign association information for Headers
+    int headerPos = request.RequestLine.Method.Count + 1 +
+        request.RequestLine.RequestURI.ToString().Count + 1 +
+        8 /* RTSP Version */ + 2 /* 0D0A */;
+    request.AssignFieldEncodingInfo("Headers", headerPos * 8, (headerLength - headerPos) * 8);
+
+    // assgin association information for body
+    if (request.MessageBody != nothing)
+    {
+        request.AssignFieldEncodingInfo("MessageBody", headerLength * 8, bodyLength * 8);
+    }
+
+    // Set SourceData
+    request.SourceData = s.PeekBytes(s.BitPosition, headerLength + bodyLength);
+
+    return request;
+}
+
+optional RTSP.Response TryDecodeResponseBody(RTSP.Response response, stream s, int headerLength, int bodyLength, bool dealWithIncompleteMessage)
+{
+    var remainingLength = RemainingByteLength(s) - headerLength;
+    if (dealWithIncompleteMessage)
+    {
+        bodyLength = remainingLength;
+    }
+
+    if (bodyLength > 0)
+    {
+        if (remainingLength < bodyLength)
+        {
+            return nothing;
+        }
+        response.MessageBody = s.PeekBytes(headerLength * 8, bodyLength);
+    }
+
+    // assign association information for Headers
+    int headerPos = 9 /* RTSP Version */ + 4 /* Status code */ + response.StatusLine.Reason.Count + 2 /* 0D0A */;
+    response.AssignFieldEncodingInfo("Headers", headerPos * 8, (headerLength - headerPos) * 8);
+
+    // assgin association information for body
+    if (response.MessageBody != nothing)
+    {
+        response.AssignFieldEncodingInfo("MessageBody", headerLength * 8, bodyLength * 8);
+    }
+
+    // Set SourceData
+    response.SourceData = s.PeekBytes(s.BitPosition);
+
+    return response;
+}
+
+map<string, any> ParseHeaderFields(map<string, any> headers)
+{
+    set<string> keys = headers.Keys;
+
+    var newHeaders = HTTP.ParseHeaderFields(headers);
+
+    if (keys["CSeq"])
+    {
+        HTTP.ParseHeaderValue<uint>("RTSP", "CSeq", ref newHeaders, RTSP.CSeqNumber, null);
+    }
+
+    return newHeaders;
+}

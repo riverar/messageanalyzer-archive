@@ -1,0 +1,123 @@
+protocol PefNdisProvider with
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382201", Date = "10/19/2015"}
+        ]
+};
+
+using Ethernet;
+using Etw;
+using EtwEvent;
+using Utility;
+using IPv6;
+
+const guid EtwProviderIdPefNdis = {9DE85B12-1202-467C-8047-ED308FB776C3};
+
+endpoint PefNdisNode
+    accepts PefNdisMsg
+    accepts PefNdisWifiMetaMsg
+{
+    process this accepts m:PefNdisMsg
+        // 0x00000001 NdisMedium802_3 
+        // 0x00000008 NdisMediumWan
+        where (m#EtwKeywords != nothing) && (((m#EtwKeywords as ulong) & (NdisMedium.NdisMedium802_3 | NdisMedium.NdisMediumWan)) != 0)
+    {
+        switch (m.FrameData)
+        {
+            case f:Ethernet.Frame from BinaryDecoder<Ethernet.Frame[false]> =>
+                dispatch (endpoint Ethernet.Node) accepts f;
+            default => 
+                ThrowDecodingException("PefNdisProvider", "Ethernet.Frame");
+        }
+    }
+    
+    process this accepts m:PefNdisMsg
+        // 0x00008000 NdisMediumTunnel
+        where (m#EtwKeywords != nothing) && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumTunnel) != 0)
+    {
+        switch (m.FrameData)
+        {
+            case f:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(f);
+            default => 
+                ThrowDecodingException("PefNdisProvider", "IPv6.Datagram");
+        }
+    }
+}
+
+autostart actor PefNdisOverEtwEvent(EtwEvent.Node etw)
+{
+    // PEF Ndis message
+    process etw accepts etwMsg:EtwProviderMsg
+        where value.EventRecord.Header.ProviderId == EtwProviderIdPefNdis
+           && value.EventRecord.Header.Descriptor.Id == 1001
+    {
+        switch (etwMsg.Payload)
+        {
+            case m:PefNdisMsg from BinaryDecoder<PefNdisMsg> =>
+                m#EtwKeywords = etwMsg.EventRecord.Header.Descriptor.Keywords;
+                m#EtwThreadID = etwMsg.EventRecord.Header.ThreadId;
+                dispatch (endpoint PefNdisNode) accepts m;
+            default =>
+                ThrowDecodingException("PefNdisProvider", "PefNdisMsg");
+        }
+    }
+    
+    // PEF Ndis Wifi MetaData message
+    process etw accepts etwMsg:EtwProviderMsg
+        where value.EventRecord.Header.ProviderId == EtwProviderIdPefNdis
+           && value.EventRecord.Header.Descriptor.Id == 1002
+    {
+        switch (etwMsg.Payload)
+        {
+            case m:PefNdisWifiMetaMsg from BinaryDecoder<PefNdisWifiMetaMsg> =>
+                dispatch (endpoint PefNdisNode) accepts m;
+            default =>
+                ThrowDecodingException("PefNdisProvider", "PefNdisWifiMetaMsg");
+        }
+    }
+}
+
+message PefNdisMsg
+{
+    uint MiniportIfIndex;
+    uint LowerIfIndex;
+    uint FrameSize;
+    binary FrameData;
+    
+    override string ToString()
+    {
+        return ( "MiniportIfIndex: " + (MiniportIfIndex as string)  +
+                 ", LowerIfIndex: " + (LowerIfIndex as string) + 
+                 ", FrameSize: " + (FrameSize as string) );
+    }
+}
+
+int get PayloadLength(this PefNdisProvider.PefNdisMsg msg)
+{
+    return msg.FrameData.Count;
+}
+
+message PefNdisWifiMetaMsg
+{
+    uint MiniportIfIndex;
+    uint LowerIfIndex;
+    binary MetaData;
+    
+    override string ToString()
+    {
+        return "MiniportIfIndex: " + (MiniportIfIndex as string)
+             + ", LowerIfIndex: " + (LowerIfIndex as string);
+    }
+}
+
+int get PayloadLength(this PefNdisProvider.PefNdisWifiMetaMsg msg)
+{
+    return msg.MetaData.Count;
+}

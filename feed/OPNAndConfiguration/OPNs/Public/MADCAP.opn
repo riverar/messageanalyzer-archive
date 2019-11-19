@@ -1,0 +1,321 @@
+protocol MADCAP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Multicast Address Dynamic Client Allocation Protocol",
+    ShortName = "MADCAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2730"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using Standard;
+using IANA;
+using Utility;
+using UDP;
+
+endpoint Node over UDP.Host accepts Packet;
+
+const set<byte> MADCAPMsgType = {1, 2, 3, 4, 5, 6, 7, 8};
+
+autostart actor MADCAPOverUDP(UDP.Host node)
+{
+    process node accepts s:UDP.Datagram where s.Payload.Count > 1 && ((s.SourcePort is Port.MADCAP || s.DestinationPort is Port.MADCAP) && MADCAPMsgType[s.Payload[1]])
+    {
+        switch (s.Payload)
+        {
+            case d:Packet from BinaryDecoder<Packet> =>
+                dispatch (endpoint MADCAP.Node over node) accepts d;
+            default =>
+                ThrowDecodingException("MADCAP");
+        }
+    }
+}
+
+// [RFC 2730    Page 5    2.1. Message Format]
+message Packet
+{
+    byte         Version;
+    MessageTypes MsgType;
+    ushort       AddrFamily;
+    uint         TransactionID;
+    array<OptionType[AddrFamily]> Options;
+    
+    override string ToString()
+    {
+        return "MsgType: " + MadcapMessageTypes(MsgType) + 
+            ", TransID: " + Utility.DecToHexFormat(TransactionID) +
+            ", AddressFamily: " + AddressFamilyTable(AddrFamily);
+    }
+}
+
+// [RFC 2730    Page 10    2.2. Message Types]
+pattern MessageTypes = enum byte
+{
+    Discover = 1,
+    Offer    = 2,
+    Request  = 3,
+    Renew    = 4,
+    Ack      = 5,
+    Nak      = 6,
+    Release  = 7,
+    GetInfo  = 8,
+    ...
+};
+
+pattern FeatureName = enum ushort
+{
+    ServerMobility        = 0,
+    RetryAfter            = 1,
+    SharedLeaseIdentifier = 2,
+};
+
+pattern MadcapOption = enum ushort
+{
+    End                      = 0,
+    LeaseTime                = 1,
+    ServerIdentifier         = 2,
+    LeaseIdentifier          = 3,
+    MulticastScope           = 4,
+    OptionRequestList        = 5,
+    StartTime                = 6,
+    NumberOfAddressRequested = 7,
+    RequestedLanguage        = 8,
+    MulticastScopeList       = 9,
+    ListOfAddressRanges      = 10,
+    CurrentTime              = 11,
+    FeatureList              = 12,
+    RetryTime                = 13,
+    MinimumLeastTime         = 14,
+    MaximumStartTime         = 15,
+    Error                    = 16,
+};
+
+type OptionType[ushort AddrFamily]
+{
+    (End                            |
+    LeaseTime                       |
+    ServerIdentifier                |
+    LeaseIdentifierType             |
+    MulticastScope[AddrFamily]      |
+    OptionRequestList               |
+    StartTime                       |
+    NumberOfAddressRequested        |
+    RequestedLanguage               |
+    MultiScopeList[AddrFamily]      |
+    ListOfAddressRanges[AddrFamily] |
+    CurrentTime                     |
+    FeatureList                     |
+    RetryTime                       |
+    MinimumLeastTime                |
+    MaximumStartTime                |
+    Error) Option;
+}
+
+type End
+{
+    (ushort where value == 0) Code;
+    ushort Length where ValidationCheck(value == 0, null, "The code for End option is zero, and its length is zero.");
+}
+
+type LeaseTime
+{
+    (ushort where value == 1) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Lease Time option is 1, and its length is 4.");
+    uint   Seconds;
+}
+
+type ServerIdentifier
+{
+    (ushort where value == 2) Code;
+    ushort Length where ValidationCheck(value >= 3, null, "The code for Server Identifier option is 2, and its minimum length is 3.");
+    ushort AddrFamily;
+    ([|AddrFamily == 1|] IPv4Address | [|AddrFamily == 2|] IPv6Address) Address;
+}
+
+type LeaseIdentifierType
+{
+    (ushort where value == 3) Code;
+    ushort Length where ValidationCheck(value >= 1, null, "The code for Lease Identifier option is 3, and its minimum length is 1.");
+    byte   Type;
+    ([|Type == 0|] Random[Length as uint] | [|Type == 1|] AddressSpecific[Length as uint]) LeaseIdentifier;
+}
+
+type Random[uint Length]
+{
+    binary RandomNumber with BinaryEncoding{Length = Length - 1};
+}
+
+type AddressSpecific[uint Length]
+{
+    ushort AddrFamily;
+    ([|AddrFamily == 1|] IPv4Address | [|AddrFamily == 2|] IPv6Address) Address;
+    binary ClientSpecID with BinaryEncoding{Length = Length - (AddressFamilySize(AddrFamily) + 3)};
+}
+
+type MulticastScope[ushort AddrFamily]
+{
+    (ushort where value == 4) Code;
+    ushort Length where ValidationCheck(value >= 1, null, "The code for Multicast Scope option is 4, and its minimum length is 1.");
+    array<ScopeIDType[AddrFamily]> ScopeID with BinaryEncoding{Length = (Length) / AddressFamilySize(AddrFamily)};
+}
+
+type ScopeIDType[ushort AddrFamily]
+{
+    ([|AddrFamily == 1|] IPv4Address | [|AddrFamily == 2|] IPv6Address) Address;
+}
+
+type OptionRequestList
+{
+    (ushort where value == 5) Code;
+    ushort Length where ValidationCheck(value >= 2, null, "The code for Option Request List option is 5, and its minimum length is 2.");
+    array<MadcapOption> Option with BinaryEncoding{Length = (Length) / 2};
+}
+
+type StartTime
+{
+    (ushort where value == 6) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Start Time option is 6, and its length is 4.");
+    uint   Time;
+}
+
+type NumberOfAddressRequested
+{
+    (ushort where value == 7) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Number of Address Requested option is 7, and its length is 4.");
+    ushort Minimum;
+    ushort Desired;
+}
+
+type RequestedLanguage
+{
+    (ushort where value == 8) Code;
+    ushort Length;
+    string Language with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = (Length)};
+}
+
+type MultiScopeList[ushort AddrFamily]
+{
+    (ushort where value == 9) Code;
+    ushort Length;
+    ushort Count with BinaryEncoding{Width = 8};
+    array<ScopeItem[AddrFamily]> Scopes with BinaryEncoding{Length = (Count)};
+}
+
+type ScopeItem[ushort AddrFamily]
+{
+    ScopeIDType[AddrFamily] FirstAddress;
+    ScopeIDType[AddrFamily] LastAddress;
+    ushort TTL with BinaryEncoding{Width = 8};
+    ushort NameCount with BinaryEncoding{Width = 8};
+    array<MadcapNames> NameList with BinaryEncoding{Length = (NameCount)};
+}
+
+type MadcapNames
+{
+    ushort Flags with BinaryEncoding{Width = 8};
+    ushort LangLength with BinaryEncoding{Width = 8};
+    string LanguageTag with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = (LangLength)};
+    ushort NameLength with BinaryEncoding{Width = 8};
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = (NameLength)};
+}
+
+type ListOfAddressRanges[ushort AddrFamily]
+{
+    (ushort where value == 10) Code;
+    ushort Length;
+    array<AddressRangeList[AddrFamily]> AddressList with BinaryEncoding{Length = (Length) / (AddressFamilySize(AddrFamily) + 2)};
+}
+
+type AddressRangeList[ushort AddrFamily]
+{
+    ([|AddrFamily == 1|] IPv4Address | [|AddrFamily == 2|] IPv6Address) StartAddress;
+    ushort BlockSize;
+}
+
+type CurrentTime
+{
+    (ushort where value == 11) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Current Time option is 11, and its length is 4.");
+    uint   Time;
+}
+
+type FeatureList
+{
+    (ushort where value == 12) Code;
+    ushort Length where ValidationCheck(value >= 6, null, "The code for Feature List option is 12, and its minimum length is 6.");
+    FeatureLists SupportedFeature;
+    FeatureLists RequestedFeature;
+    FeatureLists RequiredFeature;
+}
+
+type FeatureLists
+{
+    ushort FeatureCount;
+    array<FeatureName> Feature with BinaryEncoding{Length = (FeatureCount)};
+}
+
+type RetryTime
+{
+    (ushort where value == 13) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Retry Time option is 13, and its length is 4.");
+    uint   Time;
+}
+
+type MinimumLeastTime
+{
+    (ushort where value == 14) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Minimum Least Time option is 14, and its length is 4.");
+    uint   Time;
+}
+
+type MaximumStartTime
+{
+    (ushort where value == 15) Code;
+    ushort Length where ValidationCheck(value == 4, null, "The code for Maximum Start Time option is 15, and its length is 4.");
+    uint   Time;
+}
+
+type Error
+{
+    (ushort where value == 16) Code;
+    ushort Length where ValidationCheck(value >= 2, null, "The code for Error option is 16, and its minimum length is 2.");
+    ushort ErrorCode;
+    binary ExtraData with BinaryEncoding{Length = (Length) - 2};
+}
+
+string MadcapMessageTypes(byte msgType)
+{
+    switch (msgType)
+    {
+        case MessageTypes.Discover => return "DISCOVER";
+        case MessageTypes.Offer => return "OFFER";
+        case MessageTypes.Request => return "REQUEST";
+        case MessageTypes.Renew => return "RENEW";
+        case MessageTypes.Ack => return "ACK";
+        case MessageTypes.Nak => return "NAK";
+        case MessageTypes.Release => return "RELEASE";
+        case MessageTypes.GetInfo => return "GETINFO";
+        default => return "Unknown Message Type";
+    }
+}
+
+uint AddressFamilySize(ushort addrFamily)
+{
+    switch (addrFamily)
+    {
+        case $1 => return 4;
+        case $2 => return 16;
+        default => return 0;
+    }
+}

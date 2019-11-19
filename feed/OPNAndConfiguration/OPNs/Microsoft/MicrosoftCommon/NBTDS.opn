@@ -1,0 +1,191 @@
+protocol NBTDS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "NetBios Datagram Service",
+    ShortName = "NBTDS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1001"},
+            new Reference{Name = "RFC 1002"}, 
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "363316", Date = "04/27/2014"}
+        ]
+};
+    
+using Standard;
+using NBTNS;
+using Utility;
+using UDP;
+using IANA;
+
+endpoint Server over UDP.Host accepts Packet issues Packet;
+client endpoint Client connected to Server;
+
+autostart actor NBTDSOverUDP(UDP.Host node)
+{
+    process node accepts datagram:UDP.Datagram{DestinationPort is Port.NBTDS}
+    {
+        switch (datagram.Payload)
+        {
+            case d:Packet from BinaryDecoder<Packet> =>
+                dispatch endpoint NBTDS.Server over node accepts d;
+            default =>
+                ThrowDecodingException("NBTDS");
+        }
+    }
+    
+    process node accepts datagram:UDP.Datagram{SourcePort is Port.NBTDS}
+    {
+        switch (datagram.Payload)
+        {
+            case d:Packet from BinaryDecoder<Packet> =>
+                dispatch endpoint NBTDS.Server over node issues d;
+            default =>
+                ThrowDecodingException("NBTDS");
+        }
+    }
+}
+
+// [RFC 1002    Page 31    4.4.  DATAGRAM SERVICE PACKETS]
+message Packet
+{
+    MsgType     PacketType where ValidationCheckValueInRange((value >= 0x10 && value <= 0x16), null, true, ReferenceType.Message, "NBTDS", "PacketType", "Packet", "0x10", "0x16", value);
+    FlagsType       Flags;
+    ushort          DGMID;
+    (IPv4Address | IPv6Address) SourceIP with Visualization{AliasName = "Address"};
+    ushort          SourcePort;
+    optional [|PacketType in {MsgType.DirectUniqueDatagram, MsgType.DirectGroupDatagram, MsgType.BroadcastDatagram}|] ushort DGMLength;
+    optional [|PacketType in {MsgType.DirectUniqueDatagram, MsgType.DirectGroupDatagram, MsgType.BroadcastDatagram}|] ushort PacketOffset;
+    optional [|PacketType in {MsgType.DirectUniqueDatagram, MsgType.DirectGroupDatagram, MsgType.BroadcastDatagram}|] NbtName SourceName;
+    optional [|PacketType in {MsgType.DirectUniqueDatagram, MsgType.DirectGroupDatagram, MsgType.BroadcastDatagram, MsgType.DatagramQueryRequest, MsgType.DatagramPositiveQueryResponse, MsgType.DatagramNegativeQueryResponse}|] NbtName DestinationName;
+    optional [|PacketType == MsgType.DatagramError|] byte ErrorCode;
+    optional  binary UserData;
+
+    override string ToString()
+    {
+        string summary = NntDsMSGTypeTable(PacketType);
+        
+        if (SourceName != nothing)
+        {
+            var p = SourceName as NbtName;
+            if ((p.Name is NbtString))
+            {
+                summary += ", SourceName: " + (p.Name as NbtString).Chars;
+            }
+        }    
+        if (DestinationName != nothing)
+        {
+            var q = DestinationName as NbtName;
+            if (q.Name is NbtString)
+            {
+                summary += ", DestinationName: " + (q.Name as NbtString).Chars;
+            }
+        }
+        
+        return summary;
+    }
+} 
+
+// [RFC 1002    Page 32    4.4.1.  MSG_TYPE values (in hexidecimal)]
+pattern MsgType = enum byte
+{
+    DirectUniqueDatagram          = 0x10,
+    DirectGroupDatagram           = 0x11,
+    BroadcastDatagram             = 0x12,
+    DatagramError                 = 0x13,
+    DatagramQueryRequest          = 0x14,
+    DatagramPositiveQueryResponse = 0x15,
+    DatagramNegativeQueryResponse = 0x16,
+};
+
+// [RFC 1002    Page 32    4.4.1.  Bit definitions of the FLAGS field]
+type FlagsType
+{
+    byte Reserved      where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "NBTDS", "Reserved", "FlagsType", value) with BinaryEncoding{Width = 4};
+    byte SourceEndNode with BinaryEncoding{Width = 2};
+    byte FirstFlag     with BinaryEncoding{Width = 1};
+    byte MoreFlag      with BinaryEncoding{Width = 1};
+
+    override string ToString()
+    {
+        return NntDsSourceEndNodeTable(SourceEndNode) + ", " +
+            ((FirstFlag as bool)? "First Fragment" : "") + " " + ((MoreFlag as bool) ? "More Fragments" : "");
+    }
+}
+
+type NbtName
+{
+    (RRName | NbtString) Name;
+}
+
+type RRName
+{
+    (ushort where (value != 0x0)) PointerIndicater with BinaryEncoding{Width = 2};
+    ushort NamePointer with BinaryEncoding{Width = 14};
+}
+
+// [RFC 1002    Page 31    4.4.1.  NetBIOS DATAGRAM HEADER]
+string NntDsMSGTypeTable(byte packetType)
+{
+    switch (packetType)
+    {
+        case MsgType.DirectUniqueDatagram =>
+            return "DIRECT_UNIQUE DATAGRAM";
+        case MsgType.DirectGroupDatagram =>
+            return "DIRECT_GROUP DATAGRAM";
+        case MsgType.BroadcastDatagram =>
+            return "BROADCAST DATAGRAM";
+        case MsgType.DatagramError =>
+            return "DATAGRAM ERROR";
+        case MsgType.DatagramQueryRequest =>
+            return "DATAGRAM QUERY REQUEST";
+        case MsgType.DatagramPositiveQueryResponse =>
+            return "DATAGRAM POSITIVE QUERY RESPONSE";
+        case MsgType.DatagramNegativeQueryResponse =>
+            return "DATAGRAM NEGATIVE QUERY RESPONSE";
+        default   =>
+            return "DATAGRAM " + Utility.DecToHexFormat(packetType);
+    }
+}
+
+// [RFC 1002    Page 32    4.4.1.  NetBIOS DATAGRAM HEADER]
+string NntDsSourceEndNodeTable(byte node)
+{
+    switch (node)
+    {
+        case 0x00 =>
+            return "B node";
+        case 0x01 =>
+            return "P node";
+        case 0x02 =>
+            return "M node";
+        case 0x03 =>
+            return "NBDD";
+        default =>
+            return "Unknown NbtDs Source End Node: " + (node as string);
+    }
+}
+
+// [RFC 1002    Page 33    4.4.3.  DATAGRAM ERROR PACKET]
+string NbtDSBDErrorCode(byte code)
+{
+    switch (code)
+    {
+        case 0x82 =>
+            return "Error: DESTINATION NAME NOT PRESENT";
+        case 0x83 =>
+            return "Error: INVALID SOURCE NAME FORMAT";
+        case 0x84 =>
+            return "Error: INVALID DESTINATION NAME FORMAT";
+        default   =>
+            return "Error: Undefined: " + (code as string);
+    }
+}

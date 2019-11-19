@@ -1,0 +1,672 @@
+protocol WebIOEtwProvider
+with OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382201", Date = "10/19/2015"}
+        ]
+};
+
+using Etw;
+using EtwEvent;
+using Utility;
+using HTTP;
+using Standard;
+
+/* 
+ * This OPN decode HTTP messsage from WebIO provider.
+ * 
+ * message sequence of WebIO messages are shown as below,
+ * 1. HTTP session starts from WebIOEvent_HttpRequestHeader (Event 100),
+ *     which carries HTTP headers.
+ * 2. It is followed by WebIOEvent_HttpRequestBody (Event 111),
+ *     which carries HTTP payload. One HTTP request may contain multiple HTTP request body messages or no HTTP request body message
+ *     if there is no HTTP payload (Content-Length is 0).
+ * 3. Then WebIOEvent_HttpResponseHeader,
+ *     which carries HTTP response headers.
+ * 4. Then WebIOEvent_HttpResponseBody,
+ *     which carries HTTP payload.  One HTTP response may contain multiple HTTP request body messages or no HTTP response body message
+ *     if there is no HTTP payload (Content-Length is 0).
+ * 5. Last one will be WebIOEvent_RemoveHttpRequestInformationRoutine.
+ */
+autostart actor HttpOverWebIOEventNode(WebIOEtwProvider.WebIOEtwNode node)
+{
+    // Shared variables for whole connection.
+    ConnectionContext context = new ConnectionContext();
+    binary requestBodyCache = $[];
+    HttpContract.Request requestCache = null;
+    array<any message> requestOrigins = [];
+
+    binary responseBodyCache = $[];
+    HttpContract.Response responseCache = null;
+    array<any message> responseOrigins = [];
+    
+    observe node accepts m:WebIOEvent_RemoveHttpRequestInformationRoutine
+    {
+        // end of HTTP request and response session
+        DecodeAndDispatchRequestBody(false);
+        DecodeAndDispatchResponseBody(false);
+    }
+
+    process node accepts m:WebIOEvent_HttpRequestHeader
+    {
+        DecodeAndDispatchRequestBody(false);
+        DecodeAndDispatchResponseBody(false);
+
+        // MessageLengthMechanismEnum messageLengthMechanismEnum;
+        bool isChunkedTransport;
+
+        if (DecodeHttpRequestHeader(m.Headers, context, /*out messageLengthMechanismEnum,*/ out isChunkedTransport) is request:HttpContract.Request)
+        {
+            request#SourceAddress = "Local"; // set source for WebIO
+
+            if (context.UpperProtocol == UpperProtocolType.RPCH ||
+                context.UpperProtocol == UpperProtocolType.TSGU ||
+                isChunkedTransport)
+            {
+                // If it is RPCH or TSGU message, dispatch header immediately and not wait for its body.
+                // When RPCH or TSGU, HTTP session is used as stream and HTTP message will be very large.
+                // Then if reassemble these WebIO messages into one HTTP message will lead to below issues,
+                // 1. Several WebIO messages reassebled into one HTTP message and then one HTTP message decoded as multiple 
+                //     upper layer messages. Such 'X path' situation is not good practice in MMA.
+                // 2. Low performance because of waiting and reassebling large HTTP messages.
+                DecodeRequestBody(request, $[], [] /* by default, runtime dispatch sets the origins */);
+                dispatch (endpoint HTTP.Server over node) accepts request;
+            }
+            else
+            {
+                if (GetContentLength(request.Headers) > 0 || IsChunkedBody(request.Headers))
+                {
+                    // For Content-Length > 0 and chunked scenario, wait for following HTTP body to reassemble one HTTP message.
+                    requestOrigins += [m];
+                    requestCache = request;
+                }
+                else
+                {
+                    // Content Length is 0 and not chunked. There is not HTTP body message.
+                    // add empty HTTP payload and dispatch the HTTP message immediately.
+                    DecodeRequestBody(request, $[], [] /* by default, runtime dispatch sets the origins */);
+                    dispatch (endpoint HTTP.Server over node) accepts request;
+                }
+            }
+        }
+        else
+        {
+            // if HTTP header is not decode successfully, it is invalid WebIO Message
+            ThrowDecodingException("WebIO", "HTTP Header");
+        }
+    }
+
+    process node accepts m:WebIOEvent_HttpRequestBody
+    {
+        if (requestCache != null)
+        {
+            HttpContract.Request request = requestCache;
+
+            requestBodyCache += m.Data;
+            requestOrigins += [m];
+            if (!IsChunkedBody(request.Headers) && GetContentLength(request.Headers) <= requestBodyCache.Count) 
+            {
+                // If it is not chunked and length of body is greater or equal than Content-Length in header
+                // assign the body and dispatch the message immediately.
+               DecodeAndDispatchRequestBody(false);
+            }
+            // if it is chunked, it should wait and reassembly body message until WebIOEvent_RemoveHttpRequestInformationRoutine comes.
+            // Because in WebIO, there is no end flag in HTTP body message.
+
+            // if it is no chunked and body length is smaller than Content-Length in header,
+            // it should wait following HTTP body message.
+        }
+        else
+        {
+            // If no HTTP message header but HTTP body, it is RPCH or TSGU scenario.
+            var httpPayload = DecodeHttpPayload(m.Data, context);
+            dispatch (endpoint HTTP.Server over node) accepts httpPayload;
+        }
+    }
+
+    // see comments in WebIOEvent_HttpRequestHeader
+    process node accepts m:WebIOEvent_HttpResponseHeader
+    {
+        DecodeAndDispatchRequestBody(false);
+        DecodeAndDispatchResponseBody(false);
+
+        // MessageLengthMechanismEnum messageLengthMechanismEnum;
+        bool isChunkedTransport;
+        if (DecodeHttpResponseHeader(m.Headers, context, /*out messageLengthMechanismEnum,*/ out isChunkedTransport) is response:HttpContract.Response)
+        {
+            response#DestinationAddress = "Local"; // set desination for WebIO
+
+            if (context.UpperProtocol == UpperProtocolType.RPCH ||
+                context.UpperProtocol == UpperProtocolType.TSGU ||
+                isChunkedTransport)
+            {
+                DecodeResponseBody(response, $[], context, [] /* by default, runtime dispatch sets the origins */);
+                dispatch (endpoint HTTP.Server over node) issues response;
+            }
+            else
+            {
+                if (GetContentLength(response.Headers) > 0 || IsChunkedBody(response.Headers))
+                {
+                    responseOrigins += [m];
+                    responseCache = response;
+                    // wait following WebIOEvent_HttpResponseBody
+                }
+                else
+                {
+                    DecodeResponseBody(response, $[], context, [] /* by default, runtime dispatch sets the origins */);
+                    dispatch (endpoint HTTP.Server over node) issues response;
+                }
+            }
+        }
+        else
+        {
+            ThrowDecodingException("WebIO", "HTTP Response");
+        }
+    }
+
+    // see comments in WebIOEvent_HttpRequestBody
+    process node accepts m:WebIOEvent_HttpResponseBody
+    {
+        if (responseCache != null)
+        {
+            HttpContract.Response response = responseCache;
+
+            responseBodyCache += m.Data;
+            responseOrigins += [m];
+            if (!IsChunkedBody(response.Headers) && GetContentLength(response.Headers) <= responseBodyCache.Count)
+            {
+                DecodeAndDispatchResponseBody(false);
+            }
+        }
+        else
+        {
+            // dispatch as HTTP Payload
+            var httpPayload = DecodeHttpPayload(m.Data, context);
+            dispatch (endpoint HTTP.Server over node) issues httpPayload;
+        }
+    }
+
+    void DecodeAndDispatchRequestBody(bool isDestruct)
+    {
+        if (requestCache != null)
+        {
+            HttpContract.Request request = requestCache;
+            DecodeRequestBody(request, requestBodyCache, requestOrigins);
+
+            // clear
+            requestCache = null;
+            requestBodyCache = $[];
+            requestOrigins = [];
+
+            if (isDestruct)
+            {
+                DisplayTopLevelMessage(request);
+            }
+            else
+            {
+                dispatch (endpoint HTTP.Server over node) accepts request;
+            }
+        }
+    }
+
+    void DecodeAndDispatchResponseBody(bool isDestruct)
+    {
+        if (responseCache != null)
+        {
+            HttpContract.Response response = responseCache;
+            response.Payload = responseBodyCache;
+            DecodeResponseBody(response, responseBodyCache, context, responseOrigins);
+
+            // clear
+            responseBodyCache = $[];
+            responseCache = null;
+            responseOrigins = [];
+
+            if (isDestruct)
+            {
+                DisplayTopLevelMessage(response);
+            }
+            else
+            {
+                dispatch (endpoint HTTP.Server over node) issues response;
+            }
+        }
+    }
+
+    // destructor
+    ~endpoint(WebIOEtwProvider.WebIOEtwNode node)
+    {
+        DecodeAndDispatchRequestBody(true);
+        DecodeAndDispatchResponseBody(true);
+    }
+}
+
+HttpContract.HTTPPayload DecodeHttpPayload(binary buffer, ConnectionContext context)
+{
+    // dispatch as HTTP Payload
+    var httpPayload = new HttpContract.HTTPPayload();
+    httpPayload.Payload = buffer;
+    httpPayload#UpperProtocol = context.UpperProtocol;
+    httpPayload.SourceData = buffer;
+    httpPayload.AssignFieldEncodingInfo("Payload", 0, httpPayload.Payload.Count * 8);
+    return httpPayload;
+}
+
+void DecodeRequestBody(HttpContract.Request request, binary requestBody, array<any message> requestOrigins)
+{
+    request.Payload = requestBody;
+    SetAuthInfoForRequest(request);
+    AssociateRequest(request, 0, requestBody.Count, requestBody, requestOrigins);
+}
+
+void DecodeResponseBody(
+    HttpContract.Response response, 
+    binary responseBody,
+    ConnectionContext connectionContext,
+    array<any message> responseOrigins)
+{
+    response.Payload = responseBody;
+    SetAuthInfoForResponse(response);
+    AssociateResponseAndDecompressResponsePayload(response, 0, responseBody.Count, responseBody, responseOrigins);
+}
+
+optional HttpContract.Response DecodeHttpResponseHeader(stream s,
+    ConnectionContext context,
+    /*out MessageLengthMechanismEnum messageLengthMechanismEnum,*/
+    out bool isChunkedTransport)
+{
+    if (!IsHTTPResponse(s)) 
+    {
+        return nothing;
+    }
+    if (s.ByteLength - s.BytePosition < 9)
+    {
+        return nothing; // continue waiting for more data.
+    }
+
+    if (ResponseHeader(s) is response:HttpContract.Response) 
+    {
+        response.Headers = ParseHeaderFields(response.Headers); // further decode HTTP header.
+        response#SourceAddress = context.HostName;
+
+        bool isChunkedBody = false;
+        if (IsChunkedBody(response.Headers))
+        {
+            response.ChunkedMessageBody = new ChunkedBodyType{Chunks=[]};
+            // messageLengthMechanismEnum = MessageLengthMechanismEnum.Chunked;
+            isChunkedBody = true;
+        }
+        /*
+        else if ("Content-Length" in response.Headers && response.Headers["Content-Length"] is length:uint)
+        {
+            messageLengthMechanismEnum = MessageLengthMechanismEnum.ContentLength;
+        }
+        else if ("Connection" in response.Headers && ArrayContains(response.Headers["Connection"] as array<string>, "close"))
+        {
+            messageLengthMechanismEnum = MessageLengthMechanismEnum.ConnectionClose;
+        }*/
+
+        if (isChunkedBody && // messageLengthMechanismEnum == MessageLengthMechanismEnum.Chunked && 
+            (context.ChannelKind != ChannelKindEnum.Null || // it's in context of Channel
+                response.Headers.ContentTypeContains(CONTENT_TYPE_RPC))) // or request message is lost. 
+        {
+            isChunkedTransport = true;
+        }
+
+        // Reset ChannelKind to 'Null' if server responses with error code.
+        if (context.ChannelKind != ChannelKindEnum.Null && response.StatusCode >= 500)
+        {
+            context.ChannelKind = ChannelKindEnum.Null;
+        }
+        // Set to 'TunnelOrOutChannelEstablished' if server response with 200 for Out Channel request.
+        else if (context.ChannelKind == ChannelKindEnum.TunnelOrOutChannelEstablishing && response.StatusCode == 200)
+        {
+            context.ChannelKind = ChannelKindEnum.TunnelOrOutChannelEstablished;
+        }
+        else if (context.ChannelKind == ChannelKindEnum.InChannelEstablishing && response.StatusCode == 200)
+        {
+            context.ChannelKind = ChannelKindEnum.InChannelEstablished;
+        }
+
+        return response;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+optional HttpContract.Request DecodeHttpRequestHeader(stream s,
+    ConnectionContext context,
+    /*out MessageLengthMechanismEnum messageLengthMechanismEnum,*/
+    out bool isChunkedTransport)
+{
+    if (RequestHeader(s) is request:HttpContract.Request)
+    {
+        request.Headers = ParseHeaderFields(request.Headers); // further parsing header.
+        context.HostName = request.HTTPHost;
+        request#DestinationAddress = context.HostName;
+        
+        // Update necessary variables 
+        var method = request.Method.ToUpper();
+        if (method == "HEAD") context.IsHeadMethod = true;
+    
+        bool isChunkedBody = false;
+        // Initialize chunked related cache if needed.
+        if (IsChunkedBody(request.Headers))
+        {
+            request.ChunkedMessageBody = new ChunkedBodyType{Chunks=[]};
+            // messageLengthMechanismEnum = MessageLengthMechanismEnum.Chunked;
+            isChunkedBody = true;
+        }
+        /*
+        else if ("Content-Length" in request.Headers && request.Headers["Content-Length"] is length:uint)
+        {
+            messageLengthMechanismEnum = MessageLengthMechanismEnum.ContentLength;
+        }
+        else if ("Connection" in request.Headers && ArrayContains(request.Headers["Connection"] as array<string>, "close"))
+        {
+            messageLengthMechanismEnum = MessageLengthMechanismEnum.ConnectionClose;
+        }*/
+
+        if (isChunkedBody) // messageLengthMechanismEnum == MessageLengthMechanismEnum.Chunked
+        {
+            if (method == RPC_IN_DATA || method == RDG_IN_DATA)
+            {
+                isChunkedTransport = true;
+                context.UpperProtocol = method == RPC_IN_DATA ? UpperProtocolType.RPCH : UpperProtocolType.TSGU;
+                // Directly set to 'InChannelEstablished' state if HTTP has 'chunked' field in header.
+                // Because requests for negotiation are not encoded as chunked.
+                context.ChannelKind = ChannelKindEnum.InChannelEstablished;
+            }
+        }
+        else if (method == RPC_IN_DATA && GetContentLength(request.Headers) > 0x10) // RPCH Section 2.1.2.1.1 IN Channel Request
+        {
+            // For IN Channel Request, needn't wait for response if "Content-Length" > 0x10, set ChannelKind to ChannelKindEnum.InChannelEstablished directly
+            context.ChannelKind = ChannelKindEnum.InChannelEstablished;
+            context.UpperProtocol = UpperProtocolType.RPCH;
+        }
+        else if (method == RDG_IN_DATA)
+        {
+            context.ChannelKind = ChannelKindEnum.InChannelEstablishing;
+            context.UpperProtocol = UpperProtocolType.TSGU;
+        }
+        else if (method == RPC_OUT_DATA && GetContentLength(request.Headers) > 0x10 ||  // RPCH Section 2.1.2.1.2 OUT Channel Request
+            method == RDG_OUT_DATA || // TSGU
+            method == "CONNECT") // Treat Tunnel like Out Channel.
+        {
+            // For OUT Channel Request, need wait for response, 
+            //     set ChannelKind to ChannelKindEnum.TunnelOrOutChannelEstablishing firstly, 
+            context.ChannelKind = ChannelKindEnum.TunnelOrOutChannelEstablishing;
+            if (method == RPC_OUT_DATA)
+            {
+                context.UpperProtocol = UpperProtocolType.RPCH;
+            }
+            else if (method == RDG_OUT_DATA)
+            {
+                context.UpperProtocol = UpperProtocolType.TSGU;
+            }
+            else
+            {
+                context.UpperProtocol = UpperProtocolType.Tunnel;
+            }
+        }
+
+        if ((("Expect" in request.Headers)
+                && ("100-continue" in (request.Headers["Expect"] as array<HeaderFieldType>))))
+        {
+            context._100ContinueRequest = request;
+            context.RequestStatus = ContinueStatus.Decoding;
+        }
+        return request;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+// ------------------------------------------- Convert from Microsoft_Windows_WebIO -------------------------------------
+type Keywords
+{
+    WindowsEtwKeywords StandardKeywords;
+    
+    bool Keyword_API;
+    
+    bool Keyword_SEND;
+    
+    bool Keyword_RECEIVE;
+    
+    bool Keyword_L3_CONNECT;
+    
+    bool Keyword_CLOSE;
+    
+    bool Keyword_SECURITY;
+    
+    bool Keyword_CONFIGURATION;
+    
+    bool Keyword_GLOBAL;
+    
+    bool Keyword_DROPPED;
+    
+    bool Keyword_PII_PRESENT;
+    
+    bool Keyword_PACKET;
+    
+    bool Keyword_ADDRESS;
+    
+    bool Keyword_CONTEXT_EVENT;
+    
+    bool Keyword_STATE_TRANSITION;
+    
+    public static Keywords Decode(ulong keyword)
+    {
+        Keywords result = new Keywords();
+        result.StandardKeywords = WindowsEtwKeywordsDecoder(keyword);
+        result.Keyword_API =
+            EtwKeywordDecoder(keyword, 0x0000000000000001);
+        result.Keyword_SEND =
+            EtwKeywordDecoder(keyword, 0x0000000100000000);
+        result.Keyword_RECEIVE =
+            EtwKeywordDecoder(keyword, 0x0000000200000000);
+        result.Keyword_L3_CONNECT =
+            EtwKeywordDecoder(keyword, 0x0000000400000000);
+        result.Keyword_CLOSE =
+            EtwKeywordDecoder(keyword, 0x0000001000000000);
+        result.Keyword_SECURITY =
+            EtwKeywordDecoder(keyword, 0x0000002000000000);
+        result.Keyword_CONFIGURATION =
+            EtwKeywordDecoder(keyword, 0x0000004000000000);
+        result.Keyword_GLOBAL =
+            EtwKeywordDecoder(keyword, 0x0000008000000000);
+        result.Keyword_DROPPED =
+            EtwKeywordDecoder(keyword, 0x0000010000000000);
+        result.Keyword_PII_PRESENT =
+            EtwKeywordDecoder(keyword, 0x0000020000000000);
+        result.Keyword_PACKET =
+            EtwKeywordDecoder(keyword, 0x0000040000000000);
+        result.Keyword_ADDRESS =
+            EtwKeywordDecoder(keyword, 0x0000080000000000);
+        result.Keyword_CONTEXT_EVENT =
+            EtwKeywordDecoder(keyword, 0x0000100000000000);
+        result.Keyword_STATE_TRANSITION =
+            EtwKeywordDecoder(keyword, 0x0000200000000000);
+        return result;
+    }
+}
+
+message WebIOEvent_HttpRequestHeader[bool IsPointer32bit]
+{
+    EtwPointer[IsPointer32bit] Request with DisplayInfo{ToText = ToHex};
+    ushort Length;
+    string Headers with Standard.BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+    Keywords EtwKeywords with Standard.Encoding{Ignore = true};
+
+    public override string ToString()
+    {
+        return "WebIOEvent_HttpRequestHeader, Length: " + Length.ToString();
+    }
+}
+
+message WebIOEvent_HttpRequestBody[bool IsPointer32bit]
+{
+    EtwPointer[IsPointer32bit] Request with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] Connection with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] DataChunks with DisplayInfo{ToText = ToHex};
+    uint Index with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] Buffer with DisplayInfo{ToText = ToHex};
+    uint Length with DisplayInfo{ToText = ToHex};
+    binary Data with Standard.BinaryEncoding{Length = Length};
+    Keywords EtwKeywords with Standard.Encoding{Ignore = true};
+    
+    public override string ToString()
+    {
+        return "WebIOEvent_HttpRequestBody, Index: " + Index.ToString() + ", Length: " + Length.ToString();
+    }
+}
+
+message WebIOEvent_HttpResponseHeader[bool IsPointer32bit]
+{
+    EtwPointer[IsPointer32bit] Request with DisplayInfo{ToText = ToHex};
+    ushort Length;
+    string Headers with Standard.BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+    
+    Keywords EtwKeywords with Standard.Encoding{Ignore = true};
+    
+    public override string ToString()
+    {
+        return "WebIOEvent_HttpResponseHeader, Length: " + Length.ToString();
+    }
+}
+
+message WebIOEvent_HttpResponseBody[bool IsPointer32bit]
+{
+    EtwPointer[IsPointer32bit] Request with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] DataChunks with DisplayInfo{ToText = ToHex};
+    uint Index with DisplayInfo{ToText = ToHex};
+    uint Length with DisplayInfo{ToText = ToHex};
+    binary Data with Standard.BinaryEncoding{Length = Length};
+    Keywords EtwKeywords with Standard.Encoding{Ignore = true};
+    
+    public override string ToString()
+    {
+        return "WebIOEvent_HttpResponseBody, Index: " + Index.ToString() + ", Length: " + Length.ToString();
+    }
+}
+
+message WebIOEvent_RemoveHttpRequestInformationRoutine[bool IsPointer32bit]
+{
+    EtwPointer[IsPointer32bit] Request with DisplayInfo{ToText = ToHex};
+    ulong RequestHandle with DisplayInfo{ToText = ToHex};
+    uint Flags with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] InformationRoutine with DisplayInfo{ToText = ToHex};
+    EtwPointer[IsPointer32bit] InformationContext with DisplayInfo{ToText = ToHex};
+    uint Error with DisplayInfo{ToText = ToWin32Error};
+    Keywords EtwKeywords with Standard.Encoding{Ignore = true};
+
+    public override string ToString()
+    {
+        return "WebIOEvent_RemoveHttpRequestInformationRoutine";
+    }
+}
+
+endpoint WebIOEtwNode[ulong sessionId]
+    accepts WebIOEvent_HttpRequestHeader
+    accepts WebIOEvent_HttpRequestBody
+    accepts WebIOEvent_HttpResponseHeader
+    accepts WebIOEvent_HttpResponseBody
+    accepts WebIOEvent_RemoveHttpRequestInformationRoutine;
+
+autostart actor WebIOEventOverEtwProvider(EtwEvent.Node node)
+{
+    process node accepts m:EtwProviderMsg where (m.EventRecord.Header.ProviderId == EtwProviderIdWebIO &&
+        m.EventRecord.Header.Descriptor.Id in [25, 100, 101, 111, 129])
+    {
+        var isPointer32bit = IsPointer32Message(m);
+        switch (m.EventRecord.Header.Descriptor.Id)
+        {
+            case $ 25 =>
+                switch (m.Payload)
+                {
+                    case decodedMsg:WebIOEvent_RemoveHttpRequestInformationRoutine from BinaryDecoder<WebIOEvent_RemoveHttpRequestInformationRoutine[isPointer32bit]> =>
+                        {
+                            decodedMsg.EtwKeywords = Keywords.Decode(m.EventRecord.Header.Descriptor.Keywords);
+                            var sessionId = ConvertEtwPointerToNumeric(decodedMsg.Request, isPointer32bit);
+                            dispatch (endpoint WebIOEtwNode[sessionId]) accepts decodedMsg;
+                        }
+                    default =>
+                        ThrowDecodingException("Microsoft_Windows_WebIO", "WebIOEvent_RemoveHttpRequestInformationRoutine");
+                }
+            case $ 100 =>
+                switch (m.Payload)
+                {
+                    case decodedMsg:WebIOEvent_HttpRequestHeader from BinaryDecoder<WebIOEvent_HttpRequestHeader[isPointer32bit]> =>
+                        {
+                            decodedMsg.EtwKeywords = Keywords.Decode(m.EventRecord.Header.Descriptor.Keywords);
+                            var sessionId = ConvertEtwPointerToNumeric(decodedMsg.Request, isPointer32bit);
+                            dispatch (endpoint WebIOEtwNode[sessionId]) accepts decodedMsg;
+                        }
+                    default =>
+                        ThrowDecodingException("Microsoft_Windows_WebIO", "WebIOEvent_HttpRequestHeader");
+                }
+            case $ 101 =>
+                switch (m.Payload)
+                {
+                    case decodedMsg:WebIOEvent_HttpResponseHeader from BinaryDecoder<WebIOEvent_HttpResponseHeader[isPointer32bit]> =>
+                        {
+                            decodedMsg.EtwKeywords = Keywords.Decode(m.EventRecord.Header.Descriptor.Keywords);
+                            var sessionId = ConvertEtwPointerToNumeric(decodedMsg.Request, isPointer32bit);
+                            dispatch (endpoint WebIOEtwNode[sessionId]) accepts decodedMsg;
+                        }
+                    default =>
+                        ThrowDecodingException("Microsoft_Windows_WebIO", "WebIOEvent_HttpResponseHeader");
+                }
+            case $ 111 =>
+                switch (m.Payload)
+                {
+                    case decodedMsg:WebIOEvent_HttpRequestBody from BinaryDecoder<WebIOEvent_HttpRequestBody[isPointer32bit]> =>
+                        {
+                            decodedMsg.EtwKeywords = Keywords.Decode(m.EventRecord.Header.Descriptor.Keywords);
+                            var sessionId = ConvertEtwPointerToNumeric(decodedMsg.Request, isPointer32bit);
+                            dispatch (endpoint WebIOEtwNode[sessionId]) accepts decodedMsg;
+                        }
+                    default =>
+                        ThrowDecodingException("Microsoft_Windows_WebIO", "WebIOEvent_HttpRequestBody");
+                }
+            case $ 129 =>
+                switch (m.Payload)
+                {
+                    case decodedMsg:WebIOEvent_HttpResponseBody from BinaryDecoder<WebIOEvent_HttpResponseBody[isPointer32bit]> =>
+                        {
+                            decodedMsg.EtwKeywords = Keywords.Decode(m.EventRecord.Header.Descriptor.Keywords);
+                            var sessionId = ConvertEtwPointerToNumeric(decodedMsg.Request, isPointer32bit);
+                            dispatch (endpoint WebIOEtwNode[sessionId]) accepts decodedMsg;
+                        }
+                    default =>
+                        ThrowDecodingException("Microsoft_Windows_WebIO", "WebIOEvent_HttpResponseBody");
+                }
+            default =>
+                ThrowDecodingException("Microsoft_Windows_WebIO");
+        }
+    }
+}
+
+ulong ConvertEtwPointerToNumeric(EtwPointer pointer, bool isPointer32bit)
+{
+    if (isPointer32bit)
+    {
+        uint v = pointer.pointerValue as uint;
+        return v as ulong;
+    }
+    else
+    {
+        return pointer.pointerValue as ulong;
+    }
+}
+
+const guid EtwProviderIdWebIO = {50b3e73c-9370-461d-bb9f-26f32d68887d};
+const ulong DefaultSessionID = 0;

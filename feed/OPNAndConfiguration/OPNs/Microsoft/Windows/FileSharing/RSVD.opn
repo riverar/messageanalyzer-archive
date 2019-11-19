@@ -1,0 +1,2013 @@
+protocol RSVD with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    DocumentName = "MS-RSVD",
+    ProtocolName = "Remote Shared Virtual Disk Protocol",
+    ShortName = "RSVD",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-RSVD", Version = "11.0", Date = "09/15/2017", ProgramName = ProgramName.MCPP}
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "383011", Date = "11/27/2015"}
+    ]
+};
+
+using Standard;
+using DTYP with Documentation {UsingKind = ReferenceKind.Reference};
+using Utility;
+using SMB2;
+using FSCC;
+using ERREF;
+using FileSharingResources;
+using Diagnostics;
+using iSCSI;
+using InfrastructureResources;
+
+const uint RSVD_CDB_GENERIC_LENGTH = 0x10 with Documentation {Ignore=true};
+const uint RSVD_SCSI_SENSE_BUFFER_SIZE = 0x14 with Documentation {Ignore=true};
+const uint RSVD_MAXIMUM_NAME_LENGTH = 0x7E with Documentation {Ignore=true};
+
+endpoint Server over SMB2.FileServer provides Messages provides VirtualOperations;
+
+// SMB2.FileServer endpoint uses FId as index, but in SMB2.Create operation the Fid is updated after response is parsed,
+// OPEN_DEVICE_CONTEXT operations will never be bound due to diferent under-layer FileServer endpoint instances.
+// So use independent endpoint and InitiatorId to bind OPEN_DEVICE_CONTEXT operations.
+endpoint CreateServer provides Messages provides VirtualOp_OPEN_DEVICE_CONTEXT;
+client endpoint Client connected to Server;
+client endpoint CreateClient connected to CreateServer;
+
+annotation ulong RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE#SMB2MessageId;
+annotation ulong RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE#SMB2MessageId;
+
+const binary RSVDVersion1 = $[01000000];
+const binary RSVDVersion2 = $[02000000];
+const uint UintNull = 0;
+// --------------------------actors-------------------------------------------//
+autostart actor RsvdOverSmb2FileServer(SMB2.FileServer fileServer)
+{
+    SVHDX_META_OPERATION_START_REQUEST_OperationType operationType= UintNull;
+    SvhdxSnapshotType snapshotType = UintNull;
+    SvhdxVHDSetInformationType setInformationType = UintNull;
+    process fileServer accepts createReq:SMB2.Messages.CreateRequest 
+        where ((GetRsvdCreateContext(createReq) is var result) && result != nothing)
+    {
+        if (result is data:binary)
+        {
+            if (data.PeekBytes(0, 4) == RSVDVersion1 || data.Count == 168) // Version field
+            {
+                if (BinaryDecoder<RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE>(data) is m:RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE)
+                {
+                    dispatch endpoint CreateServer accepts m;
+                }
+                else
+                {
+                    ThrowDecodingException("RSVD", "SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE");
+                }
+            }
+            else if (data.PeekBytes(0, 4) == RSVDVersion2 || data.Count == 192) // Version field
+            {
+                if (BinaryDecoder<RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE>(data) is m:RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE)
+                {
+                    dispatch endpoint CreateServer accepts m;
+                }
+                else
+                {
+                    ThrowDecodingException("RSVD", "SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE");
+                }
+            }
+            else if (data.PeekBytes(0, 4) == RSVDVersion2 && (createReq.Request.CreateOptions & 0x00000008) > 0) // FileNoIntermediateBuffering
+            {
+                if (BinaryDecoder<RSVD.Messages.RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE>(data) is m:RSVD.Messages.RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE)
+                {
+                    dispatch endpoint CreateServer accepts m;
+                }
+                else
+                {
+                    ThrowDecodingException("RSVD", "RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE");
+                }
+            }
+            else
+            {
+                ThrowDecodingException("RSVD");
+            }
+        }
+        else if ((result is eaInfo:FSCC.FileFullEaInformation) && eaInfo.EaName == "RSVD_TARGET_SPECIFIER_EA")
+        {
+            if (BinaryDecoder<RSVD.Messages.RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE>(eaInfo.EaValue as binary) is m:RSVD.Messages.RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE)
+            {
+                dispatch endpoint CreateServer accepts m;
+            }
+            else
+            {
+                ThrowDecodingException("RSVD", "RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("RSVD");
+        }
+    }
+    
+    process fileServer issues createRes:SMB2.Messages.CreateResponse  where (GetRsvdCreateContext(createRes) is data:binary)
+    {
+        if (data.PeekBytes(0, 4) == RSVDVersion1 || data.Count == 168) // Version field
+        {
+            if (BinaryDecoder<RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE>(data) is m:RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE)
+            {
+                dispatch endpoint CreateServer issues m;
+            }
+            else
+            {
+                ThrowDecodingException("RSVD", "SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE");
+            }
+        }
+        else if (data.PeekBytes(0, 4) == RSVDVersion2 || data.Count == 192) // Version field
+        {
+            if (BinaryDecoder<RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE>(data) is m:RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE)
+            {
+                dispatch endpoint CreateServer issues m;
+            }
+            else
+            {
+                ThrowDecodingException("RSVD", "SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("RSVD");
+        }
+    }
+
+    process fileServer accepts ioctlReq:SMB2.Messages.IoctlRequest where ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_SYNC_TUNNEL_REQUEST || ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_ASYNC_TUNNEL_REQUEST
+    {
+        Process_SVHDX_TUNNEL_REQUEST(endpoint Server over fileServer, ioctlReq, ref operationType, ref snapshotType, ref setInformationType);
+    }
+    
+    process fileServer issues ioctlRes:SMB2.Messages.IoctlResponse where ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_SYNC_TUNNEL_REQUEST || ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_ASYNC_TUNNEL_REQUEST
+    {
+        Process_SVHDX_TUNNEL_RESPONSE(endpoint Server over fileServer, ioctlRes, ref operationType, ref snapshotType, ref setInformationType);
+    }
+
+    process fileServer accepts ioctlReq:SMB2.Messages.IoctlRequest where ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_QUERY_SHARED_VIRTUAL_DISK_SUPPORT
+    {
+        ProcessSharedVirtualDiskSupportRequest(endpoint Server over fileServer, ioctlReq);
+    }
+    
+    process fileServer issues ioctlRes:SMB2.Messages.IoctlResponse where ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_QUERY_SHARED_VIRTUAL_DISK_SUPPORT
+    {
+        ProcessSharedVirtualDiskSupportResponse(endpoint Server over fileServer, ioctlRes);
+    }
+}
+
+void Process_SVHDX_TUNNEL_REQUEST(Server server, SMB2.Messages.IoctlRequest ioctlReq, ref SVHDX_META_OPERATION_START_REQUEST_OperationType operationType, ref SvhdxSnapshotType snapshotType, ref SvhdxVHDSetInformationType setInformationType)
+{
+    if (ioctlReq.Request.Buffer is payload:binary && payload.Count >= RSVD_HEADER_LENGTH) // the payload must at least contain the header
+    {
+        // retrieve the OperationCode
+        var bin = payload.PeekBytes(0, 4);
+        SVHDX_TUNNEL_OPERATION_HEADER_OperationCode opCode = BinaryDecoder<SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(bin) as SVHDX_TUNNEL_OPERATION_HEADER_OperationCode;
+        if (ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_SYNC_TUNNEL_REQUEST)
+        {
+            switch (opCode)
+            {
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_GET_INITIAL_INFO_OPERATION =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_INITIAL_INFO_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_INITIAL_INFO_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_SCSI_OPERATION =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_SCSI_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_SCSI_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHECK_CONNECTION_STATUS_OPERATION =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_SRB_STATUS_OPERATION =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_SRB_STATUS_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_SRB_STATUS_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_GET_DISK_INFO_OPERATION => 
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_DISK_INFO_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_DISK_INFO_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_VALIDATE_DISK_OPERATION => 
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_VALIDATE_DISK_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_VALIDATE_DISK_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_VHDSET_QUERY_INFORMATION =>
+                {
+                    var request = DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE");
+                    if (request is req:RSVD.Messages.SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE)
+                        setInformationType = req.Request.VHDSetInformationType;
+                }
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_DELETE_SNAPSHOT =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_META_OPERATION_QUERY_PROGRESS =>
+                    DecodeMessage<RSVD.Messages.SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_GET_PARAMETERS =>
+                    DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_START =>
+                    DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_STOP =>
+                    DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_STOP_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_STOP_REQUEST_MESSAGE");
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_QUERY_SAFE_SIZE =>
+                    DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_QUERY_SAFE_SIZE_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_TUNNEL_QUERY_SAFE_SIZE_REQUEST_MESSAGE");
+                default =>
+                    // Invalid OperationCode, parse it as UnknownTunnelMessage
+                    DecodeUnknownTunnelMessage(MessageDirection.Accepts, server, payload);
+            }
+        }
+        else // ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_ASYNC_TUNNEL_REQUEST
+        {
+            switch (opCode)
+            {
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_META_OPERATION_START =>
+                {
+                    var request = DecodeMessage<RSVD.Messages.SVHDX_META_OPERATION_START_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_META_OPERATION_START_REQUEST_MESSAGE");
+                    if (request is req:RSVD.Messages.SVHDX_META_OPERATION_START_REQUEST_MESSAGE)
+                    {
+                        operationType = req.Request.OperationType;
+                        if (req.Request.Data is create:SVHDX_META_OPERATION_CREATE_SNAPSHOT)
+                        {
+                            snapshotType = create.SnapshotType;
+                        }
+                    }
+                }
+                case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_START =>
+                    DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE>(AcceptDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE");
+                default =>
+                    // Invalid OperationCode, parse it as UnknownTunnelMessage
+                    DecodeUnknownTunnelMessage(MessageDirection.Accepts, server, payload);
+            }
+        }
+    }
+    else
+    {
+        ThrowDecodingException("RSVD");
+    }
+}
+
+void Process_SVHDX_TUNNEL_RESPONSE(Server server, SMB2.Messages.IoctlResponse ioctlRes, ref SVHDX_META_OPERATION_START_REQUEST_OperationType operationType, ref SvhdxSnapshotType snapshotType, ref SvhdxVHDSetInformationType setInformationType)
+{
+    if (ioctlRes.Response.Buffer is payload:binary && payload.Count >= RSVD_HEADER_LENGTH)
+    {
+        // retrieve the OperationCode
+        var binOpCode = payload.PeekBytes(0, 4); // OperationCode field
+        SVHDX_TUNNEL_OPERATION_HEADER_OperationCode opCode = BinaryDecoder<SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(binOpCode) as SVHDX_TUNNEL_OPERATION_HEADER_OperationCode;
+        var binStatus = payload.PeekBytes(4 * 8, 4); // Status field
+        uint status = BinaryDecoder<uint>(binStatus) as uint;
+        // [MS-RSVD], section 3.2.5.5, it says that RSVD server may send a header(SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE) only message to indicate an error occurred.
+        if (payload.Count == RSVD_HEADER_LENGTH && status != 0) // deal with error response
+        {
+            DecodeMessage<RSVD.Messages.ErrorResponse>(IssueDispatcher, server, payload, "ErrorResponse");
+        }
+        else
+        {
+            if (ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_SYNC_TUNNEL_REQUEST)
+            {
+                switch (opCode)
+                {
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_GET_INITIAL_INFO_OPERATION =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_INITIAL_INFO_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_INITIAL_INFO_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_SCSI_OPERATION =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_SCSI_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_SCSI_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHECK_CONNECTION_STATUS_OPERATION =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_SRB_STATUS_OPERATION =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_SRB_STATUS_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_SRB_STATUS_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_GET_DISK_INFO_OPERATION => 
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_DISK_INFO_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_DISK_INFO_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_VALIDATE_DISK_OPERATION => 
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_VHDSET_QUERY_INFORMATION =>
+                    {
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE_MESSAGE[setInformationType]>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE_MESSAGE");
+                        setInformationType = UintNull;
+                    }
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_DELETE_SNAPSHOT =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_META_OPERATION_QUERY_PROGRESS =>
+                        DecodeMessage<RSVD.Messages.SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_GET_PARAMETERS =>
+                        DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_START =>
+                        DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_STOP =>
+                        DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_STOP_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_STOP_RESPONSE_MESSAGE");
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_QUERY_SAFE_SIZE =>
+                        DecodeMessage<RSVD.Messages.SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE_MESSAGE");
+                    default =>
+                        // Invalid OperationCode, parse it as UnknownTunnelMessage
+                        DecodeUnknownTunnelMessage(MessageDirection.Issues, server, payload);
+                }
+            }
+            else // ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_ASYNC_TUNNEL_REQUEST
+            {
+                switch (opCode)
+                {
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_META_OPERATION_START =>
+                    {
+                        DecodeMessage<RSVD.Messages.SVHDX_META_OPERATION_REPLY_MESSAGE[operationType, snapshotType]>(IssueDispatcher, server, payload, "SVHDX_META_OPERATION_REPLY_MESSAGE");
+                        operationType = UintNull;
+                        snapshotType = UintNull;
+                    }
+                    case SVHDX_TUNNEL_OPERATION_HEADER_OperationCode.RSVD_TUNNEL_CHANGE_TRACKING_START =>
+                        DecodeMessage<RSVD.Messages.SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE>(IssueDispatcher, server, payload, "SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE");
+                    default =>
+                        // Invalid OperationCode, parse it as UnknownTunnelMessage
+                        DecodeUnknownTunnelMessage(MessageDirection.Issues, server, payload);
+                }
+            }
+        }
+    }
+    else
+    {
+        ThrowDecodingException("RSVD");
+    }
+}
+
+optional T DecodeMessage<T>(void(RSVD.Server, T) dispatcher, RSVD.Server server, stream payloadStream, string messageName)
+{
+    if (BinaryDecoder<T>(payloadStream) is pdu:T)
+    {
+        dispatcher(server, pdu);
+        return pdu;
+    }
+    else
+    {
+        ThrowDecodingException("RSVD", messageName);
+        return nothing;
+    }
+}
+
+void AcceptDispatcher(RSVD.Server server, SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE pdu)
+{
+    dispatch server accepts pdu;
+}
+
+void IssueDispatcher(RSVD.Server server, SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE pdu)
+{
+    dispatch server issues pdu;
+}
+
+void DecodeUnknownTunnelMessage(MessageDirection direction, RSVD.Server server, binary payload)
+{
+    // Invalid OperationCode, parse it as UnknownTunnelMessage
+    if (BinaryDecoder<RSVD.Messages.UnknownTunnelMessage>(payload) is msg:RSVD.Messages.UnknownTunnelMessage)
+    {
+        ValidationCheck(false, msg, DiagnosisLevel.Error, Format(FileSharingResources.RSVD_INVALID_OPERATION_CODE, DecToHexFormat(msg.Header.OperationCode)));
+        if (direction == MessageDirection.Accepts)
+            dispatch server accepts msg;
+        else
+            dispatch server issues msg;
+    }
+    else
+    {
+        ThrowDecodingException("RSVD", UTILITY_UNKNOWN_DATA, ["OperationCode"]);
+    }
+}
+
+void ProcessSharedVirtualDiskSupportRequest(Server server, SMB2.Messages.IoctlRequest ioctlReq)
+{
+    if (ioctlReq.Request.Buffer is Utility.Empty)
+    {
+        RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE m = new RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE{}; // this message contains no data
+        m#SMB2MessageId = ioctlReq.Header.MessageId;
+        dispatch server accepts m;
+    }
+    else
+    {
+        ThrowDecodingException("RSVD", "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE");
+    }
+}
+
+void ProcessSharedVirtualDiskSupportResponse(Server server, SMB2.Messages.IoctlResponse ioctlRes)
+{
+    if (ioctlRes.Response.Buffer is payload:binary)
+    {
+        switch (payload)
+        {
+            case m:RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE from BinaryDecoder<RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE> =>
+                m#SMB2MessageId = ioctlRes.Header.MessageId;
+                dispatch server issues m;
+            default => 
+                ThrowDecodingException("RSVD", "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE");
+        }
+    }
+    else
+    {
+        ThrowDecodingException("RSVD", "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE");
+    }
+}
+
+optional (binary | FileFullEaInformation) GetRsvdCreateContext((SMB2.Messages.CreateRequest | SMB2.Messages.CreateResponse) create)
+{
+    if (create is createReq:SMB2.Messages.CreateRequest)
+    {
+        // According to 3.1.4.2 Application Requests Opening a Shared Virtual Disk, The client MUST append ":SharedVirtualDisk" at the end of the file name.
+        if (createReq.Request.Buffer.Name != nothing && (createReq.Request.Buffer.Name as string).LastIndexOf(":SharedVirtualDisk") >= 0 &&
+            createReq.Request.Buffer.CreateContextList is list:array<SMB2CreateContextRequest> && list.Count > 0)
+        {
+            foreach (var context in list)
+            {
+                if (context.Buffer.Name is SMB2.SVHDX_OPEN_DEVICE_CONTEXT) // 0x9CCBCF9E04C1E643980E158DA1F6EC83 represents SVHDX_OPEN_DEVICE_CONTEXT 
+                {
+                    return context.Buffer.Data as binary;
+                }
+                else if (context.Buffer.Name == SMB2CreateContextRequestValuesName.SMB2CreateEaBuffer)
+                {
+                    return context.Buffer.Data as FileFullEaInformation;
+                }
+            }
+        }
+        return nothing;
+    }
+    else if (create is createRes:SMB2.Messages.CreateResponse)
+    {
+        if (createRes.Response.Buffer is contextArray:array<SMB2CreateContextResponse>)
+        {
+            foreach (var context in contextArray)
+            {
+                if (context.Buffer.Name is SMB2.SVHDX_OPEN_DEVICE_CONTEXT)
+                {
+                    return context.Buffer.Data as binary;
+                }
+            }
+        }
+        return nothing;
+    }
+    return nothing;
+}
+
+// --------------------------virtual operation----------------------------------------- //
+contract VirtualOperations
+{
+    // Future Reference: enable virtual operation accept multi-message types, normal response and error response.
+    issues virtual operation SVHDX_TUNNEL_INITIAL_INFO
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_INITIAL_INFO, Status: " + ErrorCodeToText(Status);
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_INITIAL_INFO_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_INITIAL_INFO_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Header.Status == 0};
+    
+    issues virtual operation SVHDX_TUNNEL_SCSI
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        out SVHDX_TUNNEL_SCSI_RESPONSE_Disposition Disposition = disposition;
+        out SVHDX_TUNNEL_SCSI_SrbFlags SrbFlags = srbFlag;
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SCSI, Status: " + ErrorCodeToText(Status) + ", SrbFlags: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_SCSI_SrbFlags>(SrbFlags) + ", Disposition: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_SCSI_RESPONSE_Disposition>(Disposition);
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_SCSI_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_SCSI_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.Disposition is var disposition, Response.SrbFlags is var srbFlag, Header.Status == 0};
+
+    issues virtual operation SVHDX_TUNNEL_CHECK_CONNECTION
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_CHECK_CONNECTION, Status: " + ErrorCodeToText(Status);
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Header.Status == 0};
+    
+    issues virtual operation SVHDX_TUNNEL_SRB_STATUS
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        out SRBStatusCode SrbStatus = srbState;
+        out UCHAR ScsiStatus = scsiState;
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SRB_STATUS, Status: " + ErrorCodeToText(Status) + ", SrbStatus: " + EnumToStringInSummary<RSVD.SRBStatusCode>(SrbStatus) + ", ScsiStatus: " + ScsiStatus.ToString();
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_SRB_STATUS_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_SRB_STATUS_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.SrbStatus is var srbState, Response.ScsiStatus is var scsiState, Header.Status == 0};
+    
+    issues virtual operation SVHDX_TUNNEL_DISK_INFO
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        out SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType DiskType = diskType;
+        out BOOLEAN IsMounted = isMounted;
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DISK_INFO, Status: " + ErrorCodeToText(Status) + ", DiskType: " + 
+                EnumToStringInSummary<RSVD.SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType>(DiskType) + ", IsMounted:" + IsMounted.ToString();
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_DISK_INFO_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_DISK_INFO_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.DiskType is var diskType, Response.IsMounted is var isMounted, Header.Status == 0};
+
+    issues virtual operation SVHDX_TUNNEL_VALIDATE_DISK
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VALIDATE_DISK, Status: " + ErrorCodeToText(Status);
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_TUNNEL_VALIDATE_DISK_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Header.Status == 0};
+    
+    issues virtual operation SVHDX_SHARED_VIRTUAL_DISK_SUPPORT
+    {
+        out SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport SharedVirtualDiskSupport = support;
+        out SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState SharedVirtualDiskHandleState = handleState;
+        override string ToString()
+        {
+            return "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT, SharedVirtualDiskSupport: " + EnumToStringInSummary<SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport>(SharedVirtualDiskSupport) +
+                ", SharedVirtualDiskHandleState: " + EnumToStringInSummary<RSVD.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState>(SharedVirtualDiskHandleState);
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE{#SMB2MessageId is var mid} 
+    issues RSVD.Messages.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE{#SMB2MessageId == mid, SharedVirtualDiskSupport is var support, SharedVirtualDiskHandleState is var handleState};
+
+    issues virtual operation SVHDX_META_OPERATION
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        in guid TransactionId = transactionId;
+        in SVHDX_META_OPERATION_START_REQUEST_OperationType OperationType = operationType;
+        out optional SVHDX_TUNNEL_CHANGE_TRACKING_STATUS ChangeTrackingErrorStatus = changeTrackingErrorStatus;
+        
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION, Status: " + ErrorCodeToText(Status) + 
+                (ChangeTrackingErrorStatus is SVHDX_TUNNEL_CHANGE_TRACKING_STATUS ? 
+                 (", ChangeTrackingErrorStatus: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_CHANGE_TRACKING_STATUS>(ChangeTrackingErrorStatus as SVHDX_TUNNEL_CHANGE_TRACKING_STATUS)) : "") +
+                ", OperationType: " + EnumToStringInSummary<RSVD.SVHDX_META_OPERATION_START_REQUEST_OperationType>(OperationType) + ", TransactionId: {" + (TransactionId as string) + "}";
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_META_OPERATION_START_REQUEST_MESSAGE{Header.RequestId is var rid, Request.TransactionId is var transactionId, Request.OperationType is var operationType} ->
+    issues RSVD.Messages.SVHDX_META_OPERATION_REPLY_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.ChangeTrackingErrorStatus is var changeTrackingErrorStatus, Header.Status == 0};
+
+    issues virtual operation SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        in SvhdxVHDSetInformationType VHDSetInformationType = vhdSetInformationType;
+        in SvhdxSnapshotType SnapshotType = snapshotType;
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION, Status: " + ErrorCodeToText(Status) +
+                ", VHDSetInformationType: " + EnumToStringInSummary<RSVD.SvhdxVHDSetInformationType>(VHDSetInformationType) + 
+                ", SnapshotType: " + EnumToStringInSummary<RSVD.SvhdxSnapshotType>(SnapshotType);
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE{Header.RequestId is var rid, Request.VHDSetInformationType is var vhdSetInformationType, Request.SnapshotType is var snapshotType}
+    issues RSVD.Messages.SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+
+    issues virtual operation SVHDX_META_OPERATION_QUERY_PROGRESS
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        out ulong CurrentProgressValue = currentProgressValue;
+        out ulong CompleteValue = completeValue;
+        
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION_QUERY_PROGRESS, Status: " + ErrorCodeToText(Status) +
+                ", CurrentProgressValue: " + (CurrentProgressValue as string) +
+                ", CompleteValue: " + (CompleteValue as string);
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.CurrentProgressValue is var currentProgressValue, Response.CompleteValue is var completeValue};
+
+    issues virtual operation SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES
+    {
+        in GUID TargetSnapshotId = targetId;
+        in GUID LimitSnapshotId = limitId;
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES, Status: " + ErrorCodeToText(Status) +
+                ", TargetSnapshotId: " + TargetSnapshotId.ToString() +
+                ", LimitSnapshotId: " + LimitSnapshotId.ToString();
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST_MESSAGE{Header.RequestId is var rid, Context.TargetSnapshotId is var targetId, Context.LimitSnapshotId is var limitId}
+    issues RSVD.Messages.SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+
+    issues virtual operation SVHDX_CHANGE_TRACKING_GET_PARAMETERS
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        out ULONG ChangeTrackingStatus = changeTrackingStatus;
+        out ulong LogFileSize = logFileSize;
+    
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_GET_PARAMETERS, Status: " + ErrorCodeToText(Status) +
+                ", ChangeTrackingStatus: " + EnumToStringInSummary<SVHDX_TUNNEL_CHANGE_TRACKING_STATUS>(ChangeTrackingStatus) + 
+                ", LogFileSize: " + (LogFileSize  as string);
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state, Response.ChangeTrackingStatus is var changeTrackingStatus, Response.LogFileSize is var logFileSize};
+    
+    issues virtual operation SVHDX_TUNNEL_DELETE_SNAPSHOT
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        in guid SnapshotId = snapshotId;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DELETE_SNAPSHOT, Status: " + ErrorCodeToText(Status) +
+                ", SnapshotId: {" + (SnapshotId as string) + "}";
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_MESSAGE{Header.RequestId is var rid, Request.SnapshotId is var snapshotId}
+    issues RSVD.Messages.SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+
+    issues virtual operation SVHDX_CHANGE_TRACKING_START
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        in guid TransactionId = transactionId;
+    
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_START, Status: " + ErrorCodeToText(Status) +
+                ", TransactionId: {" + (TransactionId as string) + "}";
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE{Header.RequestId is var rid, Request.TransactionId is var transactionId}
+    issues RSVD.Messages.SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+
+    issues virtual operation SVHDX_CHANGE_TRACKING_STOP
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+    
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_STOP, Status: " + ErrorCodeToText(Status);
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_CHANGE_TRACKING_STOP_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_CHANGE_TRACKING_STOP_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+
+    issues virtual operation RSVD_TUNNEL_QUERY_SAFE_SIZE
+    {
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+    
+        override string ToString()
+        {
+            return "RSVD_TUNNEL_QUERY_SAFE_SIZE, Status: " + ErrorCodeToText(Status);
+        }
+    }=
+    accepts RSVD.Messages.SVHDX_TUNNEL_QUERY_SAFE_SIZE_REQUEST_MESSAGE{Header.RequestId is var rid}
+    issues RSVD.Messages.SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE_MESSAGE{Header.RequestId == rid, Header.Status is var state};
+    
+    issues virtual operation ErrorOperation
+    {
+        in SVHDX_TUNNEL_OPERATION_HEADER_OperationCode OperationCode = opCode;
+        out ErrorCode Status = state with DisplayInfo{ToText = ErrorCodeToText};
+        override string ToString()
+        {
+            return "ErrorOperation, OperationCode: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(OperationCode) + ", Status: " + ErrorCodeToText(Status);
+        }
+    }
+    =
+    accepts SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE{Header.RequestId is var rid, Header.OperationCode is var opCode}
+    issues RSVD.Messages.ErrorResponse{Header.RequestId == rid, Header.Status is var state, Header.Status != 0};
+}
+
+contract VirtualOp_OPEN_DEVICE_CONTEXT
+{
+    issues virtual operation SVHDX_OPEN_DEVICE_CONTEXT
+    {
+        in guid InitiatorId = initiatorId;
+        in string InitiatorHostName = initiatorHostName;
+        
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT, InitiatorId: " + InitiatorId.ToString() + 
+                ", InitiatorHostName: " + InitiatorHostName;
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE{Context.InitiatorId is var initiatorId, Context.InitiatorHostName is var initiatorHostName}
+    issues RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE{Context.InitiatorId == initiatorId};
+
+    issues virtual operation SVHDX_OPEN_DEVICE_CONTEXT_V2
+    {
+        in guid InitiatorId = initiatorId;
+        in string InitiatorHostName = initiatorHostName;
+        
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT_V2, InitiatorId: " + InitiatorId.ToString() + 
+                ", InitiatorHostName: " + InitiatorHostName;
+        }
+    }
+    =
+    accepts RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE{Context.InitiatorId is var initiatorId, Context.InitiatorHostName is var initiatorHostName}
+    issues RSVD.Messages.SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE{Context.InitiatorId == initiatorId};
+}
+
+// 2.2.4.11  SVHDX_TUNNEL_OPERATION_HEADER Structure
+message SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+{
+    SVHDX_TUNNEL_OPERATION_HEADER Header;
+    
+    override string ToString()
+    {
+        return "SVHDX_TUNNEL_OPERATION_HEADER, OperationCode: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(Header.OperationCode) + ", Status: " + ErrorCodeToText(Header.Status);
+    }
+} with Documentation{Ignore = true};
+
+// --------------------------messages-----------------------------------------//
+// SMB2 CreateRequest and CreateResponse: 
+//     SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE
+//     SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE
+//     SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE
+//     SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE
+//     RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE
+// SMB2 IOCTL and CtlCode == SMB2IoctlCtlCode.FSCTL_QUERY_SHARED_VIRTUAL_DISK_SUPPORT
+//     SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE
+//     SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE
+// SMB2 IOCTL and CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_SYNC_TUNNEL_REQUEST
+//     SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_SRB_STATUS_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_SRB_STATUS_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_DISK_INFO_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_DISK_INFO_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_SCSI_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_SCSI_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_VALIDATE_DISK_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_INITIAL_INFO_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_INITIAL_INFO_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE_MESSAGE
+//     SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_MESSAGE
+//     SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE_MESSAGE
+// SMB2 IOCTL and CtlCode == SMB2IoctlCtlCode.FSCTL_SVHDX_ASYNC_TUNNEL_REQUEST
+//     SVHDX_META_OPERATION_START_REQUEST_MESSAGE
+//     SVHDX_META_OPERATION_REPLY_MESSAGE
+//     SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST_MESSAGE
+//     SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE_MESSAGE
+//     SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST_MESSAGE
+//     SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE_MESSAGE
+//     SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE
+//     SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE
+//     SVHDX_CHANGE_TRACKING_STOP_REQUEST_MESSAGE
+//     SVHDX_CHANGE_TRACKING_STOP_RESPONSE_MESSAGE
+// Others
+//     UnknownTunnelMessage
+//     ErrorResponse
+contract Messages
+{
+    // 2.2.4.1 SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST Structure
+    accepts message SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST Request;
+     
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.2  SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE Structure
+    issues message SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE Response;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.3  SVHDX_TUNNEL_SRB_STATUS_REQUEST Structure
+    accepts message SVHDX_TUNNEL_SRB_STATUS_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_SRB_STATUS_REQUEST Request;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SRB_STATUS_REQUEST, StatusKey: " + DecToHexFormat(Request.StatusKey);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.4 SVHDX_TUNNEL_SRB_STATUS_RESPONSE Structure
+    issues message SVHDX_TUNNEL_SRB_STATUS_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_SRB_STATUS_RESPONSE Response;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SRB_STATUS_RESPONSE, Status: " + ErrorCodeToText(Header.Status) + 
+                ", SrbStatus: " + EnumToStringInSummary<RSVD.SRBStatusCode>(Response.SrbStatus) + 
+                ", ScsiStatus: " + Response.ScsiStatus.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.5 SVHDX_TUNNEL_DISK_INFO_REQUEST Structure
+    accepts message SVHDX_TUNNEL_DISK_INFO_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_DISK_INFO_REQUEST Request;
+     
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DISK_INFO_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.6 SVHDX_TUNNEL_DISK_INFO_RESPONSE Structure
+    issues message SVHDX_TUNNEL_DISK_INFO_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_DISK_INFO_RESPONSE Response;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DISK_INFO_RESPONSE, Status: " + ErrorCodeToText(Header.Status) + ", DiskType: " + 
+                EnumToStringInSummary<RSVD.SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType>(Response.DiskType) + ", IsMounted:" + Response.IsMounted.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.7 SVHDX_TUNNEL_SCSI_REQUEST Structure
+    accepts message SVHDX_TUNNEL_SCSI_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_SCSI_REQUEST Request;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SCSI_REQUEST, " + "SrbFlags: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_SCSI_SrbFlags>(Request.SrbFlags) +
+                ", Disposition: " + Request.Disposition.ToString() + (Request.CDBBuffer is iscsiCommand:iSCSI.ScsiCommandDescriptorBlock ? (", CDBBuffer:" + iscsiCommand.ToString()) : "");
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.8 SVHDX_TUNNEL_SCSI_RESPONSE Structure
+    issues message SVHDX_TUNNEL_SCSI_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_SCSI_RESPONSE Response;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_SCSI_RESPONSE, Status: " + ErrorCodeToText(Header.Status) +
+                ", SrbFlags: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_SCSI_SrbFlags>(Response.SrbFlags) + ", Disposition: " + Response.Disposition.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.9 SVHDX_TUNNEL_VALIDATE_DISK_REQUEST Structure
+    accepts message SVHDX_TUNNEL_VALIDATE_DISK_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_VALIDATE_DISK_REQUEST Request;
+     
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VALIDATE_DISK_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.10 SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE Structure
+    issues message SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE Response;
+     
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.12  SVHDX_OPEN_DEVICE_CONTEXT Structure
+    accepts message SVHDX_OPEN_DEVICE_CONTEXT_MESSAGE
+    {
+        SVHDX_OPEN_DEVICE_CONTEXT Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT, InitiatorHostName: " + Context.InitiatorHostName;
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.32 SVHDX_OPEN_DEVICE_CONTEXT_V2 Structure
+    accepts message SVHDX_OPEN_DEVICE_CONTEXT_V2_MESSAGE
+    {
+        SVHDX_OPEN_DEVICE_CONTEXT_V2 Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT_V2, InitiatorHostName: " + Context.InitiatorHostName;
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.31  SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE Structure
+    issues message SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE_MESSAGE
+    {
+        SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE, InitiatorHostName: " + Context.InitiatorHostName;
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.33 SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE Structure
+    issues message SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE_MESSAGE
+    {
+        SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE, InitiatorHostName: " + Context.InitiatorHostName;
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.34  RSVD_BLOCK_DEVICE_TARGET_SPECIFIER Structure
+    accepts message RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_MESSAGE
+    {
+        RSVD_BLOCK_DEVICE_TARGET_SPECIFIER Context;
+    
+        override string ToString()
+        {
+            return "RSVD_BLOCK_DEVICE_TARGET_SPECIFIER, TargetInformationSnapshot: " + 
+                Context.TargetInformationSnapshot.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.37 SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST
+    accepts message SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST, TargetSnapshotId: " + 
+                Context.TargetSnapshotId.ToString() + ", LimitSnapshotId: " + Context.LimitSnapshotId.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.38 SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY Structure
+    issues message SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY Context;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY, ProcessedByteLength: " + 
+                Context.ProcessedByteLength.ToString() + ", RangeCount: " + Context.RangeCount.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.13  SVHDX_TUNNEL_INITIAL_INFO_REQUEST Structure
+    accepts message SVHDX_TUNNEL_INITIAL_INFO_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_INITIAL_INFO_REQUEST Request;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_INITIAL_INFO_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.14  SVHDX_TUNNEL_INITIAL_INFO_RESPONSE Structure
+    issues message SVHDX_TUNNEL_INITIAL_INFO_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_INITIAL_INFO_RESPONSE Response;
+    
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_INITIAL_INFO_RESPONSE, Status: " + ErrorCodeToText(Header.Status) +
+                ", ServerVersion: " + Response.ServerVersion.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.15 SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST Structure
+    accepts message SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST_MESSAGE
+    {
+        override string ToString()
+        {
+            return "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.16 SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE Structure
+    issues message SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE
+    {
+        SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport SharedVirtualDiskSupport
+            where ValidationCheckEnumValue(InRange<SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport>(value), this, true, ReferenceType.Message,
+                "RSVD", "SharedVirtualDiskSupport", "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE", "0x00000001, 0x00000003", value);
+        SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState SharedVirtualDiskHandleState
+            where ValidationCheckEnumValue(InRange<SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState>(value), this, true, ReferenceType.Message,
+                "RSVD", "SharedVirtualDiskHandleState", "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE", "0x00000000, 0x00000001, 0x00000003", value);
+
+        override string ToString()
+        {
+            return "SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE, SharedVirtualDiskSupport: " + EnumToStringInSummary<SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport>(SharedVirtualDiskSupport) +
+                ", SharedVirtualDiskHandleState: " + EnumToStringInSummary<RSVD.SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState>(SharedVirtualDiskHandleState);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.17 SVHDX_META_OPERATION_START_REQUEST Structure
+    accepts message SVHDX_META_OPERATION_START_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_META_OPERATION_START_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION_START_REQUEST, OperationType: " + EnumToStringInSummary<RSVD.SVHDX_META_OPERATION_START_REQUEST_OperationType>(Request.OperationType) + ", TransactionId: {" + (Request.TransactionId as string) + "}";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.18 SVHDX_META_OPERATION_REPLY Structure
+    issues message SVHDX_META_OPERATION_REPLY_MESSAGE[SVHDX_META_OPERATION_START_REQUEST_OperationType OperationType, SvhdxSnapshotType SnapshotType] : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_META_OPERATION_REPLY[OperationType, SnapshotType] Response;
+
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION_REPLY, Status: " + ErrorCodeToText(Header.Status) + 
+                ((Response.ChangeTrackingErrorStatus is SVHDX_TUNNEL_CHANGE_TRACKING_STATUS) ? 
+                    (", ChangeTrackingErrorStatus: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_CHANGE_TRACKING_STATUS>(Response.ChangeTrackingErrorStatus as SVHDX_TUNNEL_CHANGE_TRACKING_STATUS)) : 
+                    "");
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.19 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST Structure
+    accepts message SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST, VHDSetInformationType: " + EnumToStringInSummary<RSVD.SvhdxVHDSetInformationType>(Request.VHDSetInformationType) + 
+                ", SnapshotType: " + EnumToStringInSummary<RSVD.SvhdxSnapshotType>(Request.SnapshotType) + 
+                ", SnapshotId: {" + (Request.SnapshotId as string) + "}";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.20 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE Structure
+    // 2.2.4.21 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE Structure
+    // 2.2.4.22 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_OPTIMIZE_RESPONSE Structure
+    issues message SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE_MESSAGE[SvhdxVHDSetInformationType SetInformationType] : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        ([|SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotList || SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeCdpSnapshotActiveList || SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeCdpSnapshotInactiveList|]
+            SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE |
+        [|SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotEntry || SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeCdpSnapshotRoot|]
+            SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE |
+        [|SetInformationType == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeOptimizeNeeded|] SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_OPTIMIZE_RESPONSE | binary) Response;
+
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.23 SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST Structure
+    accepts message SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST, TransactionId: {" + (Request.TransactionId as string) + "}";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.24 SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE Structure
+    issues message SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE, Status: " + ErrorCodeToText(Header.Status) +
+                ", CurrentProgressValue: " + (Response.CurrentProgressValue as string) +
+                ", CompleteValue: " + (Response.CompleteValue as string);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.25 SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE Structure
+    accepts message SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    issues message SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE, Status: " + ErrorCodeToText(Header.Status) +
+                ", ChangeTrackingStatus: " + EnumToStringInSummary<SVHDX_TUNNEL_CHANGE_TRACKING_STATUS>(Response.ChangeTrackingStatus) + 
+                ", LogFileSize: " + (Response.LogFileSize  as string);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.26 SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST Structure
+    accepts message SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST, SnapshotId: {" + (Request.SnapshotId as string) + "}";
+        }
+    } with Documentation{Ignore = true};
+
+    issues message SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.27 SVHDX_CHANGE_TRACKING_START_REQUEST Structure
+    accepts message SVHDX_CHANGE_TRACKING_START_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_START_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_START_REQUEST, TransactionId: {" + (Request.TransactionId as string) + "}";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.28 SVHDX_CHANGE_TRACKING_START_RESPONSE Structure
+    issues message SVHDX_CHANGE_TRACKING_START_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_START_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_START_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.29 SVHDX_CHANGE_TRACKING_STOP_REQUEST Structure
+    accepts message SVHDX_CHANGE_TRACKING_STOP_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_STOP_REQUEST Request;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_STOP_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.30 SVHDX_CHANGE_TRACKING_STOP_RESPONSE Structure
+    issues message SVHDX_CHANGE_TRACKING_STOP_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_CHANGE_TRACKING_STOP_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_CHANGE_TRACKING_STOP_RESPONSE, Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+
+    accepts message SVHDX_TUNNEL_QUERY_SAFE_SIZE_REQUEST_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        override string ToString()
+        {
+            return "RSVD_TUNNEL_QUERY_SAFE_SIZE_REQUEST";
+        }
+    } with Documentation{Ignore = true};
+
+    // 2.2.4.40 SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE STRUCTURE
+    issues message SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE_MESSAGE : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE Response;
+
+        override string ToString()
+        {
+            return "SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE, Status: " + ErrorCodeToText(Header.Status) +
+                "SafeVirtualSize: " + Response.SafeVirtualSize.ToString();
+        }
+    } with Documentation{Ignore = true};
+
+    // If the OperationCode in the header is an unknown code, then it will be parsed as this message.
+    message UnknownTunnelMessage : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        binary Body;
+        invariant !InRange<SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(Header.OperationCode);
+        override string ToString()
+        {
+            return "Unknown Tunnel Message, OperationCode: Unknown(" + DecToHexFormat(Header.OperationCode) + ")";
+        }
+    } with Documentation{Ignore = true};
+
+    // According to section 3.2   Server Details, Server uses SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE as the error response
+    issues message ErrorResponse : SVHDX_TUNNEL_OPERATION_HEADER_MESSAGE
+    {
+        override string ToString()
+        {
+            return "Error Response, OperationCode: " + EnumToStringInSummary<RSVD.SVHDX_TUNNEL_OPERATION_HEADER_OperationCode>(Header.OperationCode) + ", Status: " + ErrorCodeToText(Header.Status);
+        }
+    } with Documentation{Ignore = true};
+}
+
+// --------------------------structures-----------------------------------------//
+pattern SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_MESSAGE_SharedVirtualDiskSupport = enum uint
+{
+    SharedVirtualDisksSupported            = 0x00000001,
+    SharedVirtualDiskSnapshotsSupported    = 0x00000007,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.16 SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE Structure
+pattern SVHDX_SHARED_VIRTUAL_DISK_SUPPORT_RESPONSE_SharedVirtualDiskHandleState = enum uint
+{
+    HandleStateNone = 0x00000000,
+    HandleStateFileShared = 0x00000001,
+    HandleStateShared = 0x00000003,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.2    Operation Codes
+pattern SVHDX_TUNNEL_OPERATION_HEADER_OperationCode = enum uint
+{
+    RSVD_TUNNEL_GET_INITIAL_INFO_OPERATION          = 0x02001001,
+    RSVD_TUNNEL_SCSI_OPERATION                      = 0x02001002,
+    RSVD_TUNNEL_CHECK_CONNECTION_STATUS_OPERATION   = 0x02001003,
+    RSVD_TUNNEL_SRB_STATUS_OPERATION                = 0x02001004,
+    RSVD_TUNNEL_GET_DISK_INFO_OPERATION             = 0x02001005,
+    RSVD_TUNNEL_VALIDATE_DISK_OPERATION             = 0x02001006,
+    RSVD_TUNNEL_META_OPERATION_START                = 0x02002101,
+    RSVD_TUNNEL_META_OPERATION_QUERY_PROGRESS       = 0x02002002,
+    RSVD_TUNNEL_VHDSET_QUERY_INFORMATION            = 0x02002005,
+    RSVD_TUNNEL_DELETE_SNAPSHOT                     = 0x02002006,
+    RSVD_TUNNEL_CHANGE_TRACKING_GET_PARAMETERS      = 0x02002008,
+    RSVD_TUNNEL_CHANGE_TRACKING_START               = 0x02002009,
+    RSVD_TUNNEL_CHANGE_TRACKING_STOP                = 0x0200200A,
+    RSVD_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES          = 0x0200200C,
+    RSVD_TUNNEL_QUERY_SAFE_SIZE                     = 0x0200200D,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.3 Error Code
+pattern ErrorCode = enum uint
+{
+    STATUS_SVHDX_ERROR_STORED                                   = 0xC05C0000,
+    STATUS_SVHDX_ERROR_NOT_AVAILABLE                            = 0xC05CFF00,
+    STATUS_SVHDX_UNIT_ATTENTION_AVAILABLE                       = 0xC05CFF01,
+    STATUS_SVHDX_UNIT_ATTENTION_CAPACITY_DATA_CHANGED           = 0xC05CFF02,
+    STATUS_SVHDX_UNIT_ATTENTION_RESERVATIONS_PREEMPTED          = 0xC05CFF03,
+    STATUS_SVHDX_UNIT_ATTENTION_RESERVATIONS_RELEASED           = 0xC05CFF04,
+    STATUS_SVHDX_UNIT_ATTENTION_REGISTRATIONS_PREEMPTED         = 0xC05CFF05,
+    STATUS_SVHDX_UNIT_ATTENTION_OPERATING_DEFINITION_CHANGED    = 0xC05CFF06,
+    STATUS_SVHDX_RESERVATION_CONFLICT                           = 0xC05CFF07,
+    STATUS_SVHDX_WRONG_FILE_TYPE                                = 0xC05CFF08,
+    STATUS_SVHDX_VERSION_MISMATCH                               = 0xC05CFF09,
+    STATUS_VHD_SHARED                                           = 0xC05CFF0A,
+    ...
+} with Documentation{Ignore = true};
+
+string ErrorCodeToText(any code)
+{
+    uint val = code as uint;
+    if (val == 0)
+    {
+        return "Success";
+    }
+    else if (InRange<ErrorCode>(val))
+    {
+        return  EnumToString<RSVD.ErrorCode>(val);
+    }
+    else
+    {
+        return ERREF.NtStatusMap[val];
+    }
+}
+
+// 2.2.4.1 SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST Structure
+type SVHDX_TUNNEL_CHECK_CONNECTION_REQUEST
+{
+};
+
+// 2.2.4.2  SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE Structure
+type SVHDX_TUNNEL_CHECK_CONNECTION_RESPONSE
+{
+};
+
+// 2.2.4.3 SVHDX_TUNNEL_SRB_STATUS_REQUEST Structure
+type SVHDX_TUNNEL_SRB_STATUS_REQUEST
+{
+    UCHAR StatusKey;
+    binary Reserved where ValidationCheckReservedZero(value == $[000000000000000000000000000000000000000000000000000000], null, true, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_TUNNEL_SRB_STATUS_REQUEST", value)
+        with BinaryEncoding{Length = 27};
+} with Documentation{Ignore = true};
+
+// 2.2.4.4  SVHDX_TUNNEL_SRB_STATUS_RESPONSE Structure
+type SVHDX_TUNNEL_SRB_STATUS_RESPONSE
+{
+    UCHAR StatusKey;
+    bool $"A - SenseInfoAutoGenerated" with BinaryEncoding{Width = 1};
+    SRBStatusCode SrbStatus
+        where ValidationCheckEnumValueTooManyItems(InRange<SRBStatusCode>(value), null, true, ReferenceType.Type,
+            "RSVD", "SrbStatus", "SVHDX_TUNNEL_SRB_STATUS_RESPONSE", "SRB Status Code", "[MS-RSVD]")
+        with BinaryEncoding{Width = 7};
+    UCHAR ScsiStatus;
+    UCHAR SenseInfoExLength;
+    binary SenseDataEx with BinaryEncoding{Length = SenseInfoExLength, MaxLength = 20};
+} with Documentation{Ignore = true};
+
+// 2.2.4.5  SVHDX_TUNNEL_DISK_INFO_REQUEST Structure
+type SVHDX_TUNNEL_DISK_INFO_REQUEST
+{
+    ULONGLONG Reserved1 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved1", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    ULONG BlockSize where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "BlockSize", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    guid LinkageID where ValidationCheckZero(value == {00000000-0000-0000-0000-000000000000}, null, true, ReferenceType.Type, "RSVD", "LinkageID", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    BOOLEAN IsMounted where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "IsMounted", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    BOOLEAN Is4kAligned where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Is4kAligned", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    ushort Reserved2 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved2", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    ULONGLONG FileSize where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "FileSize", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+    guid VirtualDiskId  where ValidationCheckZero(value == {00000000-0000-0000-0000-000000000000}, null, true, ReferenceType.Type, "RSVD", "VirtualDiskId", "SVHDX_TUNNEL_DISK_INFO_REQUEST", value);
+} with Documentation{Ignore = true};
+
+// 2.2.4.6 SVHDX_TUNNEL_DISK_INFO_RESPONSE Structure
+type SVHDX_TUNNEL_DISK_INFO_RESPONSE
+{
+    SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType DiskType where ValidationCheckEnumValue(InRange<SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType>(value), null, true, ReferenceType.Type,
+        "RSVD", "DiskType", "SVHDX_TUNNEL_DISK_INFO_RESPONSE", "0x00000002, 0x00000003", value);
+    SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskFormat DistFormat where ValidationCheckEnumValue(InRange<SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskFormat>(value), null, true, ReferenceType.Type,
+        "RSVD", "DiskFormat", "SVHDX_TUNNEL_DISK_INFO_RESPONSE", "0x00000003", value);
+    ULONG BlockSize;
+    guid LinkageId;
+    BOOLEAN IsMounted;
+    BOOLEAN Is4kAligned;
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_TUNNEL_DISK_INFO_RESPONSE", value);
+    ULONGLONG FileSize;
+    guid VirtualDiskId;
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskType = enum uint
+{
+    VHD_TYPE_FIXED = 0x00000002,
+    VHD_TYPE_DYNAMIC = 0x00000003,
+    ...
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_DISK_INFO_RESPONSE_DiskFormat = enum uint
+{
+    VIRTUAL_STORAGE_TYPE_DEVICE_VHDX = 0x00000003,
+    VIRTUAL_STORAGE_TYPE_DEVICE_VHDSET = 0x00000004,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.7 SVHDX_TUNNEL_SCSI_REQUEST Structure
+type SVHDX_TUNNEL_SCSI_REQUEST
+{
+    ushort Length;
+    ushort Reserved1 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved1", "SVHDX_TUNNEL_SCSI_REQUEST", value);
+    UCHAR CDBLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_CDB_GENERIC_LENGTH, null, true, ReferenceType.Type, "RSVD", "CDBLength",
+        "SVHDX_TUNNEL_SCSI_REQUEST", RSVD_CDB_GENERIC_LENGTH, value);
+    UCHAR SenseInfoExLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_SCSI_SENSE_BUFFER_SIZE, null, true, ReferenceType.Type, "RSVD", "SenseInfoExLength",
+        "SVHDX_TUNNEL_SCSI_REQUEST", RSVD_SCSI_SENSE_BUFFER_SIZE, value);
+    SVHDX_TUNNEL_SCSI_REQUEST_Disposition Disposition where ValidationCheckEnumValue(InRange<SVHDX_TUNNEL_SCSI_REQUEST_Disposition>(value), null, true, ReferenceType.Type,
+        "RSVD", "Disposition", "SVHDX_TUNNEL_SCSI_REQUEST", "0x00, 0x01, 0x02", value);
+    UCHAR Reserved2 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved2", "SVHDX_TUNNEL_SCSI_REQUEST", value);
+    SVHDX_TUNNEL_SCSI_SrbFlags SrbFlags;
+    ULONG DataTransferLength;
+    (iSCSI.ScsiCommandDescriptorBlock | binary) CDBBuffer with BinaryEncoding{Length = RSVD_CDB_GENERIC_LENGTH};
+    ULONG Reserved3 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved3", "SVHDX_TUNNEL_SCSI_REQUEST", value);
+    binary DataBuffer with BinaryEncoding {Length = DataTransferLength};
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_SCSI_REQUEST_Disposition = enum byte
+{
+    $"Client is requesting data from the server" = 0x00,
+    $"Client is sending data to the server" = 0x01,
+    $"Client is neither sending nor requesting an additional data buffer" = 0x02,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.8 SVHDX_TUNNEL_SCSI_RESPONSE Structure
+type SVHDX_TUNNEL_SCSI_RESPONSE
+{
+    ushort Length;
+    bool $"A - SenseInfoAutoGenerated" with BinaryEncoding{Width = 1};
+    SRBStatusCode SrbStatus
+        where ValidationCheckEnumValueTooManyItems(InRange<SRBStatusCode>(value), null, true, ReferenceType.Type, 
+            "RSVD", "SrbStatus", "SVHDX_TUNNEL_SCSI_RESPONSE", "SRB Status Code", "[MS-RSVD]")
+        with BinaryEncoding{Width = 7}; // An 8-bit field used to communicate error messages from the server to the client, as specified in [SPC-3] section 4.18.
+    UCHAR ScsiStatus;
+    UCHAR CDBLength;
+    UCHAR SenseInfoExLength;
+    SVHDX_TUNNEL_SCSI_RESPONSE_Disposition Disposition where ValidationCheckEnumValue(InRange<SVHDX_TUNNEL_SCSI_RESPONSE_Disposition>(value), null, true, ReferenceType.Type,
+            "RSVD", "Disposition", "SVHDX_TUNNEL_SCSI_RESPONSE", "0x00, 0x01, 0x02", value);
+    UCHAR Reserved where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_TUNNEL_SCSI_RESPONSE", value);
+    SVHDX_TUNNEL_SCSI_SrbFlags SrbFlags;
+    ULONG DataTransferLength;
+    binary SenseDataEx with BinaryEncoding{Length = SenseInfoExLength};
+    binary DataBuffer with BinaryEncoding {Length = DataTransferLength};
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_SCSI_RESPONSE_Disposition = enum byte
+{
+    $"Client requested data from the server" = 0x00,
+    $"Client sent data to the server" = 0x01,
+    $"Client neither sent nor requested an additional data buffer" = 0x02,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.9 SVHDX_TUNNEL_VALIDATE_DISK_REQUEST Structure
+type SVHDX_TUNNEL_VALIDATE_DISK_REQUEST
+{
+    binary Reserved with BinaryEncoding{Length = 56};
+};
+
+// 2.2.4.10 SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE Structure
+type SVHDX_TUNNEL_VALIDATE_DISK_RESPONSE
+{
+    bool IsValidDisk;
+};
+
+// 2.2.4.11   SVHDX_TUNNEL_OPERATION_HEADER
+type SVHDX_TUNNEL_OPERATION_HEADER
+{
+    SVHDX_TUNNEL_OPERATION_HEADER_OperationCode OperationCode;
+    ErrorCode Status with DisplayInfo{ToText = ErrorCodeToText};
+    ulong RequestId;
+} with Documentation{Ignore = true};
+
+const uint RSVD_HEADER_LENGTH = 16 with Documentation {Ignore = true}; // the length of header (SVHDX_TUNNEL_OPERATION_HEADER) is 16
+
+// 2.2.4.12   SVHDX_OPEN_DEVICE_CONTEXT
+type SVHDX_OPEN_DEVICE_CONTEXT
+{
+    RVSDProtocolVersion Version;
+    BOOLEAN HasInitiatorId;
+    array<UCHAR> Reserved with BinaryEncoding{Length = 3};
+    guid InitiatorId;
+    ULONG Flags where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Flags", "SVHDX_OPEN_DEVICE_CONTEXT", value);
+    SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags OriginatorFlags
+        where ValidationCheckEnumValue(InRange<SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags>(value), null, true, ReferenceType.Type, 
+            "RSVD", "OriginatorFlags", "SVHDX_OPEN_DEVICE_CONTEXT", "0x00000001, 0x00000004", value);
+    ULONGLONG OpenRequestId;
+    ushort InitiatorHostNameLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_MAXIMUM_NAME_LENGTH, null, true, ReferenceType.Type, "RSVD", "InitiatorHostNameLength",
+        "SVHDX_OPEN_DEVICE_CONTEXT", RSVD_MAXIMUM_NAME_LENGTH, value);
+    string InitiatorHostName with BinaryEncoding{Length = ((InitiatorHostNameLength + 2) / 2), TextEncoding = TextEncoding.UTF16}; // plus 2 for UTF16 null-terminater.
+} with Documentation{Ignore = true};
+
+pattern RVSDProtocolVersion = enum uint
+{
+    $"SVHDX_OPEN_DEVICE_CONTEXT_V1" = 0x00000001,
+    $"SVHDX_OPEN_DEVICE_CONTEXT_V2" = 0x00000002,
+    ...
+} with Documentation{Ignore = true};
+
+pattern SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags = enum uint
+{
+    SVHDX_ORIGINATOR_PVHDPARSER     = 0x00000001,
+    SVHDX_ORIGINATOR_VHDMP          = 0x00000004,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.13 SVHDX_TUNNEL_INITIAL_INFO_REQUEST Structure
+type SVHDX_TUNNEL_INITIAL_INFO_REQUEST
+{
+};
+
+// 2.2.4.14 SVHDX_TUNNEL_INITIAL_INFO_RESPONSE Structure
+type SVHDX_TUNNEL_INITIAL_INFO_RESPONSE
+{
+    ULONG ServerVersion;
+    ULONG SectorSize;
+    ULONG PhysicalSectorSize;
+    ULONG Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_TUNNEL_INITIAL_INFO_RESPONSE", value);
+    ULONGLONG VirtualSize;
+};
+
+// 2.2.4.17 SVHDX_META_OPERATION_START_REQUEST Structure
+type SVHDX_META_OPERATION_START_REQUEST
+{
+    guid TransactionId;
+    SVHDX_META_OPERATION_START_REQUEST_OperationType OperationType
+         where ValidationCheckEnumValue(InRange<SVHDX_META_OPERATION_START_REQUEST_OperationType>(value), null, true, ReferenceType.Type, 
+            "RSVD", "OperationType", "SVHDX_META_OPERATION_START_REQUEST", "0x00000000, 0x00000001, 0x00000002, 0x00000003, 0x00000004", value);
+    optional [|OperationType != SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeOptimize|] uint Padding 
+        where ValidationCheckZero(value == nothing || value == 0, null, true, ReferenceType.Type,
+            "RSVD", "Padding", "SVHDX_META_OPERATION_START_REQUEST", value);
+    optional [|OperationType != SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeOptimize|]
+    ([|OperationType is SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeCreateSnapshot|] SVHDX_META_OPERATION_CREATE_SNAPSHOT |
+    [|OperationType is SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeExtractVHD|] SVHDX_META_OPERATION_EXTRACT |
+    [|OperationType is SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeConvertToVHDSet|] SVHDX_META_OPERATION_CONVERT_TO_VHDSET |
+    [|OperationType is SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeResize|] SVHDX_META_OPERATION_RESIZE_VIRTUAL_DISK |
+    [|OperationType is SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeApplySnapshot|] SVHDX_APPLY_SNAPSHOT_PARAMS) Data;
+} with Documentation{Ignore = true};
+
+pattern SVHDX_META_OPERATION_START_REQUEST_OperationType = enum uint
+{
+    SvhdxMetaOperationTypeResize          = 0x00000000,
+    SvhdxMetaOperationTypeCreateSnapshot  = 0x00000001,
+    SvhdxMetaOperationTypeOptimize        = 0x00000002,
+    SvhdxMetaOperationTypeExtractVHD      = 0x00000003,
+    SvhdxMetaOperationTypeConvertToVHDSet = 0x00000004,
+    SvhdxMetaOperationTypeApplySnapshot   = 0x00000005,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.17.1 SVHDX_META_OPERATION_CREATE_SNAPSHOT Structure
+type SVHDX_META_OPERATION_CREATE_SNAPSHOT
+{
+    SvhdxSnapshotType SnapshotType
+        where ValidationCheckEnumValue(InRange<SvhdxSnapshotType>(value), null, true, ReferenceType.Type,
+            "RSVD", "SnapshotType", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "0x00000001, 0x00000003", value);
+
+    SVHDX_META_OPERATION_CREATE_SNAPSHOT_Flags Flags
+        where ValidationCheckCombinationValueIncludeZero(InRange<SVHDX_META_OPERATION_CREATE_SNAPSHOT_Flags>(value), null,
+            true, ReferenceType.Type, "RSVD", "Flags", "SVHDX_META_OPERATION_CREATE_SNAPSHOT","0x00000001", value);
+
+    SvhdxSnapshotStage Stage1
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStage>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage1", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    SvhdxSnapshotStageWithInvalid Stage2
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStageWithInvalid>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage2", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    SvhdxSnapshotStageWithInvalid Stage3
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStageWithInvalid>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage3", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    SvhdxSnapshotStageWithInvalid Stage4
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStageWithInvalid>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage4", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    SvhdxSnapshotStageWithInvalid Stage5
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStageWithInvalid>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage5", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    SvhdxSnapshotStageWithInvalid Stage6
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxSnapshotStageWithInvalid>(value), null, true, ReferenceType.Type, 
+            "RSVD", "Stage6", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "SVHDX_META_OPERATION_CREATE_SNAPSHOT", "[MS-RSVD]");
+    guid SnapshotId;
+    uint ParametersPayloadSize;
+    SVHDX_META_OPERATION_CREATE_CDP_PARAMETER CdpParameters;
+} with Documentation{Ignore = true};
+
+pattern SVHDX_META_OPERATION_CREATE_SNAPSHOT_Flags = flags uint
+{
+    SVHDX_SNAPSHOT_DISK_FLAG_ENABLE_CHANGE_TRACKING = 0x00000001,
+    ...
+};
+
+pattern SvhdxSnapshotStage = enum uint
+{
+    SvhdxSnapshotStageInitialize        = 0x00000001,
+    SvhdxSnapshotStageBlockIO           = 0x00000002,
+    SvhdxSnapshotStageSwitchObjectStore = 0x00000003,
+    SvhdxSnapshotStageUnblockIO         = 0x00000004,
+    SvhdxSnapshotStageFinalize          = 0x00000005,
+    ...
+} with Documentation{Ignore = true};
+
+pattern SvhdxSnapshotStageWithInvalid = enum uint
+{
+    SvhdxSnapshotStageInitialize        = 0x00000001,
+    SvhdxSnapshotStageBlockIO           = 0x00000002,
+    SvhdxSnapshotStageSwitchObjectStore = 0x00000003,
+    SvhdxSnapshotStageUnblockIO         = 0x00000004,
+    SvhdxSnapshotStageFinalize          = 0x00000005,
+    SvhdxSnapshotStageInvalid           = 0x00000000,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.17.1.1 SVHDX_META_OPERATION_CREATE_CDP_PARAMETER Structure
+type SVHDX_META_OPERATION_CREATE_CDP_PARAMETER
+{
+    uint LogFileNameOffset;
+    uint LogFileNameLength;
+    guid LogFileId;
+    optional [|LogFileNameLength > 0|] string LogFileName with Encoding{Offset = LogFileNameOffset, Size = LogFileNameLength}, BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+} with Documentation{Ignore = true};
+
+// 2.2.4.17.2 SVHDX_META_OPERATION_EXTRACT Structure
+type SVHDX_META_OPERATION_EXTRACT
+{
+    SvhdxSnapshotType SnapshotType
+        where ValidationCheckEnumValue(InRange<SvhdxSnapshotType>(value), null, true, ReferenceType.Type,
+            "RSVD", "SnapshotType", "SVHDX_META_OPERATION_EXTRACT", "0x00000001, 0x00000003", value);
+    uint Padding where ValidationCheckZero(value == 0, null, true, ReferenceType.Type,
+        "RSVD", "Padding", "SVHDX_META_OPERATION_EXTRACT", value);
+    SVHDX_META_OPERATION_EXTRACT_Flags Flags
+        where ValidationCheckCombinationValueIncludeZero(InRange<SVHDX_META_OPERATION_EXTRACT_Flags>(value), null,
+            true, ReferenceType.Type, "RSVD", "Flags", "SVHDX_META_OPERATION_EXTRACT","0x00000001", value);
+    guid SourceSnapshotId;
+    guid SourceLimitSnapshotId;
+    uint DestinationVhdNameLength;
+    string DestinationVhdName with BinaryEncoding{Length = (DestinationVhdNameLength / 2), TextEncoding = TextEncoding.UTF16};
+} with Documentation{Ignore = true};
+
+pattern SVHDX_META_OPERATION_EXTRACT_Flags = flags uint
+{
+    SVHDX_EXTRACT_SNAPSHOTS_FLAG_DELETE_ON_CLOSE = 0x00000001,
+    ...
+};
+
+// 2.2.4.17.3 SVHDX_META_OPERATION_CONVERT_TO_VHDSET Structure
+type SVHDX_META_OPERATION_CONVERT_TO_VHDSET
+{
+    uint DestinationVhdSetNameLength;
+    string DestinationVhdSetName with BinaryEncoding{Length = (DestinationVhdSetNameLength / 2), TextEncoding = TextEncoding.UTF16};
+} with Documentation{Ignore = true};
+
+// 2.2.4.17.4 SVHDX_META_OPERATION_RESIZE_VIRTUAL_DISK Structure
+type SVHDX_META_OPERATION_RESIZE_VIRTUAL_DISK
+{
+    ulong NewSize;
+    BOOLEAN ExpandOnly;
+    BOOLEAN AllowUnsafeVirtualSize;
+    BOOLEAN ShrinkToMinimumSafeSize;
+    BOOLEAN Reserved where ValidationCheckZero(value == 0, null, true, ReferenceType.Type,
+        "RSVD", "Reserved", "SVHDX_META_OPERATION_RESIZE_VIRTUAL_DISK", value);
+} with Documentation{Ignore = true};
+
+// 2.2.4.18 SVHDX_META_OPERATION_REPLY Structure
+type SVHDX_META_OPERATION_REPLY[SVHDX_META_OPERATION_START_REQUEST_OperationType OperationType, SvhdxSnapshotType SnapshotType]
+{
+    optional [|OperationType == SVHDX_META_OPERATION_START_REQUEST_OperationType.SvhdxMetaOperationTypeCreateSnapshot && 
+        SnapshotType == SvhdxSnapshotType.SvhdxSnapshotTypeCDP|] SVHDX_TUNNEL_CHANGE_TRACKING_STATUS ChangeTrackingErrorStatus;
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_CHANGE_TRACKING_STATUS = enum uint
+{
+    SVHDX_TUNNEL_CHANGE_TRACKING_STATUS_SUCCESS = 0x00000000,
+    SVHDX_TUNNEL_CHANGE_TRACKING_NOT_INITIALIZED = 0xC03A0020,
+    SVHDX_TUNNEL_CHANGE_TRACKING_LOGSIZE_EXCEEDED_MAXSIZE = 0xC03A0021,
+    SVHDX_TUNNEL_CHANGE_TRACKING_VHD_CHANGED_OFFLINE = 0xC03A0022,
+    SVHDX_TUNNEL_CHANGE_TRACKING_INVALID_TRACKING_STATE = 0xC03A0023,
+    SVHDX_TUNNEL_CHANGE_TRACKING_INCONSISTENT_TRACKING_FILE = 0xC03A0024,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.19 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST Structure
+type SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST
+{
+    SvhdxVHDSetInformationType VHDSetInformationType
+        where ValidationCheckEnumValueTooManyItems(InRange<SvhdxVHDSetInformationType>(value), null, true, ReferenceType.Type, 
+            "RSVD", "VHDSetInformationType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST", "[MS-RSVD]");
+    SvhdxSnapshotType SnapshotType
+        where ValidationCheckEnumValue(InRange<SvhdxSnapshotType>(value), null, true, ReferenceType.Type, 
+            "RSVD", "SnapshotType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST", "0x00000001, 0x00000003", value);
+    guid SnapshotId;
+} with Documentation{Ignore = true};
+
+pattern SvhdxVHDSetInformationType = enum uint
+{
+    SvhdxVHDSetInformationTypeSnapshotList = 0x00000002,
+    SvhdxVHDSetInformationTypeSnapshotEntry = 0x00000005,
+    SvhdxVHDSetInformationTypeOptimizeNeeded = 0x00000008,
+    SvhdxVHDSetInformationTypeCdpSnapshotRoot = 0x00000009,
+    SvhdxVHDSetInformationTypeCdpSnapshotActiveList = 0x0000000A,
+    SvhdxVHDSetInformationTypeCdpSnapshotInactiveList = 0x0000000C,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.20 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE  Structure
+// when the SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST's VHDSetInformationType is SvhdxVHDSetInformationTypeSnapshotList
+type SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE
+{
+    SvhdxVHDSetInformationType VHDSetInformationType
+        where ValidationCheckValue(value == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotList, null, true, ReferenceType.Type, 
+            "RSVD", "VHDSetInformationType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE", "SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotList", EnumToStringInSummary<SvhdxVHDSetInformationType>(value));
+    uint Reserved1;
+    SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE_ResponseComplete ResponseComplete;
+    uint Reserved2 with BinaryEncoding{Width = 24};
+    uint NumberOfSnapshots;
+    optional [|ResponseComplete == 0x00000001|] array<guid> SnapshotIds with BinaryEncoding{Length = NumberOfSnapshots};
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_LIST_RESPONSE_ResponseComplete = enum byte
+{
+    $"SnapshotIds field is not present" = 0x00000000,
+    $"SnapshotIds field is present" = 0x00000001,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.21 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE Structure
+// when the SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST's VHDSetInformationType is SvhdxVHDSetInformationTypeSnapshotEntry
+type SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE
+{
+    SvhdxVHDSetInformationType VHDSetInformationType
+        where ValidationCheckValue(value == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotEntry, null, true, ReferenceType.Type, 
+            "RSVD", "VHDSetInformationType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE", "SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeSnapshotEntry", EnumToStringInSummary<SvhdxVHDSetInformationType>(value));
+    uint Reserved;
+    DateTimeMilliSeconds SnapshotCreationTime;
+    SvhdxSnapshotType SnapshotType
+        where ValidationCheckEnumValue(InRange<SvhdxSnapshotType>(value), null, true, ReferenceType.Type,
+            "RSVD", "SnapshotType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE", "0x00000001, 0x00000003", value);
+    SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE_IsValidSnapshot IsValidSnapshot;
+    guid SnapshotId;
+    guid ParentSnapshotId;
+    guid LogFileId;
+} with Documentation{Ignore = true};
+
+type DateTimeMilliSeconds
+{
+    ulong MilliSeconds;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddMilliseconds(MilliSeconds as double).ToLocalTime().ToString("MM/dd/yyyy HH:mm:ss.fffffff K");
+    }
+}
+
+pattern SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_SNAPSHOT_ENTRY_RESPONSE_IsValidSnapshot = enum uint
+{
+    $"Snapshot is valid" = 0x00000001,
+    $"Snapshot is invalid" = 0x00000000,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.22 SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_OPTIMIZE_RESPONSE Structure
+// when the SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_REQUEST's VHDSetInformationType is SvhdxVHDSetInformationTypeOptimizeNeeded
+type SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_OPTIMIZE_RESPONSE
+{
+    SvhdxVHDSetInformationType VHDSetInformationType
+        where ValidationCheckValue(value == SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeOptimizeNeeded, null, true, ReferenceType.Type, 
+            "RSVD", "VHDSetInformationType", "SVHDX_TUNNEL_VHDSET_QUERY_INFORMATION_OPTIMIZE_RESPONSE", "SvhdxVHDSetInformationType.SvhdxVHDSetInformationTypeOptimizeNeeded", EnumToStringInSummary<SvhdxVHDSetInformationType>(value));
+    uint Reserved ;
+    uint OptimizeNeeded;
+} with Documentation{Ignore = true};
+
+// 2.2.4.23 SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST Structure
+type SVHDX_META_OPERATION_QUERY_PROGRESS_REQUEST
+{
+    guid TransactionId;
+} with Documentation{Ignore = true};
+
+// 2.2.4.24 SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE Structure
+type SVHDX_META_OPERATION_QUERY_PROGRESS_RESPONSE
+{
+    ulong CurrentProgressValue;
+    ulong CompleteValue;
+} with Documentation{Ignore = true};
+
+// 2.2.4.25 SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE Structure
+type SVHDX_CHANGE_TRACKING_GET_PARAMETERS_REQUEST
+{
+}
+
+type SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE
+{
+    ULONG ChangeTrackingStatus
+        where ValidationCheckEnumValueTooManyItems(InRange<SVHDX_TUNNEL_CHANGE_TRACKING_STATUS>(value), null, true, ReferenceType.Type, 
+            "RSVD", "ChangeTrackingStatus", "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE", "SVHDX_CHANGE_TRACKING_GET_PARAMETERS_RESPONSE", "[MS-RSVD]");
+    uint Reserved;
+    ulong LogFileSize;
+} with Documentation{Ignore = true};
+
+// 2.2.4.26 SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST Structure
+type SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST
+{
+    guid SnapshotId;
+    SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_PersistReference PersistReference;
+    SvhdxSnapshotType SnapshotType
+        where ValidationCheckEnumValue(InRange<SvhdxSnapshotType>(value), null, true, ReferenceType.Type,
+            "RSVD", "SnapshotType", "SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST", "0x00000001, 0x00000003", value);
+} with Documentation{Ignore = true};
+
+pattern SVHDX_TUNNEL_DELETE_SNAPSHOT_REQUEST_PersistReference = enum uint
+{
+    $"The snapshot will be deleted" = 0x00000000,
+    $"The snapshot will be stored as a reference without any data" = 0x00000001,
+    ...
+} with Documentation{Ignore = true};
+
+type SVHDX_TUNNEL_DELETE_SNAPSHOT_RESPONSE
+{
+} with Documentation{Ignore = true};
+
+// 2.2.4.27 SVHDX_CHANGE_TRACKING_START_REQUEST Structure
+type SVHDX_CHANGE_TRACKING_START_REQUEST
+{
+    guid TransactionId;
+    uint LogFileNameOffset;
+    uint LogFileNameLength;
+    guid LogFileId;
+    ulong MaxLogFileSize;
+    uint AppendData;
+    uint Reserved;
+    string LogFileName with BinaryEncoding{Length = (LogFileNameLength / 2), TextEncoding = TextEncoding.UTF16};
+} with Documentation{Ignore = true};
+
+// 2.2.4.28 SVHDX_CHANGE_TRACKING_START_RESPONSE Structure
+type SVHDX_CHANGE_TRACKING_START_RESPONSE
+{
+} with Documentation{Ignore = true};
+
+// 2.2.4.29 SVHDX_CHANGE_TRACKING_STOP_REQUEST Structure
+type SVHDX_CHANGE_TRACKING_STOP_REQUEST
+{
+} with Documentation{Ignore = true};
+
+// 2.2.4.30 SVHDX_CHANGE_TRACKING_STOP_RESPONSE Structure
+type SVHDX_CHANGE_TRACKING_STOP_RESPONSE
+{
+    SVHDX_TUNNEL_CHANGE_TRACKING_STATUS ChangeTrackingStatus;
+} with Documentation{Ignore = true};
+
+// 2.2.4.31 SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE  Structure
+type SVHDX_OPEN_DEVICE_CONTEXT_RESPONSE
+{
+    RVSDProtocolVersion Version;
+    BOOLEAN HasInitiatorId;
+    array<UCHAR> Reserved with BinaryEncoding{Length = 3};
+    guid InitiatorId;
+    ULONG Flags where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Flags", "SVHDX_OPEN_DEVICE_CONTEXT", value);
+    SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags OriginatorFlags
+        where ValidationCheckEnumValue(InRange<SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags>(value), null, true, ReferenceType.Type, 
+            "RSVD", "OriginatorFlags", "SVHDX_OPEN_DEVICE_CONTEXT", "0x00000001, 0x00000004", value);
+    ULONGLONG OpenRequestId;
+    ushort InitiatorHostNameLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_MAXIMUM_NAME_LENGTH, null, true, ReferenceType.Type, "RSVD", "InitiatorHostNameLength",
+        "SVHDX_OPEN_DEVICE_CONTEXT", RSVD_MAXIMUM_NAME_LENGTH, value);
+    string InitiatorHostName with BinaryEncoding{Length = ((InitiatorHostNameLength + 2) / 2), TextEncoding = TextEncoding.UTF16}; // plus 2 for UTF16 null-terminater.
+} with Documentation{Ignore = true};
+
+// 2.2.4.32 SVHDX_OPEN_DEVICE_CONTEXT_V2 Structure
+type SVHDX_OPEN_DEVICE_CONTEXT_V2
+{
+    RVSDProtocolVersion Version
+        where ValidationCheckValue(value == 0x00000002, null, true, ReferenceType.Type, 
+            "RSVD", "Version", "SVHDX_OPEN_DEVICE_CONTEXT_V2", "RSVD Protocol version 2(0x00000002)", EnumToStringInSummary<RVSDProtocolVersion>(value));
+    BOOLEAN HasInitiatorId;
+    array<UCHAR> Reserved with BinaryEncoding{Length = 3};
+    guid InitiatorId;
+    ULONG Flags where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Flags", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags OriginatorFlags
+        where ValidationCheckEnumValue(InRange<SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags>(value), null, true, ReferenceType.Type, 
+            "RSVD", "OriginatorFlags", "SVHDX_OPEN_DEVICE_CONTEXT_V2", "0x00000001, 0x00000004", value);
+    ULONGLONG OpenRequestId;
+    ushort InitiatorHostNameLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_MAXIMUM_NAME_LENGTH, null, true, ReferenceType.Type, "RSVD", "InitiatorHostNameLength",
+        "SVHDX_OPEN_DEVICE_CONTEXT_V2", RSVD_MAXIMUM_NAME_LENGTH, value);
+    string InitiatorHostName with BinaryEncoding{Length = 126 / 2, TextEncoding = TextEncoding.UTF16};
+    uint VirtualDiskPropertiesInitialized where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, 
+        "RSVD", "VirtualDiskPropertiesInitialized", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    uint ServerServiceVersion where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, 
+        "RSVD", "ServerServiceVersion", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    uint VirtualSectorSize where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, 
+        "RSVD", "VirtualSectorSize", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    uint PhysicalSectorSize where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, 
+        "RSVD", "PhysicalSectorSize", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    ulong VirtualSize where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, 
+        "RSVD", "VirtualSize", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+} with Documentation{Ignore = true};
+
+// 2.2.4.33 SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE Structure
+type SVHDX_OPEN_DEVICE_CONTEXT_V2_RESPONSE
+{
+    RVSDProtocolVersion Version
+        where ValidationCheckValue(value == 0x00000002, null, true, ReferenceType.Type, 
+            "RSVD", "Version", "SVHDX_OPEN_DEVICE_CONTEXT_V2", "RSVD Protocol version 2(0x00000002)", EnumToStringInSummary<RVSDProtocolVersion>(value));
+    BOOLEAN HasInitiatorId;
+    array<UCHAR> Reserved with BinaryEncoding{Length = 3};
+    guid InitiatorId;
+    ULONG Flags where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Flags", "SVHDX_OPEN_DEVICE_CONTEXT_V2", value);
+    SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags OriginatorFlags
+        where ValidationCheckEnumValue(InRange<SVHDX_OPEN_DEVICE_CONTEXT_OriginatorFlags>(value), null, true, ReferenceType.Type, 
+            "RSVD", "OriginatorFlags", "SVHDX_OPEN_DEVICE_CONTEXT_V2", "0x00000001, 0x00000004", value);
+    ULONGLONG OpenRequestId;
+    ushort InitiatorHostNameLength where ValidationCheckLessThanOrEqualTo(value <= RSVD_MAXIMUM_NAME_LENGTH, null, true, ReferenceType.Type, "RSVD", "InitiatorHostNameLength",
+        "SVHDX_OPEN_DEVICE_CONTEXT_V2", RSVD_MAXIMUM_NAME_LENGTH, value);
+    string InitiatorHostName with BinaryEncoding{Length = 126 / 2, TextEncoding = TextEncoding.UTF16};
+    uint VirtualDiskPropertiesInitialized;
+    uint ServerServiceVersion;
+    uint VirtualSectorSize;
+    uint PhysicalSectorSize;
+    ulong VirtualSize;
+} with Documentation{Ignore = true};
+
+// 2.2.4.34 RSVD_BLOCK_DEVICE_TARGET_SPECIFIER Structure
+type RSVD_BLOCK_DEVICE_TARGET_SPECIFIER
+{
+    RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_Namespace RsvdBlockDeviceTargetNamespace 
+        where ValidationCheckEnumValue(InRange<RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_Namespace>(value), null, true, ReferenceType.Type, 
+            "RSVD", "RsvdBlockDeviceTargetNamespace", "RSVD_BLOCK_DEVICE_TARGET_SPECIFIER", "0x00000000", value);
+    RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_SNAPSHOT TargetInformationSnapshot;
+} with Documentation{Ignore = true};
+
+pattern RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_Namespace = enum uint
+{
+    SnapshotId = 0x00000000,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.4.35 RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_SNAPSHOT Structure
+type RSVD_BLOCK_DEVICE_TARGET_SPECIFIER_SNAPSHOT
+{
+    SvhdxSnapshotType SnapshotType;
+    GUID SnapshotID;
+} with Documentation{Ignore = true};
+
+// 2.2.4.36 SVHDX_APPLY_SNAPSHOT_PARAMS Structure
+// This struct is used in 3.1.4.25 Application Requests to Apply Snapshot
+type SVHDX_APPLY_SNAPSHOT_PARAMS
+{
+    SvhdxSnapshotType SnapshotType;
+    GUID SnapshotID;
+} with Documentation{Ignore = true};
+
+// 2.2.4.37 SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST Structure
+type SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REQUEST
+{
+    GUID TargetSnapshotId;
+    GUID LimitSnapshotId;
+    SvhdxSnapshotType SnapshotType;
+    uint Reserved;
+    ULONG ByteOffset;
+    ULONG ByteLength;
+} with Documentation{Ignore = true};
+
+type SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_RESPONSE
+{
+} with Documentation{Ignore = true};
+
+// 2.2.4.38 SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY Structure
+type SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY
+{
+    ULONG ProcessedByteLength;
+    USHORT RangeCount;
+    USHORT Reserved where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_TUNNEL_QUERY_VIRTUAL_DISK_CHANGES_REPLY", value);
+    array<SVHDX_VIRTUAL_DISK_CHANGED_RANGE> Ranges with BinaryEncoding{Length = RangeCount};
+} with Documentation{Ignore = true};
+
+// 2.2.4.39 SVHDX_VIRTUAL_DISK_CHANGED_RANGE Structure
+type SVHDX_VIRTUAL_DISK_CHANGED_RANGE
+{
+    ULONG ByteOffset;
+    ULONG ByteLength;
+    ULONG Reserved where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Type, "RSVD", "Reserved", "SVHDX_VIRTUAL_DISK_CHANGED_RANGE", value);
+} with Documentation{Ignore = true};
+
+// 2.2.4.40 SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE STRUCTURE
+type SVHDX_TUNNEL_QUERY_SAFE_SIZE_RESPONSE
+{
+    ulong SafeVirtualSize;
+}
+
+// 2.2.5 SRB Status Code
+pattern SRBStatusCode = enum byte
+{
+    $"The request status is pending" = 0x00,
+    $"The request was completed successfully" = 0x01,
+    $"The request was aborted" = 0x02,
+    $"The Shared Virtual Disk does not support the given request" = 0x06,
+    $"The Shared Virtual Disk device is no longer available" = 0x08,
+    $"The SCSI device selection timed out" = 0x0A,
+    $"A data overrun or underrun error occurred" = 0x12,
+    $"The request completed with any other error" = 0x04,
+    ...
+} with Documentation{Ignore = true};
+
+// 2.2.6 Snapshot Types
+pattern SvhdxSnapshotType = enum uint
+{
+    SvhdxSnapshotTypeVM = 0x00000001,
+    SvhdxSnapshotTypeCDP = 0x00000003,
+    SvhdxSnapshotTypeWriteable = 0x00000004
+    ...
+} with Documentation{Ignore = true};
+
+// SCSI command descriptor block flags
+pattern SVHDX_TUNNEL_SCSI_SrbFlags = flags uint
+{
+    SRB_FLAGS_QUEUE_ACTION_ENABLE        = 0x00000002,
+    SRB_FLAGS_DISABLE_DISCONNECT         = 0x00000004,
+    SRB_FLAGS_DISABLE_SYNCH_TRANSFER     = 0x00000008,
+    SRB_FLAGS_BYPASS_FROZEN_QUEUE        = 0x00000010,
+    SRB_FLAGS_DISABLE_AUTOSENSE          = 0x00000020,
+    SRB_FLAGS_DATA_IN                    = 0x00000040,
+    SRB_FLAGS_DATA_OUT                   = 0x00000080,
+    SRB_FLAGS_NO_DATA_TRANSFER           = 0x00000000,
+    SRB_FLAGS_UNSPECIFIED_DIRECTION      = (SRB_FLAGS_DATA_IN | SRB_FLAGS_DATA_OUT),
+    SRB_FLAGS_NO_QUEUE_FREEZE            = 0x00000100,
+    SRB_FLAGS_ADAPTER_CACHE_ENABLE       = 0x00000200,
+    SRB_FLAGS_FREE_SENSE_BUFFER          = 0x00000400,
+    SRB_FLAGS_D3_PROCESSING              = 0x00000800,
+    SRB_FLAGS_IS_ACTIVE                  = 0x00001000,
+    SRB_FLAGS_ALLOCATED_FROM_ZONE        = 0x00002000,
+    SRB_FLAGS_SGLIST_FROM_POOL           = 0x00004000,
+    SRB_FLAGS_BYPASS_LOCKED_QUEUE        = 0x00008000,
+    SRB_FLAGS_NO_KEEP_AWAKE              = 0x00010000,
+    SRB_FLAGS_PORT_DRIVER_ALLOCSENSE     = 0x00020000,
+    SRB_FLAGS_PORT_DRIVER_SENSEHASPORT   = 0x00040000,
+    SRB_FLAGS_DONT_START_NEXT_PACKET     = 0x00080000,
+    ...
+} with Documentation{Ignore = true};

@@ -1,0 +1,2229 @@
+protocol PSRP with
+Documentation
+{
+    ProtocolName = "PowerShell Remoting Protocol",
+    ProtocolType = "block",
+    ShortName = "PSRP",
+    DocumentName = "MS-PSRP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+        new Reference{Name = "MS-PSRP", Version = "13.0", Date = "08/19/2015", ProgramName = ProgramName.MCPP}
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "381503", Date = "09/29/2015"}
+    ]
+};
+
+using WSTransfer;
+using WSMV;
+using WSManagement;
+using SOAP;
+using Utility;
+using OthersResources;
+using InfrastructureResources;
+
+endpoint Server over ReassembleServer accepts PowerShellRemotingProtocolMessage issues PowerShellRemotingProtocolMessage;
+client endpoint Client connected to Server;
+
+endpoint ReassembleServer over WSTransfer.ResourceIntermidiateEndpoint | over WSMV.WSMVIntermediateServer accepts PacketFragment issues PacketFragment
+{
+    PsrpDecodingCache SendDC = new PsrpDecodingCache{Dispatcher = IssueDispatcher};
+    PsrpDecodingCache ReceiveDC = new PsrpDecodingCache{Dispatcher = AcceptDispatcher};
+    
+    void AcceptDispatcher(PowerShellRemotingProtocolMessage msg, array<any message> origins)
+    {
+        msg.Origins = origins;
+        dispatch (endpoint Server) accepts msg;
+    }
+    
+    void IssueDispatcher(PowerShellRemotingProtocolMessage msg, array<any message> origins)
+    {
+        msg.Origins = origins;
+        dispatch (endpoint Server) issues msg;
+    }   
+    
+    process this accepts p:PacketFragment
+    {
+        ReceiveDC.Add(p);
+    }
+    
+    process this issues p:PacketFragment
+    {
+        SendDC.Add(p);
+    }
+    
+    ~endpoint(ReassembleServer server)
+    {
+        SendDC.Clear();
+        ReceiveDC.Clear();
+    }
+}
+
+type PsrpDecodingCache
+{
+    binary buffer = $[];
+    ulong? LastFragmentId = null;
+    ulong? LastObjectId = null;
+    array<any message> origins = [];
+
+    void(PowerShellRemotingProtocolMessage, array<any message>) Dispatcher;
+        
+    void Add(PacketFragment frag)
+    {
+        if (frag.S == 1)
+        {
+            Clear();
+            LastFragmentId = frag.FragmentId;
+            LastObjectId = frag.ObjectId;
+            buffer += frag.Blob;
+            origins += [frag];
+        }
+        else if (LastFragmentId != null && LastObjectId != null && LastFragmentId + 1 == frag.FragmentId && LastObjectId == frag.ObjectId)
+        {
+            LastFragmentId = (LastFragmentId as ulong) + 1;
+            buffer += frag.Blob;
+            origins += [frag];
+        }
+        else
+        {
+            Clear();
+            ValidationCheck(false, frag, DiagnosisLevel.Warning, PSRP_INSUFFICIENT_DATA);
+            release frag;
+        }
+        
+        if (frag.E == 1 && buffer != $[])
+        {
+            DecodeAndDispatchPsrpMessage();
+        }
+    }
+    
+    void Clear()
+    {
+        buffer = $[];
+        LastFragmentId = null;
+        LastObjectId = null;
+        foreach (var msg in origins)
+        {
+            ValidationCheck(false, msg, DiagnosisLevel.Warning, PSRP_DECODING_FAILURE);
+            release msg;
+        }
+        origins = [];
+    }
+    
+    void DecodeAndDispatchPsrpMessage()
+    {
+        if (buffer.Count < 8)
+        {
+            ThrowDecodingException("PSRP");
+        }
+        uint messageType = BinaryDecoder<uint>(buffer.Segment(4, 4)) as uint;
+        switch (messageType)
+        {
+            case PowerShellMessageType.SESSION_CAPABILITY => 
+                DecodePsrpMessage<SESSION_CAPABILITY_Message>(buffer, "SESSION_CAPABILITY_Message", Dispatcher, origins);
+            case PowerShellMessageType.INIT_RUNSPACEPOOL =>
+                DecodePsrpMessage<INIT_RUNSPACEPOOL_Message>(buffer, "INIT_RUNSPACEPOOL_Message", Dispatcher, origins);
+            case PowerShellMessageType.PUBLIC_KEY =>
+                DecodePsrpMessage<PUBLIC_KEY_Message>(buffer, "PUBLIC_KEY_Message", Dispatcher, origins);
+            case PowerShellMessageType.ENCRYPTED_SESSION_KEY =>
+                DecodePsrpMessage<ENCRYPTED_SESSION_KEY_Message>(buffer, "ENCRYPTED_SESSION_KEY_Message", Dispatcher, origins);
+            case PowerShellMessageType.PUBLIC_KEY_REQUEST =>
+                DecodePsrpMessage<PUBLIC_KEY_REQUEST_Message>(buffer, "PUBLIC_KEY_REQUEST_Message", Dispatcher, origins);
+            case PowerShellMessageType.SET_MAX_RUNSPACES =>
+                DecodePsrpMessage<SET_MAX_RUNSPACES_Message>(buffer, "SET_MAX_RUNSPACES_Message", Dispatcher, origins);
+            case PowerShellMessageType.SET_MIN_RUNSPACES =>
+                DecodePsrpMessage<SET_MIN_RUNSPACES_Message>(buffer, "SET_MIN_RUNSPACES_Message", Dispatcher, origins);
+            case PowerShellMessageType.RUNSPACE_AVAILABILITY =>
+                DecodePsrpMessage<RUNSPACE_AVAILABILITY_Message>(buffer, "RUNSPACE_AVAILABILITY_Message", Dispatcher, origins);
+            case PowerShellMessageType.RUNSPACEPOOL_STATE =>
+                DecodePsrpMessage<RUNSPACEPOOL_STATE_Message>(buffer, "RUNSPACEPOOL_STATE_Message", Dispatcher, origins);
+            case PowerShellMessageType.CREATE_PIPELINE =>
+                DecodePsrpMessage<CREATE_PIPELINE_Message>(buffer, "CREATE_PIPELINE_Message", Dispatcher, origins);
+            case PowerShellMessageType.CONNECT_RUNSPACEPOOL =>
+                DecodePsrpMessage<CONNECT_RUNSPACEPOOL_Message>(buffer, "CONNECT_RUNSPACEPOOL_Message", Dispatcher, origins);
+            case PowerShellMessageType.RUNSPACE_INIT_DATA =>
+                DecodePsrpMessage<RUNSPACE_INIT_DATA_Message>(buffer, "RUNSPACE_INIT_DATA_Message", Dispatcher, origins);
+            case PowerShellMessageType.GET_AVAILABLE_RUNSPACES =>
+                DecodePsrpMessage<GET_AVAILABLE_RUNSPACES_Message>(buffer, "GET_AVAILABLE_RUNSPACES_Message", Dispatcher, origins);
+            case PowerShellMessageType.USER_EVENT =>
+                DecodePsrpMessage<USER_EVENT_Message>(buffer, "USER_EVENT_Message", Dispatcher, origins);
+            case PowerShellMessageType.APPLICATION_PRIVATE_DATA =>
+                DecodePsrpMessage<APPLICATION_PRIVATE_DATA_Message>(buffer, "APPLICATION_PRIVATE_DATA_Message", Dispatcher, origins);
+            case PowerShellMessageType.GET_COMMAND_METADATA =>
+                DecodePsrpMessage<GET_COMMAND_METADATA_Message>(buffer, "GET_COMMAND_METADATA_Message", Dispatcher, origins);
+            case PowerShellMessageType.RUNSPACEPOOL_HOST_CALL =>
+                DecodePsrpMessage<RUNSPACEPOOL_HOST_CALL_Message>(buffer, "RUNSPACEPOOL_HOST_CALL_Message", Dispatcher, origins);
+            case PowerShellMessageType.RUNSPACEPOOL_HOST_RESPONSE =>
+                DecodePsrpMessage<RUNSPACEPOOL_HOST_RESPONSE_Message>(buffer, "RUNSPACEPOOL_HOST_RESPONSE_Message", Dispatcher, origins);
+            case PowerShellMessageType.PIPELINE_INPUT =>
+                DecodePsrpMessage<PIPELINE_INPUT_Message>(buffer, "PIPELINE_INPUT_Message", Dispatcher, origins);
+            case PowerShellMessageType.END_OF_PIPELINE_INPUT =>
+                DecodePsrpMessage<END_OF_PIPELINE_INPUT_Message>(buffer, "END_OF_PIPELINE_INPUT_Message", Dispatcher, origins);
+            case PowerShellMessageType.PIPELINE_OUTPUT =>
+                DecodePsrpMessage<PIPELINE_OUTPUT_Message>(buffer, "PIPELINE_OUTPUT_Message", Dispatcher, origins);
+            case PowerShellMessageType.ERROR_RECORD =>
+                DecodePsrpMessage<ERROR_RECORD_Message>(buffer, "ERROR_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.PIPELINE_STATE =>
+                DecodePsrpMessage<PIPELINE_STATE_Message>(buffer, "PIPELINE_STATE_Message", Dispatcher, origins);
+            case PowerShellMessageType.DEBUG_RECORD =>
+                DecodePsrpMessage<DEBUG_RECORD_Message>(buffer, "DEBUG_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.VERBOSE_RECORD =>
+                DecodePsrpMessage<VERBOSE_RECORD_Message>(buffer, "VERBOSE_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.WARNING_RECORD =>
+                DecodePsrpMessage<WARNING_RECORD_Message>(buffer, "WARNING_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.PROGRESS_RECORD =>
+                DecodePsrpMessage<PROGRESS_RECORD_Message>(buffer, "PROGRESS_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.PIPELINE_HOST_CALL =>
+                DecodePsrpMessage<PIPELINE_HOST_CALL_Message>(buffer, "PIPELINE_HOST_CALL_Message", Dispatcher, origins);
+            case PowerShellMessageType.PIPELINE_HOST_RESPONSE =>
+                DecodePsrpMessage<PIPELINE_HOST_RESPONSE_Message>(buffer, "PIPELINE_HOST_RESPONSE_Message", Dispatcher, origins);
+            case PowerShellMessageType.INFORMATION_RECORD =>
+                DecodePsrpMessage<INFORMATION_RECORD_Message>(buffer, "INFORMATION_RECORD_Message", Dispatcher, origins);
+            case PowerShellMessageType.RESET_RUNSPACE_STATE =>
+                DecodePsrpMessage<RESET_RUNSPACE_STATE_Message>(buffer, "RESET_RUNSPACE_STATE_Message", Dispatcher, origins);
+            default =>
+                ThrowDecodingException("PSRP");
+        }
+        origins = [];
+    }
+}
+
+void DecodePsrpMessage<T>(binary data, string msgStr, void(T, array<any message>) dispatcher, array<any message> origins)
+{
+    if (BinaryDecoder<T>(data) is msg:T)
+    {
+        dispatcher(msg, origins);
+    }
+    else
+    {
+        ThrowDecodingException("PSRP", msgStr);
+    }
+}
+
+client endpoint ReassembleClient connected to Server;
+
+autostart actor PSRPOverWSTransfer(WSTransfer.ResourceIntermidiateEndpoint server) follows WSMVExtendingWSTransfer
+{
+    bool isCreateRequestExtenedByPSRP = false;
+    observe server accepts createReq:ResourceFactoryMessageContract.CreateRequest where createReq.AnyElement is wrapper:XmlWrapperWSMVEx
+        && wrapper.Shell is sh:Shell && sh.AnyElements is arr:array<xml> 
+        && (arr.Filter<xml>((xml x) => (x.Name is xmlName:XmlName && xmlName.LocalName == "creationXml" && xmlName.NamespaceUri == PowerShellNamespace)) is creationXml:ArrayXmlNotEmpty)
+    {
+        ShellEx shell = new ShellEx{};
+        bool decodeSucceed = false;
+        // Decode creationXml element in Shell
+        shell.creationXml = DecodeElementAndValidationCheck<CreationXml>(createReq, creationXml[0], "PSRP", "CreationXml", ref decodeSucceed);
+        
+        if (decodeSucceed)
+        {
+            shell.AnyElements = arr.Filter<xml>(e => !(e in creationXml));
+            if ((shell.AnyElements as array<xml>).Count == 0)
+            {
+                shell.AnyElements = nothing;
+            }
+            shell.ShellId = sh.ShellId;
+            shell.Name = sh.Name;
+            shell.ResourceUri = sh.ResourceUri;
+            shell.Owner = sh.Owner;
+            shell.ClientIP = sh.ClientIP;
+            shell.ProcessId = sh.ProcessId;
+            shell.Environment = sh.Environment;
+            shell.WorkingDirectory = sh.WorkingDirectory;
+            shell.Lifetime = sh.Lifetime;
+            shell.IdleTimeOut = sh.IdleTimeOut;
+            shell.InputStreams = sh.InputStreams;
+            shell.OutputStreams = sh.OutputStreams;
+            shell.MaxIdleTimeOut = sh.MaxIdleTimeOut;
+            shell.Locale = sh.Locale;
+            shell.DataLocale = sh.DataLocale;
+            shell.CompressionMode = sh.CompressionMode;
+            shell.ProfileLoaded = sh.ProfileLoaded;
+            shell.Encoding = sh.Encoding;
+            shell.BufferMode = sh.BufferMode;
+            shell.State = sh.State;
+            shell.ShellRunTime = sh.ShellRunTime;
+            shell.ShellInactivity = sh.ShellInactivity;
+
+            wrapper.Shell = shell;
+            isCreateRequestExtenedByPSRP = true;
+        }
+    }
+    process server accepts createReq:ResourceFactoryMessageContract.CreateRequest where isCreateRequestExtenedByPSRP
+    {
+        isCreateRequestExtenedByPSRP = false; // switch to false once processing rule matches successfully. 
+        if (createReq.AnyElement is wrapper:XmlWrapperWSMVEx && wrapper.Shell is shell:PSRP.ShellEx && shell.creationXml is xmlValue:CreationXml)
+        {
+            // Decode the Base64Encoded data in creationXml element
+            if (Base64StringToBinary(xmlValue.Base64EncodedData) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer accepts (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }  
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }
+        }
+        else
+        {
+            ThrowDecodingException("PSRP", "PacketFragment");
+        }
+    }      
+}
+
+autostart actor PSRPOverWSMV(WSMV.WSMVIntermediateServer server)
+{
+    bool isConnectRequestExtenedByPSRP = false;
+    observe server accepts connectReq:WSMVMessages.ConnectRequest where connectReq.Connect.AnyElements is arr:array<xml> 
+        && (arr.Filter<xml>((xml x) => (x.Name is xmlName:XmlName && ((xmlName.LocalName == "connectXml" && xmlName.NamespaceUri == PowerShellNamespace)
+            || (xmlName.LocalName == "BufferMode" && xmlName.NamespaceUri == WSMVShellNamespace)))) is connectXml:ArrayXmlNotEmpty) 
+    {
+        ConnectTypeEx connectEx = new ConnectTypeEx{};
+        bool decodeSucceed = false;
+        array<xml> leftElements = [];
+        // There should be at most one connectXml and one BufferMode
+        foreach (var cx in connectXml)
+        {
+            if ((cx.Name as XmlName).LocalName == "connectXml")
+            {
+                connectEx.connectXml = DecodeElementAndValidationCheck<ConnectXml>(connectReq, cx, "PSRP", "ConnectXml", ref decodeSucceed, ref leftElements);
+            }
+            else
+            {
+                connectEx.BufferMode = DecodeElementAndValidationCheck<BufferMode>(connectReq, cx, "PSRP", "BufferMode", ref decodeSucceed, ref leftElements);
+            }
+        }
+        
+        if (decodeSucceed)
+        {
+            connectEx.AnyElements = arr.Filter<xml>(e => !(e in connectXml)) + leftElements;
+            if ((connectEx.AnyElements as array<xml>).Count == 0)
+            {
+                connectEx.AnyElements = nothing;
+            }
+            connectReq.Connect = connectEx;
+            isConnectRequestExtenedByPSRP = true;
+        }
+    }
+
+    process server accepts connectReq:WSMVMessages.ConnectRequest where isConnectRequestExtenedByPSRP
+    {
+        isConnectRequestExtenedByPSRP = false; // switch to false once processing rule matches successfully. 
+        if (connectReq.Connect is connect:PSRP.ConnectTypeEx && connect.connectXml is xmlValue:PSRP.ConnectXml)
+        {
+            if (Base64StringToBinary(xmlValue.Base64EncodedData) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer accepts (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }
+        }
+        else
+        {
+            ThrowDecodingException("PSRP", "PacketFragment");
+        }  
+    }
+
+    bool isConnectResponseExtenedByPSRP = false;
+    observe server issues connectRes:WSMVMessages.ConnectResponse where connectRes.ConnectResponse.AnyElements is arr:array<xml> 
+        && (arr.Filter<xml>((xml x) => (x.Name is xmlName:XmlName && xmlName.LocalName == "connectResponseXml" && xmlName.NamespaceUri == PowerShellNamespace)) is connectResponseXml:ArrayXmlNotEmpty)
+    {
+        ConnectResponseTypeEx connectResponseEx = new ConnectResponseTypeEx{};
+        bool decodeSucceed = false;
+        
+        connectResponseEx.connectResponseXml = DecodeElementAndValidationCheck<ConnectResponseXml>(connectRes, connectResponseXml[0], "PSRP", "ConnectResponseXml", ref decodeSucceed);
+
+        if (decodeSucceed)
+        {
+            connectResponseEx.AnyElements = arr.Filter<xml>(e => !(e in connectResponseXml));
+            if ((connectResponseEx.AnyElements as array<xml>).Count == 0)
+            {
+                connectResponseEx.AnyElements = nothing;
+            }
+            connectRes.ConnectResponse = connectResponseEx;
+            isConnectResponseExtenedByPSRP = true;
+        }
+    }
+    process server issues connectRes:WSMVMessages.ConnectResponse where isConnectResponseExtenedByPSRP
+    {
+        isConnectResponseExtenedByPSRP = false; // switch to false once processing rule matches successfully. 
+        if (connectRes.ConnectResponse is conRes:PSRP.ConnectResponseTypeEx && conRes.connectResponseXml is xmlValue:PSRP.ConnectResponseXml)
+        {
+            if (Base64StringToBinary(xmlValue.Base64EncodedData) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer issues (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }  
+        }
+        else
+        {
+            ThrowDecodingException("PSRP", "PacketFragment");
+        }
+    }
+   
+    // Only take windows implementation into scope
+    process server accepts commandReq:WSMVMessages.CommandRequest where (commandReq.Origins[0] as SoapMessage).ResourceURI == PsrpResourceUri
+        && commandReq.CommandLine.Arguments is arr:array<string> && arr.Count > 0
+    {
+        foreach (string s in arr)
+        {
+            if (Base64StringToBinary(s) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer accepts (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }
+        }
+    }
+    
+    // Only take windows implementation into scope
+    process server accepts sendReq:WSMVMessages.SendRequest where sendReq#CompressionType is nothing 
+        && (sendReq.Origins[0] as SoapMessage).ResourceURI == PsrpResourceUri && sendReq.Send.Stream.Count > 0
+    {
+        array<StreamType> arr = sendReq.Send.Stream;
+        foreach (var streamType in arr)
+        {
+            if (Base64StringToBinary(streamType.Value) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer accepts (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }
+        }
+    }
+    
+    bool WsmvReceiveResponseContainsPsrpData = false;
+    
+    observe server accepts receiveReq:WSMVMessages.ReceiveRequest
+    {
+        WsmvReceiveResponseContainsPsrpData = ((receiveReq.Origins[0] as SoapMessage).ResourceURI == PsrpResourceUri);
+    }
+    
+    // Only take windows implementation into scope
+    process server issues receiveRes:WSMVMessages.ReceiveResponse where receiveRes#CompressionType is nothing 
+        && WsmvReceiveResponseContainsPsrpData && receiveRes.ReceiveResponse.Stream.Count > 0 
+    {
+        foreach (StreamType s in receiveRes.ReceiveResponse.Stream)
+        {
+            if (Base64StringToBinary(s.Value) is data:BinaryNotEmpty)
+            {
+                stream str = data;
+                while (str.RemainingByteLength > 0)
+                {
+                    var fragment = BinaryDecoder<PacketFragment>(str);
+                    if (fragment != nothing)
+                    {
+                        dispatch endpoint ReassembleServer issues (fragment as PacketFragment);
+                    }
+                    else
+                    {
+                        ThrowDecodingException("PSRP", "PacketFragment");
+                    }
+                }
+            }
+            else
+            {
+                ThrowDecodingException("PSRP", "PacketFragment", UTILITY_INVALID_DATA, ["Base64-Encoded string"]);
+            }
+        }
+    }
+}
+
+const string PowerShellNamespace = "http://schemas.microsoft.com/powershell";
+
+type ShellEx : WSMV.Shell
+{
+    optional CreationXml creationXml;
+} 
+
+type CreationXml
+{
+    string Base64EncodedData with XmlEncoding{Kind = XmlKind.Text};
+} with XmlEncodingDefaults{Namespace = PowerShellNamespace};
+
+type ConnectTypeEx : WSMV.ConnectType
+{
+    optional BufferMode BufferMode;
+    optional ConnectXml connectXml;
+}
+
+type ConnectXml
+{
+    string Base64EncodedData with XmlEncoding{Kind = XmlKind.Text};
+} with XmlEncodingDefaults{Namespace = PowerShellNamespace};
+
+type BufferMode
+{
+    optional OutputBufferingModeEnumeration Value with XmlEncoding{Kind = XmlKind.Text};
+} with XmlEncodingDefaults{Namespace = WSMVShellNamespace};
+
+type ConnectResponseTypeEx : WSMV.ConnectResponseType
+{
+    optional ConnectResponseXml connectResponseXml;
+}
+
+type ConnectResponseXml
+{
+    string Base64EncodedData with XmlEncoding{Kind = XmlKind.Text};
+} with XmlEncodingDefaults{Namespace = PowerShellNamespace};
+
+internal pattern ArrayXmlNotEmpty = array<xml> where value.Count > 0;
+internal pattern BinaryNotEmpty = binary where value.Count > 0;
+
+// Section 2.2.1   PowerShell Remoting Protocol Message
+message PowerShellRemotingProtocolMessage
+{
+    PowerShellDestination Destination where ValidationCheckEnumValue(InRange<PowerShellDestination>(value), this, true, ReferenceType.Message,
+                    "PSRP", "Destination", "PowerShellRemotingProtocolMessage", "0x00000001, 0x00000002", value);
+    PowerShellMessageType MessageType;
+    guid RPID;
+    guid PID;
+}
+
+pattern PowerShellDestination = enum uint
+{
+    PowerShellClient = 0x00000001,
+    PowerShellServer = 0x00000002,
+    ...
+};
+
+pattern PowerShellMessageType = enum uint
+{
+    SESSION_CAPABILITY              = 0x00010002,
+    INIT_RUNSPACEPOOL               = 0x00010004,
+    PUBLIC_KEY                      = 0x00010005,
+    ENCRYPTED_SESSION_KEY           = 0x00010006,
+    PUBLIC_KEY_REQUEST              = 0x00010007,
+    CONNECT_RUNSPACEPOOL            = 0x00010008,
+    RUNSPACE_INIT_DATA              = 0x0002100B,
+    RESET_RUNSPACE_STATE            = 0x0002100C,
+    SET_MAX_RUNSPACES               = 0x00021002,
+    SET_MIN_RUNSPACES               = 0x00021003,
+    RUNSPACE_AVAILABILITY           = 0x00021004,
+    RUNSPACEPOOL_STATE              = 0x00021005,
+    CREATE_PIPELINE                 = 0x00021006,
+    GET_AVAILABLE_RUNSPACES         = 0x00021007,
+    USER_EVENT                      = 0x00021008,
+    APPLICATION_PRIVATE_DATA        = 0x00021009,
+    GET_COMMAND_METADATA            = 0x0002100A,
+    RUNSPACEPOOL_HOST_CALL          = 0x00021100,
+    RUNSPACEPOOL_HOST_RESPONSE      = 0x00021101,
+    PIPELINE_INPUT                  = 0x00041002,
+    END_OF_PIPELINE_INPUT           = 0x00041003,
+    PIPELINE_OUTPUT                 = 0x00041004,
+    ERROR_RECORD                    = 0x00041005,
+    PIPELINE_STATE                  = 0x00041006,
+    DEBUG_RECORD                    = 0x00041007,
+    VERBOSE_RECORD                  = 0x00041008,
+    WARNING_RECORD                  = 0x00041009,
+    PROGRESS_RECORD                 = 0x00041010,
+    INFORMATION_RECORD              = 0x00041011,
+    PIPELINE_HOST_CALL              = 0x00041100,
+    PIPELINE_HOST_RESPONSE          = 0x00041101,
+    ...
+};
+
+// Section 2.2.2.1   SESSION_CAPABILITY Message
+message SESSION_CAPABILITY_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.SESSION_CAPABILITY;
+    
+    SessionCapabilityMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<SessionCapabilityMessageDataObject>};
+
+    override string ToString()
+    {
+        string summary = "SESSION_CAPABILITY Message";
+        foreach (Version v in Obj.MS.Version)
+        {
+            if (v.N != nothing && v.N != null)
+            {
+                summary += ", " + v.ToString();
+            }
+        }
+        return summary;
+    }
+}
+
+type SessionCapabilityMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    SessionCapabilityMessageData MS;
+}
+
+type SessionCapabilityMessageData
+{
+    array<Version> Version;
+    optional TimeZone BA;
+    optional NullValue Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// Section 2.2.2.2   INIT_RUNSPACEPOOL Message
+message INIT_RUNSPACEPOOL_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.INIT_RUNSPACEPOOL;
+    
+    InitRunspacePoolMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<InitRunspacePoolMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "INIT_RUNSPACEPOOL Message";
+        foreach (SignedInt i in Obj.MS.I32)
+        {
+            if (i.N != nothing && i.N != null)
+            {
+                summary += ", " + i.N.ToString() + ": " + i.Value.ToString();
+            }
+        }
+        return summary;
+    }
+}
+
+type InitRunspacePoolMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    InitRunspacePoolMessageData MS;
+}
+
+type InitRunspacePoolMessageData
+{
+    array<SignedInt> I32;
+    array<PSThreadOptionsObject | ApartmentStateObject | HostInfoObject | PrimitiveDictionaryObject | ComplexObject> Obj;
+    optional array<NullValue> Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// Section 2.2.2.3 PUBLIC_KEY Message
+message PUBLIC_KEY_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PUBLIC_KEY;
+    
+    PublicKeyMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<PublicKeyMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "PUBLIC_KEY Message";
+    }
+}
+
+type PublicKeyMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    PublicKeyMessageData MS;
+}
+
+type PublicKeyMessageData
+{
+    String S;
+}
+
+// 2.2.2.4 ENCRYPTED_SESSION_KEY Message
+message ENCRYPTED_SESSION_KEY_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.ENCRYPTED_SESSION_KEY;
+    
+    EncryptedSessionKeyMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<EncryptedSessionKeyMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "ENCRYPTED_SESSION_KEY Message";
+    }
+}
+
+type EncryptedSessionKeyMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    EncryptedSessionKeyMessageData MS;
+}
+
+type EncryptedSessionKeyMessageData
+{
+    String S;
+}
+
+// 2.2.2.5 PUBLIC_KEY_REQUEST Message
+message PUBLIC_KEY_REQUEST_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PUBLIC_KEY_REQUEST;
+    
+    String S with Encoding{Decoder = XmlDecoderFromXml<String>};
+         
+    override string ToString()
+    {
+        return "PUBLIC_KEY_REQUEST Message";
+    }
+}
+
+// 2.2.2.6 SET_MAX_RUNSPACES Message
+message SET_MAX_RUNSPACES_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.SET_MAX_RUNSPACES;
+    
+    SetMaxRunspacesMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<SetMaxRunspacesMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "SET_MAX_RUNSPACES Message";
+        if (Obj.MS.I32.N == "MaxRunspaces")
+        {
+            summary += ", MaxRunspaces: " + (Obj.MS.I32.Value as string);
+        }
+        if (Obj.MS.I64.N == "ci")
+        {
+            summary += ", CallID: " + (Obj.MS.I64.Value as string);
+        }
+        return summary;
+    }
+}
+
+type SetMaxRunspacesMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    SetMaxRunspacesMessageData MS;
+}
+
+type SetMaxRunspacesMessageData
+{
+    SignedLong I64;
+    SignedInt I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.7 SET_MIN_RUNSPACES Message
+message SET_MIN_RUNSPACES_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.SET_MIN_RUNSPACES;
+    
+    SetMinRunspacesMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<SetMinRunspacesMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "SET_MIN_RUNSPACES Message";
+        if (Obj.MS.I32.N == "MinRunspaces")
+        {
+            summary += ", MinRunspaces: " + (Obj.MS.I32.Value as string);
+        }
+        if (Obj.MS.I64.N == "ci")
+        {
+            summary += ", CallID: " + (Obj.MS.I64.Value as string);
+        }
+        return summary;
+    }
+}
+
+type SetMinRunspacesMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    SetMinRunspacesMessageData MS;
+}
+
+type SetMinRunspacesMessageData
+{
+    SignedLong I64;
+    SignedInt I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.8 RUNSPACE_AVAILABILITY Message
+message RUNSPACE_AVAILABILITY_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RUNSPACE_AVAILABILITY;
+    
+    RunspaceAvailabiltyMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<RunspaceAvailabiltyMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "RUNSPACE_AVAILABILITY Message";
+        foreach (var sl in Obj.MS.I64)
+        {
+            if (sl.N == "ci")
+            {
+                summary += ", CallID: " + sl.Value.ToString();
+            }
+            else if (sl.N == "SetMinMaxRunspacesResponse")
+            {
+                summary += ", Response: " + sl.Value.ToString();
+            }
+        }
+        if (Obj.MS.B is b:Boolean && b.N == "SetMinMaxRunspacesResponse")
+        {
+            summary += ", Response: " + b.Value.ToString();
+        }
+        return summary;
+    }
+}
+
+type RunspaceAvailabiltyMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    RunspaceAvailabiltyMessageData MS;
+}
+
+type RunspaceAvailabiltyMessageData
+{
+    array<SignedLong> I64;
+    optional Boolean B;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.9 RUNSPACEPOOL_STATE Message
+message RUNSPACEPOOL_STATE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RUNSPACEPOOL_STATE;
+    
+    RunspacePoolStateMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<RunspacePoolStateMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "RUNSPACEPOOL_STATE Message";
+        if (Obj.MS.I32.N == "RunspaceState")
+        {
+            summary += ", RunspaceState: " + EnumToString(Obj.MS.I32.Value, "PSRP.RunspacePoolStateEnum");
+        }
+        if (Obj.MS.Obj is obj:ErrorRecordObject)
+        {
+            foreach (var ob in obj.MS.Obj)
+            {
+                if (ob is o:ComplexObject && o.N == "Exception" && o.Tostring != nothing && o.Tostring != null)
+                {
+                    summary += ", Exception: " + (o.Tostring as string);
+                    break;
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+type RunspacePoolStateMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    RunspacePoolStateMessageData MS;
+}
+
+type RunspacePoolStateMessageData
+{
+    RunspacePoolState I32;
+    optional ErrorRecordObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.10 CREATE_PIPELINE Message
+message CREATE_PIPELINE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.CREATE_PIPELINE;
+    
+    CreatePipelineMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<CreatePipelineMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "CREATE_PIPELINE Message";
+        foreach (var b in Obj.MS.B)
+        {
+            if (b.Value && b.N != nothing)
+            {
+                summary += ", " + b.N.ToString();
+            }
+        }
+        return summary;
+    }
+}
+
+type CreatePipelineMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    CreatePipelineMessageData MS;
+}
+
+type CreatePipelineMessageData
+{
+    array<Boolean> B;
+    array<ApartmentStateObject | PowerShellPipelineObject | RemoteStreamOptionsObject | HostInfoObject | ComplexObject> Obj;
+    optional array<NullValue> Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.11 GET_AVAILABLE_RUNSPACES Message
+message GET_AVAILABLE_RUNSPACES_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.GET_AVAILABLE_RUNSPACES;
+    
+    GetAvailableRunspacesMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<GetAvailableRunspacesMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "GET_AVAILABLE_RUNSPACES Message";
+        if (Obj.MS.I64.N == "ci")
+        {
+            summary += ", CallID: " + (Obj.MS.I64.Value as string);
+        }
+        return summary;
+    }
+}
+
+type GetAvailableRunspacesMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    GetAvailableRunspacesMessageData MS;
+}
+
+type GetAvailableRunspacesMessageData
+{
+    SignedLong I64;
+}
+
+// 2.2.2.12 USER_EVENT Message
+message USER_EVENT_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.USER_EVENT;
+    
+    UserEventMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<UserEventMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "USER_EVENT Message";
+    }
+}
+
+type UserEventMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    UserEventMessageData MS;
+}
+
+type UserEventMessageData
+{
+    SignedInt I32;
+    array<String> S;
+    DateTime DT;
+    array<ComplexObject> Obj;
+    optional array<NullValue> Nil;
+    GUID G;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.13 APPLICATION_PRIVATE_DATA Message
+message APPLICATION_PRIVATE_DATA_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.APPLICATION_PRIVATE_DATA;
+    
+    ApplicationPrivateDataMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<ApplicationPrivateDataMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "APPLICATION_PRIVATE_DATA Message";
+    }
+}
+
+type ApplicationPrivateDataMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    ApplicationPrivateDataMessageData MS;
+}
+
+type ApplicationPrivateDataMessageData
+{
+    optional PrimitiveDictionaryObject Obj;
+    optional NullValue Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.14 GET_COMMAND_METADATA Message
+message GET_COMMAND_METADATA_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.GET_COMMAND_METADATA;
+    
+    GetCommandMetadataMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<GetCommandMetadataMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "GET_COMMAND_METADATA Message";
+    }
+}
+
+type GetCommandMetadataMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    GetCommandMetadataMessageData MS;
+}
+
+type GetCommandMetadataMessageData
+{
+    array<ListObject | CommandTypeObject | ComplexObject> Obj;
+    optional array<NullValue> Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.15 RUNSPACEPOOL_HOST_CALL Message
+message RUNSPACEPOOL_HOST_CALL_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RUNSPACEPOOL_HOST_CALL;
+    
+    HostCallMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<HostCallMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "RUNSPACEPOOL_HOST_CALL Message";
+        foreach (var obj in Obj.MS.Obj)
+        {
+            if (obj is o:HostMethodIdentifierObject)
+            {
+                summary += ", Host Method: " + o.ToString();
+            }
+        }
+        return summary;
+    }
+}
+
+type HostCallMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    HostCallMessageData MS;
+}
+
+type HostCallMessageData
+{
+    SignedLong I64;
+    array<HostMethodIdentifierObject | HostParametersObject | ComplexObject> Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.16 RUNSPACEPOOL_HOST_RESPONSE Message
+message RUNSPACEPOOL_HOST_RESPONSE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RUNSPACEPOOL_HOST_RESPONSE;
+    
+    HostResponseMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<HostResponseMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "RUNSPACEPOOL_HOST_RESPONSE Message";
+        foreach (var obj in Obj.MS.Obj)
+        {
+            if (obj is o:HostMethodIdentifierObject)
+            {
+                summary += ", Host Method: " + o.ToString();
+            }
+        }
+        return summary;
+    }
+}
+
+type HostResponseMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    HostResponseMessageData MS;
+}
+
+type HostResponseMessageData : PrimitiveType
+{
+    array<HostMethodIdentifierObject | ComplexObject> Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.17 PIPELINE_INPUT Message
+message PIPELINE_INPUT_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PIPELINE_INPUT;
+    
+    ComplexObject Obj with Encoding{Decoder = XmlDecoderFromXml<ComplexObject>};
+         
+    override string ToString()
+    {
+        return "PIPELINE_INPUT Message";
+    }
+}
+
+// 2.2.2.18 END_OF_PIPELINE_INPUT Message
+message END_OF_PIPELINE_INPUT_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.END_OF_PIPELINE_INPUT;
+    
+    override string ToString()
+    {
+        return "END_OF_PIPELINE_INPUT Message";
+    }
+}
+
+// 2.2.2.19 PIPELINE_OUTPUT Message
+message PIPELINE_OUTPUT_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PIPELINE_OUTPUT;
+    
+    ComplexObject Obj with Encoding{Decoder = XmlDecoderFromXml<ComplexObject>};
+        
+    override string ToString()
+    {
+        return "PIPELINE_OUTPUT Message";
+    }
+}
+
+// 2.2.2.20 ERROR_RECORD Message
+message ERROR_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.ERROR_RECORD;
+    
+    ErrorRecordObject Obj with Encoding{Decoder = XmlDecoderFromXml<ErrorRecordObject>};
+         
+    override string ToString()
+    {
+        string summary = "ERROR_RECORD Message";
+        foreach (var obj in Obj.MS.Obj)
+        {
+            if (obj is o:ComplexObject && o.N == "Exception" && o.Tostring != nothing && o.Tostring != null)
+            {
+                summary += ", Exception: " + (o.Tostring as string);
+                break;
+            }
+        }
+        return summary;
+    }
+}
+
+// 2.2.2.21 PIPELINE_STATE Message
+message PIPELINE_STATE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PIPELINE_STATE;
+    
+    PipelineStateMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<PipelineStateMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "PIPELINE_STATE Message";
+        if (Obj.MS.I32.N != nothing && Obj.MS.I32.N != null)
+        {
+            summary += ", " + Obj.MS.I32.N.ToString() + ": " + EnumToString(Obj.MS.I32.Value, "PSRP.PSInvocationStateEnum");
+        }
+        return summary;
+    }
+}
+
+type PipelineStateMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    PipelineStateMessageData MS;
+}
+
+type PipelineStateMessageData
+{
+    PSInvocationState I32;
+    optional ErrorRecordObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.2.22 DEBUG_RECORD Message
+message DEBUG_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.DEBUG_RECORD;
+    
+    InformationRecordObject Obj with Encoding{Decoder = XmlDecoderFromXml<InformationRecordObject>};
+         
+    override string ToString()
+    {
+        return "DEBUG_RECORD Message";
+    }
+}
+
+// 2.2.2.23 VERBOSE_RECORD Message
+message VERBOSE_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.VERBOSE_RECORD;
+    
+    InformationRecordObject Obj with Encoding{Decoder = XmlDecoderFromXml<InformationRecordObject>};
+         
+    override string ToString()
+    {
+        return "VERBOSE_RECORD Message";
+    }
+}
+
+// 2.2.2.24 WARNING_RECORD Message
+message WARNING_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.WARNING_RECORD;
+    
+    InformationRecordObject Obj with Encoding{Decoder = XmlDecoderFromXml<InformationRecordObject>};
+         
+    override string ToString()
+    {
+        return "WARNING_RECORD Message";
+    }
+}
+
+// 2.2.2.25 PROGRESS_RECORD Message
+message PROGRESS_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PROGRESS_RECORD;
+    
+    ProgressRecordObject Obj with Encoding{Decoder = XmlDecoderFromXml<ProgressRecordObject>};
+         
+    override string ToString()
+    {
+        return "PROGRESS_RECORD Message";
+    }
+}
+
+// 2.2.2.26 INFORMATION_RECORD Message
+message INFORMATION_RECORD_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.INFORMATION_RECORD;
+    InformationRecord2Object Obj with Encoding{Decoder = XmlDecoderFromXml<InformationRecord2Object>};
+         
+    override string ToString()
+    {
+        return "INFORMATION_RECORD Message";
+    }
+}
+
+// 2.2.2.27 PIPELINE_HOST_CALL Message
+message PIPELINE_HOST_CALL_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PIPELINE_HOST_CALL;
+    
+    HostCallMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<HostCallMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "PIPELINE_HOST_CALL Message";
+        foreach (var obj in Obj.MS.Obj)
+        {
+            if (obj is o:HostMethodIdentifierObject)
+            {
+                summary += ", " + o.ToString();
+            }
+        }
+        return summary;
+    }
+} 
+
+// 2.2.2.28 PIPELINE_HOST_RESPONSE Message
+message PIPELINE_HOST_RESPONSE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.PIPELINE_HOST_RESPONSE;
+    
+    HostResponseMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<HostResponseMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "PIPELINE_HOST_RESPONSE Message";
+        foreach (var obj in Obj.MS.Obj)
+        {
+            if (obj is o:HostMethodIdentifierObject)
+            {
+                summary += ", " + o.ToString();
+            }
+        }
+        return summary;
+    }
+} 
+
+// 2.2.2.29 CONNECT_RUNSPACEPOOL Message
+message CONNECT_RUNSPACEPOOL_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.CONNECT_RUNSPACEPOOL;
+    
+    ConnectRunspacePoolMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<ConnectRunspacePoolMessageDataObject>};
+         
+    override string ToString()
+    {
+        return "CONNECT_RUNSPACEPOOL Message";
+    }
+} 
+
+type ConnectRunspacePoolMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional ConnectRunspacePoolMessageData MS;
+} with XmlEncoding{IsAny = true};
+
+type ConnectRunspacePoolMessageData
+{
+    optional array<SignedInt> I32;
+    optional String S;
+}
+
+// 2.2.2.30 RUNSPACE_INIT_DATA Message
+message RUNSPACE_INIT_DATA_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RUNSPACE_INIT_DATA;
+    
+    RunspaceInitDataMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<RunspaceInitDataMessageDataObject>};
+         
+    override string ToString()
+    {
+        string summary = "RUNSPACE_INIT_DATA Message";
+        foreach (var i in Obj.MS.I32)
+        {
+            if (i.N == "MinRunspaces")
+            {
+                summary += ", MinRunspaces: " + i.Value.ToString();
+            }
+            else if (i.N == "MaxRunspaces")
+            {
+                summary += ", MaxRunspaces: " + i.Value.ToString();
+            }
+        }
+        return summary;
+    }
+} 
+
+type RunspaceInitDataMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    RunspaceInitDataMessageData MS;
+}
+
+type RunspaceInitDataMessageData
+{
+    array<SignedInt> I32;
+}
+
+// section 2.2.2.31 RESET_RUNSPACE_STATE Message
+message RESET_RUNSPACE_STATE_Message : PowerShellRemotingProtocolMessage
+{
+    invariant MessageType == PowerShellMessageType.RESET_RUNSPACE_STATE;
+    ResetRunspaceStateMessageDataObject Obj with Encoding{Decoder = XmlDecoderFromXml<ResetRunspaceStateMessageDataObject>};
+
+    override string ToString()
+    {
+        return "RESET_RUNSPACE_STATE Message";
+    }
+}
+
+type ResetRunspaceStateMessageDataObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    ResetRunspaceStateMessageData MS;
+}
+
+type ResetRunspaceStateMessageData
+{
+    SignedLong I64;
+}
+
+// Section 2.2.4   Packet Fragment
+message PacketFragment
+{
+    ulong ObjectId with BinaryEncoding{Endian = Endian.Big};
+    ulong FragmentId with BinaryEncoding{Endian = Endian.Big};
+    byte Reserved with BinaryEncoding{Width = 6};
+    PacketFragment_E E with BinaryEncoding{Width = 1};
+    PacketFragment_S S with BinaryEncoding{Width = 1};
+    uint BlobLength with BinaryEncoding{Endian = Endian.Big};
+    binary Blob with BinaryEncoding{Length = BlobLength};
+    
+    override string ToString()
+    {
+        string summary = "Packet Fragment, ObjectId: " + ObjectId.ToString() + ", FragmentId: " + FragmentId.ToString();
+        if (S == 1)
+        {
+            summary += ", Start Fragment";
+        }
+        if (E == 1)
+        {
+            summary += ", End Fragment";
+        }
+        return summary;
+    }
+}
+
+pattern PacketFragment_E = enum byte
+{
+    NotAnEndFragment = 0,
+    EndFragment = 1,
+};
+
+pattern PacketFragment_S = enum byte
+{
+    NotAStartFragment = 0,
+    StartFragment = 1,
+};
+
+// Section 2.2.3 Other Object Types
+// 2.2.3.1 Coordinates
+type CoordinatesObject : ComplexObjectBase
+{
+    Coordinates MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Coordinates
+{
+    String S;
+    CoordinatesValueObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CoordinatesValueObject : ComplexObjectBase
+{
+    CooridinatesValue MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CooridinatesValue
+{
+    array<SignedInt> I32;
+}
+
+// 2.2.3.2 Size
+type SizeObject : ComplexObjectBase
+{
+    Size MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Size
+{
+    String S;
+    SizeValueObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type SizeValueObject : ComplexObjectBase
+{
+    SizeValue MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type SizeValue
+{
+    array<SignedInt> I32;
+}
+
+// 2.2.3.3 Color
+type ColorObject : ComplexObjectBase
+{
+    Color MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Color
+{
+    String S;
+    ColorValue I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type ColorValue
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    ColorValueEnum Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+pattern ColorValueEnum = enum int
+{
+    DarkBlue = 1,
+    DarkGreen = 2,
+    DarkCyan = 3,
+    DarkRed = 4,
+    DarkMagenta = 5,
+    DarkYellow = 6,
+    Gray = 7,
+    DarkGray = 8,
+    Blue = 9,
+    Green = 10,
+    Cyan = 11,
+    Red = 12,
+    Magenta = 13,
+    Yellow = 14,
+    White = 15,
+    ...
+};
+
+// 2.2.3.4 RunspacePoolState
+type RunspacePoolState
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    RunspacePoolStateEnum Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+pattern RunspacePoolStateEnum = enum int
+{
+    BeforeOpen = 0,
+    Opening = 1,
+    Opened = 2,
+    Closed = 3,
+    Closing = 4,
+    Broken = 5,
+    NegotiationSent = 6,
+    NegotiationSucceeded = 7,
+    Connecting = 8,
+    Disconnected = 9,
+    ...   
+};
+
+// 2.2.3.5 PSInvocationState
+type PSInvocationState
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    PSInvocationStateEnum Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+pattern PSInvocationStateEnum = enum int
+{
+    NotStarted = 0,
+    Running = 1,
+    Stopping = 2,
+    Stopped = 3,
+    Completed = 4,
+    Failed = 5,
+    Disconnected = 6,
+    ...
+};
+
+// 2.2.3.6 PSThreadOptions
+type PSThreadOptionsObject : ComplexObjectBase
+{
+    invariant N == "PSThreadOptions";
+    
+    SignedInt I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.7 ApartmentState
+type ApartmentStateObject : ComplexObjectBase
+{
+    invariant N == "ApartmentState";
+    
+    SignedInt I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.8 RemoteStreamOptions
+type RemoteStreamOptionsObject : ComplexObjectBase
+{
+    invariant N == "RemoteStreamOptions";
+    
+    RemoteStreamOptionsValue I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type RemoteStreamOptionsValue
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    RemoteStreamOptionsFlag Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+pattern RemoteStreamOptionsFlag = flags int
+{
+    AddInvocationInfoToErrorRecord = 0x01,
+    AddInvocationInfoToWarningRecord = 0x02,
+    AddInvocationInfoToDebugRecord = 0x04,
+    AddInvocationInfoToVerboseRecord = 0x08,
+    ...
+};
+
+// 2.2.3.9 ErrorCategory
+type ErrorCategory
+{
+    string N where value == "ErrorCategory" with XmlEncoding{Kind = XmlKind.Attribute};
+    ErrorCategoryEnum I32 with XmlEncoding{Kind = XmlKind.Text};
+}
+
+pattern ErrorCategoryEnum = enum int
+{
+    NotSpecified = 0,
+    OpenError = 1,
+    CloseError = 2,
+    DeviceError = 3,
+    DeadlockDetected = 4,
+    InvalidArgument = 5,
+    InvalidData = 6,
+    InvalidOperation = 7,
+    InvalidResult = 8,
+    InvalidType = 9,
+    MetadataError = 10,
+    NotImplemented = 11,
+    NotInstalled = 12,
+    ObjectNotFound = 13,
+    OperationStopped = 14,
+    OperationTimeout = 15,
+    SyntaxError = 16,
+    ParserError = 17,
+    PermissionDenied = 18,
+    ResourceBusy = 19,
+    ResourceExists = 20,
+    ResourceUnavailable = 21,
+    ReadError = 22,
+    SecurityError = 25,
+    ...
+};
+
+// 2.2.3.10 TimeZone
+pattern TimeZone = ArrayOfBytes;
+
+// 2.2.3.11 PowerShell Pipeline
+type PowerShellPipelineObject : ComplexObjectBase
+{
+    invariant N == "PowerShell";
+    
+    PowerShellPipeline MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type PowerShellPipeline
+{
+    CommandObjectListObject Obj;
+    Boolean B;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CommandObjectListObject : ComplexObjectBase
+{
+    invariant N == "Cmds";
+    
+    CommandObjectList LST;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CommandObjectList
+{
+    array<CommandObject> Obj;
+}
+
+// 2.2.3.12 Command
+type CommandObject : ComplexObjectBase
+{
+    Command MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Command
+{
+    String S where value.N == "Cmd";
+    array<Boolean> B;
+    optional NullValue Nil;
+    array<CommandParameterObjectListObject | PipelineResultTypes> Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CommandParameterObjectListObject : ComplexObjectBase
+{
+    invariant N == "Args";
+    
+    CommandParameterObjectList LST;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CommandParameterObjectList
+{
+    array<CommandParameterObject> Obj;
+}
+
+// 2.2.3.13 Command Parameter
+type CommandParameterObject : ComplexObjectBase
+{
+    CommandParameter MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type CommandParameter
+{
+    optional String S;
+    optional NullValue Nil;
+    optional ComplexObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.14 HostInfo
+type HostInfoObject : ComplexObjectBase
+{
+    invariant N == "HostInfo";
+    
+    HostInfo MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type HostInfo
+{
+    optional DictionaryObject Obj;
+    array<Boolean> B;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type DictionaryObject : ComplexObjectBase
+{
+    Dictionary MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Dictionary
+{
+    PrimitiveDictionaryObject Obj;
+}
+
+// 2.2.3.15 ErrorRecord
+type ErrorRecordObject : ComplexObjectBase
+{
+    ErrorRecord MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type ErrorRecord
+{
+    array<InvocationInfoObject | ComplexObject> Obj;
+    array<String> S;
+    array<NullValue> Nil;
+    array<Boolean> B;
+    array<ErrorCategory | SignedInt> I32;
+    optional array<RefElement> Ref;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type InvocationInfoObject : ComplexObjectBase
+{
+    invariant N == "InvocationInfo";
+    
+    new optional InvocationInfoSpecificExtendedProperty Props;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type InvocationInfoSpecificExtendedProperty
+{
+    array<ComplexObject> Obj;
+    array<String> S;
+    array<CommandOrigin | SignedInt> I32;
+    optional Boolean B;
+    optional SignedLong I64;
+    optional array<NullValue> Nil;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.16 Information Record
+type InformationRecordObject : ComplexObjectBase
+{
+    InformationRecord MS;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type InformationRecord
+{
+    String S;
+    Boolean B;
+    optional ListObject Obj;
+    optional PrimitiveType LST;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.17 Host Method Identifier
+type HostMethodIdentifierObject : ComplexObjectBase
+{
+    invariant N == "mi";
+    
+    HostMethodIdentifier I32;
+    
+    override string ToString()
+    {
+        return "Host Method: " + EnumToString<HostMethodIdentifierEnum>(I32.Value, true);
+    }
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type HostMethodIdentifier
+{
+    HostMethodIdentifierEnum Value with XmlEncoding{Kind = XmlKind.Text};
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+}
+
+pattern HostMethodIdentifierEnum = enum int
+{
+    GetName = 1,
+    GetVersion = 2,
+    GetInstanceId = 3,
+    GetCurrentCulture = 4,
+    GetCurrentUICulture = 5,
+    SetShouldExit = 6,
+    EnterNestedPrompt = 7,
+    ExitNestedPrompt = 8, 
+    NotifyBeginApplication = 9,
+    NotifyEndApplication = 10,
+    ReadLine = 11,
+    ReadLineAsSecureString = 12,
+    Write1 = 13,
+    Write2 = 14,
+    WriteLine1 = 15,
+    WriteLine2 = 16,
+    WriteLine3 = 17,
+    WriteErrorLine = 18,
+    WriteDebugLine = 19,
+    WriteProgress = 20,
+    WriteVerboseLine = 21,
+    WriteWarningLine = 22,
+    Prompt = 23,
+    PromptForCredential1 = 24,
+    PromptForCredential2 = 25,
+    PromptForChoice = 26,
+    GetForegroundColor = 27,
+    SetForegroundColor = 28,
+    GetBackgroundColor = 29,
+    SetBackgroundColor = 30,
+    GetCursorPosition = 31,
+    SetCursorPosition = 32,
+    GetWindowPosition = 33,
+    SetWindowPosition = 34,
+    GetCursorSize = 35,
+    SetCursorSize = 36,
+    GetBufferSize = 37,
+    SetBufferSize = 38,
+    GetWindowSize = 39,
+    SetWindowSize = 40,
+    GetWindowTitle = 41,
+    SetWindowTitle = 42,
+    GetMaxWindowSize = 43,
+    GetMaxPhysicalWindowSize = 44,
+    GetKeyAvailable = 45,
+    ReadKey = 46,
+    FlushInputBuffer = 47,
+    SetBufferContents1 = 48,
+    SetBufferContents2 = 49,
+    GetBufferContents = 50,
+    ScrollBufferContents = 51,
+    PushRunspace = 52,
+    PopRunspace = 53,
+    GetIsRunspacePushed = 54,
+    GetRunspace = 55,
+    PromptForChoiceMultipleSelection = 56,
+    ...
+};
+
+// 2.2.3.18 Primitive Dictionary
+type PrimitiveDictionary
+{
+    optional array<KeyValuePair> En;
+}
+
+type KeyValuePair : PrimitiveType
+{
+    optional ComplexObject Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type PrimitiveDictionaryObject : ComplexObjectBase
+{
+    PrimitiveDictionary DCT;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.19 CommandType
+type CommandTypeObject : ComplexObjectBase
+{
+    SignedInt I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.3.27 ControlKeyStates
+pattern ControlKeyStatesFlags = flags int
+{
+    RightAltPressed = 0x0001,
+    LeftAltPressed = 0x0002,
+    RightCtrlPressed = 0x0004,
+    LeftCtrlPressed = 0x0008,
+    ShiftPressed = 0x0010,
+    NumLockOn = 0x0020,
+    ScrollLockOn = 0x0040,
+    CapsLockOn = 0x0080,
+    EnhancedKey = 0x0100,
+    ...
+};
+
+// 2.2.3.29 BufferCellType
+pattern BufferCellTypeEnum = enum int
+{
+    Complete = 0,
+    Leading = 1,
+    Trailing = 2,
+    ...
+};
+
+// 2.2.3.30 CommandOrigin
+type CommandOrigin : ComplexObjectBase
+{
+    CommandOriginEnum I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+pattern CommandOriginEnum = enum int
+{
+    Runspace = 0,
+    Internal = 1,
+    ...
+};
+
+// 2.2.3.31 PipelineResultTypes 
+type PipelineResultTypes : ComplexObjectBase
+{
+    PipelineResultTypeValue I32;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type PipelineResultTypeValue
+{
+    PipelineResultTypesFlag Value with XmlEncoding{Kind = XmlKind.Text};
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+}
+
+pattern PipelineResultTypesFlag = flags int
+{
+    None = 0x00,
+    Output = 0x01,
+    Error = 0x02,
+    Warning = 0x04,
+    Verbose = 0x08,
+    Debug = 0x10,
+    All = 0x20,
+    Null = 0x40,
+    ...
+};
+
+// Section 2.2.5.1 Serialization of Primitive Type Objects
+type String
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Character
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    ushort Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Boolean
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    bool Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type DateTime
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Duration
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type UnsignedByte
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    byte Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type SignedByte
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    sbyte Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type UnsignedShort
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    ushort Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type SignedShort
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    short Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type UnsignedInt
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    uint Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type SignedInt
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    int Value with XmlEncoding{Kind = XmlKind.Text};
+    
+    override string ToString()
+    {
+        if (N is n:string)
+        {
+            string summary = n + ": ";
+            switch (n)
+            {
+                case "foregroundColor" =>
+                    return summary + EnumToString<ColorValueEnum>(Value);
+                case "backgroundColor" =>
+                    return summary + EnumToString<ColorValueEnum>(Value);
+                case "bufferCellType" =>
+                    return summary + EnumToString<BufferCellTypeEnum>(Value);
+                case "controlKeyState" =>
+                    return summary + EnumToString<ControlKeyStatesFlags>(Value);
+                default =>
+                    return summary + Value.ToString();
+            }
+        }
+        else
+        {
+            return Value.ToString();
+        }
+    }
+}
+
+type UnsignedLong
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    ulong Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type SignedLong
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    long Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Float
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    float Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Double
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    double Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Decimal
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    // Future reference: Decimal type is not supported
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type ArrayOfBytes
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type GUID
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    guid Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type URI
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type NullValue
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+}
+
+type Version 
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+    
+    override string ToString()
+    {
+        string summary = (N != nothing && N != null) ? (N as string) + ": " : "";
+        summary += Value;
+        return summary;
+    }
+}
+
+type XmlDocument
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type ScriptBlock
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type SecureString
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type ProgressRecordObject
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    ProgressRecordData MS;
+}
+
+type ProgressRecordData
+{
+    array<String> S;
+    array<SignedInt> I32;
+    NullValue Nil;
+    RecordTypeObject Obj;
+} with XmlEncoding{IsAny = true, Order = XmlOrderIndicator.All};
+
+type RecordTypeObject 
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional TN TN;
+    optional string Tostring with XmlEncoding{Name = "ToString"};
+    optional SignedInt I32;
+}
+
+type InformationRecord2Object
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    InformationRecord2Data MS;
+}
+
+type InformationRecord2Data
+{
+    array<String> S;
+    DateTime DT;
+    array<UnsignedInt> U32;
+    InformationRecord2Type Obj;
+} with XmlEncoding{IsAny = true, Order = XmlOrderIndicator.All};
+
+type InformationRecord2Type
+{
+    TN TN;
+    optional PrimitiveType LST;
+}
+
+type TN
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional array<string> T;
+}
+
+type ProgressRecord
+{
+    optional array<String> S;
+    optional array<SignedInt> I32;
+    optional array<NullValue> Nil;
+    optional array<ComplexObject> Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type PrimitiveType
+{
+    optional array<String> S;
+    optional array<Character> C;
+    optional array<Boolean> B;
+    optional array<DateTime> DT;
+    optional array<Duration> TS;
+    optional array<UnsignedByte> By;
+    optional array<SignedByte> SB;
+    optional array<UnsignedShort> U16;
+    optional array<SignedShort> I16;
+    optional array<UnsignedInt> U32;
+    optional array<SignedInt> I32;
+    optional array<UnsignedLong> U64;
+    optional array<SignedLong> I64;
+    optional array<Float> Sg;
+    optional array<Double> Db;
+    optional array<Decimal> D;
+    optional array<GUID> G;
+    optional array<ArrayOfBytes> BA;
+    optional array<URI> URI;
+    optional array<NullValue> Nil;
+    optional array<Version> Version;
+    optional array<XmlDocument> XD;
+    optional array<ScriptBlock> SBK;
+    optional array<SecureString> SS;
+    optional array<PrimitiveDictionary> DCT;
+    optional array<ExtendedProperties> LST;
+    optional array<ExtendedProperties> STK;
+    optional array<ExtendedProperties> QUE;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.5.2.1.2
+type RefElement
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+}
+
+// 2.2.5.2.6 Contents of Known Containers (Stack/Queue/List)
+type ListObject : ComplexObjectBase
+{
+    ExtendedProperties LST;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.5.3.4 Structure of Complex Objects
+type TypeNames
+{
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional array<string> T;
+}
+
+type ComplexObjectBase
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional TypeNames TN;
+    optional TypeNames TNRef;
+    optional array<RefElement> Ref;
+    optional string Tostring with XmlEncoding{Name = "ToString"};
+    optional ExtendedProperties Props;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type ComplexObject : PrimitiveType
+{
+    optional string N with XmlEncoding{Kind = XmlKind.Attribute};
+    optional string RefId with XmlEncoding{Kind = XmlKind.Attribute};
+    optional TypeNames TN;
+    optional TypeNames TNRef;
+    optional array<RefElement> Ref;
+    optional string Tostring with XmlEncoding{Name = "ToString"};
+    optional ExtendedProperties Props;
+    optional ExtendedProperties MS;
+    optional string Value with XmlEncoding{Kind = XmlKind.Text};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type ExtendedProperties : PrimitiveType
+{
+    optional array<ComplexObject> Obj;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.6 
+type HostParametersObject : ComplexObjectBase
+{
+    invariant N == "mp";
+    
+    ExtendedProperties LST;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 6   Appendix A: Product Behavior
+const string PsrpResourceUri =  "http://schemas.microsoft.com/powershell/Microsoft.PowerShell";

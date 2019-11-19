@@ -1,0 +1,256 @@
+protocol RDMAP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "A Remote Direct Memory Access Protocol",
+    ShortName = "RDMAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 5040"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "366681", Date = "07/24/2014"}
+        ]
+};
+
+using Standard;
+using DDP;
+using Utility;
+
+annotation byte Msg#MessageOpCode;
+
+// Endpoints
+endpoint Server 
+    over DDP.Server
+    accepts Msg issues Msg;
+
+client endpoint Client connected to Server;
+
+autostart actor RDMAPOverDDP(DDP.Server server)
+{
+    bool isTagged; // "t": DDP.Segment.bufferModel is TaggedBufferModel or UntaggedBufferModel.
+    OpCode opCode; // "opCode": RDMAP's opCode which is to diff the header type of RDMAP.
+    
+    observe server accepts s:DDP.Segment
+    {
+        ExtendDDP(s);
+    }
+    observe server issues s:DDP.Segment
+    {
+        ExtendDDP(s);
+    }
+
+    void ExtendDDP(DDP.Segment s)
+    {
+        if (s.BufferModel is untagged:UntaggedBufferModel)
+        {
+            var rsvdBin = untagged.RsvdULP.Value;
+            RdmapControlOverUntaggedBufferModel control = BinaryDecoder<RdmapControlOverUntaggedBufferModel>(rsvdBin) as RdmapControlOverUntaggedBufferModel; // decoding always succeeds.
+            isTagged = false;
+            opCode = control.OpCode;
+            untagged.RsvdULP = control;
+        }
+        else
+        {
+            var tagged = s.BufferModel as TaggedBufferModel;
+            var rsvdBin = tagged.RsvdULP.Value;
+            RdmapControlOverTaggedBufferMode control = BinaryDecoder<RdmapControlOverTaggedBufferMode>(rsvdBin) as RdmapControlOverTaggedBufferMode; // decoding always succeeds.
+            isTagged = false;
+            opCode = control.OpCode;
+            tagged.RsvdULP = control;
+        }
+    }
+
+    process server accepts s:DDP.Segment where s.Payload.Count > 0
+    {
+        switch (s.Payload)
+        {
+            case m:Msg from BinaryDecoder<Msg[isTagged, opCode]> =>
+                m#MessageOpCode = opCode;
+                dispatch (endpoint Server over server) accepts m;
+            default =>
+                ThrowDecodingException("RDMAP", "Msg");
+        }
+    }
+    
+    process server issues s:DDP.Segment where s.Payload.Count > 0
+    {
+        switch (s.Payload)
+        {
+            case m:Msg from BinaryDecoder<Msg[isTagged, opCode]> =>
+                m#MessageOpCode = opCode;
+                dispatch (endpoint Server over server) issues m;
+            default =>
+                ThrowDecodingException("RDMAP", "Msg");
+        }
+    }
+}
+
+const set<byte> OpCodeHavingPayload = {OpCode.RDMAWrite, OpCode.RDMAReadResponse, OpCode.Send, OpCode.SendWithInvalidate, OpCode.SendWithSE, OpCode.SendWithSEAndInvalidate};
+message Msg[bool IsTagged, byte Code]
+{
+    // header part
+    optional [|Code == OpCode.RDMAReadRequest|] ReadRequestHeader ReadRequestHeader;
+    optional [|Code == OpCode.Terminate|] TerminateHeader[IsTagged] TerminateHeader;
+    
+    // message part
+    optional [|Code in OpCodeHavingPayload|] binary ULPPayload;
+    
+    override string ToString()
+    {
+        switch (this#MessageOpCode)
+        {
+            case OpCode.RDMAWrite               => return "RDMA Write";
+            case OpCode.RDMAReadRequest         => return "RDMA Read Request, RDMARDSZ: " + ((ReadRequestHeader as ReadRequestHeader).RDMARDSZ as string);
+            case OpCode.RDMAReadResponse        => return "RDMA Read Response";
+            case OpCode.Send                    => return "Send";
+            case OpCode.SendWithInvalidate      => return "Send With Invalidate";
+            case OpCode.SendWithSE              => return "Send With SE";
+            case OpCode.SendWithSEAndInvalidate => return "Send With SE and Invalidate";
+            case OpCode.Terminate               => return "Terminate, Error Code: " + EnumToString<RDMAP.ErrorCode>((TerminateHeader as TerminateHeader).ErrorCode, false);
+            default                              => return "Unknown(" + Utility.DecToHexFormat(this#MessageOpCode) + ")";
+        }
+    }
+}
+
+pattern OpCode = enum byte
+{
+    RDMAWrite = 0,
+    RDMAReadRequest = 1,
+    RDMAReadResponse = 2,
+    Send = 3,
+    SendWithInvalidate = 4,
+    SendWithSE = 5,
+    SendWithSEAndInvalidate = 6,
+    Terminate = 7
+};
+
+/*    4.2.  RDMA Message Definitions
+   -------+-----------+-------------------+-------------------------
+   RDMA   | Message   | RDMA Header Used  | ULP Message allowed in
+   Message| Type      |                   | the RDMA Message
+   OpCode |           |                   |
+          |           |                   |
+   -------+-----------+-------------------+-------------------------
+   0000b  | RDMA Write| None              | Yes
+          |           |                   |
+   -------+-----------+-------------------+-------------------------
+   0001b  | RDMA Read | RDMA Read Request | No
+          | Request   | Header            |
+   -------+-----------+-------------------+-------------------------
+   0010b  | RDMA Read | None              | Yes
+          | Response  |                   |
+   -------+-----------+-------------------+-------------------------
+   0011b  | Send      | None              | Yes
+          |           |                   |
+   -------+-----------+-------------------+-------------------------
+   0100b  | Send with | None              | Yes
+          | Invalidate|                   |
+   -------+-----------+-------------------+-------------------------
+   0101b  | Send with | None              | Yes
+          | SE        |                   |
+   -------+-----------+-------------------+-------------------------
+   0110b  | Send with | None              | Yes
+          | SE and    |                   |
+          | Invalidate|                   |
+   -------+-----------+-------------------+-------------------------
+   0111b  | Terminate | Terminate Header  | No
+          |           |                   |
+   -------+-----------+-------------------+-------------------------
+   1000b  |           |
+   to     | Reserved  |            Not Specified
+   1111b  |           |
+   -------+-----------+-------------------+-------------------------
+*/
+
+// 4.4.  RDMA Read Request Header
+type ReadRequestHeader
+{
+    uint SinkSTag; // Data Sink Steering Tag
+    ulong SinkTO;  // Data Sink Tagged Offset
+    uint RDMARDSZ; // RDMA Read Message Size.
+    uint SrcSTag;  // Data Source Steering Tag
+    ulong SrcTO;   // Data Source Tagged Offset
+}
+
+// 4.8.  Terminate Header
+type TerminateHeader[bool Tagged]
+{
+    // Terminate Control: 19 bits
+    LayerPattern Layer with BinaryEncoding{Width = 4};
+    ErrorType EType with BinaryEncoding{Width = 4};
+    ErrorCode ErrorCode with BinaryEncoding{Width = 8};
+     // HdrCt: 3 bits. Header control bits
+    bool M with BinaryEncoding{Width = 1}; // DDP Segment Length valid.
+    bool D with BinaryEncoding{Width = 1}; // DDP Header Included.
+    bool R with BinaryEncoding{Width = 1}; // RDMAP Header Included.
+
+    uint Reserved with BinaryEncoding{Width = 13};
+    
+    optional [|(Layer == LayerPattern.DDP) && D|] ushort DDPSegmentLength;
+    
+    optional [|D|] ([|(EType != ErrorType.LocalCatastrophicError) && Tagged|] DDP.TaggedBufferModel 
+        | [|(EType != ErrorType.LocalCatastrophicError) && !Tagged|] DDP.UntaggedBufferModel) TerminatedDDPHeader;
+    
+    optional [|R|] ReadRequestHeader TerminatedRDMAHeader;
+}
+
+pattern LayerPattern = enum byte
+{
+    RDMA = 0,
+    DDP = 1,
+    LLP = 2
+};
+
+pattern ErrorType = enum byte
+{
+    LocalCatastrophicError = 0,
+    RemoteProtectionError  = 1,
+    RemoteOperationError   = 2
+};
+
+pattern ErrorCode = enum byte
+{
+    InvalidSTag = 0x00,
+    BaseOrBoundsViolation = 0x01,
+    AccessRightsViolation = 0x02,
+    STagNotAssociatedWithRdmapStream = 0x03,
+    TOWrap = 0x04,
+    InvalidRdmapVersion = 0x05,
+    UnexpectedOpCode = 0x06,
+    CatastrophicErrorLocalizedToRdmapStream = 0x07,
+    CatastrophicErrorGlobal = 0x08,
+    STagCannotBeInvalidated = 0x09,
+    UnspecifiedError = 0xFF
+};
+
+type ControlFlag
+{
+    byte Version with BinaryEncoding{Width = 2};
+    byte Reserved with BinaryEncoding{Width = 2};
+    OpCode OpCode with BinaryEncoding{Width = 4};
+}
+
+type RdmapControlOverTaggedBufferMode : DDP.RsvdULPType
+{
+    new optional binary Value with Encoding{Ignore = true};
+    byte Version with BinaryEncoding{Width = 2};
+    byte Reserved with BinaryEncoding{Width = 2};
+    OpCode OpCode with BinaryEncoding{Width = 4};
+}
+
+type RdmapControlOverUntaggedBufferModel : DDP.RsvdULPType
+{
+    new optional binary Value with Encoding{Ignore = true};
+    byte Version with BinaryEncoding{Width = 2};
+    byte Reserved with BinaryEncoding{Width = 2};
+    OpCode OpCode with BinaryEncoding{Width = 4};
+    optional [|OpCode in {4, 6}|] uint InvalidateSTag;
+    optional [|!(OpCode in {4, 6})|] uint RsvdULP;
+}

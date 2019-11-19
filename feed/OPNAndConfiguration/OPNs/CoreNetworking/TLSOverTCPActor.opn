@@ -1,0 +1,133 @@
+module TLSOverTCPActor with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "379059", Date = "07/13/2015"}
+        ]
+};
+
+using Utility;
+using TCP;
+using Standard;
+using TLS;
+using IANA;
+using Configurations;
+
+autostart actor TLSOverTCP(TCP.EncryptionServer server)
+{
+    TLSDecodingHelper TLSHelper = null;
+
+    TLS.Server EPT;
+    TCP.Server tcpServer = null;
+    bool IsTLSEncryptedSession = false;
+    TDSConfiguration tdsConfig = GetConfigurableValue<TDSConfiguration>();
+
+    process server accepts s:TCP.Segment
+    {    
+        if (!(IsTLSEncryptedSession && s.Payload.Count == 0) && // Is not pure ack under TLS encrypted session
+            (TLSHelper == null || TLSHelper.AcceptsCache.BufferCount() == 0) && !IsTLS(s, MessageDirection.Accepts))
+        {
+            IsTLSEncryptedSession = false;
+            if (tcpServer == null)
+            {
+                tcpServer = endpoint TCP.Server[server.ClientAddress, server.ServerAddress, server.ClientPort, server.ServerPort];
+            }
+            dispatch tcpServer accepts s;
+            tcpServer.IsFromTLS = false;
+            return;
+        }
+        
+        IsTLSEncryptedSession = true;
+        if (TLSHelper == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            TLSHelper = new TLSDecodingHelper();
+            TLSHelper.InitializeTLSHelper(EPT);
+            InitializeTLSServerFromTCP(s, MessageDirection.Accepts, DispathDecrytedMessageBack, EPT);
+        }
+        // TDS may contain TLS and TDS data in the same TCP Segment, so use function TryDecodeTLSFromPartialTCPPayload in TLSDecodingHelper to decode
+        // It decode the TLS part and dispatch the non-TLS part to TCP
+        if (server.ServerPort == Port.TDS || server.ServerPort in tdsConfig.Ports)
+        {
+            TLSHelper.TryDecodeTLSFromPartialTCPPayload(s, MessageDirection.Accepts);
+        }
+        else
+        {
+            TLSHelper.TryDecode(s, MessageDirection.Accepts);
+        }
+    }
+    
+    process server issues s:TCP.Segment
+    {
+        if (!(IsTLSEncryptedSession && s.Payload.Count == 0) && // Is not pure ack under TLS encrypted session
+            (TLSHelper == null || TLSHelper.IssuesCache.BufferCount() == 0) && !IsTLS(s, MessageDirection.Issues))
+        {
+            IsTLSEncryptedSession = false;
+            if (tcpServer == null)
+            {
+                tcpServer = endpoint TCP.Server[server.ClientAddress, server.ServerAddress, server.ClientPort, server.ServerPort];
+            }
+            dispatch tcpServer issues s;
+            tcpServer.IsFromTLS = false;
+            return;
+        }
+        
+        IsTLSEncryptedSession = true;
+        if (TLSHelper == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            TLSHelper = new TLSDecodingHelper();
+            TLSHelper.InitializeTLSHelper(EPT);
+            InitializeTLSServerFromTCP(s, MessageDirection.Issues, DispathDecrytedMessageBack, EPT);
+        }
+        // TDS may contain TLS and TDS data in the same TCP Segment, so use function TryDecodeTLSFromPartialTCPPayload in TLSDecodingHelper to decode
+        // It decode the TLS part and dispatch the non-TLS part to TCP
+        if (server.ServerPort == Port.TDS || server.ServerPort in tdsConfig.Ports)
+        {
+            TLSHelper.TryDecodeTLSFromPartialTCPPayload(s, MessageDirection.Issues);
+        }
+        else
+        {
+            TLSHelper.TryDecode(s, MessageDirection.Issues);
+        }
+    }
+    
+    ~endpoint(TCP.EncryptionServer server)
+    {
+        if (TLSHelper != null)
+        {
+            TLSHelper.ClearInDestructor();
+        }
+    }
+        
+    void DispathDecrytedMessageBack(binary bin, TLS.RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        if (rls.Origins[0] is first:TCP.Segment &&
+            GetLastDataSegment(rls.Origins) is last:TCP.Segment)
+        {
+            DispathBackToTCP(bin, server, direction, first, last);
+        }
+    }
+
+    bool IsTLS(Segment s, MessageDirection direction)
+    {
+        if (TLSHelper == null)
+        {
+            return IsTlsHeader(s.Payload);
+        }
+        
+        if (direction == MessageDirection.Accepts)
+        {
+            return IsTlsHeaderBySegment(TLSHelper.AcceptsCache, s);
+        }
+        else
+        {
+            return IsTlsHeaderBySegment(TLSHelper.IssuesCache, s);
+        }
+    }
+}

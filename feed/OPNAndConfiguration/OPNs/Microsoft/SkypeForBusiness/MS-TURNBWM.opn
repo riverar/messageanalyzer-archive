@@ -1,0 +1,381 @@
+protocol MSTURNBWM with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Traversal using Relay NAT (TURN) Bandwidth Management Extensions",
+    ShortName = "MS-TURNBWM",
+    DocumentName = "MS-TURNBWM",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+           new Reference{Name = "MS-TURNBWM", Version = "3.0"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "1.0.0", Date = "05/19/2015"}
+        ]
+};
+
+using Utility;
+using MSTURN;
+using TURN;
+using TCP;
+using UDP;
+
+endpoint Server
+    over MSTURN.Server
+    accepts Message issues Message;
+
+client endpoint Client connected to Server;
+
+autostart actor ActorOverMSTURN(MSTURN.Server node)
+{
+    process node accepts msTurnMsg:MSTURN.Message where IsMsTurnbwmMsg(msTurnMsg)
+    { 
+        optional Message msg = new Message(msTurnMsg);			
+		dispatch (endpoint Server over node) accepts msg as Message;
+    } 
+	
+	process node issues msTurnMsg:MSTURN.Message where IsMsTurnbwmMsg(msTurnMsg)
+    {
+        optional Message msg = new Message(msTurnMsg);	
+		dispatch (endpoint Server over node) issues msg as Message;
+    }    
+}
+
+bool IsMsTurnbwmMsg(MSTURN.Message msTurnMsg)
+{
+	ushort messageType = msTurnMsg.MessageHeader.MessageType;
+
+	if ((messageType == null) || ((messageType & 0x000f) as ushort != 0x0003)) // Must be Allocate Request or Response
+	{
+		return false;
+	}
+
+	array<MSTURN.Attribute> attributes = msTurnMsg.Attributes;
+	
+	if ((attributes == null) || (attributes.Count == 0))
+	{
+		return false;
+	}
+	
+    foreach (MSTURN.Attribute attribute in attributes)
+	{
+		if (attribute is GenericAttribute)
+		{
+			if (InRange<AttributeType>((attribute as GenericAttribute).Type))
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+ 
+message Message[bool IsOverTCP]
+{
+    optional ([|IsOverTCP|] MSTURN.TCPFramingHeader) TCPFramingHeader;
+    MSTURN.MessageHeader MessageHeader;
+    array<Attribute> Attributes with BinaryEncoding{WidthForComposedType = MessageHeader.MessageLength << 3};
+	
+	Message(MSTURN.Message msTurnMsg)
+	{		
+		optional Message msTurnbwmMsg;
+		array<any message> tempOrigins = msTurnMsg.Origins;	
+	
+		if ((tempOrigins == null) || (tempOrigins.Count != 1))
+		{
+			ThrowDecodingException("MSTURNBWM", "This frame MUST have only one origin message.", null);
+		}
+		else if (tempOrigins[0] is s:TCP.Segment)
+		{
+			msTurnbwmMsg = BinaryDecoder<Message[true]>(s.Payload);
+		}
+		else if (tempOrigins[0] is m:TURN.Message)
+		{
+			array<any message> udpOrigins = m.Origins;
+
+			if (udpOrigins == null || udpOrigins.Count != 1)
+			{
+				ThrowDecodingException("MSTURNBWM", "The TURN layer of this frame MUST have only one origin message.", null);
+			}
+			else if (udpOrigins[0] is d:UDP.Datagram)
+			{
+				msTurnbwmMsg = BinaryDecoder<Message[false]>(d.Payload);
+			}
+			else 
+			{
+				ThrowDecodingException("MSTURNBWM", "The origin of TURN of this frame should be of type UDP.Datagram.", null);
+			}
+		} 
+		else
+		{
+			ThrowDecodingException("MSTURNBWM", "The MSTURN layer of this frame should be based on top of either TCP or UDP", null);	
+		}
+
+		if ((msTurnbwmMsg != nothing) && (msTurnbwmMsg != null))
+		{
+			Message parsedMessage = msTurnbwmMsg as Message;
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSTURNBWM");
+		}
+	}
+
+    override string ToString()
+    {	    
+		string summary = "Allocate ";
+		
+		ushort messageType  = this.MessageHeader.MessageType;
+		ushort turnClass = (messageType & 0x0110) as ushort;
+		
+		if (turnClass in MsTurnMessageClasses)
+        {
+            summary += MsTurnMessageClasses[turnClass];
+        }
+		else
+		{
+			summary = "Unknown Message Type(" + DecToHexFormat(messageType) + ")";
+		}		
+
+		foreach (Attribute attribute in this.Attributes)
+		{
+			if (attribute is BandwidthAdmissionControlMessage)
+			{
+				MessageTypeEnum bwmMessageType = (attribute as BandwidthAdmissionControlMessage).MessageType;
+				
+				if (bwmMessageType == null)
+				{
+					summary += "Invalid Message Format: Missing MessageType for Attribute BandwidthAdmissionControlMessage";
+				}
+				else if (bwmMessageType == 0x0000)
+				{
+					summary += ", Bandwidth Admission Control Check Message";
+				}
+				else if (bwmMessageType == 0x0001)
+				{
+					summary += ", Bandwidth Admission Control Commit Message";
+				}
+				else if (bwmMessageType == 0x0002)
+				{
+					summary += ", Bandwidth Admission Control Update Message";
+				}
+				else
+				{
+					summary += ", Unknown Bandwidth Admission Control Message";
+				}
+			}
+		}
+        return summary;
+    }
+}
+
+// Section 2.1
+pattern Attribute = [|stream.RemainingByteLength() >= 2|]
+    ([|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8056|] BandwidthAdmissionControlMessage |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8057|] BandwidthReservationIdentifier |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8058|] BandwidthReservationAmount |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8059|] RemoteSiteAddress |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805A|] RemoteRelaySiteAddress |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805B|] LocalSiteAddress |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805C|] LocalRelaySiteAddress |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805D|] RemoteSiteAddressResponse |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805E|] RemoteRelaySiteAddressResponse |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x805F|] LocalSiteAddressResponse |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8060|] LocalRelaySiteAddressResponse |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8061|] SIPDialogIdentifier |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8062|] SIPCallIdentifier |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8068|] LocationProfile |
+	MSTURN.Attribute); // Other Attributes
+
+type BandwidthAdmissionControlMessage
+{
+    (ushort where value == 0x8056) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute BandwidthAdmissionControlMessage must be 0x0004(4).");
+    ushort Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURNBWM: The Reserved in attribute BandwidthAdmissionControlMessage should be 0.");
+	MessageTypeEnum MessageType where ValidationCheck(value == 0 || value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURNBWM: The MessageType in attribute BandwidthAdmissionControlMessage must be 0x0000(0), 0x0001(1), or 0x0002(2).");
+}
+
+type BandwidthReservationIdentifier
+{
+    (ushort where value == 0x8057) Type;
+    ushort Length where ValidationCheck(value == 16, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute BandwidthReservationIdentifier must be 0x0010(16).");
+    binary ReservationId with BinaryEncoding{Length = Length};
+}
+
+type BandwidthReservationAmount
+{
+    (ushort where value == 0x8058) Type;
+    ushort Length where ValidationCheck(value == 16, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute BandwidthReservationAmount must be 0x0010(16).");
+	uint MinimumSendBandwidth;
+	uint MaximumSendBandwidth;
+	uint MinimumReceiveBandwidth;
+	uint MaximumReceiveBandwidth;
+}
+
+type RemoteSiteAddress
+{
+    (ushort where value == 0x8059) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute RemoteSiteAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURNBWM: The Reserved in attribute RemoteSiteAddress should be 0.");
+    FamilyEnum Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURNBWM: The Family in attribute RemoteSiteAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+	ushort Xport;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) XIPAddress;
+}
+
+type RemoteRelaySiteAddress
+{
+    (ushort where value == 0x805A) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute RemoteRelaySiteAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURNBWM: The Reserved in attribute RemoteRelaySiteAddress should be 0.");
+    FamilyEnum Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURNBWM: The Family in attribute RemoteRelaySiteAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+	ushort Xport;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) XIPAddress;
+}
+
+type LocalSiteAddress
+{
+    (ushort where value == 0x805B) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute LocalSiteAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURNBWM: The Reserved in attribute LocalRelaySiteAddress should be 0.");
+    FamilyEnum Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURNBWM: The Family in attribute LocalSiteAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+	ushort Xport;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) XIPAddress;
+}
+
+type LocalRelaySiteAddress
+{
+    (ushort where value == 0x805C) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute LocalRelaySiteAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURNBWM: The Reserved in attribute LocalRelaySiteAddress should be 0.");
+    FamilyEnum Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURNBWM: The Family in attribute LocalRelaySiteAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+	ushort Xport;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) XIPAddress;
+}
+
+type RemoteSiteAddressResponse
+{
+    (ushort where value == 0x805D) Type;
+    ushort Length where ValidationCheck(value == 12, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute RemoteSiteAddressResponse must be 0x000C(12).");
+    byte ValidFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The ValidFlag in attribute RemoteSiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};
+	byte PSTNFailoverFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The PSTNFailoverFlag in attribute RemoteSiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 30};
+	uint MaximumSendBandwidth;
+	uint MaximumReceiveBandwidth; 
+}
+
+type RemoteRelaySiteAddressResponse
+{
+    (ushort where value == 0x805E) Type;
+    ushort Length where ValidationCheck(value == 12, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute RemoteRelaySiteAddressResponse must be 0x000C(12).");
+    byte ValidFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The ValidFlag in attribute RemoteRelaySiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};	
+    byte Reserved with BinaryEncoding{Width = 31};
+	uint MaximumSendBandwidth;
+	uint MaximumReceiveBandwidth; 
+}
+
+type LocalSiteAddressResponse
+{
+    (ushort where value == 0x805F) Type;
+    ushort Length where ValidationCheck(value == 12, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute LocalSiteAddressResponse must be 0x000C(12).");
+    byte ValidFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The ValidFlag in attribute LocalSiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};	
+	byte PSTNFailoverFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The PSTNFailoverFlag in attribute LocalSiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 30};
+	uint MaximumSendBandwidth;
+	uint MaximumReceiveBandwidth; 
+}
+
+type LocalRelaySiteAddressResponse
+{
+    (ushort where value == 0x8060) Type;
+    ushort Length where ValidationCheck(value == 12, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute LocalRelaySiteAddressResponse must be 0x000C(12).");
+    byte ValidFlag where ValidationCheck(value == 0 || value == 1, null, DiagnosisLevel.Error, "MSTURNBWM: The ValidFlag in attribute LocalRelaySiteAddressResponse must be either 0x0 or 0x1.") with BinaryEncoding{Width = 1};	
+    byte Reserved with BinaryEncoding{Width = 31};
+	uint MaximumSendBandwidth;
+	uint MaximumReceiveBandwidth; 
+}
+
+type SIPDialogIdentifier
+{
+    (ushort where value == 0x8061) Type;
+    ushort Length where ValidationCheck(value <= 256, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute SIPDialogIdentifier must not exceed 256.");
+    binary SIPDialogID with BinaryEncoding{Length = Length};
+}
+
+type SIPCallIdentifier
+{
+    (ushort where value == 0x8062) Type;
+    ushort Length where ValidationCheck(value <= 256, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute SIPCallIdentifier must not exceed 256.");
+    binary SIPCallID with BinaryEncoding{Length = Length};
+}
+
+type LocationProfile
+{
+    (ushort where value == 0x8068) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURNBWM: The Length in attribute LocationProfile must be 0x0004(4).");
+    PeerLocationEnum PeerLocation;
+	SelfLocationEnum SelfLocation;
+	Federation Federation;
+	byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSTURNBWM: The Reserved in attribute LocationProfile must be 0x0000(0).");
+}
+
+pattern MessageTypeEnum = enum ushort
+{
+	ReservationCheck = 0x0000,
+	ReservationCommit = 0x0001,
+	ReservationUpdate = 0x0002,
+	...
+};
+
+pattern FamilyEnum = enum byte
+{
+	IPv4 = 0x01,
+	IPv6 = 0x02,
+};
+
+pattern PeerLocationEnum = enum byte
+{
+	Unknown = 0x00,
+	Internet = 0x01,
+	Intranet = 0x02,
+};
+
+pattern SelfLocationEnum = enum byte
+{
+	Unknown = 0x00,
+	Internet = 0x01,
+	Intranet = 0x02,
+};
+
+pattern Federation = enum byte
+{
+	Unknown = 0x00,
+	Internet = 0x01,
+	Intranet = 0x02,
+};
+
+pattern AttributeType = enum uint
+{
+    BandwidthAdmissionControlMessage = 0x8056,
+    BandwidthReservationIdentifier	 = 0x8057,
+    BandwidthReservationAmount	     = 0x8058,
+    RemoteSiteAddress				 = 0x8059,
+    RemoteRelaySiteAddress			 = 0x805A,
+    LocalSiteAddress				 = 0x805B,
+    LocalRelaySiteAddress			 = 0x805C,
+    RemoteSiteAddressResponse		 = 0x805D,
+    RemoteRelaySiteAddressResponse	 = 0x805E,
+    LocalSiteAddressResponse         = 0x805F,
+    LocalRelaySiteAddressResponse    = 0x8060,
+    SIPDialogIdentifier				 = 0x8061,
+    SIPCallIdentifier				 = 0x8062,
+	LocationProfile		             = 0x8068,
+};

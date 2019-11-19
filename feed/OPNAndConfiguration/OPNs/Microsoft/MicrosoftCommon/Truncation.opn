@@ -1,0 +1,109 @@
+protocol Truncation with
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "356534", Date = "11/18/2013"}
+        ]
+};
+
+using Utility;
+using IANA;
+using IKE;
+using AuthIP;
+using TCP;
+using UDP;
+
+endpoint MicrosoftCommonTruncationEndpoint accepts any message;
+
+// Accroding to OPN in MicrosoftCommon package, parse message from CoreNetworkingTruncationEndpoint
+autostart actor MicrosoftCommonTruncationOverCoreNetworkingTruncation(CoreNetworkingTruncationEndpoint coreEnpoint)
+{
+    process coreEnpoint accepts m:any message
+    {
+        DecodeAndDispatchTruncationMessage(m);
+    }
+}
+
+void DecodeAndDispatchTruncationMessage(any message chokepointMsg)
+{
+    binary payload;
+    TruncationProtocolType nextProtocol;
+    if (chokepointMsg is segment:TCP.Segment)
+    {
+        payload = segment.Payload;
+        set<ushort> ports = {segment.SourcePort, segment.DestinationPort};
+        nextProtocol = GetNextProtocolForIKEOrAuthIP(ref ports, payload);
+    }
+    else if (chokepointMsg is datagram:UDP.Datagram)
+    {
+        payload = datagram.Payload;
+        set<ushort> ports = {datagram.SourcePort, datagram.DestinationPort};
+        nextProtocol = GetNextProtocolForIKEOrAuthIP(ref ports, payload);
+    }
+    else
+    {
+        nextProtocol = TruncationProtocolType.None;
+    }
+    any message resultMsg= chokepointMsg;
+    
+    while (nextProtocol != TruncationProtocolType.None)
+    {
+        switch (nextProtocol)
+        {
+            case TruncationProtocolType.IKE =>
+                switch (payload)
+                {
+                    case p:IKEDatagram from IKEDecoder =>
+                        p#IsTruncated = true;
+                        p.Origins = [resultMsg];
+                        resultMsg = p;
+                        payload = null;
+                        nextProtocol = TruncationProtocolType.None;
+                    default => 
+                        nextProtocol = TruncationProtocolType.None;
+                }
+            case TruncationProtocolType.AuthIP =>
+                switch (payload)
+                {
+                    case p:IsakmpMessage from AuthIPDecoder =>
+                        p#IsTruncated = true;
+                        p.Origins = [resultMsg];
+                        resultMsg = p;
+                        payload = null;
+                        nextProtocol = TruncationProtocolType.None;
+                    default => 
+                        nextProtocol = TruncationProtocolType.None;
+                }
+            default =>
+                nextProtocol = TruncationProtocolType.None;
+        }
+    }
+    dispatch endpoint MicrosoftCommonTruncationEndpoint accepts resultMsg;
+}
+
+TruncationProtocolType GetNextProtocolForIKEOrAuthIP(ref set<ushort> ports, binary payload)
+{
+    if (payload.Count == 0)
+    {
+        return TruncationProtocolType.None;
+    }
+    
+    if (ports[IANA.Port.IKE] && !IsAuthIP(payload)
+        || ports[IANA.Port.NATT] && payload.Count > 12 && payload.Segment(0,4) == $[00000000])
+    {
+        return TruncationProtocolType.IKE;
+    }
+    else if ((ports[IANA.Port.IKE] || ports[IANA.Port.GDOI]) && IsAuthIP(payload))
+    {
+        return TruncationProtocolType.AuthIP;
+    }
+    else
+    {
+        return TruncationProtocolType.None;
+    }
+}

@@ -1,0 +1,260 @@
+protocol DVRD with
+XmlEncodingDefaults{Namespace = TnsNamespace},
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "Device Registration Discovery Protocol",
+    ShortName = "DVRD",
+    DocumentName = "MS-DVRD",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-DVRD", Version = "1.0", Date = "08/08/2013", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = [new Revision {Class = RevisionClass.Major, Version = "361243", Date = "03/24/2014"}
+    ]
+};
+
+using XSD;
+using HTTP;
+using Utility;
+
+const string TnsNamespace = "http://schemas.datacontract.org/2004/07/Microsoft.DeviceRegistration.Entities";
+const string DvrdUri = "/EnrollmentServer/contract";
+
+//------------------------------------- Endpoint & Actor---------------------------------------//
+endpoint Server
+    over HTTP.Server
+    provides DVRDContract;
+
+client endpoint Client connected to Server;
+
+autostart actor DVRDServerOverHTTP(HTTP.Server server)
+{
+    bool isDVRDRequestReceived = false;
+
+    process server accepts httpRequest:HttpContract.Request where IsDVRDRequestMessage(httpRequest)
+    {
+        if (httpRequest.Uri.Query is parameters:map<string, string>)
+        {
+            parameters = ParsePercentEncodedQuery(parameters);
+            if (parameters.Keys["api-version"])
+            {
+                DVRDContract.Request request = new DVRDContract.Request
+                {
+                    ApiVersion = parameters["api-version"] as string
+                };
+                dispatch (endpoint DVRD.Server over server) accepts request;
+                isDVRDRequestReceived = true;
+            }
+            else
+            {
+                ThrowDecodingException("DVRD", "DVRDContract.Request");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("DVRD", "DVRDContract.Request");
+        }
+    }
+
+    process server issues httpResponse:HttpContract.Response where isDVRDRequestReceived
+    {
+        // reset
+        isDVRDRequestReceived = false;
+
+        if (!httpResponse.Headers.Keys["Content-Type"] 
+            || !(httpResponse.Headers["Content-Type"] is HTTP.HeaderFieldType))
+        {
+            ThrowDecodingException("DVRD", "DVRDContract.Response"); 
+        }
+
+        string contentType = (httpResponse.Headers["Content-Type"] as HTTP.HeaderFieldType).Value;
+        DVRDContract.Response response = null;
+        switch (contentType)
+        {
+            // From the point of HTTP, the Content-Type may not match to the actual encoded type of payload.
+            // So the actor will try both Json & Xml decoding.
+            case "application/json" =>
+                var v = JsonDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                if (v == nothing)
+                {
+                    // try XML decoder.
+                    v = XmlDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                    if(v == nothing)
+                    {
+                        ThrowDecodingException("DVRD", "DVRDContract.Response");
+                    }
+                }
+                response = v as DVRDContract.Response;
+            case "application/xml" =>
+                var v = XmlDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                if (v == nothing)
+                {
+                    // try JSON decoder.
+                    v = JsonDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                    if(v == nothing)
+                    {
+                        ThrowDecodingException("DVRD", "DVRDContract.Response");
+                    }
+                }
+                response = v as DVRDContract.Response;
+            default =>
+                // try XML decoder first
+                var v = XmlDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                if (v == nothing)
+                {
+                    // try JSON decoder.
+                    v = JsonDecoder<DVRDContract.Response>(httpResponse.Payload as stream);
+                    if(v == nothing)
+                    {
+                        ThrowDecodingException("DVRD", "DVRDContract.Response");
+                    }
+                }
+                response = v as DVRDContract.Response;
+        }
+
+        dispatch (endpoint DVRD.Server over server) issues response;
+    }
+}
+
+//-------------------------------------- Constracts -------------------------------------------//
+contract DVRDContract
+{
+    accepts Request
+    {
+        string ApiVersion;
+
+        override string ToString()
+        {
+            return "Request, api-version: " + ApiVersion;
+        }
+    }
+
+    // 2.2.4.3   Discovery
+    issues Response
+    {
+        optional DeviceRegistrationServiceData DeviceRegistrationService;
+        optional AuthenticationServiceData AuthenticationService;
+        optional IdentityProviderServiceData IdentityProviderService;
+
+        override string ToString()
+        {
+            return "Response";
+        }
+    }
+
+    issues virtual operation Operation
+    {
+        string ApiVersion = apiVersion;
+        optional DeviceRegistrationServiceData DeviceRegistrationService = deviceRegistrationService;
+        optional AuthenticationServiceData AuthenticationService = authenticationService;
+        optional IdentityProviderServiceData IdentityProviderService = identityProviderService;
+        
+        override string ToString()
+        {
+            return "Operation, api-version: " + ApiVersion;
+        }
+    } =
+    accepts DVRDContract.Request{ApiVersion is var apiVersion}
+    issues DVRDContract.Response{DeviceRegistrationService is var deviceRegistrationService, 
+                                AuthenticationService is var authenticationService,
+                                IdentityProviderService is var identityProviderService};
+}
+
+//----------------------------------------- Types ---------------------------------------------//
+// 2.2.4.1   AuthenticationServiceData
+type AuthenticationServiceData
+{
+    optional OAuth2ServiceData OAuth2;
+
+    override string ToString()
+    {
+        return OAuth2 == nothing ? "AuthenticationServiceData" : OAuth2.ToString();
+    }
+}
+
+// 2.2.4.2   DeviceRegistrationServiceData
+type DeviceRegistrationServiceData
+{
+    optional XSAnyURI RegistrationEndpoint;
+    optional XSAnyURI RegistrationResourceId;
+    optional string ServiceVersion;
+
+    override string ToString()
+    {
+        string summary = "";
+        if (RegistrationEndpoint != nothing)
+        {
+            summary = "RegistrationEndpoint: " + (RegistrationEndpoint as string);
+        }
+        if (RegistrationResourceId != nothing)
+        {
+            if (summary.Count > 0)
+            {
+                summary += ", ";
+            }
+            summary += "RegistrationResourceId: " + (RegistrationResourceId as string);
+        }
+        if (ServiceVersion != nothing)
+        {
+            if (summary.Count > 0)
+            {
+                summary += ", ";
+            }
+            summary += "ServiceVersion: " + (ServiceVersion as string);
+        }
+        return summary.Count == 0 ? "DeviceRegistrationServiceData" : summary;
+    }
+
+}
+
+// 2.2.4.4   OAuth2ServiceData
+type OAuth2ServiceData
+{
+    optional XSAnyURI AuthCodeEndpoint;
+    optional XSAnyURI TokenEndpoint;
+
+    override string ToString()
+    {
+        string summary = "";
+        if (AuthCodeEndpoint != nothing)
+        {
+            summary = "AuthCodeEndpoint: " + (AuthCodeEndpoint as string);
+        }
+        if (TokenEndpoint != nothing)
+        {
+            if (summary.Count > 0)
+            {
+                summary += ", ";
+            }
+            summary += "TokenEndpoint: " + (TokenEndpoint as string);
+        }
+        return summary.Count == 0 ? "OAuth2ServiceData" : summary;
+    }
+}
+
+// 2.2.4.5   IdentityProviderServiceData
+type IdentityProviderServiceData
+{
+    optional XSAnyURI PassiveAuthEndpoint;
+
+    override string ToString()
+    {
+        return PassiveAuthEndpoint == nothing ?
+            "IdentityProviderServiceData" :
+            PassiveAuthEndpoint as string;
+    }
+}
+
+//------------------------------------- Utilities ---------------------------------------------//
+bool IsDVRDRequestMessage(HttpContract.Request request)
+{
+    return request.Method == "GET" && request.Uri.AbsPath != nothing && request.Uri.Query != nothing
+        && request.Uri.AbsPath is path:string
+        && path == DvrdUri;
+}

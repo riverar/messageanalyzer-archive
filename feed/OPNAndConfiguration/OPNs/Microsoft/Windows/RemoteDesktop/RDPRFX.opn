@@ -1,0 +1,577 @@
+protocol RDPRFX with
+Visualization{AliasName = "RDP"},
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: RemoteFX Codec Extension",
+    ShortName = "RDPRFX",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "MS-RDPRFX", Version = "18.0", Date = "06/01/2017", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="383234", Date="12/23/2015"}
+        ]
+};
+
+using Utility;
+using T125;
+using RDPBCGR;
+using InfrastructureResources;
+using Diagnostics;
+
+endpoint Server over T125.Node accepts TS_FRAME_ACKNOWLEDGE_PDU;
+
+autostart actor RDPRFXOverT125(T125.Node node)
+{
+    // decode message TS_FRAME_ACKNOWLEDGE_PDU
+    process node accepts domainMCSPDU :T125.DomainMCSPDU where (domainMCSPDU.DomainMCSPDU is T125.SendDataRequestPattern)
+    {
+        ushort indexPort = (domainMCSPDU#T125SourcePort is port:ushort) ? port : 0;
+        bool serverMCSConnectResponsePDUReceived = (indexPort in ServerMCSConnectResponsePDUReceivedFlags) ? ServerMCSConnectResponsePDUReceivedFlags[indexPort] : false;
+        uint encryptionLevel = (indexPort in encryptionLevels) ? encryptionLevels[indexPort] : 0;
+        uint encryptionMethod = (indexPort in encryptionMethods) ? encryptionMethods[indexPort] : 0;
+
+        binary payload = (domainMCSPDU.DomainMCSPDU as T125.SendDataRequestPattern).UserData as binary;
+        if (serverMCSConnectResponsePDUReceived && (payload.Count >= 18) && // 18 is shareDataHeader's length
+            (RDPBCGR.GetPduType(payload, encryptionLevel, encryptionMethod, RDPBCGRMsgType.MonitorLayoutPdu)) == 0x07 && 
+            (RDPBCGR.GetPdu2Type(payload, encryptionLevel, encryptionMethod, RDPBCGRMsgType.MonitorLayoutPdu) == 0x38))
+        {
+            var m = BinaryDecoder<TS_FRAME_ACKNOWLEDGE_PDU[encryptionMethod]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as TS_FRAME_ACKNOWLEDGE_PDU;
+                dispatch endpoint Server accepts msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPRFX", "TS_FRAME_ACKNOWLEDGE_PDU");
+            }
+        }
+        else
+        {
+            reject;
+        }
+    }
+}
+
+autostart actor RDPRFXOverRDPBCGR(RDPBCGR.Server server)
+{
+    // decode TSRFXMessage
+    observe server issues pdu : RDPBCGR.TS_FP_UPDATE_PDU
+        where (pdu.fpOutputUpdates != nothing && (pdu.fpOutputUpdates as array<RDPBCGR.TS_FP_UPDATE>).Count > 0)
+    {
+        foreach (RDPBCGR.TS_FP_UPDATE tsfpupdate in (pdu.fpOutputUpdates as array<RDPBCGR.TS_FP_UPDATE>))
+        {
+            if (tsfpupdate is RDPBCGR.TS_FP_SURFCMDS)
+            {
+                RDPBCGR.TS_FP_SURFCMDS tsfpsurfcmds = tsfpupdate as RDPBCGR.TS_FP_SURFCMDS;
+                if (tsfpsurfcmds.surfaceCommands != nothing && (tsfpsurfcmds.surfaceCommands as array<RDPBCGR.TS_SURFCMD>).Count > 0)
+                {
+                    foreach (RDPBCGR.TS_SURFCMD tssurfcmd in (tsfpsurfcmds.surfaceCommands as array<RDPBCGR.TS_SURFCMD>))
+                    {
+                        if (tssurfcmd.cmdData is RDPBCGR.TS_SURFCMD_SET_SURF_BITS)
+                        {
+                            RDPBCGR.TS_SURFCMD_SET_SURF_BITS surfbits = tssurfcmd.cmdData as RDPBCGR.TS_SURFCMD_SET_SURF_BITS;
+                            if ((surfbits.bitmapData.codecID != 0x01) && (surfbits.bitmapData.bitmapData is data:binary))
+                            {
+                                optional TSRFXMessageType msg = BinaryDecoder<TSRFXMessageType>(data);
+                                if (msg != nothing)
+                                {
+                                    array<TSRFXMessage> msgArray =(msg as TSRFXMessageType).messages;
+                                    surfbits.bitmapData.bitmapData = msgArray;
+                                }
+                                // just ignore it if can't be decoded as TSRFXMessageType
+                            }                            
+                        }
+                        else if (tssurfcmd.cmdData is RDPBCGR.TS_SURFCMD_STREAM_SURF_BITS)
+                        {
+                            RDPBCGR.TS_SURFCMD_STREAM_SURF_BITS streamSurfbits = tssurfcmd.cmdData as RDPBCGR.TS_SURFCMD_STREAM_SURF_BITS;
+                            if ((streamSurfbits.bitmapData.codecID != 0x01) && (streamSurfbits.bitmapData.bitmapData is data:binary))
+                            {
+                                optional TSRFXMessageType msg = BinaryDecoder<TSRFXMessageType>(data);
+                                if (msg != nothing)
+                                {
+                                    array<TSRFXMessage> msgArray =(msg as TSRFXMessageType).messages;
+                                    streamSurfbits.bitmapData.bitmapData = msgArray;
+                                }
+                                // just ignore it if can't be decoded as TSRFXMessageType.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    observe server accepts pdu : RDPBCGR.ClientConfirmActivePdu
+    {
+        pdu.confirmActivePduData.capabilitySets = ParsingExtendedTSCapsSet(pdu.confirmActivePduData.capabilitySets);
+    } 
+
+    observe server issues pdu : RDPBCGR.ServerDemandActivePdu
+    {
+        pdu.demandActivePduData.capabilitySets = ParsingExtendedTSCapsSet(pdu.demandActivePduData.capabilitySets);
+    }
+
+    array<RDPBCGR.TSCapsSetPattern> ParsingExtendedTSCapsSet(array<RDPBCGR.TSCapsSetPattern> capabilitySets)
+    {
+        array<RDPBCGR.TSCapsSetPattern> newArray = [];
+        foreach (RDPBCGR.TSCapsSetPattern capsetpat in capabilitySets)
+        {
+            if (capsetpat is RDPBCGR.TS_BITMAPCODECS_CAPABILITYSET)
+            {
+                RDPBCGR.TS_BITMAPCODECS_CAPABILITYSET bitmapcapset = capsetpat as RDPBCGR.TS_BITMAPCODECS_CAPABILITYSET;
+                foreach (RDPBCGR.TS_BITMAPCODEC bitmapcodec in bitmapcapset.supportedBitmapCodecs.bitmapCodecArray)
+                {
+                    if (bitmapcodec.codecGUID == RDPBCGR.CODEC_GUID_REMOTEFX || bitmapcodec.codecGUID == RDPBCGR.CODEC_GUID_IMAGE_REMOTEFX)
+                    {
+                        var prop = BinaryDecoder<TS_RFX_CLNT_CAPS_CONTAINER>(bitmapcodec.codecProperties as binary);
+                        if (prop != nothing)
+                        {
+                            bitmapcodec.codecProperties = prop as TS_RFX_CLNT_CAPS_CONTAINER;
+                        }
+                        else
+                        {
+                            var prop2 = BinaryDecoder<TS_RFX_SRVR_CAPS_CONTAINER[bitmapcodec.codecPropertiesLength]>(bitmapcodec.codecProperties as binary);
+                            if (prop2 != nothing)
+                            {
+                                bitmapcodec.codecProperties = prop2 as TS_RFX_SRVR_CAPS_CONTAINER[bitmapcodec.codecPropertiesLength];
+                            }
+                            else
+                            {
+                                ThrowDecodingException("RDPRFX", "TS_RFX_CLNT_CAPS_CONTAINER | TS_RFX_SRVR_CAPS_CONTAINER");
+                            }
+                        }
+                    }
+                }
+            }
+            else if (capsetpat is RDPBCGR.UnKnownTSCapsSet) // decode TS_FRAME_ACKNOWLEDGE_CAPABILITYSET
+            {
+                if (capsetpat is RDPBCGR.TS_CAPS_SET)
+                {
+                    RDPBCGR.TS_CAPS_SET capset = capsetpat as RDPBCGR.TS_CAPS_SET;
+                    if (capset.capabilitySetType == RDPBCGR.TSCapsSetCapabilitySetType.CAPSSETTYPE_FRAME_ACKNOWLEDGE)
+                    {
+                        TS_FRAME_ACKNOWLEDGE_CAPABILITYSET ack = new TS_FRAME_ACKNOWLEDGE_CAPABILITYSET
+                        {
+                            capabilitySetType = capset.capabilitySetType, 
+                            lengthCapability = capset.lengthCapability, 
+                            maxUnacknowledgedFrameCount = BinaryDecoder<uint>(capset.capabilityData) as uint
+                        };
+                        capsetpat = ack;
+                    }
+                }
+            }
+            newArray += [capsetpat];
+        }
+        return newArray;
+    }
+}
+
+// [MS-RDPRFX] 2.2.1.1   TS_RFX_CLNT_CAPS_CONTAINER
+pattern TS_RFX_CLNT_CAPS_CONTAINER_captureFlags = flags uint
+{
+    CARDP_CAPS_CAPTURE_NON_CAC = 0x00000001
+        with Documentation
+            {Description = "The client supports mixing RemoteFX data with data compressed by other codecs."}
+};
+
+type TS_RFX_CLNT_CAPS_CONTAINER
+{
+    uint length;
+    TS_RFX_CLNT_CAPS_CONTAINER_captureFlags captureFlags;
+    uint capsLength;
+    TS_RFX_CAPS capsData;
+}
+
+type TS_RFX_CAPS
+{
+    ushort blockType where value == 0xCBC0;
+    uint blockLen where ValidationCheck(value == 0x0008, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "blockLen", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CAPS", INFRASTRUCTURE_STR_MUST, "0x0008", Utility.DecToHexFormat(value)]));
+    ushort numCapsets where ValidationCheck(value == 0x0001, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "numCapsets", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CAPS", INFRASTRUCTURE_STR_MUST, "0x0001", Utility.DecToHexFormat(value)]));
+    array<TS_RFX_CAPSET> capsetsData with BinaryEncoding{Length = numCapsets};
+
+    override string ToString()
+    {
+        return "TS_RFX_CAPS, capsetsData: " + capsetsData.ToString();
+    }
+}
+
+type TS_RFX_CAPSET
+{
+    ushort blockType where value == 0xCBC1;
+    uint blockLen;
+    byte codecId where ValidationCheck(value == 0x01, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "codecId", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CAPSET", INFRASTRUCTURE_STR_MUST, "0x01", Utility.DecToHexFormat(value)]));
+    ushort capsetType where ValidationCheck(value == 0xCFC0, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "capsetType", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CAPSET", INFRASTRUCTURE_STR_MUST, "CLY_CAPSET (0xCFC0)", Utility.DecToHexFormat(value)]));
+    ushort numIcaps;
+    ushort icapLen;
+    array<TS_RFX_ICAP> icapsData with BinaryEncoding{Length = numIcaps};
+
+    override string ToString()
+    {
+        return "TS_RFX_CAPSET, numIcaps: " + numIcaps.ToString() + ", icapLen: " + icapLen.ToString();
+    }
+}
+
+type TS_RFX_ICAP
+{
+    ushort version where value == 0x0100;
+    ushort tileSize where ValidationCheck(value == 0x0040, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "tileSize", INFRASTRUCTURE_STR_TYPE, "TS_RFX_ICAP", INFRASTRUCTURE_STR_MUST, "CT_TILE_64x64 (0x0040)", Utility.DecToHexFormat(value)]));
+    TS_RFX_ICAP_flags $"flags";
+    byte colConvBits where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "colConvBits", INFRASTRUCTURE_STR_TYPE, "TS_RFX_ICAP", INFRASTRUCTURE_STR_MUST, "CLW_COL_CONV_ICT (0x1)", Utility.DecToHexFormat(value)]));
+    byte transformBits where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "transformBits", INFRASTRUCTURE_STR_TYPE, "TS_RFX_ICAP", INFRASTRUCTURE_STR_MUST, "CLW_XFORM_DWT_53_A (0x1)", Utility.DecToHexFormat(value)]));
+    TS_RFX_ICAP_entropyBits entropyBits;
+}
+
+pattern TS_RFX_ICAP_flags = flags byte
+{
+    CODEC_MODE = 0x02
+        with Documentation
+            {Description = "Only image mode is supported by the decoder, and therefore, the codec MUST operate in image mode."}
+};
+
+pattern TS_RFX_ICAP_entropyBits = enum byte
+{
+    CLW_ENTROPY_RLGR1 = 0x01,
+    CLW_ENTROPY_RLGR3 = 0x04
+};
+
+// [MS-RDPRFX] 2.2.1.2   TS_RFX_SRVR_CAPS_CONTAINER
+type TS_RFX_SRVR_CAPS_CONTAINER[ushort CodecPropertiesLength]
+{
+    binary Reserved with BinaryEncoding{Length = CodecPropertiesLength};
+}
+
+// 2.2.1.3   TS_FRAME_ACKNOWLEDGE_CAPABILITYSET
+type TS_FRAME_ACKNOWLEDGE_CAPABILITYSET
+{
+    ushort capabilitySetType where value == 0x001E;
+    ushort lengthCapability;
+    uint maxUnacknowledgedFrameCount;
+}
+
+// 2.2.2.1.1   TS_RFX_BLOCKT
+type TS_RFX_BLOCKT
+{
+    TS_RFX_BLOCKT_blockType blockType;
+    uint blockLen;
+}
+
+pattern TS_RFX_BLOCKT_blockType = enum ushort
+{
+    CBT_TILE = 0xCAC3,
+    CBY_CAPS = 0xCBC0,
+    CBY_CAPSET = 0xCBC1,
+    WBT_SYNC = 0xCCC0,
+    WBT_CODEC_VERSIONS = 0xCCC1,
+    WBT_CHANNELS = 0xCCC2,
+};
+
+// 2.2.2.1.2   TS_RFX_CODEC_CHANNELT
+pattern TS_RFX_CODEC_CHANNELT_blockType = enum ushort
+{
+    WBT_CONTEXT = 0xCCC3,
+    WBT_FRAME_BEGIN = 0xCCC4,
+    WBT_FRAME_END = 0xCCC5,
+    WBT_REGION = 0xCCC6,
+    WBT_EXTENSION = 0xCCC7
+};
+
+type TS_RFX_CODEC_CHANNELT
+{
+    TS_RFX_CODEC_CHANNELT_blockType blockType;
+    uint blockLen;
+    byte codecId where ValidationCheck(value == 0x01, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "codecId", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CODEC_CHANNELT", INFRASTRUCTURE_STR_MUST, "0x01", Utility.DecToHexFormat(value)]));
+    byte channelId where ValidationCheck(value == 0x00, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "channelId", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CODEC_CHANNELT", INFRASTRUCTURE_STR_MUST, "0x00", Utility.DecToHexFormat(value)]));
+}
+
+// 2.2.2.1.3   TS_RFX_CHANNELT
+type TS_RFX_CHANNELT
+{
+    byte channelId where ValidationCheck(value == 0x00, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "channelId", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CHANNELT", INFRASTRUCTURE_STR_MUST, "0x00", Utility.DecToHexFormat(value)]));
+    ushort width where ValidationCheck(value >= 1 && value <= 4096, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE_IN_RANGE, ["RDPRFX", "width", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CHANNELT", INFRASTRUCTURE_STR_MUST, "1", "4096", value]));
+    ushort height where ValidationCheck(value >= 1 && value <= 2048, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE_IN_RANGE, ["RDPRFX", "height", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CHANNELT", INFRASTRUCTURE_STR_MUST, "1", "2048", value]));
+
+    override string ToString()
+    {
+        return "TS_RFX_CHANNELT, width: " + width.ToString() + ", height: " + height.ToString();
+    }
+}
+
+// 2.2.2.1.4   TS_RFX_CODEC_VERSIONT
+type TS_RFX_CODEC_VERSIONT
+{
+    byte codecId where value == 0x01;
+    ushort version where value == 0x0100;
+
+    override string ToString()
+    {
+        return "TS_RFX_CODEC_VERSIONT, codecId: " + codecId.ToString() + ", version: " + version.ToString();
+    }
+}
+
+// 2.2.2.1.5   TS_RFX_CODEC_QUANT
+type TS_RFX_CODEC_QUANT
+{
+    byte HH1 with BinaryEncoding{Width = 4};
+    byte HL1 with BinaryEncoding{Width = 4};
+    byte LH1 with BinaryEncoding{Width = 4};
+    byte HH2 with BinaryEncoding{Width = 4};
+    byte HL2 with BinaryEncoding{Width = 4};
+    byte LH2 with BinaryEncoding{Width = 4};
+    byte HH3 with BinaryEncoding{Width = 4};
+    byte HL3 with BinaryEncoding{Width = 4};
+    byte LH3 with BinaryEncoding{Width = 4};
+    byte LL3 with BinaryEncoding{Width = 4};
+}with BinaryEncoding{WidthForComposedType = 40, DecodeAsUnit = true, Endian = Endian.Little};
+
+// 2.2.2.1.6   TS_RFX_RECT
+type TS_RFX_RECT
+{
+    ushort x;
+    ushort y;
+    ushort width;
+    ushort height;
+
+    override string ToString()
+    {
+        return "TS_RFX_RECT, x: " + x.ToString() + ", y: " + y.ToString() + ", width: " + width.ToString() + ", height" + height.ToString();
+    }
+}
+
+// 2.2.2.2.1   TS_RFX_SYNC
+message TS_RFX_SYNC
+{
+    TS_RFX_BLOCKT BlockT where value.blockType == TS_RFX_BLOCKT_blockType.WBT_SYNC;
+    uint magic where ValidationCheck(value == 0xCACCACCA, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "BlockT", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_SYNC", INFRASTRUCTURE_STR_MUST, "WF_MAGIC (0xCACCACCA)", Utility.DecToHexFormat(value)]));
+    ushort version where ValidationCheck(value == 0x0100, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "version", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_SYNC", INFRASTRUCTURE_STR_MUST, "WF_VERSION_1_0 (0x0100)", Utility.DecToHexFormat(value)]));
+
+    override string ToString()
+    {
+        return "TS_RFX_SYNC, magic: " + magic.ToString() + ", version: " + version.ToString();
+    }
+}
+
+// 2.2.2.2.2   TS_RFX_CODEC_VERSIONS
+message TS_RFX_CODEC_VERSIONS
+{
+    TS_RFX_BLOCKT BlockT where value.blockType == TS_RFX_BLOCKT_blockType.WBT_CODEC_VERSIONS;
+    byte numCodecs where ValidationCheck(value == 0x01, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "numCodecs", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_CODEC_VERSIONS", INFRASTRUCTURE_STR_MUST, "0x01", Utility.DecToHexFormat(value)]));
+    TS_RFX_CODEC_VERSIONT codecs;
+
+    override string ToString()
+    {
+        return "TS_RFX_CODEC_VERSIONS, numCodecs: " + numCodecs.ToString() + ", codecs: " + codecs.ToString();
+    }
+}
+
+// 2.2.2.2.3   TS_RFX_CHANNELS
+message TS_RFX_CHANNELS
+{
+    TS_RFX_BLOCKT BlockT where value.blockType == TS_RFX_BLOCKT_blockType.WBT_CHANNELS;
+    byte numChannels;
+    array<TS_RFX_CHANNELT> Channels with BinaryEncoding{Length = numChannels};
+
+    override string ToString()
+    {
+        return "TS_RFX_CHANNELS, numChannels: " + numChannels.ToString();
+    }
+}
+
+// 2.2.2.2.4   TS_RFX_CONTEXT
+type TS_RFX_CONTEXT_properties
+{
+    ushort r with BinaryEncoding{Width = 1};
+    ushort qt where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "qt", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CONTEXT_properties", INFRASTRUCTURE_STR_MUST, "0x1", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 2};
+    ushort et where ValidationCheck(value == 0x01 || value == 0x04, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "et", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CONTEXT_properties", INFRASTRUCTURE_STR_MUST, "CLW_ENTROPY_RLGR1 (0x01)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 4};
+    ushort xft where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "xft", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CONTEXT_properties", INFRASTRUCTURE_STR_MUST, "CLW_XFORM_DWT_53_A (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 4};
+    ushort cct where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "cct", INFRASTRUCTURE_STR_TYPE, "TS_RFX_CONTEXT_properties", INFRASTRUCTURE_STR_MUST, "COL_CONV_ICT (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 2};
+    ushort $"flags" with BinaryEncoding{Width = 3};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+message TS_RFX_CONTEXT
+{
+    TS_RFX_CODEC_CHANNELT CodecChannelT where value.blockType == TS_RFX_CODEC_CHANNELT_blockType.WBT_CONTEXT;
+    byte ctxId  where ValidationCheck(value == 0x00, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "ctxId", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_CONTEXT", INFRASTRUCTURE_STR_MUST, "0x00", Utility.DecToHexFormat(value)]));
+    ushort tileSize where ValidationCheck(value == 0x40, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "tileSize", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_CONTEXT", INFRASTRUCTURE_STR_MUST, "CT_TILE_64x64 (0x0040)", Utility.DecToHexFormat(value)]));
+    TS_RFX_CONTEXT_properties Properties;
+
+    override string ToString()
+    {
+        return "TS_RFX_CONTEXT, ctxId: " + ctxId.ToString() + ", tileSize: " + tileSize.ToString();
+    }
+}
+
+message TS_RFX_FRAME_BEGIN
+{
+    TS_RFX_CODEC_CHANNELT CodecChannelT where value.blockType == TS_RFX_CODEC_CHANNELT_blockType.WBT_FRAME_BEGIN;
+    uint frameIdx;
+    ushort numRegions;
+
+    override string ToString()
+    {
+        return "TS_RFX_FRAME_BEGIN, frameIdx: " + frameIdx.ToString() + ", numRegions: " + numRegions.ToString();
+    }
+}
+
+message TS_RFX_FRAME_END
+{
+    TS_RFX_CODEC_CHANNELT CodecChannelT where value.blockType == TS_RFX_CODEC_CHANNELT_blockType.WBT_FRAME_END;
+
+    override string ToString()
+    {
+        return "TS_RFX_FRAME_END";
+    }
+}
+
+message TS_RFX_REGION
+{
+    TS_RFX_CODEC_CHANNELT CodecChannelT where value.blockType == TS_RFX_CODEC_CHANNELT_blockType.WBT_REGION;
+    byte regionFlags;
+    ushort numRects;
+    TS_RFX_RECT rects;
+    ushort regionType where ValidationCheck(value == 0xCAC1, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "regionType", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_REGION", INFRASTRUCTURE_STR_MUST, "CBT_REGION (0xCAC1)", Utility.DecToHexFormat(value)]));
+    ushort numTilesets where ValidationCheck(value == 0x0001, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "numTilesets", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_REGION", INFRASTRUCTURE_STR_MUST, "0x0001", Utility.DecToHexFormat(value)]));
+
+    override string ToString()
+    {
+        return "TS_RFX_REGION, regionFlags: " + regionFlags.ToString() + ", numRects: " + numRects.ToString();
+    }
+}
+
+message TS_RFX_TILESET
+{
+    TS_RFX_CODEC_CHANNELT CodecChannelT where value.blockType == TS_RFX_CODEC_CHANNELT_blockType.WBT_EXTENSION;
+    ushort subtype where value == 0xCAC2;
+    ushort idx where ValidationCheck(value == 0x0000, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "idx", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_TILESET", INFRASTRUCTURE_STR_MUST, "0x0000", Utility.DecToHexFormat(value)]));
+    TS_RFX_TILESET_properties properties;
+    byte numQuant;
+    byte tileSize where ValidationCheck(value == 0x40, this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "tileSize", INFRASTRUCTURE_STR_MESSAGE, "TS_RFX_TILESET", INFRASTRUCTURE_STR_MUST, "0x40", Utility.DecToHexFormat(value)]));
+    ushort numTiles;
+    uint tilesDataSize;
+    array<TS_RFX_CODEC_QUANT> quantVals with BinaryEncoding{Length = numQuant};
+    array<TS_RFX_TILE> tiles with BinaryEncoding{Length = numTiles};
+
+    override string ToString()
+    {
+        return "TS_RFX_TILESET, numQuant: " + numQuant.ToString() + ", numTiles: " + numTiles.ToString();
+    }
+}
+
+type TS_RFX_TILESET_properties
+{
+    ushort qt where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "qt", INFRASTRUCTURE_STR_TYPE, "TS_RFX_TILESET_properties", INFRASTRUCTURE_STR_MUST, "SCALAR_QUANTIZATION (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 2};
+    TS_RFX_TILESET_properties_et et with BinaryEncoding{Width = 4};
+    ushort xft where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "xft", INFRASTRUCTURE_STR_TYPE, "TS_RFX_TILESET_properties", INFRASTRUCTURE_STR_MUST, "CLW_XFORM_DWT_53_A (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 4};
+    ushort cct where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "cct", INFRASTRUCTURE_STR_TYPE, "TS_RFX_TILESET_properties", INFRASTRUCTURE_STR_MUST, "COL_CONV_ICT (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 2};
+    ushort $"flags" with BinaryEncoding{Width = 3};
+    ushort lt where ValidationCheck(value == 0x1, null, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPRFX", "lt", INFRASTRUCTURE_STR_TYPE, "TS_RFX_TILESET_properties", INFRASTRUCTURE_STR_MUST, "TRUE (0x1)", Utility.DecToHexFormat(value)]))
+        with BinaryEncoding{Width = 1};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+pattern TS_RFX_TILESET_properties_et = enum byte
+{
+    CLW_ENTROPY_RLGR1 = 0x01,
+    CLW_ENTROPY_RLGR3 = 0x04
+};
+
+message TS_RFX_TILE
+{
+    TS_RFX_BLOCKT BlockT where value.blockType == TS_RFX_BLOCKT_blockType.CBT_TILE;
+    byte quantIdxY;
+    byte quantIdxCb;
+    byte quantIdxCr;
+    ushort xIdx;
+    ushort yIdx;
+    ushort YLen;
+    ushort CbLen;
+    ushort CrLen;
+    binary YData with BinaryEncoding{Length = YLen};
+    binary CbData with BinaryEncoding{Length = CbLen};
+    binary CrData with BinaryEncoding{Length = CrLen};
+
+    override string ToString()
+    {
+        return "TS_RFX_TILE";
+    }
+}
+
+message TS_FRAME_ACKNOWLEDGE_PDU[TSUDSCSec1EncryptionMethod EncryptionMethod]
+{
+    optional ([|(EncryptionMethod == TSUDSCSec1EncryptionMethod.ENCRYPTION_METHOD_40BIT) || 
+            (EncryptionMethod == TSUDSCSec1EncryptionMethod.ENCRYPTION_METHOD_128BIT) || 
+            (EncryptionMethod == TSUDSCSec1EncryptionMethod.ENCRYPTION_METHOD_56BIT)|] TS_SECURITY_HEADER1 |
+              [|(EncryptionMethod == TSUDSCSec1EncryptionMethod.ENCRYPTION_METHOD_FIPS)|] TS_SECURITY_HEADER2) TS_SECURITY_HEADER2;
+    TS_SHAREDATAHEADER shareDataHeader;
+    uint frameID;
+    override string ToString()
+    {
+        return "TS_FRAME_ACKNOWLEDGE_PDU";
+    }
+}
+
+const array<byte> WBT_SYNC_BYTEARRAY = [0xC0, 0xCC];
+const array<byte> WBT_CODEC_VERSIONS_BYTEARRAY = [0xC1, 0xCC];
+const array<byte> WBT_CHANNELS_BYTEARRAY = [0xC2, 0xCC];
+const array<byte> WBT_CONTEXT_BYTEARRAY = [0xC3, 0xCC];
+const array<byte> WBT_FRAME_BEGIN_BYTEARRAY = [0xC4, 0xCC];
+const array<byte> WBT_REGION_BYTEARRAY = [0xC6, 0xCC];
+const array<byte> WBT_EXTENSION_BYTEARRAY = [0xC7, 0xCC];
+const array<byte> WBT_FRAME_END_BYTEARRAY = [0xC5, 0xCC];
+
+pattern TSRFXMessage =  [|RemainingBitLength(stream) >= 16|]
+    ([|PeekByteCompare(stream, stream.BitPosition, WBT_SYNC_BYTEARRAY)|] TS_RFX_SYNC | 
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_CODEC_VERSIONS_BYTEARRAY)|] TS_RFX_CODEC_VERSIONS |
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_CHANNELS_BYTEARRAY)|] TS_RFX_CHANNELS | 
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_CONTEXT_BYTEARRAY)|] TS_RFX_CONTEXT | 
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_FRAME_BEGIN_BYTEARRAY)|] TS_RFX_FRAME_BEGIN |
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_REGION_BYTEARRAY)|] TS_RFX_REGION |
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_EXTENSION_BYTEARRAY)|] TS_RFX_TILESET |
+    [|PeekByteCompare(stream, stream.BitPosition, WBT_FRAME_END_BYTEARRAY)|] TS_RFX_FRAME_END);
+
+type TSRFXMessageType
+{
+    array<TSRFXMessage> messages;
+}

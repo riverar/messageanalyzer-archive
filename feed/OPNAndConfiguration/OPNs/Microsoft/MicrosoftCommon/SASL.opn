@@ -1,0 +1,330 @@
+protocol SASL with
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.UTF8},
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.BER},
+Documentation
+{
+    ProtocolName = "Simple Authentication and Security Layer (SASL)",
+    ShortName = "SASL",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "RFC 4422"},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "379917", Date = "07/24/2015"},
+    ]
+};
+
+using Standard;
+using Utility;
+using GSSAPI;
+using GSSAPIKRB5;
+using NLMP;
+using Digest;
+using Technologies.ASN1;
+
+const string DigestMd5MechanismName = "DIGEST-MD5";
+const string GssApiMechanismName = "GSS-API";
+const string NlmpMechanismName = "NLMP";
+
+// for binding SASL message and wrapped LDAP message, which data is not encrypted in SASL message.
+annotation string SaslMessage#AuthMechanism;
+// The value will be assigned when decoding SASL message. And it should be re-assigned to null after
+// the binary in PlainDataFromSasl has been decoded as LDAP.
+annotation binary SaslMessage#PlainDataFromSasl;
+annotation SaslApplicationTypeEnumPattern SaslMessage#SaslApplicationType;
+
+endpoint SaslServer issues SaslMessage accepts SaslMessage;
+
+/* RFC 4422 3.7.  Security Layers
+ * Each buffer of protected data is transferred over the underlying
+ * transport connection as a sequence of octets pretended with a four-octet
+ * field in network byte order that represents the length of the buffer
+ */
+message SaslMessage[string AuthenticationMechanism, bool IsDecodingIncompletedMessage]
+{
+    uint Length;
+    (GssapiType | KerberosToken | NlmpMessage | NtlmSealedMessage | binary) Buffer with Encoding{Decoder = SaslBufferDecoder};
+    optional binary ApplicationData with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        return "SASL Message" + (this#SaslApplicationType is SaslApplicationTypeEnumPattern.LDAP ? " with LDAP" : "") + ", " +
+            ((this#AuthMechanism is nothing) ? "Unknown AuthMechanism" : ("AuthMechanism: " + (this#AuthMechanism as string))) + ", Buffer Length: " + (Length as string);
+    }
+    
+    optional (GssapiType | KerberosToken | NlmpMessage | NtlmSealedMessage | binary) SaslBufferDecoder(stream s)
+    {
+        if (s.RemainingBitLength() <= 0)
+        {
+            return nothing;
+        }
+        
+        // pick up the SASL buffer from the stream with the Length
+        // because in GSSAPI, it will consume the stream to the end.
+        // However, we should assume that all the buffer in received decoding cache is for SASL message.
+        // So if it is not decoding incomplete message, it should get the binary with specific Length first.
+        binary saslBuffer = null;
+        if (!IsDecodingIncompletedMessage)
+        {
+            if (BinaryDecoder<Blob[Length as uint]>(s) is blob:Blob)
+            {
+                saslBuffer = blob.Data;
+            }
+            else
+            {
+                // return nothing if decoding the full SASL message and the stream is not enough to decoding a whole message
+                return nothing;
+            }
+        }
+        
+        this#PlainDataFromSasl = nothing; // reset PlainDataFromGss
+        if (AuthenticationMechanism == DigestMd5MechanismName)
+        {
+            this#AuthMechanism = DigestMd5MechanismName;
+            if (saslBuffer == null)
+            {
+                // for decoding incomplete message, decoding to the end of the stream
+                if (s.RemainingByteLength() > 4)
+                {
+                    this#PlainDataFromSasl = s.PeekBytes(32, s.ByteLength - 4);
+                    return BinaryDecoder<binary>(s);
+                }
+                else
+                {
+                    // remaining bytes are not enough to decode the SASL message
+                    return nothing;
+                }
+            }
+            
+            // decoding complete SASL message
+            if (saslBuffer.Count > 20)
+            {
+                this#PlainDataFromSasl = saslBuffer.Segment(4, saslBuffer.Count - 4 - 16);
+                return saslBuffer;
+            }
+
+            // the length of SASL message is invalid for SASL message with Digest mechanism
+            return nothing;
+        }
+        else
+        {
+            if (saslBuffer != null)
+            {
+                stream saslBufferStream = saslBuffer;
+                return SaslGssapiOrNlmpDecoder(saslBuffer);
+            }
+            else
+            {
+                // for decoding incomplete message
+                return SaslGssapiOrNlmpDecoder(s);
+            }
+        }
+        return nothing;
+    }
+    
+    // sub decoder of SASL Buffer Decoder
+    optional (GssapiType | KerberosToken | NlmpMessage | NtlmSealedMessage) SaslGssapiOrNlmpDecoder((stream | binary) saslBuffer)
+    {
+        binary saslBufferBinary = null;
+        stream saslBufferStream = null;
+        if (saslBuffer is bin:binary)
+        {
+            // saslBuffer is binary when decoding complete message
+            saslBufferStream = bin;
+            saslBufferBinary = bin;
+        }
+        else if (saslBuffer is s:stream)
+        {
+            // saslBuffer is stream when decoding incomplete message
+            saslBufferStream = s;
+
+            // verify the remaining byte length for the stream when decoding incomplete SASL message
+            if (saslBufferStream.RemainingByteLength() <= 9)
+            {
+                return nothing;
+            }
+            saslBufferBinary = saslBufferStream.PeekBytes(saslBufferStream.BitPosition, 9 /*from performance consideration, 9 bytes enough to identify the mechanism*/);
+        }
+        
+        binary plainData = null;
+        optional (GssapiType | KerberosToken | NlmpMessage | NtlmSealedMessage | binary) decodeResult = nothing;
+        if (IsGSSAPIByCheckingTag(saslBufferBinary))
+        {
+            if (DecodeGssapiAndSetAnnotation(saslBufferStream, this) is gssapi:GssapiType)
+            {
+                this#AuthMechanism = GssApiMechanismName;
+                ContainUnsealedData(gssapi, out plainData);
+                decodeResult = gssapi;
+            }
+        }
+        else if (IsGssapiKrb(saslBufferBinary))
+        {
+            if (BinaryDecoder<KerberosToken>(saslBufferStream) is krb5:KerberosToken)
+            {
+                this#AuthMechanism = GssApiMechanismName;
+                ContainUnsealedData(krb5, out plainData);
+                decodeResult = krb5;
+            }
+        }
+        else if (IsNLMP(saslBufferBinary))
+        {
+            if (NlmpDecoder(saslBufferStream) is nlmp:NlmpMessage)
+            {
+                this#AuthMechanism = NlmpMechanismName;
+                decodeResult = nlmp;
+            }
+        }
+        else if (IsNLMPSignature(saslBufferBinary))
+        {
+            if (BinaryDecoder<NtlmSealedMessage>(saslBufferStream) is nlmpSealed:NtlmSealedMessage)
+            {
+                this#AuthMechanism = NlmpMechanismName;
+                decodeResult = nlmpSealed;
+            }
+        }
+        
+        // return failure
+        if (decodeResult == nothing)
+        {
+            return nothing;
+        }
+        
+        // assign the plain data for wrapped LDAP if decoding success
+        if (plainData == null)
+        {
+            // consider the situation that the plainData is not in GSSAPI structure
+            // assign remaining binary in the stream
+            if (saslBufferStream.RemainingBitLength() > 0)
+            {
+                this#PlainDataFromSasl = BinaryDecoder<binary>(saslBufferStream) as binary;
+                this.ApplicationData = this#PlainDataFromSasl;
+            }
+            else
+            {
+                this#PlainDataFromSasl = nothing;
+            }
+        }
+        else
+        {
+            this#PlainDataFromSasl = plainData;
+        }
+        
+        return decodeResult;
+    }
+}
+
+// Section 3.3
+optional (Digest.DigestResponse | GssapiType | NlmpMessage) AuthenticationRequestDecoder(string mechanism, binary buffer)
+{
+    if (mechanism is DigestMd5MechanismName)
+    {
+        return Digest.DigestResponseSyntax(buffer);
+    }
+    else if (IsGSSAPIByCheckingTag(buffer))
+    {
+        return DecodeGssapiAndSetAnnotation(buffer, null /*set null here, the annotation does not work for LDAP*/);
+    }
+    else if (IsNLMP(buffer))
+    {
+        // NLMP
+        return NlmpDecoder(buffer);
+    }
+
+    // mechanism which does not support yet
+    return nothing;
+}
+
+// section 3.4
+optional (GssapiType | NlmpMessage | Digest.DigestChallenge)
+    AuthenticationChallengesDecoder(string mechanism, binary buffer, any message applicationProtocol)
+{
+    if (mechanism == DigestMd5MechanismName)
+    {
+        return Digest.DigestChallengeSyntax(buffer);
+    }
+    return DecodeChallengeAndResponseForGssapiAndNlmp(buffer, applicationProtocol);
+}
+
+optional (GssapiType | NlmpMessage | Digest.ResponseAuth) 
+    AuthenticationResponseDecoder(string mechanism, binary buffer, any message applicationProtocol)
+{
+    if (mechanism == DigestMd5MechanismName)
+    {
+        return Digest.ResponseAuthSyntax(buffer);
+    }
+    return DecodeChallengeAndResponseForGssapiAndNlmp(buffer, applicationProtocol);
+}
+
+// decode GSSAPI and NLMP 
+optional (GssapiType | NlmpMessage) DecodeChallengeAndResponseForGssapiAndNlmp(binary bin, any message applicationProtocol)
+{
+    if (IsGSSAPIByCheckingTag(bin))
+    {
+        return DecodeGssapiAndSetAnnotation(bin, applicationProtocol);
+    }
+    else if (IsNLMP(bin))
+    {
+        return NlmpDecoder(bin);
+    }
+    return nothing;
+}
+
+type RawGssApi
+{
+    OctetString Signature with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+    optional OctetString TokenOctetString;
+    optional (GssapiType | NlmpMessage | Digest.DigestChallenge | Digest.ResponseAuth) Token with Encoding{Ignore = true};
+
+    optional string GetSummaryInfo()
+    {
+        if (Token is digestChallenge:Digest.DigestChallenge)
+        {
+            return digestChallenge.GetSummaryInfo();
+        }
+        else if (Token is responseAuth:Digest.ResponseAuth)
+        {
+            return responseAuth.GetSummaryInfo();
+        }
+        else if (Token is gssapiType:GssapiType)
+        {
+            return gssapiType#KeyInformation;
+        }
+        else if (Token is nlmpMessage:NlmpMessage)
+        {
+            return GetSummaryInfo(nlmpMessage);
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+}
+with Asn1Encoding
+{
+    TagClass = Asn1TagClass.ContextSpecific,
+    TagNumber = 3,
+    Tagging = Asn1Tagging.Implicit
+};
+
+type RawGssApiWrapper
+{
+    RawGssApi Gss;
+}
+with Asn1Encoding
+{
+    TagClass = Asn1TagClass.ContextSpecific,
+    TagNumber = 7,
+    Tagging = Asn1Tagging.Implicit
+};
+
+pattern SaslApplicationTypeEnumPattern = enum byte
+{
+    LDAP = 0,
+    ...
+};

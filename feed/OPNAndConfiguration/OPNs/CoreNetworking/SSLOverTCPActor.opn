@@ -1,0 +1,100 @@
+module SSLOverTCPActor with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376123", Date = "03/31/2015"}
+        ]
+};
+
+using Utility;
+using Standard;
+using TCP;
+using TLS;
+using SSL;
+using TLSOverTCPActor;
+
+autostart actor SSLOverTCP(TCP.EncryptionServer server) precedes TLSOverTCP
+{
+    SSLDecodingHelper SSLHelper = null;
+    TLS.Server EPT;
+    bool IsSSLEncryptedSession = false;
+    
+    process server accepts s:TCP.Segment
+    {
+        if (!(IsSSLEncryptedSession && s.Payload.Count == 0) && 
+            (SSLHelper == null || SSLHelper.AcceptsCache.BufferCount() == 0) && !IsSSL(s, MessageDirection.Accepts))
+        {
+            IsSSLEncryptedSession = false;
+            reject;
+        }
+
+        IsSSLEncryptedSession = true;
+        if (SSLHelper == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            SSLHelper = new SSLDecodingHelper();
+            SSLHelper.InitializeSSLHelper(EPT);
+            InitializeTLSServerFromTCP(s, MessageDirection.Accepts, DispathDecrytedMessageBack, EPT);
+        }
+        SSLHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment
+    {
+        if (!(IsSSLEncryptedSession && s.Payload.Count == 0) && 
+            (SSLHelper == null || SSLHelper.IssuesCache.BufferCount() == 0) && !IsSSL(s, MessageDirection.Issues))
+        {
+            IsSSLEncryptedSession = false;
+            reject;
+        }
+
+        IsSSLEncryptedSession = true;
+        if (SSLHelper == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            SSLHelper = new SSLDecodingHelper();
+            SSLHelper.InitializeSSLHelper(EPT);
+            InitializeTLSServerFromTCP(s, MessageDirection.Issues, DispathDecrytedMessageBack, EPT);
+        }
+        SSLHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(TCP.EncryptionServer e)
+    {
+        if (SSLHelper != null)
+        {
+            SSLHelper.ClearInDestructor();
+        }
+    }
+    
+    void DispathDecrytedMessageBack(binary bin, TLS.RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        if (rls.Origins[0] is first:TCP.Segment &&
+            GetLastDataSegment(rls.Origins) is last:TCP.Segment)
+        {
+            DispathBackToTCP(bin, server, direction, first, last);
+        }
+    }
+
+    bool IsSSL(Segment s, MessageDirection direction)
+    {
+        if (SSLHelper == null)
+        {
+            return IsSSLHeader(s.Payload);
+        }
+        
+        if (direction == MessageDirection.Accepts)
+        {
+            return IsSslHeaderBySegment(SSLHelper.AcceptsCache, s);
+        }
+        else
+        {
+            return IsSslHeaderBySegment(SSLHelper.IssuesCache, s);
+        }
+    }
+}

@@ -1,0 +1,387 @@
+module GSSAPI with Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.BER},
+Documentation
+{
+    ProtocolName = "Generic Security Service Application Program Interface",
+    ShortName = "GSSAPI",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2743"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "381842", Date = "10/14/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using SPNG;
+using Technologies.ASN1;
+using NLMP;
+using GSSAPIKRB5;
+using DNS;
+
+message GssapiType
+{
+    (NegotiationToken | InitialContextToken) Gssapi;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+// RFC 2743 3.1
+message InitialContextToken
+{
+    MechType ThisMech with DisplayInfo{ToText = MechTypeToText};
+    any InnerContextToken with Encoding{Ignore = true};
+} with Asn1Encoding{TagClass = Asn1TagClass.Application, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+
+// RFC 2478 3.1
+pattern MechType = ObjectIdentifier;
+
+// Store names of token in the GSSAPI messag, the format is "GSSAPI, Spengo, Kerberos".
+annotation string GssapiType#TokenName;
+
+// Store Authentication method and user name in GSSAPI.
+// index 0: authentication method, like "NTLM, Kerberos", required.
+// index 1: user name be authenticated, optional for kerberos. "Contoso\User"
+annotation string GssapiType#KeyInformation;
+
+// GSSAPI decoding function exposed to application protocol
+// Decode GSSAPI message, and set Embeded annotation if application protocol messsage is passed.
+// Parameter:
+//    s: stream to be decoded Gssapi.
+//    applicationProtocol: the message instance of decoded application protocol that has Gssapi embedded.
+optional GssapiType DecodeGssapiAndSetAnnotation(stream s, any message applicationProtocol)
+{
+    var length = CalculateAsn1BerLength(s);
+    if (length == nothing)
+    {
+        return nothing;
+    }
+    
+    // Create a new stream for decoding and move BytePosition of passed stream parameter.
+    var blob = BinaryDecoder<Blob[length as uint]>(s);
+    if (blob == nothing)
+    {
+        return nothing;
+    }
+    stream tempStrem = (blob as Blob).Data;
+    string innerTokenName = "";
+    switch (tempStrem)
+    {
+        case m:GssapiType from Asn1BerDecoder<GssapiType> =>
+            if (m.Gssapi is InitialContextToken)
+            {
+                int beginPosition = tempStrem.BitPosition;
+                var initialToken = m.Gssapi as InitialContextToken;
+                // InitialContextToken contains a SPNEGO token
+                if (Array2String<int>(initialToken.ThisMech as array<int>, ".") == "1.3.6.1.5.5.2")
+                {
+                    var negTokenType = Asn1BerDecoder<NegotiationTokenType>(tempStrem);
+                    if (negTokenType != nothing)
+                    {
+                        initialToken.InnerContextToken = (negTokenType as NegotiationTokenType).SpnegoToken;
+                        DecodeSpnegoToken(initialToken.InnerContextToken, ref innerTokenName, m);
+                        m#TokenName = "GSSAPI, SPENGO" + (innerTokenName != null && innerTokenName != "" ? ", " + innerTokenName : "");
+                    }
+                }
+                // Decode remaining binaries to NLMP/Kerberos token if it's not Spnego token
+                else
+                {
+                    initialToken.InnerContextToken = DecodeConcreteToken(tempStrem, ref innerTokenName, m);
+                    m#TokenName = "GSSAPI" + (innerTokenName != null || innerTokenName != "" ? ", " + innerTokenName : "");
+                }
+                AssociateFieldPosition(initialToken, "InnerContextToken", s, beginPosition);
+            }
+            // it's SPNEGO token without GSSAPI wrapper
+            else // m.Gssapi is NegotiationToken
+            {
+                var negToken = m.Gssapi as NegotiationToken;
+                DecodeSpnegoToken(negToken, ref innerTokenName, m);
+                m#TokenName = "GSSAPI, SPENGO" + (innerTokenName != "" ? ", " + innerTokenName : "");
+            }
+            
+            // Set Embedded annotation for application protocol message.
+            if (applicationProtocol != null)
+            {
+                if (m#TokenName is tokenName:Utility.StringNotNullOrEmpty)
+                {
+                    applicationProtocol#Embedded = {tokenName -> ""};
+                }
+            }
+            return m;
+        default =>
+            return nothing;
+    }
+}
+
+bool IsGSSAPIByCheckingTag(binary bin)
+{
+    // 0x60: Tag of InitialContextToken
+    // 0xA0: Tag of SPNG.NegTokenInit
+    // 0xA1: Tag of SPNG.NegTokenResp
+    return bin.Count > 0 && (bin[0] in {0x60, 0xA0, 0xA1});
+}
+
+void DecodeSpnegoToken(NegotiationToken negToken, ref string innerTokenName, GssapiType gssapi)
+{
+    if (negToken is negTokenInit:NegTokenInit && negTokenInit.MechToken != nothing && negTokenInit.MechToken is data:binary)
+    {
+        stream s = data;
+        if (IsGSSAPIByCheckingTag(data))
+        {
+            if (Asn1BerDecoder<InitialContextToken>(s) is innerToken:InitialContextToken)
+            {
+                int beginPosition = s.BitPosition;
+                innerToken.InnerContextToken = DecodeConcreteToken(s, ref innerTokenName, gssapi);
+                AssociateFieldPosition(innerToken, "InnerContextToken", s, beginPosition);
+                negTokenInit.MechToken = innerToken;
+            }
+        }
+        else
+        {
+            var innerToken = DecodeConcreteToken(data, ref innerTokenName, gssapi);
+            if (innerToken != nothing)
+            {
+                negTokenInit.MechToken = innerToken;
+            }
+        }
+    }
+    else if (negToken is negTokenResp:NegTokenResp)
+    {
+        if (negTokenResp.ResponseToken != nothing && negTokenResp.ResponseToken is data2:binary)
+        {
+            stream s = data2;
+            if (IsGSSAPIByCheckingTag(data2))
+            {
+                if (Asn1BerDecoder<InitialContextToken>(s) is innerToken:InitialContextToken)
+                {
+                    int beginPosition = s.BitPosition;
+                    innerToken.InnerContextToken = DecodeConcreteToken(s, ref innerTokenName, gssapi);
+                    AssociateFieldPosition(innerToken, "InnerContextToken", s, beginPosition);
+                    negTokenResp.ResponseToken = innerToken;
+                }
+            }
+            else
+            {
+                var innerToken = DecodeConcreteToken(s, ref innerTokenName, gssapi);
+                if (innerToken != nothing)
+                {
+                    negTokenResp.ResponseToken = innerToken;
+                }
+            }
+        }
+        if (negTokenResp.MechListMIC is bin:binary)
+        {
+            if (IsGSSAPIByCheckingTag(bin))
+            {
+                stream s = bin;
+                if (Asn1BerDecoder<InitialContextToken>(s) is innerToken:InitialContextToken)
+                {
+                    int beginPosition = s.BitPosition;
+                    innerToken.InnerContextToken = DecodeConcreteToken(s, ref innerTokenName, gssapi);
+                    AssociateFieldPosition(innerToken, "InnerContextToken", s, beginPosition);
+                    negTokenResp.MechListMIC = innerToken;
+                }
+            }
+            else if (IsGssapiKrb(bin))
+            {
+                negTokenResp.MechListMIC = BinaryDecoder<KerberosToken>(bin);
+                if (negTokenResp.MechListMIC is krb5:KerberosToken)
+                {
+                    innerTokenName = "Kerberos";
+                    gssapi#KeyInformation = GetSummaryInfo(krb5);
+                }
+            }
+        }
+    }
+}
+
+optional any DecodeConcreteToken(stream s, ref string token, GssapiType gssapi)
+{
+    binary bin = s.PeekBytes(s.BitPosition);
+    // Decode NLMP token
+    if (IsNLMP(bin))
+    {
+        var nlmp = NLMP.NlmpDecoder(s);
+        if (nlmp != nothing)
+        {
+            gssapi#KeyInformation = GetSummaryInfo(nlmp);
+            token = "NTLM";
+            return nlmp;
+        }
+    }
+    // Decode Kerberos token
+    else if (IsGssapiKrb(bin))
+    {
+        if (BinaryDecoder<KerberosToken>(s) is krb:KerberosToken)
+        {
+            token = "Kerberos";
+            gssapi#KeyInformation = GetSummaryInfo(krb);
+            return krb;
+        }
+    }
+    // Decode unwrapped Kerberos
+    else if ((bin[0] & 0x60) == 0x60)
+    {
+        if (Asn1BerDecoder<Krb5Type>(s) is krb:Krb5Type)
+        {
+            token = "Kerberos";
+            gssapi#KeyInformation = GetSummaryInfo(krb);
+            return krb;
+        }
+    }
+    return nothing;
+}
+
+// Determine if unsealed data is encapsulated in GSSAPI message.
+bool ContainUnsealedData(GssapiType gssapi, out binary unsealedData)
+{
+    if (gssapi.Gssapi is initialContextToken:InitialContextToken)
+    {
+        string oid = Array2String<int>(initialContextToken.ThisMech as array<int>, ".");
+        var innerToken = initialContextToken.InnerContextToken as optional any;
+        if (oid == "1.2.840.48018.1.2.2" || oid == "1.2.840.113554.1.2.2")
+        {
+            return ContainUnsealedData(innerToken as KerberosToken, out unsealedData);
+        }
+        else if (oid == "1.3.6.1.5.5.2")
+        {
+            ContainUnsealedData(innerToken as NegotiationToken, out unsealedData);
+        }
+    }
+    else if (gssapi.Gssapi is NegotiationToken)
+    {
+        ContainUnsealedData(gssapi.Gssapi as NegotiationToken, out unsealedData);
+    }
+    return false;
+}
+
+// Determine if unsealed data is encapsulated in Spnego token
+bool ContainUnsealedData(NegotiationToken negToken, out binary unsealedData)
+{
+    if (negToken is init:NegTokenInit)
+    {
+        if (init.MechToken != nothing && init.MechToken is krb:KerberosToken)
+        {
+            return ContainUnsealedData(krb, out unsealedData);
+        }
+        else if (init.MechToken != nothing && init.MechToken is token:InitialContextToken)
+        {
+            string oid = Array2String<int>(token.ThisMech as array<int>, ".");
+            var innerToken = token.InnerContextToken as optional any;
+            if (oid == "1.2.840.48018.1.2.2" || oid == "1.2.840.113554.1.2.2")
+            {
+                return ContainUnsealedData(innerToken as KerberosToken, out unsealedData);
+            }
+        }
+    }
+    else if (negToken is resp:NegTokenResp)
+    {
+        if (resp.ResponseToken != nothing && resp.ResponseToken is krb:KerberosToken)
+        {
+            return ContainUnsealedData(krb, out unsealedData);
+        }
+        else if (resp.ResponseToken != nothing && resp.ResponseToken is token:InitialContextToken)
+        {
+            string oid = Array2String<int>(token.ThisMech as array<int>, ".");
+            var innerToken = token.InnerContextToken as optional any;
+            if (oid == "1.2.840.48018.1.2.2" || oid == "1.2.840.113554.1.2.2")
+            {
+                return ContainUnsealedData(innerToken as KerberosToken, out unsealedData);
+            }
+        }
+    }
+    return false;
+}
+
+// This method is only worked with the summary string generated by GetSummaryInfo in NLMP.opn and GSSAPIKRB5.opn
+string GetAuthInfoFromSummary(string summary)
+{
+    if (summary.IndexOf("NTLM") == 0)
+    {
+        return summary.Split([','], true)[0];
+    }
+    else if (summary.IndexOf("Kerberos") == 0)
+    {
+        return "Kerberos";
+    }
+    else
+    {
+        return "";
+    }
+}
+
+// Code for decoding GSSAPI in DNS are placed in GSSAPI.opn due to DNS.opn can not reference GSSAPI.opn
+// GSSAPI and its dependencies are in Common package, while DNS is in BasicNetworking package.
+autostart actor GssapiEmbeddedInDns(DNS.Server node) precedes DNS.Server
+{
+    // GSSAPI can only be encapsulated in the additional information section, refer to RFC 2930 4.3 Query for GSS-API Establishment
+    observe node accepts m:DNSMessage where m.Additional != nothing && (m.Additional is array<OPTPseudoResourceRecord | ResourceRecord>)
+    {
+        var additionalRRs = m.Additional as array<OPTPseudoResourceRecord | ResourceRecord>;
+        DecodeGSSAPIInDNS(additionalRRs, m);
+    }
+    // GSSAPI can only be encapsulated in the additional information section, refer to RFC 2930 4.3 Query for GSS-API Establishment
+    observe node issues m:DNSMessage where m.Additional != nothing && (m.Additional is array<OPTPseudoResourceRecord | ResourceRecord>)
+    {
+        var additionalRRs = m.Additional as array<OPTPseudoResourceRecord | ResourceRecord>;
+        DecodeGSSAPIInDNS(additionalRRs, m);
+    }
+    
+    void DecodeGSSAPIInDNS(array<OPTPseudoResourceRecord | ResourceRecord> additionalRRs, DNSMessage m)
+    {
+        for (int i = 0; i < additionalRRs.Count; i++)
+        {
+            if (additionalRRs[i] is ResourceRecord)
+            {
+                var curRR = additionalRRs[i] as ResourceRecord;
+                if (curRR.Type == DNS.RRType.TKEY)
+                {
+                    TransactionKey tk = curRR.RData as TransactionKey;
+                    if (tk.Mode == DNS.TKEYMode.GSSAPINegotiation && tk.KeyData is keyData:binary)
+                    {
+                        if (IsGSSAPIByCheckingTag(keyData))
+                        {
+                            var gssapi = DecodeGssapiAndSetAnnotation(keyData, m);
+                            if (gssapi != nothing)
+                            {
+                                tk.Gssapi = gssapi;
+                                tk.KeyData = nothing;
+                            }
+                            else
+                            {
+                                ValidationCheck(false, m, DiagnosisLevel.Warning, "DNS: The KeyData in type TransactionKey should be decoded as GSSAPI.");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+optional NlmpMessage GetNTLMFromGssapiType(GssapiType gss)
+{
+    optional NlmpMessage nlmpMess = nothing;
+    if (gss.Gssapi is initToken:InitialContextToken && initToken.InnerContextToken is nlmpMess2:NlmpMessage)
+    {
+        nlmpMess = nlmpMess2;
+    }
+    else if (gss.Gssapi is negInit:NegTokenInit && negInit.MechToken is nlmpMess3:NlmpMessage)
+    {
+        nlmpMess = nlmpMess3;
+    }
+    else if (gss.Gssapi is negResp1:NegTokenResp && negResp1.ResponseToken is nlmpMess4:NlmpMessage)
+    {
+        nlmpMess = nlmpMess4;
+    }
+    else if (gss.Gssapi is negResp2:NegTokenResp && negResp2.MechListMIC is nlmpMess5:NlmpMessage)
+    {
+        nlmpMess = nlmpMess5;
+    }
+    return nlmpMess;
+}

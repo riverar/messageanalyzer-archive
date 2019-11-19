@@ -1,0 +1,132 @@
+protocol NCT with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Network Cost Transfer Protocol",
+    ShortName = "NCT",
+    DocumentName = "MS-NCT",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-NCT", Version = "1.0", Date = "07/14/2016", ProgramName = ProgramName.WSPP}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "", Date = ""}
+        ]
+};
+
+using WiFi;
+using Utility;
+
+const binary NCTOUI = $[0050f2];
+const byte NetworkCostIEOUIType = 0x11;
+const byte TetheringIdentifierIEOUIType = 0x12; // TDI: #7034
+
+autostart actor NctObserveWiFi(WiFi.Node node)
+{
+    observe node accepts m:WiFiMessage
+    {
+        // 2.1 Transport
+        if (m.Body is beaconFrame:WiFi.BeaconFrame)
+        {
+            ExtendNctInformationElement(ref beaconFrame.InformationElements);
+        }
+        else if (m.Body is probeResponseFrame:WiFi.ProbeResponseFrame)
+        {
+            ExtendNctInformationElement(ref probeResponseFrame.InformationElements);
+        }
+    }
+}
+
+void ExtendNctInformationElement(ref array<InformationField> informationElements)
+{
+    array<InformationField> newInformationElements = [];
+    binary wfdInformationElementBinary = $[];
+    for (int i = 0; i < informationElements.Count; i++)
+    {
+        if (informationElements[i] is vendorSpecificInformation:VendorSpecificInformation &&
+            vendorSpecificInformation.OUI == NCTOUI && vendorSpecificInformation.VendorSpecificContent is data:binary &&
+            data.Count > 0)
+        {
+            if (data[0] == NetworkCostIEOUIType)
+            {
+                if (BinaryDecoder<NetworkCostIE>(data) is networkCostIE:NetworkCostIE)
+                {
+                    networkCostIE.ElementID = vendorSpecificInformation.ElementID;
+                    networkCostIE.Length = vendorSpecificInformation.Length;
+                    networkCostIE.OUI = vendorSpecificInformation.OUI;
+
+                    // replace as extension IE
+                    informationElements[i] = networkCostIE;
+                }
+            }
+            else if (data[0] == TetheringIdentifierIEOUIType)
+            {
+                if (BinaryDecoder<TetheringIdentifierIE>(data) is tetheringIdentifierIE:TetheringIdentifierIE)
+                {
+                    tetheringIdentifierIE.ElementID = vendorSpecificInformation.ElementID;
+                    tetheringIdentifierIE.Length = vendorSpecificInformation.Length;
+                    tetheringIdentifierIE.OUI = vendorSpecificInformation.OUI;
+
+                    // replace as extension IE
+                    informationElements[i] = tetheringIdentifierIE;
+                }
+            }
+        }
+    }
+}
+
+// 2.2.1 Network Cost IE
+type NetworkCostIE : VendorSpecificInformation
+{
+    new byte ElementID with Encoding{Ignore = true};
+    new byte Length with Encoding{Ignore = true};
+    new binary OUI with Encoding{Ignore = true};
+    new optional any VendorSpecificContent with Encoding{Ignore = true};
+    byte OUI_Type;
+    // TDI: #7034. then not check Reserved
+    byte Reserved;
+    CostFlags CostFlags where ValidationCheckCombinationValue(InRange<CostFlags>(value), null, true, ReferenceType.Type,
+        "NCT", "CostFlags", "NetworkCostIE", "0x01, 0x02, 0x04, 0x08", value);
+    byte Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type,
+        "NCT", "Reserved1", "NetworkCostIE", value);
+    CostLevel CostLevel where ValidationCheckCombinationValue(InRange<CostFlags>(value), null, true, ReferenceType.Type,
+        "NCT", "CostLevel", "NetworkCostIE", "0x01, 0x02, 0x04", value);
+}
+
+pattern CostFlags = flags byte
+{
+    OverDataLimit = 0x01,
+    Congested = 0x02,
+    Roaming = 0x04,
+    ApproachingDataLimit = 0x08,
+    ...
+};
+
+pattern CostLevel = enum byte
+{
+    Unrestricted = 0x01,
+    Fixed = 0x02,
+    Variable = 0x04,
+    ...
+};
+
+// 2.2.2 Tethering Identifier IE
+type TetheringIdentifierIE : VendorSpecificInformation
+{
+    new byte ElementID with Encoding{Ignore = true};
+    new byte Length with Encoding{Ignore = true};
+    new binary OUI with Encoding{Ignore = true};
+    new optional any VendorSpecificContent with Encoding{Ignore = true};
+    byte OUI_Type;
+    ushort Type;
+    // WORKAROUND: Length defined in TetheringIdentifierIE is duplicated with Length define in base InformationElement
+    ushort TetheringIdentifierIELength where ValidationCheckValue(value == 6, null, true, ReferenceType.Type,
+        "NCT", "TetheringIdentifierIELength", "TetheringIdentifierIE", 6, value);
+    MacAddress MacAddress;
+}

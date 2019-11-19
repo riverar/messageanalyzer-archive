@@ -1,0 +1,362 @@
+protocol MSSIPREGE with
+Documentation
+{
+    ProtocolName = "Session Initiation Protocol (SIP) Registration Extensions",
+    ShortName = "MS-SIPREGE",
+    DocumentName = "MS-SIPREGE",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-SIPREGE", Version = "6.1"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision {Class=RevisionClass.Major, Version="1.0.0", Date="05/19/2015"},
+        ]
+};
+
+using Diagnostics;
+using SIP;
+using Standard;
+using SkypeforBusinessShared;
+
+endpoint Server 
+	over SIP.Server 
+	accepts RequestMessage issues ResponseMessage
+	accepts NotifyMessage;
+	
+client endpoint Client connected to Server;
+autostart actor ActorOverSIP(SIP.Server node)
+{		
+    process node accepts sipMsg:SIP.Request
+    {   
+		RequestMessage msg;
+		
+		switch (GetSipregeReqMessage(sipMsg))
+		{
+			case ("RegisterRequestMessage") =>
+			{
+				msg = new RegisterRequestMessage(sipMsg);
+			}
+			case ("ProvisioningRequestMessage") =>
+			{
+				msg = new ProvisioningRequestMessage(sipMsg);
+			}
+			default =>
+			{
+				reject;
+			}				
+		}
+		dispatch (endpoint Server over node) accepts msg;		
+    }		
+
+	process node issues sipMsg:SIP.Request
+    {    
+		switch (GetSipregeReqMessage(sipMsg))
+		{			
+			case ("ProvisioningNotifyMessage") =>
+			{
+				RequestMessage notifyMsg = new ProvisioningNotifyMessage(sipMsg);
+				dispatch (endpoint Server over node) accepts notifyMsg;
+			}
+			case ("DeregisterNotifyMessage") =>
+			{
+				NotifyMessage notifyMsg = new DeregisterNotifyMessage(sipMsg);
+				dispatch (endpoint Server over node) accepts notifyMsg;	
+			}
+			case ("SurvivableModeNotifyMessage") =>
+			{
+				NotifyMessage notifyMsg = new SurvivableModeNotifyMessage(sipMsg);
+				dispatch (endpoint Server over node) accepts notifyMsg;	
+			}
+			default =>
+			{
+				reject;
+			}	
+		}
+    }
+
+	process node issues sipMsg:SIP.Response		
+    {   	
+		ResponseMessage msg;
+		switch (GetSipregeRspMessage(sipMsg))
+		{
+			case ("RegisterResponseMessage") => 
+			{
+				msg = new RegisterResponseMessage(sipMsg);
+			}
+			case ("ProvisioningResponseMessage") => 
+			{
+				msg = new ProvisioningResponseMessage(sipMsg);
+			}				
+			default => 
+			{
+				reject;
+			}					
+		}			
+		dispatch (endpoint Server over node) issues msg;
+	}
+}
+
+string GetSipregeRspMessage(SIP.Response sipMsg)
+{
+	string cSeq = TryGetHeaderValue("CSeq", sipMsg.Headers);
+
+	if (cSeq == "REGISTER")
+	{
+		if (ContainsHeaders(["Server", "Contact"], sipMsg.Headers))
+		{
+			return "RegisterResponseMessage";
+		}
+	}
+	else if (cSeq == "SUBSCRIBE")
+	{
+		if ((ContainsHeaders(["Event"], sipMsg.Headers)) && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/vnd-microsoft-roaming-provisioning-v2+xml") && (TryGetHeaderValue("Event", sipMsg.Headers) == "vnd-microsoft-provisioning-v2"))
+		{
+			return "ProvisioningResponseMessage";
+		}
+	}
+	return null;
+}
+
+string GetSipregeReqMessage(SIP.Request sipMsg)
+{
+	if (sipMsg.Method == "REGISTER")
+	{
+		if ((TryGetHeaderValue("Event", sipMsg.Headers) == "registration") || (TryGetHeaderValue("Event", sipMsg.Headers) == "registrations"))
+		{
+			return "RegisterRequestMessage";
+		}
+
+		array<string> supportedHeaderValules = TryGetHeaderValues("Supported", sipMsg.Headers);
+
+		if (supportedHeaderValules != null && supportedHeaderValules.Count != 0)
+		{
+			foreach (string tag in supportedHeaderValules)
+			{
+				if (tag == "gruu-10" || tag == "com.microsoft.msrtc.presence" || tag == "msrtc-event-categories" || tag == "gruu-10" || tag == "ms-forking" || tag == "ms-userservices-state-notification" || tag == "ms-cluster-failover")
+				{
+					return "RegisterRequestMessage";
+				}
+			}
+		}		
+	}
+	else if ((sipMsg.Method == "SUBSCRIBE") && (TryGetHeaderValue("Event", sipMsg.Headers) == "vnd-microsoft-provisioning-v2"))		
+	{
+		return "ProvisioningRequestMessage";
+	}
+	else if ((sipMsg.Method == "NOTIFY") && (TryGetHeaderValue("Event", sipMsg.Headers) == "vnd-microsoft-provisioning-v2"))
+	{
+		return "ProvisioningNotifyMessage";
+	}
+	else if ((sipMsg.Method == "NOTIFY") && (TryGetHeaderValue("Event", sipMsg.Headers) == "registration-notify"))
+	{
+		if ("Subscription-State" in sipMsg.Headers)
+		{
+			string headerContent = TryGetHeaderValue("Subscription-State", sipMsg.Headers);
+			int index = IndexOf(headerContent, ";");
+			string mode = Segment(headerContent, 0, index);
+			
+			if (mode == "terminated") 
+			{
+				return "DeregisterNotifyMessage";
+			}
+			else if (mode == "active") 
+			{
+				return "SurvivableModeNotifyMessage";
+			}
+		}
+	}		
+	return null;
+}
+	
+message RequestMessage : SipRequestMessage
+{
+	RequestMessage(SIP.Request sipReqMsg)
+	{
+		InitializeSIPReq(sipReqMsg, ["From", "To", "Event", "Supported"], this);
+	}
+	
+	override string ToString()
+	{ 
+		return "Request";
+	}	
+}
+
+message RegisterRequestMessage : RequestMessage
+{
+	RegisterRequestMessage(SIP.Request sipReqMsg)
+	{
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Ms-Keep-Alive", "Ms-Subnet", "Ms-Device-Info"]);
+	}
+	
+	override string ToString()
+	{
+		return "REGISTER Request";
+	}
+}
+
+message ProvisioningRequestMessage : RequestMessage
+{
+	ProvisioningRequestMessage(SIP.Request sipReqMsg)
+	{
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Accept", "Content-Type", "Expires"]);
+	}
+	
+	override string ToString()
+	{
+		return "In-band Provisioning Request";
+	}
+}
+
+message ResponseMessage : SipResponseMessage
+{		
+	ResponseMessage(SIP.Response sipRspMsg)
+	{
+		InitializeSIPRsp(sipRspMsg, ["From", "To", "Event", "Supported", "Content-Type"], this);
+	}
+	
+	override string ToString()
+	{
+		return Format("Response, {0} {1}", this.StatusCode, this.ReasonPhrase);
+	}	
+}
+
+message RegisterResponseMessage : ResponseMessage
+{
+	RegisterResponseMessage(SIP.Response sipRspMsg)
+	{
+		base.ResponseMessage(sipRspMsg);
+		this.Headers += GetHeaders(sipRspMsg.Headers, ["Ms-Keep-Alive", "Presence-State", "Server", "Contact"]);
+	}
+	
+	override string ToString()
+	{
+		return Format("REGISTER Response, {0} {1}", this.StatusCode, this.ReasonPhrase);
+	}	
+}
+
+message ProvisioningResponseMessage : ResponseMessage
+{
+	ProvisioningResponseMessage(SIP.Response sipRspMsg)
+	{
+		base.ResponseMessage(sipRspMsg);
+		this.Headers += GetHeaders(sipRspMsg.Headers, ["Expires"]);
+	}
+	
+	override string ToString()
+	{
+		return Format("In-band Provisioning Response, {0} {1}", this.StatusCode, this.ReasonPhrase);
+	}
+}
+
+message NotifyMessage
+{
+	string Method;
+	string Uri;
+	optional SIP.SipHeadersType Headers;
+	optional string Body;
+
+	NotifyMessage(SIP.Request sipReqMsg)
+	{
+		this.Method = sipReqMsg.Method;
+		this.Uri = sipReqMsg.Uri;
+		this.Headers = GetHeaders(sipReqMsg.Headers, ["From", "To", "Event", "Supported", "Subscription-State", "Content-Type", "Ms-Diagnostics-Public"]);
+		optional binary bodyBinary = sipReqMsg.Body;
+
+		if (bodyBinary == nothing || bodyBinary == null)
+		{			
+			this.Body = nothing;
+		}
+        else
+        {			
+			optional string tempBody = BinaryStringDecoder(bodyBinary as binary, TextEncoding.ASCII);
+			
+			if (tempBody == nothing || tempBody == null)
+			{	
+				this.Body = nothing;
+			}
+			else
+			{
+				this.Body = tempBody;
+			}
+        }
+	}
+
+	override string ToString()
+	{
+		return "Notify Message";
+	}
+
+	string GetSummaryLine(string notifyType)
+	{ 
+		string msDiagnosticsPublicValue =  TryGetErrorDetails("Ms-Diagnostics-Public", (this.Headers as SIP.SipHeadersType));
+		
+		if (notifyType == null)
+		{
+			return "Notify Message";
+		}
+		else if (msDiagnosticsPublicValue == null)
+		{
+			return notifyType + " NOTIFY";
+		}
+		else
+		{
+			return notifyType + " NOTIFY, " + msDiagnosticsPublicValue;
+		}
+	}
+}
+
+message DeregisterNotifyMessage : NotifyMessage
+{
+	DeregisterNotifyMessage(SIP.Request sipReqMsg)
+	{
+		base.NotifyMessage(sipReqMsg);
+	}
+
+	override string ToString()
+	{			
+		return this.GetSummaryLine("Deregister");
+	}
+}
+
+message SurvivableModeNotifyMessage : NotifyMessage
+{
+	SurvivableModeNotifyMessage(SIP.Request sipReqMsg)
+	{
+		base.NotifyMessage(sipReqMsg);
+	}
+
+	override string ToString()
+	{
+		return this.GetSummaryLine("Survivable Mode");
+	}
+}
+
+message ProvisioningNotifyMessage : RequestMessage
+{
+	ProvisioningNotifyMessage(SIP.Request sipReqMsg)
+	{
+		base.RequestMessage(sipReqMsg);
+	}
+
+	override string ToString()
+	{
+		string msDiagnosticsPublicValue =  TryGetErrorDetails("Ms-Diagnostics-Public", (this.Headers as SIP.SipHeadersType));
+		
+		if (msDiagnosticsPublicValue == null)
+		{
+			return "In-band Provisioning NOTIFY";
+		}
+		else
+		{
+			return "In-band Provisioning NOTIFY, " + msDiagnosticsPublicValue;
+		}
+	}
+}

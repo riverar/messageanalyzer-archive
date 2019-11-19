@@ -1,0 +1,864 @@
+protocol MWBF with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+XmlEncodingDefaults{Namespace = AdfsNamespace},
+Documentation
+{
+    ProtocolName = "Microsoft Web Browser Federated Sign-On Protocol",
+    ShortName = "MWBF"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-MWBF", Version = "13.0", Date = "09/15/2017", ProgramName = ProgramName.WSPP},
+        new Reference {Name = "MS-MWBE", Version = "9.0", Date = "08/08/2013", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "382132", Date = "10/12/2015"}
+    ]
+};
+
+using Diagnostics;
+using DTYP;
+using XSD;
+using Utility;
+using HTTP;
+using HTML;
+using WSTrust;
+using SAMLCore;
+using XMLEnc;
+using XMLDSig;
+using WSA2004;
+using WSA2005;
+using WSPolicy;
+using IdentityAndSecurityResources;
+
+const string AdfsNamespace = "urn:Microsoft:federation";
+// indicator the response is reassembled
+annotation bool WSignin10Response#IsReassembledResponse;
+
+const int WSignin10WaLength = 13;
+const string WSWAString = "wa";
+const string WSignin10WaString = "wsignin1.0";
+const binary WSignin10WaBinary = $[77613D777369676E696E312E30];
+const int WSignout10WaLength = 14;
+const string WSignout10WaString = "wsignout1.0";
+const binary WSignout10WaBinary = $[77613D777369676E6F7574312E30];
+const int WSignoutCleanup10WaLength = 21;
+const string WSignoutCleanup10WaString = "wsignoutcleanup1.0";
+const binary WSignoutCleanup10WaBinary = $[77613D777369676E6F7574636C65616E7570312E30];
+
+//------------------------------------- Endpoint & Actor---------------------------------------//
+// Endpoint: Server
+endpoint Server[string hostName] 
+    accepts WSignMessage
+    issues WSignin10Response
+{
+    MWBFDecodingCache reassemblyCache = null;
+    
+    process this issues response:WSignin10Response where response.ttpindex != nothing && response.ttpsize != nothing
+    {
+        if (reassemblyCache == null)
+        {
+            reassemblyCache = new MWBFDecodingCache();
+        }
+        
+        reassemblyCache.Add(response);
+        reassemblyCache.ReassembleAndDispatch(this);
+    }
+    
+    ~endpoint(MWBF.Server server)
+    {
+        if (reassemblyCache != null)
+        {
+            reassemblyCache.Reset(true);
+        }
+    }
+}
+
+client endpoint Client connected to Server;
+
+// actor
+autostart actor MWBFServerOverHTTP(HTTP.Server server)
+{
+    /*
+     * set "isWSigninResponse" when decoded MWBF messages in http request successfully
+     * reset "isWSigninResponse" in when process http response
+     */
+    bool isWSigninResponse = false;
+    
+    // listen and try to catch WSignin10Request, WSignout10Request, WSignoutCleanup10Request
+    // and WSignin10Response
+    process server accepts httpRequest:HttpContract.Request where IsMWBFMessageOverHttpRequest(httpRequest)
+    {
+        stream s;
+        switch (httpRequest.Method)
+        {
+            case "GET" =>
+                // If Http Method is GET, the information of MWBF exists in the Uri.Query
+                var ret = TryDecodeFromUri(httpRequest.Uri);
+                if (ret == nothing)
+                {
+                    reject;
+                }
+                else if (ret is WSignin10Response)
+                {
+                    WSignin10Response response = ret as WSignin10Response;
+                    dispatch (endpoint MWBF.Server[GetHostFromHttpRequest(httpRequest)]) issues response;
+
+                    isWSigninResponse = true;
+                }
+                else if (ret is WSignMessage)
+                {
+                    WSignMessage request = ret as WSignMessage;
+                    dispatch (endpoint MWBF.Server[GetHostFromHttpRequest(httpRequest)]) accepts request;
+
+                    isWSigninResponse = true;
+                }
+                else
+                {// no such situation, just for the logic integrity
+                    reject;
+                }
+            case "POST" =>
+                // If Http Method is POST, the information of MWBF exists in the Payload
+                if(!TryDecodeAndDispatchHttpRequestPayload(server, httpRequest))
+                {
+                    reject;
+                }
+                else
+                {
+                    isWSigninResponse = true;
+                }
+            default =>
+                reject;
+        }
+    }
+
+    // listen and try to catch WSignin10Response
+    process server issues httpResponse:HttpContract.Response where IsMWBFMessageOverHttpResponsePayload(httpResponse, ref isWSigninResponse)
+    {
+        // try to decode the WSignin10Response from payload
+        var v = TryDecodeWSignin10ResponseFromHttpResponsePayload(httpResponse);
+        if ( v == nothing)
+        {
+            reject;
+            return;
+        }
+
+        WSignin10Response wsignin10Response = v as WSignin10Response;
+        TryDecodeRSTR(wsignin10Response);
+
+        dispatch (endpoint MWBF.Server[GetHostFromHttpResponse(httpResponse)]) issues wsignin10Response;
+    }
+
+    process server issues httpResponse:HttpContract.Response where IsMWBFMessageOverHttpResponseRedirect(httpResponse)
+    {
+        // reset
+        isWSigninResponse = false;
+
+        UriType uri = httpResponse.Headers["Location"] as HTTP.UriType;
+        
+        var ret = TryDecodeFromUri(uri);
+        if (ret == nothing)
+        {
+            reject;
+        }
+        else if (ret is WSignin10Response)
+        {
+            WSignin10Response response = ret as WSignin10Response;
+            dispatch (endpoint MWBF.Server[GetHostFromHttpResponse(httpResponse)]) issues response;
+            return;
+        }
+        else if (ret is WSignMessage)
+        {
+            WSignMessage request = ret as WSignMessage;
+            dispatch (endpoint MWBF.Server[GetHostFromHttpResponse(httpResponse)]) accepts request;
+        }
+        else
+        {// no such situation, just for the logic integrity
+            reject;
+        }
+    }
+
+    // Try decode WSignin10Reponse
+    // From HTTP Request Payload
+    bool TryDecodeAndDispatchHttpRequestPayload(HTTP.Server server, HttpContract.Request httpRequest)
+    {
+        if (QueryParameters(httpRequest.Payload) is o:map<string, string>)
+        {
+            map<string, string> v = ParsePercentEncodedQuery(o);
+            WSignin10Response response = CreateWSignin10Response(v);
+            // decode RSTR in "wresult" <key, value> pair
+            TryDecodeRSTR(response);
+            dispatch (endpoint MWBF.Server[GetHostFromHttpRequest(httpRequest)]) issues response;
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    
+    ~endpoint(HTTP.Server server)
+    {
+        isWSigninResponse = false;
+    }
+}
+
+// -------------------------------------- Messages ---------------------------------------------//
+message WSignMessage
+{
+    string wa;
+    optional (UriType | string) wreply;
+    optional any wres;
+    optional string wctx;
+    optional any wp;
+    optional string wct;
+    
+    override string ToString()
+    {
+        return "WSignin1.0 Request";
+    }
+};
+
+message WSignin10Request: WSignMessage
+{   
+    optional int ttpindex;
+    optional any wtrealm;
+    optional string wreq;
+
+    override string ToString()
+    {
+        string ret = "wsignin1.0 Request";
+        if (ttpindex != nothing)
+        {
+            ret += ", ttpindex: " + (ttpindex as string);
+        }
+        if (wtrealm != nothing)
+        {
+            ret += ", wtream: " + (wtrealm as string);
+        }
+        if (wreply != nothing)
+        {
+            ret += ", wreply: " + (wreply as string);
+        }
+        return ret;
+    }
+};
+
+message WSignin10Response : WSignMessage
+{
+    optional int ttpindex;
+    optional int ttpsize;
+    (MWBF.RequestSecurityTokenResponseType | string) wresult;
+
+    override string ToString()
+    {
+        string ret = this#IsReassembledResponse != nothing && (this#IsReassembledResponse as bool) ? "Reassembled wsignin1.0 Response" : "wsignin1.0 Response";
+        if (ttpindex != nothing)
+        {
+            ret += ", ttpindex: " + (ttpindex as string);
+        }
+        if (ttpsize != nothing)
+        {
+            ret += ", ttpsize: " + (ttpsize as string);
+        }
+        if (wresult is rstr:MWBF.RequestSecurityTokenResponseType
+            && rstr.RequestedSecurityToken is rst:MWBF.RequestedSecurityTokenType)
+        {
+            if (rst.Assertion != nothing)
+            {
+                ret += ", RequestedSecurityToken element contains Assertion element";
+            }
+            if (rst.EncryptedData != nothing)
+            {
+                ret += ", RequestedSecurityToken element contains EncryptedData element";
+            }
+        }
+
+        return ret;
+    }
+
+    // Clone itself
+    WSignin10Response Clone()
+    {
+        return new WSignin10Response
+                {
+                        wa = this.wa,
+                        wreply = this.wreply,
+                        wres = this.wres,
+                        wctx = this.wctx,
+                        wp = this.wp,
+                        wct = this.wct,
+                        ttpindex = this.ttpindex,
+                        ttpsize = this.ttpsize,
+                        wresult = this.wresult
+                };
+    }
+};
+
+message WSignout10Request: WSignMessage
+{
+    override string ToString()
+    {
+        return "wsignout1.0 Request";
+    }
+};
+
+message WSignoutCleanup10Request: WSignMessage
+{
+    override string ToString()
+    {
+        return "wsignoutcleanup1.0 Request";
+    }
+};
+
+//----------------------------------------- Types ---------------------------------------------//
+// MS-MWBE 2.2.3.2 WindowsIndentifiers Structure
+type WindowsIndentifiers
+{
+    WindowsIdentifierFlags WindowsIdentifierFlags
+        where ValidationCheckCombinationValueIncludeZero(InRange<MWBF.WindowsIdentifierFlags>(value), null, true, Utility.ReferenceType.Type,
+                    "MWBF", "WindowsIdentifierFlags", "WindowsIndentifiers", "0x00000040, 0x00000020", value);
+    uint PackedSidsCount 
+        where ValidationCheckGreaterThan(value != 0, null, true, Utility.ReferenceType.Type, "MWBF", "PackedSidsCount", "WindowsIndentifiers", 0, value);
+    array<PACKED_SIDs> PackedSids with BinaryEncoding{Length = PackedSidsCount};
+};
+
+// 2.2.3.2.1   WindowsIdentifierFlags Structure
+pattern WindowsIdentifierFlags = flags uint
+{
+    TryLocalAccount = 0x00000040,
+    NoUserSid = 0x00000020,
+    ...
+};
+
+// 2.2.3.2.2   PACKED_SIDs Structure
+type PACKED_SIDs
+{
+    DTYP.SID DomainSid;
+    uint RidCount
+        where ValidationCheckGreaterThan(value != 0, null, true, Utility.ReferenceType.Type, "MWBF", "RidCount", "PACKED_SIDs", 0, value);
+    array<uint> RID with BinaryEncoding{Length = RidCount};
+};
+
+// restriction to SAMLCore.RequestSecurityTokenResponseType
+type RequestSecurityTokenResponseType
+{
+    optional TokenType TokenType with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RequestType RequestType with XmlEncoding{Namespace = WSTrustNamespace};
+    MWBF.RequestedSecurityTokenType RequestedSecurityToken with XmlEncoding{Namespace = WSTrustNamespace};
+    optional MWBF.AppliesTo AppliesTo with XmlEncoding{Namespace = WSTrust.Wsp};
+    optional RequestedReferenceType RequestedAttachedReference with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RequestedReferenceType RequestedUnattachedReference with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RequestedProofTokenType RequestedProofToken with XmlEncoding{Namespace = WSTrustNamespace};
+    optional EntropyType Entropy with XmlEncoding{Namespace = WSTrustNamespace};
+    optional LifetimeType Lifetime with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RequestedTokenCancelledType RequestedTokenCancelled with XmlEncoding{Namespace = WSTrustNamespace};
+    optional StatusType Status with XmlEncoding{Namespace = WSTrustNamespace};
+    optional AllowPostdatingType AllowPostdating with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RenewingType Renewing with XmlEncoding{Namespace = WSTrustNamespace};
+    optional SignChallengeType SignChallenge with XmlEncoding{Namespace = WSTrustNamespace};
+    optional SignChallengeType SignChallengeResponse with XmlEncoding{Namespace = WSTrustNamespace};
+    optional BinaryExchangeType BinaryExchange with XmlEncoding{Namespace = WSTrustNamespace};
+    optional RequestKETType RequestKET with XmlEncoding{Namespace = WSTrustNamespace};
+    optional KeyExchangeTokenType KeyExchangeToken with XmlEncoding{Namespace = WSTrustNamespace};
+    optional OnBehalfOfType OnBehalfOf with XmlEncoding{Namespace = WSTrustNamespace};
+    optional WSA2004.EndpointReferenceType Issuer with XmlEncoding{Namespace = WSAddressing2004Namespace};
+    optional AuthenticationType AuthenticationType with XmlEncoding{Namespace = WSTrustNamespace};
+    optional AuthenticatorType Authenticator with XmlEncoding{Namespace = WSTrustNamespace};
+    optional KeyType KeyType with XmlEncoding{Namespace = WSTrustNamespace};
+    optional KeySize KeySize with XmlEncoding{Namespace = WSTrustNamespace};
+    optional SignatureAlgorithm SignatureAlgorithm with XmlEncoding{Namespace = WSTrustNamespace};
+    optional EncryptionType Encryption with XmlEncoding{Namespace = WSTrustNamespace};
+    optional EncryptionAlgorithm EncryptionAlgorithm with XmlEncoding{Namespace = WSTrustNamespace};
+    optional CanonicalizationAlgorithm CanonicalizationAlgorithm with XmlEncoding{Namespace = WSTrustNamespace};
+    optional ProofEncryptionType ProofEncryption with XmlEncoding{Namespace = WSTrustNamespace};
+    optional UseKeyType UseKey with XmlEncoding{Namespace = WSTrustNamespace};
+    optional SignWith SignWith with XmlEncoding{Namespace = WSTrustNamespace};
+    optional EncryptWith EncryptWith with XmlEncoding{Namespace = WSTrustNamespace};
+    optional DelegateToType DelegateTo with XmlEncoding{Namespace = WSTrustNamespace};
+    optional Forwardable Forwardable with XmlEncoding{Namespace = WSTrustNamespace};
+    optional Delegatable Delegatable with XmlEncoding{Namespace = WSTrustNamespace};
+    optional Policy Policy with XmlEncoding{Namespace = Wsp};
+    optional PolicyReference PolicyReference with XmlEncoding{Namespace = Wsp};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+    optional XSAnyURI Context with XmlEncoding{Kind = XmlKind.Attribute, Namespace = WSTrustNamespace};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type AppliesTo
+{
+    optional WSA2005.EndpointReferenceType EndpointReference2005 with XmlEncoding{Name = "EndpointReference", Namespace = WSAddressing2005Namespace};
+    optional WSA2004.EndpointReferenceType EndpointReference2004 with XmlEncoding{Name = "EndpointReference", Namespace = WSAddressing2004Namespace};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+    
+    invariant EndpointReference2005 != nothing || EndpointReference2004 != nothing;
+}
+
+// restriction to WSTrust.RequestedSecurityTokenType
+type RequestedSecurityTokenType
+{
+    optional string EncryptedKey with XmlEncoding{Namespace = Xenc};
+    optional MWBF.AssertionType Assertion with XmlEncoding{Namespace = SamlNamespace};
+    optional XMLEnc.EncryptedDataType EncryptedData with XmlEncoding{Namespace = XencNamespace};
+    optional xml AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// restriction to element <Assertion>
+type AssertionType
+{
+    XSInt MajorVersion
+        where ValidationCheckValue(value == 1, null, true, Utility.ReferenceType.Type, "MWBF", "MajorVersion", "AssertionType", 1, value) 
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSInt MinorVersion 
+        where ValidationCheckValue(value == 1, null, true, Utility.ReferenceType.Type, "MWBF", "MinorVersion", "AssertionType", 1, value) 
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSDId AssertionID with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Issuer with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSDDateTime IssueInstant with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    ConditionsType Conditions
+        where ValidationCheck(value.NotBefore != nothing, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_CONDITIONS_NOTBEFORE)
+            && ValidationCheck(value.NotOnOrAfter != nothing, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_CONDITIONS_NOTONORAFTER)
+            && ValidationCheck(value.AudienceRestrictionCondition == nothing
+               || (value.AudienceRestrictionCondition as array<AudienceRestrictionConditionType>).Count >= 1,
+                    null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_CONDITIONS_AUDIENCE_RESTRICTION_CONDITION)
+        with XmlEncoding{Namespace = SamlNamespace};
+    optional MWBF.AdviceType Advice with XmlEncoding{Namespace = SamlNamespace};
+    
+    // Future Reference: use Choice and IsWrapped aspect.
+    // Statements other than the AuthenticationStatement and the AttributeStatement MUST NOT be placed in the SAML assertion.
+    // The SAML assertion MUST contain one and only one AuthenticationStatement
+    AuthenticationStatementType AuthenticationStatement
+        where ValidationCheck(value.SubjectLocality == nothing, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_AUTHENTICATION_LOCALITY)
+            && ValidationCheck(value.AuthorityBinding == nothing, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_AUTHENTICATION_AUTHORITY_BINDING)
+        with XmlEncoding{Namespace = SamlNamespace};
+    optional AttributeStatementType AttributeStatement
+        where ValidationCheck(value == nothing || (value as AttributeStatementType).Attribute.Count > 0, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_ATTRIBUTES_ATTRIBUTE)
+            && ValidationCheck(value == nothing || (value as AttributeStatementType).Subject.CompareTo(AuthenticationStatement.Subject) == 0, null, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_ATTRIBUTES_AUTHENTICATION_SUBJECT)
+        with XmlEncoding{Namespace = SamlNamespace};
+    optional XMLDSig.SignatureType Signature with XmlEncoding{Namespace = DsNamespace};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// extension to <Advice>
+type AdviceType
+{
+    optional XSAnyURI ClaimSource;
+    optional XSAnyURI CookieInfoHash;
+    optional XSAnyURI WindowsUserIdentifier;
+    optional XSAnyURI WindowsUserName;
+    optional WindowsIndentifiers WindowsIdentifiers
+        with Encoding
+        {
+            Decoder = BinaryDecoder<WindowsIndentifiers>,
+            SourceConverter = Base64StringToBinary,
+            SourcePattern = TypeOf<string>()
+        };
+    
+    // Future Reference: use Choice and IsWrapped aspect.
+    optional AssertionIDReferenceType AssertionIDReference with XmlEncoding{Name = "AssertionIDReference", Namespace = SamlNamespace};
+    optional AssertionType Assertion with XmlEncoding{Name = "Assertion", Namespace = SamlNamespace};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All, Namespace = SamlNamespace};
+
+type MWBFDecodingCache
+{
+    string Buffer = "";
+    int totalSize = 0;
+    array<any message> Origins = [];
+
+    void Add(WSignin10Response response)
+    {
+        // assume that it is the response should be reassembled
+        if (response.ttpindex == nothing || response.ttpsize == nothing)
+        {
+            DisplayTopLevelMessage(response);
+            return;
+        }
+        
+        int index = response.ttpindex as int;
+        int size = response.ttpsize as int;
+        if (Buffer.Count != index || (totalSize != 0 && totalSize != size))
+        { // index and size information is incorrect
+            Reset(true);
+            return;
+        }
+        
+        totalSize = size;
+        Buffer += response.wresult as string;
+        Origins += [response];
+    }
+    
+    void Reset(bool failed)
+    {
+        if (failed)
+        {
+            foreach (var msg in Origins)
+            {
+                ValidationCheck(false, msg, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_SEGMENT_MISSING);
+                DisplayTopLevelMessage(msg);
+            }
+        }
+        Origins = [];
+        totalSize = 0;
+        Buffer = "";
+    }
+    
+    void ReassembleAndDispatch(MWBF.Server server)
+    {
+        if (Buffer.Count == totalSize)
+        {
+            WSignin10Response response = new WSignin10Response
+            {
+                wa = WSignin10WaString,
+                wresult = Buffer
+            };
+            response#IsReassembledResponse = true;
+            response.Origins = Origins;
+            
+            // 1. Base64 Decode wresult; 2. Decompress the data from step1; 3. UTF-8 Decode the data from step2
+            if (Base64StringToBinary(Buffer) is base64DecodedBinary:binary
+                && ZlibDecompress(base64DecodedBinary) is decompressedBinary: binary)
+            {
+                // XmlDecode RSTR
+                if (XmlDecoder<MWBF.RequestSecurityTokenResponseType>(decompressedBinary) is rstr:MWBF.RequestSecurityTokenResponseType)
+                {
+                    response.wresult = rstr;
+                    ValidationCheckOnWSignin10Response(response);
+                }
+            }
+        
+            dispatch server issues response;
+            
+            Reset(false);
+        }
+        else if (Buffer.Count > totalSize)
+        { // index & size information is incorrect
+            Reset(true);
+        }
+    }
+}
+
+//------------------------------------- Utilities ---------------------------------------------//
+// Try decode WSignin10Request, WSignin10Response(Reassemble), WSignout10Request & WSignoutCleanup10Request
+// from URI in HTTP request with GET method
+// If return nothing, cannot decoded as MWBF message, should reject http request
+// If return MWBF message, decoded as MWBF message, should dispatch to MWBF Server endpoint
+// If return map<string, any>, it is the segment of WSignin10Response, should be cached and reassembled.
+any TryDecodeFromUri(HTTP.UriType uri)
+{
+    if (uri.Query == nothing)
+    {
+        return nothing;
+    }
+
+    if (uri.Query is query:map<string, string>)
+    {
+        var parameters = ParsePercentEncodedQuery(query);
+        if (IsWSignin10Message(uri))
+        {
+            if (parameters.Keys["ttpindex"] 
+                && parameters.Keys["ttpsize"])
+            {// Segment of WSignin10Response
+                return CreateWSignin10Response(parameters);
+            }
+
+            // decode the parameters in the WSignin1.0 request
+            return CreateWSignin10Request(parameters);
+        }
+        else if (IsWSignout10Message(uri))
+        {
+            WSignout10Request request = new WSignout10Request();
+            AssignWSignMessageFields(request, parameters, "wsignout1.0 Request Message");
+            return request;
+        }
+        else if (IsWSignoutCleanup10Message(uri))
+        {
+            WSignoutCleanup10Request request = new WSignoutCleanup10Request();
+            AssignWSignMessageFields(request, parameters, "wsignoutcleanup1.0 Request Message");
+            return request;
+        }
+    }
+    return nothing;
+}
+
+// Try decode value of "wresult" in WSignin10Response 
+void TryDecodeRSTR(WSignin10Response wsResponse)
+{
+    // try decode value "wresult" as WSTrust.RequestSecurityTokenResponse(RSTR)
+    stream xmlStream = wsResponse.wresult as string;
+    if (XmlDecoder<MWBF.RequestSecurityTokenResponseType>(xmlStream) is rstr:MWBF.RequestSecurityTokenResponseType)
+    {
+        wsResponse.wresult = rstr;
+        ValidationCheckOnWSignin10Response(wsResponse);
+    }
+}
+
+void ValidationCheckOnWSignin10Response(WSignin10Response wsResponse)
+{
+    if (wsResponse.wresult is rstr:MWBF.RequestSecurityTokenResponseType)
+    {      
+        MWBF.RequestedSecurityTokenType rst = rstr.RequestedSecurityToken;
+        ValidationCheck(rst.Assertion != nothing || rst.EncryptedData != nothing, wsResponse, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_RST_CONTAIN_ASSERTION_OR_ENCRYPTEDDATA);
+        if (rst.Assertion is assertion:MWBF.AssertionType
+            && assertion.Conditions is conditions:ConditionsType
+            && conditions.AudienceRestrictionCondition != nothing)
+        {
+            array<AudienceRestrictionConditionType> audienceRestrictionConditions = 
+                conditions.AudienceRestrictionCondition as array<AudienceRestrictionConditionType>;
+            foreach(AudienceRestrictionConditionType audienceRestrictionCondition in audienceRestrictionConditions)
+            {
+                // The AudienceRestrictionCondition element MUST contain one and only one Audience element
+                ValidationCheck(audienceRestrictionCondition.Audience.Count == 1, wsResponse, DiagnosisLevel.Error, MWBF_WSIGNIN10RESPONSE_AUDIENCE_RESTRICTION_CONDITION_AUDIENCE);
+            }
+        }
+    }
+}
+
+// Try to decode WSignin10Response from HTML Form in Http Response Payload.
+optional WSignin10Response TryDecodeWSignin10ResponseFromHttpResponsePayload(HttpContract.Response httpResponse)
+{
+    // get HTML form from http response payload
+    stream htmlStream = httpResponse.Payload;
+    var v = HTML.GetHtmlFormStream(htmlStream);
+    if (v == nothing)
+    {
+        return nothing;
+    }
+    HTML.Form form = v as HTML.Form;
+    if (form.Method != "POST")
+    {
+        return nothing;
+    }
+
+    // construct WSignin10Response
+    map<string, string> parameters = {};
+    foreach(var input in form.Input)
+    {
+        if (input.Value == nothing || parameters.Keys[input.Name])
+        {
+            continue;
+        }
+        parameters[input.Name] = HtmlCharacterDecode(input.Value as string);
+    }
+    if (!("wa" in parameters && parameters["wa"] == "wsignin1.0"))
+    {
+        // if there is no "wa" parameter, return nothing
+        return nothing;
+    }
+
+    WSignin10Response response = CreateWSignin10Response(parameters);
+    TryDecodeRSTR(response);
+    return response;
+} 
+
+// check whether it is the MWBF message transported over http request
+bool IsMWBFMessageOverHttpRequest(HttpContract.Request request)
+{
+    switch (request.Method)
+    {
+        case "GET" =>
+            // when transported over http method GET, the MWBF message is in the URI
+            return IsWSignin10Message(request.Uri) 
+                || IsWSignout10Message(request.Uri)
+                || IsWSignoutCleanup10Message(request.Uri);
+        case "POST" =>
+            // when transported over http method POST, the MWBF message is in the Payload
+            if (request.Payload.Count < WSignin10WaLength)
+            {
+                return false;
+            }
+            binary b = Segment(request.Payload, 0, WSignin10WaLength);
+            return b == WSignin10WaBinary;
+         default=>
+            return false;
+    }
+}
+
+// check whether WSignin10 Request/Response message transported over URI
+bool IsWSignin10Message(HTTP.UriType uri)
+{
+    return uri.Query != nothing 
+        && uri.Query is query:map<string, string>
+        && WSWAString in query.Keys
+        && query[WSWAString] == WSignin10WaString;
+}
+
+// check whether WSignout10 Request message transported over URI
+bool IsWSignout10Message(HTTP.UriType uri)
+{
+    return uri.Query != nothing
+        && uri.Query is query:map<string, string>
+        && WSWAString in query.Keys
+        && query[WSWAString] == WSignout10WaString;
+}
+
+// check whether WSignoutCleanup10 Request message transported over URI
+bool IsWSignoutCleanup10Message(HTTP.UriType uri)
+{
+    return uri.Query != nothing
+        && uri.Query is query:map<string, string>
+        && WSWAString in query.Keys
+        && query[WSWAString] == WSignoutCleanup10WaString;
+}
+
+// check whether it is the MWBF response transported over http payload
+bool IsMWBFMessageOverHttpResponsePayload(HttpContract.Response httpResponse, ref bool isWSigninResponse)
+{
+    bool ret = isWSigninResponse && httpResponse.StatusCode == 200;
+    isWSigninResponse = false;
+    return ret;
+}
+
+// check whether it is the MWBF message transported over http redirect response
+bool IsMWBFMessageOverHttpResponseRedirect(HttpContract.Response response)
+{
+    if (response.StatusCode != 302 || !("Location" in response.Headers)
+        || !(response.Headers["Location"] is HTTP.UriType))
+    {
+        return false;
+    }
+    
+    HTTP.UriType uri = response.Headers["Location"] as HTTP.UriType;
+    return IsWSignin10Message(uri) 
+        || IsWSignout10Message(uri)
+        || IsWSignoutCleanup10Message(uri);
+}
+
+// Try decode the field value as URI
+optional UriType TryDecodedAsUri(WSignMessage m, string messageName, string fieldName, stream s)
+{
+    var fieldValue = HTTP.UriSyntax(s);
+    if (fieldValue == nothing)
+    {
+        ValidationCheck(false, m, DiagnosisLevel.Error, () => Format(MWBF_WSIGNIN10_URI_FORMAT, [fieldName, messageName]));
+        return nothing;
+    }
+    return fieldValue as UriType;
+}
+
+// Validatoin check of wsignin1.0 request message
+// section 2.2.3
+WSignin10Request CreateWSignin10Request(map<string, string> parameters)
+{
+    WSignin10Request request = new WSignin10Request();
+    AssignWSignMessageFields(request, parameters, "wsignin1.0 Request Message");
+
+    // ttpindex
+    request.ttpindex = parameters.Keys["ttpindex"] ? (parameters["ttpindex"] as int) : nothing;
+    // wtrealm
+    if(parameters.Keys["wtrealm"])
+    {
+        var wtrealm = TryDecodedAsUri(request, "wsignin1.0 Request Message", "wtrealm", parameters["wtrealm"]);
+        if(wtrealm == nothing)
+        {
+            request.wtrealm = parameters["wtrealm"];
+        }
+        else
+        {
+            UriType wtrealmValue = wtrealm as UriType;
+            request.wtrealm = wtrealmValue;
+        }
+    }
+    // wreq
+    request.wreq = parameters.Keys["wreq"] ? parameters["wreq"] : nothing;
+    return request;
+}
+
+// Create WSignin10Response from map table
+WSignin10Response CreateWSignin10Response(map<string, string> parameters)
+{
+    if(!parameters.Keys["wresult"])
+    {
+        ThrowDecodingException("MWBF", "wsignin1.0 Response Message");
+    }
+
+    WSignin10Response response = new WSignin10Response();
+    AssignWSignMessageFields(response, parameters, "wsignin1.0 Response Message");
+
+    response.ttpindex = parameters.Keys["ttpindex"] ? (parameters["ttpindex"] as int) : nothing;
+    response.ttpsize = parameters.Keys["ttpsize"] ? (parameters["ttpsize"] as int) : nothing;
+    response.wresult = parameters["wresult"];
+    response#IsReassembledResponse = false;
+
+    return response;
+}
+
+// Assign fields from map table to WSign Message
+void AssignWSignMessageFields(WSignMessage m, map<string, string> parameters, string messageName)
+{
+    if(!parameters.Keys["wa"])
+    {
+        ThrowDecodingException("MWBF", messageName);
+    }
+    
+    // wa
+    m.wa = parameters["wa"];
+    // wreply
+    if(parameters.Keys["wreply"])
+    {
+        var wreply = TryDecodedAsUri(m, messageName, "wreply", parameters["wreply"]);
+        if(wreply == nothing)
+        {
+            m.wreply = parameters["wreply"];
+        }
+        else
+        {
+            UriType wreplyValue = wreply as UriType;
+            m.wreply = wreplyValue;
+        }
+    }
+    // wres
+    if(parameters.Keys["wres"])
+    {
+        var wres = TryDecodedAsUri(m, messageName, "wres", parameters["wres"]);
+        if(wres == nothing)
+        {
+            m.wres = parameters["wres"];
+        }
+        else
+        {
+            UriType wresValue = wres as UriType;
+            m.wres = wresValue;
+        }
+    }
+    // wctx
+    m.wctx = parameters.Keys["wctx"] ? parameters["wctx"] : nothing;
+    // wp
+    if(parameters.Keys["wp"])
+    {
+        var wp = TryDecodedAsUri(m, messageName, "wp", parameters["wp"]);
+        if(wp == nothing)
+        {
+            m.wp = parameters["wp"];
+        }
+        else
+        {
+            UriType wpValue = wp as UriType;
+            m.wp = wpValue;
+        }
+    }
+    // wct
+    m.wct = parameters.Keys["wct"] ? parameters["wct"] : nothing;
+}
+
+string GetHostFromHttpRequest(HttpContract.Request httpRequest)
+{
+    if (httpRequest#DestinationAddress is hostName:string)
+    {
+        return hostName;
+    }
+    return "";
+}
+
+string GetHostFromHttpResponse(HttpContract.Response httpResponse)
+{
+    if (httpResponse#SourceAddress is hostName:string)
+    {
+        return hostName;
+    }
+    return "";
+}

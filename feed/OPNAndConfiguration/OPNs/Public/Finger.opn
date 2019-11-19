@@ -1,0 +1,142 @@
+protocol Finger
+    with StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Finger User Information Protocol",
+    ShortName = "Finger",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1288"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376094", Date = "03/30/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using IANA;
+
+endpoint Server
+    over TCP.Server
+    accepts Request issues Response;
+
+client endpoint Client connected to Server;
+
+autostart actor FingerOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+
+    process server accepts p:TCP.Segment where p.DestinationPort == Port.Finger
+    {
+        InitializeDecodingHelperIfNull();
+        decodingHelper.TryDecode(p, MessageDirection.Accepts);
+    }
+    process server issues p:TCP.Segment where p.SourcePort == Port.Finger
+    {
+        InitializeDecodingHelperIfNull();
+        decodingHelper.TryDecode(p, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+        }
+    }
+
+    void InitializeDecodingHelperIfNull()
+    {
+        if (decodingHelper == null)
+        {
+            TCP.TCPTextDecodingCache reqCache = new TCP.TCPTextDecodingCache();
+            reqCache.InitializeTextDecodingCache("Finger",
+                endpoint Server over server,
+                MessageDirection.Accepts,
+                (binary b) => (true as bool?), // isCurrentProtocol
+                () => CRLFBinary, // getEndMarkBinary
+                (stream s) => Q(s) as optional any message, // decodeSingleMessage
+                (binary b)=> Q(b) as optional any message // decodeIncompleteMessage
+            );
+            TCP.TCPDecodingCache resCache = new TCP.TCPDecodingCache();
+            resCache.Initialize("Finger",
+                endpoint Server over server,
+                MessageDirection.Issues,
+                (binary b) => (true as bool?), // isCurrentProtocol
+                IsSufficientForSingleResponseMsg, // isSufficientForSingleMsg
+                (stream s) => Fields(s) as optional any message, // decodeSingleMessage
+                (binary b)=> Fields(b) as optional any message // decodeIncompleteMessage
+            );
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.AcceptsCache = reqCache;
+            decodingHelper.IssuesCache = resCache;
+        }
+    }
+
+    uint? IsSufficientForSingleResponseMsg(binary data)
+    {
+        int cnt = data.Count;
+        if (cnt < 2) return null;
+        return (data[cnt - 2] == 0x0D && data[cnt - 1] == 0x0A) ? 0 : null; // the last 2 bytes must be CRLF($[0D0A])
+    }
+}
+
+message Request
+{
+    string RequestCommandLine;
+    override string ToString()
+    {
+        return "Finger Request" + (RequestCommandLine.Count == 0 ? "" : ", Command: " + RequestCommandLine);
+    }
+}
+
+message Response
+{
+    array<string> FingerInformationReturn with DisplayInfo{ToText = MergeFingerInformation};
+
+    override string ToString()
+    {
+        return "Finger Response" + (FingerInformationReturn.Count > 0 ? ", User Information: " + FingerInformationReturn[0] + " ..." : "");
+    }
+
+    string MergeFingerInformation(any s)
+    {
+        string str = "";
+        if (s is arr:array<string>)
+        {
+            foreach (var item in arr)
+            {
+                str += item + "\r\n";
+            }
+        }
+        return str;
+    }
+}
+
+syntax CRLF = "\r\n";
+syntax Token = s:regex{[^\r\n@]*} => s;
+syntax UserName = Token;
+syntax HostName = Token;
+syntax H = "@" HostName;
+syntax U = UserName;
+syntax S = " ";
+syntax SP = S+;
+
+// Request:::::::::::::::::::::::::::::::
+syntax Q1 = SP? s:UserName CRLF => s;
+syntax Q2 = SP? u:UserName h:H+ CRLF => (u + ConvertStringArrayToString(h));
+syntax Q = u:(Q1 | Q2)  => new Request{RequestCommandLine = u};
+
+// Response::::::::::::::::::::::::::::::
+syntax Field = s:Token CRLF => s;
+syntax Fields = s:Field+ => new Response{FingerInformationReturn = s};
+
+const binary CRLFBinary = $[0D0A];

@@ -1,0 +1,140 @@
+protocol AH
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "IP Authentication Header",
+    ShortName = "AH",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2402"},
+            new Reference{Name = "RFC 1700"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "377030", Date = "04/17/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using IPv4;
+using IPv6;
+using TCP;
+using UDP;
+using ICMP;
+using GRE;
+
+annotation binary AH.Msg#SourceAddress;
+annotation binary AH.Msg#DestinationAddress;
+
+endpoint Node
+      over IPv4.Node
+    | over GRE.Node 
+    accepts Msg;
+
+autostart actor AHOverIPv4(IPv4.Node node)
+{
+    process node accepts p:IPv4.Datagram where (p.Protocol == ProtocolType.AH)
+    {
+        switch (p.Payload)
+        {
+            case a:AH.Msg from BinaryDecoder<AH.Msg> =>
+                a#SourceAddress = p.SourceAddress.FlatAddress;
+                a#DestinationAddress = p.DestinationAddress.FlatAddress;
+                dispatch endpoint Node over node accepts a;
+            default =>
+                ThrowDecodingException("AHOverIPv4");
+        }
+    }
+}
+
+autostart actor AHOverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.AH)
+    {
+        switch (p.Payload)
+        {
+            case d:AH.Msg from BinaryDecoder<AH.Msg> =>
+                dispatch endpoint Node over node accepts d;
+            default =>
+                ThrowDecodingException("AHOverGRE");
+        }
+    }
+}
+
+// AH is inserted after the IP header and before an upper layer protocol, e.g., TCP, UDP, ICMP, etc. or before any other IPsec headers that have already been inserted.
+autostart actor TCPOverAH(AH.Node node)
+{
+    TcpEndpointHelper eptHelper = new TcpEndpointHelper{};
+
+    process node accepts p:AH.Msg where p.NextHeader == ProtocolType.TCP
+    {
+        DecodeAndDispatchSegment(eptHelper, p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload);
+    }
+}
+
+autostart actor UDPOverAH(AH.Node node)
+{
+    process node accepts p:AH.Msg where p.NextHeader == ProtocolType.UDP
+    {
+        UDP.DecodeDatagram(p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload);
+    }
+}
+
+autostart actor IPv4OverAH(AH.Node node)
+{
+    process node accepts p:AH.Msg where (p.NextHeader == ProtocolType.IPv4)
+    {
+        switch (p.Payload)
+        {
+            case d:IPv4.Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPv4OverAH");
+        }
+    }
+}
+
+autostart actor IPv6OverAH(AH.Node node)
+{
+    process node accepts p:AH.Msg where (p.NextHeader == ProtocolType.IPv6)
+    {
+        switch (p.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv6OverAH");
+        }
+    }
+}
+
+autostart actor ICMPOverAH(AH.Node node)
+{
+    process node accepts p:AH.Msg where (p.NextHeader == ProtocolType.ICMP)
+    {
+        ICMP.DecodeDatagram(p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload, false);
+    }
+}
+
+message Msg
+{
+    ProtocolType NextHeader;
+    byte PayloadLength;
+    short Reserved where ValidationCheck(value == 0, this, "Value of Reserved must be zero.");
+    uint SecurityParametersIndex where ValidationCheck(value > 255, this, "Value of SPI less than or equal to 255 is reversed.");
+    uint SequenceNumber;
+    binary AuthenticationData with BinaryEncoding{Length = ((PayloadLength + 2) * 4 - 12)};
+    binary Payload;
+    
+    override string ToString()
+    {
+        return "Next Protocol = " + NextHeader.Name + ", " + "SPI = " + (SecurityParametersIndex as string) + ", " + "Seq = " + (SequenceNumber as string);
+    }
+}

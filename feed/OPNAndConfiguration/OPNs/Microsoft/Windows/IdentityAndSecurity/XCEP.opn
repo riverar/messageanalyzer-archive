@@ -1,0 +1,349 @@
+protocol XCEP with 
+XmlEncodingDefaults{Namespace = XcepNamespace},
+Documentation
+{
+    ProtocolName = "X.509 Certificate Enrollment Policy Protocol",
+    ShortName = "XCEP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "MS-XCEP", Version = "8.0", Date = "01/31/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="371750", Date="12/02/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using SOAP;
+using Technologies.SOAP;
+using XSD;
+
+endpoint Server 
+    over IntermediateServer
+    provides OperationContract;
+client endpoint Client connected to Server;
+
+// Intermidiate layer
+endpoint IntermediateServer 
+    over SOAP.Server 
+    provides MessageContract;
+client endpoint IntermidiateClient connected to IntermediateServer;
+
+autostart actor XCEPOverSOAP(SOAP.Server node)
+{
+    //GetPolicies message
+    process node accepts soap:SOAP.SoapMessage where soap.WsaAction == XcepGetPoliciesAction && soap.Body != null
+    {
+        switch (soap.Body)
+        {
+            case m:MessageContract.GetPolicies from XmlDecoder<MessageContract.GetPolicies> =>
+                dispatch (endpoint IntermediateServer over node) accepts m;
+            default =>
+                ThrowDecodingException("GetPolicies");
+        }
+    }
+    
+    //GetPoliciesResponse message
+    process node issues soap:SOAP.SoapMessage where soap.WsaAction == XcepGetPoliciesResponseAction && soap.Body != null
+    {
+        switch (soap.Body)
+        {
+            case m:MessageContract.GetPoliciesResponse from XmlDecoder<MessageContract.GetPoliciesResponse> =>
+                dispatch (endpoint IntermediateServer over node) issues m;
+            default =>
+                ThrowDecodingException("GetPoliciesResponse");
+        }
+    }
+}
+
+autostart actor OperationActor(IntermediateServer node)
+{
+    MessageContract.GetPolicies getPolicies = null;
+    
+    ~endpoint(IntermediateServer node)
+    {
+        if (getPolicies != null)
+        {
+            ReportInsufficientOperation(getPolicies, "XCEP", "GetPoliciesOp", false);
+            release getPolicies;
+        }
+
+        getPolicies = null;
+    }
+
+    //GetPolicies Request
+    process node accepts req:MessageContract.GetPolicies
+    {
+        if (getPolicies == null)
+        {
+            getPolicies = req;
+        }
+        else
+        {
+            ValidationCheck(false, getPolicies, "Incomplete GetPolicies operation due to missing GetPolicies response.");
+            DisplayTopLevelMessage(getPolicies);
+            getPolicies = req;
+        }
+    }
+    
+    // GetPoliciesResponse
+    process node issues res:MessageContract.GetPoliciesResponse
+    {
+        if (getPolicies == null)
+        {
+            ValidationCheck(false, res, "Incomplete GetPolicies operation due to missing GetPolicies request.");
+            reject;
+        }
+        else
+        {
+            var getPoliciesOp = new OperationContract.GetPoliciesOp
+            {
+                Client = getPolicies.GetPolicies.Client,
+                RequestFilter = getPolicies.GetPolicies.RequestFilter,
+                
+                Response = res.GetPoliciesResponse.Response,
+                CAs = res.GetPoliciesResponse.CAs,
+                OIDs = res.GetPoliciesResponse.OIDs,
+            };
+            getPoliciesOp.Origins = [getPolicies as any message, res as any message];
+            getPolicies = null;
+            dispatch (endpoint Server over node) accepts getPoliciesOp;
+        }
+    }
+}
+
+contract OperationContract
+{
+    accepts operation GetPoliciesOp
+    {
+        in ClientType Client;
+        in optional RequestFilterType RequestFilter;
+        out optional ResponseType Response;
+        out optional CACollection CAs;
+        out optional OIDCollection OIDs;
+        
+        override string ToString()
+        {
+            return "XCEP.GetPolicies Operation";
+        }
+    } with SoapMessageInfo{
+                Action = XcepGetPoliciesAction,
+                ReplyAction = XcepGetPoliciesResponseAction};
+}
+
+// Message contract
+contract MessageContract
+{
+    accepts message GetPolicies
+    {
+        GetPoliciesType GetPolicies with XmlEncoding{Name = "GetPolicies"};
+    }
+    issues message GetPoliciesResponse
+    {
+        GetPoliciesResponseType GetPoliciesResponse with XmlEncoding{Name = "GetPoliciesResponse"}; 
+    }
+}
+
+type GetPoliciesType
+{
+    ClientType Client with XmlEncoding{Name = "client"};
+    optional RequestFilterType RequestFilter with XmlEncoding{Name = "requestFilter"};
+}
+
+type ClientType
+{
+    optional XSDatatime LastUpdate with XmlEncoding{Name = "lastUpdate"};
+    optional XSLanguage PreferredLanguage with XmlEncoding{Name = "preferredLanguage"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type RequestFilterType
+{
+    optional FilterOIDCollectionType PolicyOIDs with XmlEncoding{Name = "policyOIDs"};
+    optional int ClientVersion with XmlEncoding{Name = "clientVersion"};
+    optional int ServerVersion with XmlEncoding{Name = "serverVersion"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type FilterOIDCollectionType
+{
+    optional array<string> Oid with XmlEncoding{Name = "oid"};
+}
+
+type GetPoliciesResponseType
+{
+    optional ResponseType Response with XmlEncoding{Name = "response"};
+    optional CACollection CAs with XmlEncoding{Name = "cAs"};
+    optional OIDCollection OIDs with XmlEncoding{Name = "oIDs"};
+}
+
+type ResponseType
+{
+    string PolicyID with XmlEncoding{Name = "policyID"};
+    optional string PolicyFriendlyName with XmlEncoding{Name = "policyFriendlyName"};
+    uint NextUpdateHours with XmlEncoding{Name = "nextUpdateHours"};
+    optional string PoliciesNotChanged with XmlEncoding{Name = "policiesNotChanged"};
+    PolicyCollection Policies with XmlEncoding{Name = "policies"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type PolicyCollection
+{
+    array<CertificateEnrollmentPolicy> Policy with XmlEncoding{Name = "policy"};
+}
+
+type CertificateEnrollmentPolicy
+{
+    int PolicyOIDReference with XmlEncoding{Name = "policyOIDReference"};
+    optional CAReferenceCollection CAs with XmlEncoding{Name = "cAs"};
+    AttributesType Attributes with XmlEncoding{Name = "attributes"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type CAReferenceCollection
+{
+    array<int> CAReference with XmlEncoding{Name = "cAReference"};
+}
+
+type AttributesType
+{
+    string CommonName with XmlEncoding{Name = "commonName"};
+    uint PolicySchema with XmlEncoding{Name = "policySchema"};
+    CertificateValidityType CertificateValidity with XmlEncoding{Name = "certificateValidity"};
+    EnrollmentPermission Permission with XmlEncoding{Name = "permission"};
+    PrivateKeyAttributesType PrivateKeyAttributes with XmlEncoding{Name = "privateKeyAttributes"};
+    RevisionType Revision with XmlEncoding{Name = "revision"};
+    optional SupersededPoliciesType SupersededPolicies with XmlEncoding{Name = "supersededPolicies"};
+    optional uint PrivateKeyFlags with XmlEncoding{Name = "privateKeyFlags"};
+    optional uint SubjectNameFlags with XmlEncoding{Name = "subjectNameFlags"};
+    optional uint EnrollmentFlags with XmlEncoding{Name = "enrollmentFlags"};
+    optional uint GeneralFlags with XmlEncoding{Name = "generalFlags"};
+    optional int HashAlgorithmOIDReference with XmlEncoding{Name = "hashAlgorithmOIDReference"};
+    optional RARequirementsType RARequirements with XmlEncoding{Name = "rARequirements"};
+    optional KeyArchivalAttributesType KeyArchivalAttributes with XmlEncoding{Name = "keyArchivalAttributes"};
+    optional ExtensionCollectionType ExtensionCollection with XmlEncoding{Name = "extensions"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type CertificateValidityType
+{
+    ulong ValidityPeriodSeconds with XmlEncoding{Name = "validityPeriodSeconds"};
+    ulong RenewalPeriodSeconds with XmlEncoding{Name = "renewalPeriodSeconds"};
+}
+
+type EnrollmentPermission
+{
+    string Enroll with XmlEncoding{Name = "enroll"};
+    string AutoEnroll with XmlEncoding{Name = "autoEnroll"};
+}
+
+type PrivateKeyAttributesType
+{
+    uint MinimalKeyLength with XmlEncoding{Name = "minimalKeyLength"};
+    optional uint KeySpec with XmlEncoding{Name = "keySpec"};
+    optional uint KeyUsageProperty with XmlEncoding{Name = "keyUsageProperty"};
+    optional string Permissions with XmlEncoding{Name = "permissions"};
+    optional int AlgorithmOIDReference with XmlEncoding{Name = "algorithmOIDReference"};
+    optional CryptoProvidersType CryptoProviders with XmlEncoding{Name = "cryptoProviders"};
+}
+
+type CryptoProvidersType
+{
+    array<string> Provider with XmlEncoding{Name = "provider"};
+}
+
+type RevisionType
+{
+    uint MajorRevision with XmlEncoding{Name = "majorRevision"};
+    optional uint MinorRevision with XmlEncoding{Name = "minorRevision"};
+}
+
+type SupersededPoliciesType
+{
+    array<string> CommonName with XmlEncoding{Name = "commonName"};
+}
+
+type RARequirementsType
+{
+    uint RASignatures with XmlEncoding{Name = "rASignatures"};
+    optional OIDReferenceCollection RAEKUs with XmlEncoding{Name = "rAEKUs"};
+    optional OIDReferenceCollection RAPolicies with XmlEncoding{Name = "rAPolicies"};
+}
+
+type OIDReferenceCollection
+{
+    array<int> OIDReference with XmlEncoding{Name = "oIDReference"};
+}
+
+type KeyArchivalAttributesType
+{
+    int SymmetricAlgorithmOIDReference with XmlEncoding{Name = "symmetricAlgorithmOIDReference"};
+    uint SymmetricAlgorithmKeyLength with XmlEncoding{Name = "symmetricAlgorithmKeyLength"};
+}
+
+type ExtensionCollectionType
+{
+    array<ExtensionType> Extension with XmlEncoding{Name = "extension"};
+}
+
+type ExtensionType
+{
+    int OIDReference with XmlEncoding{Name = "oIDReference"};
+    optional string Critical with XmlEncoding{Name = "critical"};
+    optional string Value with XmlEncoding{Name = "value"};
+}
+
+type CACollection
+{
+    array<CAType> CA with XmlEncoding{Name = "cA"};
+}
+
+type CAType
+{
+    CAURICollectionType Uris with XmlEncoding{Name = "uris"};
+    string Certificate with XmlEncoding{Name = "certificate"};
+    string EnrollPermission with XmlEncoding{Name = "enrollPermission"};
+    int CAReferenceID with XmlEncoding{Name = "cAReferenceID"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type CAURICollectionType
+{
+    array<CAURIType> CAURI with XmlEncoding{Name = "cAURI"};
+}
+
+type CAURIType
+{
+    uint ClientAuthentication with XmlEncoding{Name = "clientAuthentication"};
+    XSAnyURI URI with XmlEncoding{Name = "uri"};
+    optional uint Priority with XmlEncoding{Name = "priority"};
+    optional string RenewalOnly with XmlEncoding{Name = "renewalOnly"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+
+type OIDCollection
+{
+    array<OIDType> OID with XmlEncoding{Name = "oID"};
+}
+
+type OIDType
+{
+    string Value with XmlEncoding{Name = "value"};
+    uint Group with XmlEncoding{Name = "group"};
+    int OIDReferenceID with XmlEncoding{Name = "oIDReferenceID"};
+    optional string DefaultName with XmlEncoding{Name = "defaultName"};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+// Constant declaration: namespace for MS-XCEP
+const string XcepNamespace = "http://schemas.microsoft.com/windows/pki/2009/01/enrollmentpolicy";
+const string XcepGetPoliciesAction = XcepNamespace + "/IPolicy/GetPolicies";
+const string XcepGetPoliciesResponseAction = XcepNamespace + "/IPolicy/GetPoliciesResponse";

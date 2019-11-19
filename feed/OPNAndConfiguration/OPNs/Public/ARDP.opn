@@ -1,0 +1,523 @@
+protocol ARDP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "AllJoyn Reliable Data Protocol",
+    ShortName = "ARDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "AllJoyn Source Code", Link = "https://git.allseenalliance.org/cgit/core/alljoyn.git/", Version = "15.04"},
+            new Reference{Name = "AllJoyn System Description", Link = "https://allseenalliance.org/developers/learn/core/system-description", Version = "15.04"},
+            new Reference{Name = "RFC 908"},
+            new Reference{Name = "RFC 1151"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376105", Date = "03/30/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+using Diagnostics;
+using PublicResources;
+
+// Annotation
+annotation bool Packet#SegmentLost;
+
+endpoint Server
+    over OrderingServer
+    accepts Packet issues Packet;
+
+autostart actor ARDPOverUDP(UDP.Host host)
+{
+    // In AllJoyn real implementation, both UDP peers could use the same port number(9955). 
+    // From parsing perspective, in this case we cannot distinguish client/server from UDP layer by comparing port. 
+    // We have to distinguish client/server role by checking ARDP handshaking message, like what we do for TCP.
+    // If handshaking message miss in capturing, checking ARDP.Payload for AllJoyn request.
+
+    // client port + destination port
+    set<uint> clientFirstIndentifers = {}; // Record client port, the port is abstract port in ARDP protocol instead of UDP port.
+    process host accepts d:UDP.Datagram where (d.DestinationPort == Port.$"AllJoyn-STM" || d.SourcePort == Port.$"AllJoyn-STM") && d.Payload.Count > 0 
+    {
+        switch (d.Payload)
+        {
+            case m:Packet from BinaryDecoder<Packet> =>
+                DispatchMessage(m);
+            default => 
+                ThrowDecodingException("ARDP", "Packet");
+        }
+    }
+
+    void DispatchMessage(Packet p)
+    {
+        if (p.Flags.SYN && !p.Flags.ACK) // first SYN (client -> server), destination port of first SYN is 0.
+        {
+            dispatch (endpoint OrderingServer[p.SourcePort] over host) accepts p;
+        }
+        else if (p.Flags.SYN && p.Flags.ACK) // second SYN (server -> client)
+        {
+            uint clintPortFirst = ((p.DestinationPort as uint) << 16) + p.SourcePort;
+            clientFirstIndentifers[clintPortFirst] = true;
+            dispatch (endpoint OrderingServer[p.DestinationPort] over host) issues p;
+        }
+        else // data exchange message.
+        {
+            uint srcFirst = ((p.SourcePort as uint) << 16) + p.DestinationPort;
+            uint destFirst = ((p.DestinationPort as uint) << 16) + p.SourcePort;
+            if (srcFirst in clientFirstIndentifers) // request, (client -> server)
+            {
+                dispatch (endpoint OrderingServer[p.SourcePort] over host) accepts p;
+                if (p.Flags.RST)
+                {
+                    clientFirstIndentifers[srcFirst] = false;
+                }
+            }
+            else if (destFirst in clientFirstIndentifers) // response , (server -> client)
+            {
+                dispatch (endpoint OrderingServer[p.DestinationPort] over host) issues p;
+                if (p.Flags.RST)
+                {
+                    clientFirstIndentifers[destFirst] = false;
+                }
+            }
+            else // handshaking messages are lost, checking AllJoyn request
+            {
+                // second byte of p.Payload is AllJoyn 'MessageType'
+                if (p.Payload.Count > 2 && p.Payload[1] is ajMsgType:byte && ajMsgType == 1) // value '1' represents AllJoyn 'METHOD_CALL' message type.
+                {
+                    clientFirstIndentifers[srcFirst] = true;
+                    dispatch (endpoint OrderingServer[p.SourcePort] over host) accepts p;
+                }
+                else
+                {
+                    dispatch (endpoint OrderingServer[p.DestinationPort] over host) issues p;
+                }
+            }
+        }
+    }
+}
+
+// Multiple connection could established at the same over one UDP connection, so need to add ARDP port in endpoint index.
+// The destination port of first SYN message is 0, so only use client port in endpoint index.
+endpoint OrderingServer[ushort ClientPort]
+    over UDP.Host
+    accepts Packet issues Packet
+{
+    TCB rcvTCB = new TCB{Dispatcher = AcceptDispatcher};
+    TCB sndTCB = new TCB{Dispatcher = IssueDispatcher};
+
+    process this accepts s:Packet
+    {
+        if (!rcvTCB.Initialized) 
+            rcvTCB.Initialize(s);
+        sndTCB.AckNumber = s.AcknowledgementNumber;
+
+        if (s.Payload.Count == 0) 
+        {
+            rcvTCB.HandlePureAckSegment(s, sndTCB);
+        }
+        else
+        {
+            sndTCB.HandleDataSegment(null);
+            rcvTCB.HandleDataSegment(s);
+        }
+    }
+
+    process this issues s:Packet
+    {
+        if (!sndTCB.Initialized) 
+            sndTCB.Initialize(s);
+        rcvTCB.AckNumber = s.AcknowledgementNumber;
+
+        if (s.Payload.Count == 0)
+        {
+            sndTCB.HandlePureAckSegment(s, rcvTCB);
+        }
+        else
+        {
+            rcvTCB.HandleDataSegment(null);
+            sndTCB.HandleDataSegment(s);
+        }
+    }
+
+    // destructor
+    ~endpoint(OrderingServer server)
+    {
+        rcvTCB.Clear(true);
+        sndTCB.Clear(true);
+    }
+
+    void AcceptDispatcher(Packet s)
+    {
+        dispatch endpoint Server over this accepts s;
+    }
+
+    void IssueDispatcher(Packet s)
+    {
+        dispatch endpoint Server over this issues s;
+    }
+}
+
+// alljoyn\alljoyn_core\router\UDPTransport.cc"
+// alljoyn\alljoyn_core\router\ArdpProtocol.cc, search "ArdpSynHeader", "MarshalSynHeader", "SendSyn"
+// alljoyn\alljoyn_core\router\ArdpProtocol.cc, search "ArdpHeader", "MarshalHeader", "SendMsgData", "SendMsgHeader"
+message Packet
+{
+    Flags Flags;
+    byte HeaderLength; /* Length of the header in units of two octets (number of uint16_t) */
+    ushort SourcePort; /* Used to distinguish between multiple connections on the local side. */
+    ushort DestinationPort; /* Used to distinguish between multiple connections on the foreign side. */
+    ushort DataLength; /* The length in octets of the data in this segment, not include the RDP header. */
+    /*
+     Each time a segment containing data is transmitted, the sequence number is incremented.
+     Segments containing no data do not increment the sequence number. However, the SYN and NUL segments, which cannot contain data, are exceptions.
+    */
+    uint SequenceNumber; /* The sequence number of the current segment. */
+    uint AcknowledgementNumber; /* The number of the segment that the sender of this segment last received correctly and in sequence. */
+    // Fields of SYN packet
+    optional [|Flags.SYN|] ushort LocalReceiveWindowSize; /* The maximum number of outstanding segments the other side can send without acknowledgement. */
+    optional [|Flags.SYN|] ushort MaximumSizeOfReceivableDatagram;  /* The maximum segment size we are willing to receive.  (the RBUF.MAX specified by the user calling open). */
+    optional [|Flags.SYN|] uint DeleyedACKTimeout; /* Receiver's delayed ACK timeout. Used in TTL estimate prior to sending a message. */
+    optional [|Flags.SYN|] ushort Options; /* Options for the connection.  Always Sequenced Delivery Mode (SDM). */
+    // Field of non-SYN packet
+    optional [|!Flags.SYN && Flags.ACK|] uint TimeToLive; /* Time-to-live.  Zero means forever. */
+    optional [|!Flags.SYN && Flags.ACK|] uint LastConsumedSequenceNumber; /* Last "in-order" consumed segment. */
+    optional [|!Flags.SYN && Flags.ACK|] uint AcknowledgeNext; /* First unexpired segment, TTL accounting */
+    optional [|!Flags.SYN && Flags.ACK|] uint StartOfMessageSequence; /* Start sequence number for fragmented message */
+    optional [|!Flags.SYN && Flags.ACK|] ushort FragmentCount; /* Number of segments comprising fragmented message */
+    ushort Reserved;
+
+    optional [|Flags.EAK && HeaderLength * 2 > FIXED_HEADER_LEN_OF_DATA_PACKET|] binary ExtendedAckBuffer 
+            with BinaryEncoding{Length = HeaderLength * 2 - FIXED_HEADER_LEN_OF_DATA_PACKET};
+    binary Payload with Encoding{Offset = HeaderLength * 2, Size = DataLength};
+
+    override string ToString()
+    {
+        return ((FragmentCount is cnt:ushort && cnt > 1) ? "[Fragment] " : "") +
+            "Flags: " + Flags.ToString() + 
+            ", SourcePort: " + SourcePort.ToString() + ", DestinationPort: " + DestinationPort.ToString() + 
+            ", DataLength: " + DataLength.ToString() + ", SequenceNumber: " + SequenceNumber.ToString() +
+            ", Ack: " + AcknowledgementNumber.ToString();
+    }
+}
+
+const byte FIXED_HEADER_LEN_OF_DATA_PACKET = 36;
+
+type Flags
+{
+    byte VersionNumber with BinaryEncoding{Width = 2};
+    bool Unused with BinaryEncoding{Width = 1};
+    bool NUL with BinaryEncoding{Width = 1};    // This is a null (zero data length) segment.
+    bool RST with BinaryEncoding{Width = 1};    // Reset the connection.
+    bool EAK with BinaryEncoding{Width = 1};    // Non-cumulative (Extended) acknowledgement.
+    bool ACK with BinaryEncoding{Width = 1};    // Acknowledge field significant.
+    bool SYN with BinaryEncoding{Width = 1};    // Establish connection and synchronize sequence numbers.
+
+    override string ToString()
+    {
+        string ret = "";
+        if (SYN)
+            ret += "|SYN";
+        if (ACK)
+            ret += "|ACK";
+        if (EAK)
+            ret += "|EAK";
+        if (RST)
+            ret += "|RST";
+        if (NUL)
+            ret += "|NUL";
+
+        if (ret.Count > 0)
+            return ret.Segment(1) + ", Version: " + VersionNumber.ToString();
+        else
+            return "Version: " + VersionNumber.ToString();
+    }
+}
+
+// When count of packets cached reaches the limit, force dispatching.
+const int CountOfPacketToTriggerReassembly = 100;
+
+// Reliable UDP transmission control block
+type TCB
+{
+    bool Initialized = false;
+
+    void(Packet) Dispatcher;
+    // The list cached the out-of-order messages
+    SortedLinkedList<Packet> OutOfOrderList = new SortedLinkedList{Comparer = (Packet x, Packet y) => SequenceComparer(x.SequenceNumber, y.SequenceNumber)};
+    // Cache fragments of a complete messages.
+    array<Packet> Fragments = [];
+    // Keep the next sequence number of current direction.
+    uint ExpectedSequenceNumber;
+    // The acknowledged sequence number by pure ACK frame, used to force dispatch message in opposite direction whose SequenceNumber is less than AckNumber.
+    uint? AckNumber = null;
+    
+    /*
+     * Public functions
+     */
+
+    // The central method to handle Segments in TCB
+    // s == null, invoked from opposite direction triggered by ACK.
+    // s != null, invoked from current direction when new data segment arrives, 's' is instance of the incoming data segment.
+    void HandleDataSegment(Packet s)
+    {
+        if (s != null)
+        {
+            int ret = SequenceComparer(s.SequenceNumber, ExpectedSequenceNumber);
+
+            // Add the fragment into the list if out-of-order
+            if (ret > 0)
+            {
+                OutOfOrderList.Insert(s); // sorted insert
+                // When there are 'CountOfPacketToTriggerReassembly' or more fragments in out-of-order list that have push flag set
+                // force to clear the buffer and ignore missing fragments if the sequence in out-of-order list has been acknowledged
+                while (OutOfOrderList.Count >= CountOfPacketToTriggerReassembly)
+                {
+                    DispatchSegmentFromOutOfOrderList(false);
+                }
+            }
+            // s.SequenceNumber == ExpectedSequenceNumber
+            else if (ret == 0)
+            {
+                DispatchDataSegment(s);
+                DispatchSegmentFromOutOfOrderList(true);
+            }
+            else // s.SequenceNumber < ExpectedSequenceNumber, retransmission 
+            {
+                ErrorCodeIf(true, s, DiagnosisLevel.Warning, ARDP_RETRANSMIT_ORIGINAL);
+                // Because one message consumes one sequence number, it is not possible for retransmission packet has overlapping data.
+                // It's safe to dispatch retransmission packet to top level endpoint.
+                DisplayTopLevelMessage(s);
+            }
+        }
+        else
+        {
+            while (OutOfOrderList.Head != null
+                && AckNumber != null && SequenceComparer((OutOfOrderList.Head.Value as Packet).SequenceNumber, AckNumber as uint) <= 0)
+            {
+                DispatchSegmentFromOutOfOrderList(false);
+            }
+        }
+    }
+
+    void HandlePureAckSegment(Packet s, TCB oppTCB)
+    {
+        if (s.Flags.SYN || s.Flags.NUL) // even SYN and NUL doesn't carry data, one sequence number is consumed.
+        {
+            ExpectedSequenceNumber++;
+        }
+        if (oppTCB.Initialized && 
+            SequenceComparer(s.AcknowledgementNumber, oppTCB.ExpectedSequenceNumber) > 0)
+        {
+            // Force pushing incomplete ARDP packets by observing the ACK
+            oppTCB.HandleDataSegment(null);
+        }
+        // Dispatch pure ack message in its original direction.
+        Dispatcher(s);
+    }
+
+    // Function to initialize the fields in the cache
+    void Initialize(Packet s)
+    {
+        ExpectedSequenceNumber = s.SequenceNumber;
+        Initialized = true;
+    }
+
+    // Clear TCB when TCP connection close(Fin/Rst) or capture end(endpoint destructor).
+    void Clear(bool inDestructor)
+    {
+        // If the function is called by endpoint destructor, directly dispatch cached message.
+        // Because upper layer protocol will not handle TCP segments dispatched in endpoint destructor.
+        if (inDestructor) 
+        {
+            while (OutOfOrderList.Head != null)
+            {
+                var frag = OutOfOrderList.Head.Value;
+                OutOfOrderList.RemoveHead();
+                DisplayTopLevelMessage(frag);
+            }
+        }
+        // Otherwise, the function is called intentionally when TCP connection is closed, 
+        // cached TCP segments should be dispatched by normal logic, so that upper layer continues parsing.
+        else
+        {
+            while (OutOfOrderList.Head != null)
+            {
+                DispatchSegmentFromOutOfOrderList(false);
+            }
+        }
+        ClearCachedFragments();
+        AckNumber = null;
+        Initialized = false;
+    }
+   
+    /*
+     *  Internal functions
+     */
+    internal void DispatchSegmentFromOutOfOrderList(bool checkSequence)
+    {
+        if (OutOfOrderList.Head == null)
+        {
+            return;
+        }
+        var frag = OutOfOrderList.Head.Value;
+        if (SequenceComparer(ExpectedSequenceNumber, frag.SequenceNumber) < 0)
+        {
+            // If need to check sequence number, exit without moving
+            if (checkSequence)
+            {
+                return;
+            }
+            // Identify segment lost
+            frag#SegmentLost = true;
+            ErrorCodeIf (true, frag, DiagnosisLevel.Warning, Format(ARDP_LOST_SEQ_RANGE, ExpectedSequenceNumber.ToString(), frag.SequenceNumber.ToString()));
+            OutOfOrderList.RemoveHead();
+            DispatchDataSegment(frag);
+        }
+        
+        while (OutOfOrderList.Head != null && 
+            SequenceComparer((OutOfOrderList.Head.Value as Packet).SequenceNumber, ExpectedSequenceNumber) <= 0)
+        {
+            frag = OutOfOrderList.Head.Value;
+            OutOfOrderList.RemoveHead();
+            DispatchDataSegment(frag);
+        }
+    }
+
+    // Dispatch Packet which is continuous to 'ExpectedSequenceNumber'.
+    internal void DispatchDataSegment(Packet s)
+    {
+        HandleFragments(s);
+        // One data packet consumes one sequence number.
+        ExpectedSequenceNumber++;
+    }
+
+    // If Packet is a fragment, cache fragments until all fragments arrives.
+    // otherwise, directly dispatched.
+    internal void HandleFragments(Packet s)
+    {
+        // it's not a fragment
+        if (s.FragmentCount == 1 || s.Flags.SYN) // SYN carrying payload doesn't get fragmented. SYN packet doesn't have FragmentCount field.
+        {
+            // Clear cache fragment is there is.
+            ClearCachedFragments();
+            // directly dispatch 
+            Dispatcher(s);
+        }
+        else
+        {
+            if (s#SegmentLost == true) // clear cached fragments if SegmentLost.
+            {
+                ClearCachedFragments();
+            }
+
+            // StartOfMessageSequence - the sequence number of the first fragment of message
+            if (s.SequenceNumber - s.StartOfMessageSequence != Fragments.Count) // Meaning start fragments are missing.
+            {
+                DisplayTopLevelMessage(s, ARDP_FRAGMENT_MISSING);
+            }
+            else if (Fragments.Count + 1 == s.FragmentCount) // all fragments arrive
+            {
+                binary payload = $[];
+                array<any message> origins = [];
+                foreach (var frag in Fragments)
+                {
+                    payload += frag.Payload;
+                    origins += [frag];
+                }
+                Packet p = new Packet
+                    {
+                        Flags = s.Flags,
+                        HeaderLength = s.HeaderLength,
+                        SourcePort = s.SourcePort,
+                        DestinationPort = s.DestinationPort,
+                        SequenceNumber = s.SequenceNumber,
+                        AcknowledgementNumber = s.AcknowledgementNumber,
+                        TimeToLive = s.TimeToLive,
+                        LastConsumedSequenceNumber = s.LastConsumedSequenceNumber,
+                        AcknowledgeNext = s.AcknowledgeNext,
+                        StartOfMessageSequence = s.StartOfMessageSequence,
+                        FragmentCount = 1,
+                        Reserved = 0,
+                        Payload = payload + s.Payload,
+                    };
+                p.DataLength = p.Payload.Count as ushort;
+                p.Origins = origins + [s];
+                p.SourceData = p.Payload;
+                p.AssignFieldEncodingInfo("Payload", 0, p.Payload.Count * 8);
+                Dispatcher(p);
+                // reset
+                Fragments = [];
+            }
+            else
+            {
+                Fragments += [s];
+            }
+        }
+    }
+
+    internal void ClearCachedFragments()
+    {
+        if (Fragments != null && Fragments.Count > 0)
+        {
+            foreach (var m in Fragments)
+            {
+                DisplayTopLevelMessage(m, ARDP_FRAGMENT_MISSING);
+            }
+            Fragments = [];
+        }
+    }
+}
+
+// ARDP implementation of Compare function required by SortedLinkedList.
+/*
+ * The function is used to compare two sequence numbers
+ * Similar to TCP, ARDP sequence numbers and receive windows behave very much like a clock. The receive window shifts each time the receiver
+ * receives and acknowledges a new segment of data. Once it runs out of sequence numbers, the sequence number loops back to 0.
+ * Since in one connection, sequence numbers and acknowledgement number change in the same trend, 
+ * we assume the absolute value is less than 'MaxSequenceNumber/2'.
+ * x == y: return 0
+ * x > y: return > 0
+ * x < y: return < 0
+ */
+int SequenceComparer(uint x, uint y) 
+{
+    if (x == y)
+    {
+        return 0;
+    }
+    long delta = (x as long) - (y as long);
+    if (delta > 0)
+    {
+        if (delta < SemiMaxSequenceNumber)
+        {
+             return 1;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+    else
+    {
+        delta = 0 - delta;
+        if (delta < SemiMaxSequenceNumber)
+        {
+            return -1;
+        }
+        else
+        {
+            return 1;
+        }
+    }
+}
+// Sequence number is type of uint32.
+const uint SemiMaxSequenceNumber = 0x80000000;

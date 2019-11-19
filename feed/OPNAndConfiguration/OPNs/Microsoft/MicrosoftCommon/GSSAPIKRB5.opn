@@ -1,0 +1,234 @@
+protocol GSSAPIKRB5 with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "The Kerberos Version 5 Generic Security Service Application Program Interface (GSS-API) Mechanism",
+    ShortName = "GSSAPIKRB5",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 1964"},
+            new Reference{Name = "RFC 4121"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "374936", Date = "02/27/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using KerberosV5;
+using Technologies.ASN1;
+using MicrosoftCommonResources;
+using Diagnostics;
+
+bool ContainUnsealedData(KerberosToken kbr, out binary unsealedData)
+{
+    if (kbr.TokID == 0x0201)
+    {
+        var token = kbr.Token as WrapToken;
+        
+        if (token.SealAlg is SealAlgType.None)
+        {
+            unsealedData = token.Data;
+            return true;
+        }
+    }
+    return false;
+}
+
+string GetSummaryInfo(KerberosToken krbToken)
+{
+    string summary = "Kerberos";
+    if (krbToken.Token is krb5Type:Krb5Type &&
+        krbToken.TokID == 0x0300)
+    {
+        summary += ", " + EnumToString<KerberosV5.ErrorCode>((krb5Type.Krb5 as KrbError).ErrorCode);
+    }
+    return summary;
+}
+
+string GetSummaryInfo(Krb5Type krb5Type)
+{
+    string summary = "Kerberos";
+    if (krb5Type.Krb5 is krbError:KrbError)
+    {
+        summary += ", " + EnumToString<KerberosV5.ErrorCode>(krbError.ErrorCode);
+    }
+    return summary;
+}
+
+const set<ushort> Krb5TypeKerberosTokenID = {0x0100, 0x0200, 0x0300};
+const set<ushort> KerberosTokenID = {0x0101, 0x0102, 0x0201, 0x0400, 0x0401, 0x0404, 0x0504};
+
+bool IsGssapiKrb(binary data)
+{
+    return IsGssapiKrb(data, -1 /* -1 to ignore the check on length */);
+}
+
+bool IsGssapiKrb(binary data, int length)
+{
+    if (data.Count < 8)
+    {
+        return false;
+    }
+    
+    ushort tokenId = PeekUShort(data, 0, Endian.Big);
+    
+    switch (tokenId)
+    {
+        case 0x0101 =>
+            // MicToken, data 4th ~ 7th byte is FF
+            return data[4] == 0xFF && data[5] == 0xFF && data[6] == 0xFF && data[7] == 0xFF;
+        case 0x0201 =>
+            // WrapToken, data 6th ~ 7th byte is FF
+            return data[6] == 0xFF && data[7] == 0xFF;
+        case 0x0102 =>
+            // ContextDeletionToken, data 4th ~ 7th byte is FF
+            return data[4] == 0xFF && data[5] == 0xFF && data[6] == 0xFF && data[7] == 0xFF;
+        case 0x0404 =>
+            // MicTokenV2, data 3th ~ 6th byte is FF
+            return data[3] == 0xFF && data[4] == 0xFF && data[5] == 0xFF && data[6] == 0xFF;
+        case 0x0504 =>
+            // WrapTokenV2, data 3th is FF
+            return data[3] == 0xFF;
+        case (0x0100 | 0x0200 | 0x0300 | 0x0400 | 0x0401) =>
+            return (length == -1 && data[3] != 0x00) || length == CalculateAsn1BerLength(data.Segment(2)) + 2;
+        default =>
+            return false;
+    }
+}
+
+pattern KerberosTokenType = MicToken | WrapToken | ContextDeletionToken | MicTokenV2 | WrapTokenV2 | TGTReq | TGTRep | Krb5TypeWithTokID;
+// [RFC 1964    1.2.1. & 1.2.2. and RFC 4121    4.2.6.1. & 4.2.6.2.]
+type KerberosToken
+{
+    ushort TokID;
+    optional [|TokID in KerberosTokenID || TokID in Krb5TypeKerberosTokenID|] KerberosTokenType Token with Encoding{Decoder = TokenDecoder};
+
+    optional KerberosTokenType TokenDecoder(stream s)
+    {
+        optional KerberosTokenType res = nothing;
+        int sPos = s.BitPosition;
+
+        switch (TokID)
+        {
+            case 0x0101 => res = BinaryDecoder<MicToken>(s);
+            case 0x0201 => res = BinaryDecoder<WrapToken>(s);
+            case 0x0102 => res = BinaryDecoder<ContextDeletionToken>(s);
+            case 0x0404 => res = BinaryDecoder<MicTokenV2>(s);
+            case 0x0504 => res = BinaryDecoder<WrapTokenV2>(s);
+            case 0x0400 => res = Asn1BerDecoder<TGTReq>(s);
+            case 0x0401 => res = Asn1BerDecoder<TGTRep>(s);
+            case (0x0100 | 0x0200 | 0x0300) => res = Asn1BerDecoder<Krb5TypeWithTokID[TokID]>(s);
+            default     =>;
+        }
+
+        if (res == nothing)
+        {
+            ValidationCheck(false, null, () => Format(GSSAPIKRB5_DECODING_KERBEROSTOKEN_FAILURE, TokID));
+        }
+        return res;
+    }
+}
+
+// [RFC 1964    1.2.1. Per-message Tokens - MIC]
+type MicToken
+{
+    SgnAlgType SgnAlg;
+    uint Filler where ValidationCheck(value == 0xFFFFFFFF, null, "GSSAPIKRB5: The Filler in type MicToken should contain four octets of hex value 0xFF, not " + value.ToString() + ".");
+    ulong SndSeq;
+    ulong SgnCheckSum;
+}
+
+pattern SgnAlgType = enum ushort
+{
+    DesMacMd5 = 0x0000,
+    Md25      = 0x0100,
+    DesMac    = 0x0200,
+    ...
+};
+
+// [RFC 4757    7.3.   GSS-API WRAP Semantics]
+type WrapToken
+{
+    SgnAlgType SgnAlg;
+    SealAlgType SealAlg;
+    ushort Filler where ValidationCheck(value == 0xFFFF, null,
+        () => "GSSAPIKRB5: The Filler in type WrapToken should contain two octets of hex value 0xFF, not " + value.ToString() + ".");
+    ulong SndSeq;
+    ulong SgnCheckSum;
+    ulong Confounder;
+    binary Data;
+}
+
+pattern SealAlgType = enum ushort
+{
+    None = 0xFFFF,
+    Des  = 0x0000,
+    ...
+};
+
+// [RFC 1964    1.2.3. Context deletion token]
+type ContextDeletionToken
+{
+    SgnAlgType SgnAlg;
+    uint Filler where ValidationCheck(value == 0xFFFFFFFF, null, "GSSAPIKRB5: The Filler in type ContextDeletionToken should contain four octets of hex value 0xFF, not " + value.ToString() + ".");
+    ulong SndSeq;
+    ulong SgnCheckSum;
+}
+
+// [RFC 4121    4.2.6.1.  MIC Tokens]
+type MicTokenV2
+{
+    FlagsType Flags;
+    binary Filler where ValidationCheck(value == $[FFFFFFFFFF], null, "GSSAPIKRB5: The Filler in type MicTokenV2 should contain five octets of hex value 0xFF, not " + value.ToString() + ".") with BinaryEncoding{Length = 5};
+    ulong SndSeq;
+    binary SgnCheckSum;
+}
+
+type FlagsType
+{
+    byte Reserved       with BinaryEncoding{Width = 5};
+    bool SentByAcceptor with BinaryEncoding{Width = 1};
+    bool Sealed         with BinaryEncoding{Width = 1};
+    bool AcceptorSubkey with BinaryEncoding{Width = 1};
+}
+
+// [RFC 4121    4.2.6.2.  Wrap Tokens]
+type WrapTokenV2
+{
+    FlagsType Flags;
+    byte Filler where ValidationCheck(value == 0xFF, null, 
+        () => "GSSAPIKRB5: The Filler in type WrapTokenV2 should contain the hex value 0xFF, not " + value.ToString() + ".");
+    ushort ExtraCount;
+    ushort RightRotationCount;
+    ulong SndSeq;
+    // ref : gssapikrb5.npl for ldap.opn
+    optional [|Flags.Sealed|] binary Data;
+    optional [|!Flags.Sealed|] binary Checksum with BinaryEncoding{Length = ExtraCount};
+}
+
+// Used only in type KerberosToken
+type Krb5TypeWithTokID[ushort TokID]
+{
+    // we need to encapsulate the following types in Krb5Type 
+    // because Asn1BerDecoder does not respect the aspect 
+    // attached to an pattern definition except used in a type.
+    ([|TokID == 0x0100|] APReq
+    | [|TokID == 0x0200|] APRep
+    | [|TokID == 0x0300|] KrbError) Krb5;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+type Krb5Type
+{
+    // we need to encapsulate the following types in Krb5Type 
+    // because Asn1BerDecoder does not respect the aspect 
+    // attached to an pattern definition except used in a type.
+    (APReq | APRep | KrbError) Krb5;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};

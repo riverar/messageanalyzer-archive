@@ -1,0 +1,382 @@
+protocol OCSP with
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.DER},
+Documentation
+{
+    ProtocolName = "X.509 Internet Public Key Infrastructure Online Certificate Status Protocol - OCSP",
+    ShortName = "OCSP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2560"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class=RevisionClass.Major, Version="363617", Date="05/06/2014"}
+        ]
+};
+    
+using Standard;
+using Technologies.ASN1;
+using X509;
+using HTTP;
+using Utility;
+using CoreNetworkingResources;
+
+// -------------------------------------endpoints---------------------------------------------- //
+endpoint Server 
+    over HTTP.Server
+    accepts OCSPRequest
+    issues mutable OCSPResponse
+    provides VirtualOperations;
+
+client endpoint Client connected to Server;
+
+// -------------------------------------actors------------------------------------------------- //
+// RFC 2560, A.1.1 Request
+// An OCSP request using the GET method is constructed as follows:
+// GET {url}/{url-encoding of base-64 encoding of the DER encoding of the OCSPRequest} where {url} may be derived from the value of AuthorityInfoAccess or
+// other local configuration of the OCSP client. An OCSP request using the POST method is constructed as follows: The Content-Type header has the value 
+// "application/ocsp-request" while the body of the message is the binary value of the DER encoding of the OCSPRequest.
+
+// In OPN, we don't have ability to determine whether a HTTP GET request is an OCSP request according to the {url} part.
+// To solve this issue, we'll cache every HTTP GET request in variable #cachedHttpRequest. And if the corressponding HTTP response carries an OCSP response,
+// then we'll try to decode the cached HTTP request as an OCSP request. 
+autostart actor OcspOverHttp(HTTP.Server ser)
+{
+    HTTP.HttpContract.Request cachedHttpRequest = null;
+    process ser accepts req:HTTP.HttpContract.Request where req.Method == "POST" && IsOcspRequest(req)
+    {
+        if (Asn1BerDecoder<OCSPRequest>(req.Payload) is  m:OCSPRequest)
+        {
+            dispatch (endpoint Server over ser) accepts m;
+        }
+        else
+        {
+            ThrowDecodingException("OCSP", "OCSPRequest");
+        }
+    }
+    
+    observe ser accepts r:HTTP.HttpContract.Request where r.Method == "GET"
+    {
+        cachedHttpRequest = r; // if it's a HTTP GET message, cache it
+    }
+    
+    process ser issues res:HTTP.HttpContract.Response where IsOcspResponse(res, ref cachedHttpRequest)
+    {
+        // The response is OCSP response, so try to decode the cached HTTP request as OCSP request
+        if (cachedHttpRequest != null && cachedHttpRequest.Uri.AbsPath is absPath:string)
+        {
+            // An OCSP request using the GET method is constructed as follows: GET {url}/{url-encoding of base-64 encoding of the DER encoding of the OCSPRequest}
+            // Here, we simply take the content after the last '/' as the OCSRequest.
+            int lastSlashIdx = absPath.LastIndexOf("/");
+            if (lastSlashIdx != -1)
+            {
+                string urlEncodedData = absPath.Segment(lastSlashIdx + 1);
+                if (URLBase64StringToBinary(urlEncodedData) is data:binary)
+                {
+                    switch (data)
+                    {
+                        case m:OCSPRequest from Asn1BerDecoder<OCSPRequest> =>
+                            m.Origins = [cachedHttpRequest];
+                            dispatch (endpoint Server over ser) accepts m;
+                        default =>
+                            ValidationCheck(false, cachedHttpRequest, DiagnosisLevel.Error, CoreNetworkingResources.OCSP_REQUEST_DECODE_FAIL);
+                    }
+                }
+            }
+        }
+        switch (res.Payload)
+        {
+            case m:OCSPResponse from Asn1BerDecoder<OCSPResponse> =>
+                dispatch (endpoint Server over ser) issues m;
+            default =>
+                ThrowDecodingException("OCSP", "OCSPResponse");
+        }
+        cachedHttpRequest = null; // clear the cached HTTP request
+    }
+}
+
+bool IsOcspRequest(HTTP.HttpContract.Request req)
+{
+    return req.HTTPContentType != null && (req.HTTPContentType as HTTP.HeaderFieldType).Value == "application/ocsp-request";
+}
+
+bool IsOcspResponse(HTTP.HttpContract.Response res, ref HTTP.HttpContract.Request cachedHttpRequest)
+{
+    if (res.HTTPContentType != null && (res.HTTPContentType as HTTP.HeaderFieldType).Value == "application/ocsp-response")
+    {
+        return true;
+    }
+    else
+    {
+        cachedHttpRequest = null; // if the request is not OCSP response, clear the cached http request.
+        return false;
+    }
+}
+
+// -------------------------------------virtual operations--------------------------------------------- //
+contract VirtualOperations
+{
+    // Future Reference: enable virtual operation accept multi-message types, normal response and error response.
+    issues virtual operation Operation
+    {
+        in Version version = ver;
+        out OCSPResponseStatus status = stat;
+        
+        override string ToString()
+        {
+            return "Operation, Version: " + EnumToStringInSummary<Version>(version) + 
+                ", Status: " + EnumToStringInSummary<OCSPResponseStatus>(status);
+        }
+    }
+    =
+    accepts OCSPRequest{tbsRequest.version is var ver}
+    issues OCSPResponse{responseStatus is var stat};
+}
+
+// --------------------------------------------messages------------------------------------------------- //
+// Appendix B.  OCSP in ASN.1
+message OCSPRequest
+{
+    TBSRequest tbsRequest;
+    optional Signature optionalSignature with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return "Request, Version: " + EnumToStringInSummary<Version>(tbsRequest.version);
+    }
+}
+
+message OCSPResponse
+{
+    OCSPResponseStatus responseStatus;
+    optional ResponseBytes responseBytes with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        string summary = "Response";
+        if (responseBytes is rb:ResponseBytes && rb.reponse is basicRes:BasicOCSPResponse)
+        {
+            summary += ", Version: " + EnumToStringInSummary<Version>(basicRes.tbsResponseData.version);
+        }
+        summary += ", Status: " + EnumToStringInSummary<OCSPResponseStatus>(responseStatus);
+        return summary;
+    }
+}
+
+// --------------------------------------------structures------------------------------------------------- //
+// Appendix B.  OCSP in ASN.1
+type TBSRequest
+{
+    Version version = Version.v1 with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.HasDefaultValue};
+    optional GeneralName requestorName with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    array<Request> requestList;
+    optional OcspExtensions requestExtensions with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+}
+
+type Signature
+{
+    AlgorithmIdentifier signatureAlgorithm;
+    BitString signature;
+    optional array<Certificate> certs with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern Version = enum Integer {v1 = 0};
+
+type Request
+{
+    CertID reqCert;
+    optional OcspExtensions singleRequestExtensions with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+}
+
+type CertID
+{
+    AlgorithmIdentifier hashAlgorithm;
+    OctetString issuerNameHash;
+    OctetString issuerKeyHash;
+    CertificateSerialNumber serialNumber;
+}
+
+pattern OCSPResponseStatus = enum Integer
+{
+    successful = 0,
+    malformedRequest = 1,
+    internalError = 2,
+    tryLater = 3,
+    sigRequired = 5,
+    unauthorized = 6,
+    ...
+};
+
+type ResponseBytes
+{
+    ObjectIdentifier reponseType with DisplayInfo{ToText = ObjectIdentifierToString};
+    (BasicOCSPResponse | CrlID | AcceptableResponses | ArchiveCutoff | ServiceLocator 
+    | OctetString) reponse with Encoding{Decoder = ReponseDecoder, SourcePattern = TypeOf<binary>()};
+    
+    optional any ReponseDecoder(binary bin)
+    {
+        optional any res = nothing;
+        if (reponseType == idPkixOcspBasicOID)
+        {
+            res = Asn1BerDecoder<BasicOCSPResponse>(bin);
+        }
+        else if(reponseType == idPkixOcspCrlOID)
+        {
+            res = Asn1BerDecoder<CrlID>(bin);
+        }
+        else if(reponseType == idPkixOcspResponseOID)
+        {
+            res = Asn1BerDecoder<AcceptableResponses>(bin);
+        }
+        else if(reponseType == idPkixOcspArchiveCutOffOID)
+        {
+            res = Asn1BerDecoder<ArchiveCutoff>(bin);
+        }
+        else if(reponseType == idPkixOcspServiceLocatorOID)
+        {
+            res = Asn1BerDecoder<ServiceLocator>(bin);
+        }
+        
+        return res == nothing ? bin : res;
+    }
+}
+
+type BasicOCSPResponse
+{
+    ResponseData tbsResponseData;
+    AlgorithmIdentifier signatureAlgorithm;
+    BitString signature;
+    optional array<Certificate> certs with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+}
+
+type ResponseData
+{
+    Version version = Version.v1 with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.HasDefaultValue};
+    ResponderID responderID;
+    GeneralizedTime producedAt;
+    array<SingleResponse> responses;
+    optional OcspExtensions responseExtensions with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern ResponderID = byName | byKey;
+pattern byName = Name with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+pattern byKey = KeyHash with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+pattern KeyHash = OctetString;
+
+type SingleResponse
+{
+    CertID certID;
+    CertStatus certStatus with DisplayInfo{ToText = CertStatusToText};
+    GeneralizedTime thisUpdate;
+    optional GeneralizedTime nextUpdate with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional OcspExtensions singleExtensions with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+// CertStatus is choice type
+pattern CertStatus = good | revoked | unknown;
+pattern good = Null with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+pattern revoked = RevokedInfo with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+pattern unknown = UnknownInfo with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Implicit};
+pattern UnknownInfo = Null;
+
+type RevokedInfo
+{
+    GeneralizedTime revocationTime;
+    optional CrlReason revocationReason with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern ArchiveCutoff = GeneralizedTime;
+
+pattern AcceptableResponses = array<ObjectIdentifier>;
+
+type ServiceLocator
+{
+    Name issuer;
+    // Future reference: In section "4.4.6  Service Locator" of RFC 2560 this field is OPTIONAL.
+    // However, in section "Appendix B.  OCSP in ASN.1", it's not OPTIONAL.
+    AuthorityInfoAccessSyntax locator;
+}
+
+const array<int> idKpOCSPSigningOID = idKpOID + [9];
+const array<int> idPkixOcspOID = idAdOcspOID;
+const array<int> idPkixOcspBasicOID = idPkixOcspOID + [1];
+const array<int> idPkixOcspNonceOID = idPkixOcspOID + [2];
+const array<int> idPkixOcspCrlOID = idPkixOcspOID + [3];
+const array<int> idPkixOcspResponseOID = idPkixOcspOID + [4];
+const array<int> idPkixOcspNocheckOID = idPkixOcspOID + [5];
+const array<int> idPkixOcspArchiveCutOffOID = idPkixOcspOID + [6];
+const array<int> idPkixOcspServiceLocatorOID = idPkixOcspOID + [7];
+
+// 4.4.2 CRL References
+type CrlID
+{
+    optional IA5String crlUrl with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional Integer crlNum with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional GeneralizedTime crlTime with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+}
+
+// OCSP extensions
+pattern OcspExtensions = array<OcspExtension>;
+
+type OcspExtension
+{
+    ObjectIdentifier ExtnID with DisplayInfo{ToText = ObjectIdentifierToString};
+    optional Boolean Critical;
+    ([|ExtnID in 
+        {
+            idPkixOcspCrlOID,
+            idPkixOcspResponseOID,
+            idPkixOcspServiceLocatorOID
+        }
+     |] ExtnValueExtension[ExtnID] | OctetString) ExtnValue;
+}
+
+type ExtnValueExtension[ObjectIdentifier ExtnID]
+{
+    ([|ExtnID == idPkixOcspCrlOID|] CrlID
+        | [|ExtnID == idPkixOcspArchiveCutOffOID|] AcceptableResponses
+        | [|ExtnID == idPkixOcspServiceLocatorOID|] ServiceLocator
+        ) ExtnValue;
+}
+
+string CertStatusToText(any input)
+{
+    if (input is good)
+    {
+        return "good";
+    }
+    else if (input is revoked)
+    {
+        return "revoked";
+    }
+    else if (input is unknown)
+    {
+        return "unknown";
+    }
+    return "";
+}
+
+// WORKAROUND for PEF bug#78630
+// WORKAROUND for Base64URL, URL may have no padding for Base64 encoded string
+optional binary URLBase64StringToBinary(string str)
+{
+    if (str != null)
+    {
+        str = str.Replace("%2B", "+").Replace("%2F", "/").Replace("%2b", "+").Replace("%2f", "/").Replace("%3D", "=").Replace("%3d", "=");
+        int lastGroupLen = str.Count % 4;
+        if (lastGroupLen == 3)
+        {
+            str = str + "=";
+        }
+        else if (lastGroupLen == 2)
+        {
+            str = str + "==";
+        }
+    }
+    return Base64StringToBinary(str);
+}

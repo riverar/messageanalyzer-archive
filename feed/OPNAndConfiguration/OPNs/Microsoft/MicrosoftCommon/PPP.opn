@@ -1,0 +1,211 @@
+protocol PPP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "The Point-to-Point Protocol (PPP)",
+    ShortName = "PPP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1661"},
+            new Reference{Name = "RFC 1662"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "370439", Date = "11/03/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using Ethernet;
+using IPv4;
+using IPv6;
+using GRE;
+
+annotation string PPP.Frame#PPPDestinationAddress;
+annotation string PPP.Frame#PPPSourceAddress;
+
+endpoint Node
+    accepts Frame;
+
+autostart actor PPPOverEthernet(Ethernet.Node node)
+{
+    process node accepts p:Ethernet.Frame where p.LengthOrType == EtherType.PPP
+    {
+        switch (p.MacClientData)
+        {
+            case f:Frame from BinaryDecoder<Frame> =>
+                var n = endpoint PPP.Node;
+                f#PPPDestinationAddress = p.DestinationAddress.ToString();
+                f#PPPSourceAddress = p.SourceAddress.ToString();
+                dispatch n accepts f;
+            default =>
+                ThrowDecodingException("PPP", "Frame");
+           }
+   }
+} 
+
+autostart actor PPPOverGRE(GRE.Node gre)
+{
+    process gre accepts p:GRE.Packet where (p.ProtocolType == GREProtocolType.PPP && p.Payload.Count > 0)
+    {
+        switch (p.Payload)
+        {
+            case f:Frame from BinaryDecoder<Frame> =>
+                f#PPPSourceAddress = BinaryToIP(p#SourceAddress as binary);
+                f#PPPDestinationAddress = BinaryToIP(p#DestinationAddress as binary);
+                dispatch (endpoint Node over gre) accepts f;
+            default =>
+                ThrowDecodingException("PPP", "Frame");
+        }
+    }
+}
+
+autostart actor IPv4OverPPP(PPP.Node node)
+{
+    process node accepts f:PPP.Frame where GetPacketTypeValue(f.PacketType) == 0x0021 // 0000-3FFF identifies the network layer protocol of specific packets, IPv4: 0x0021
+    {
+        switch (f.Payload)
+        {
+            case d:IPv4.Datagram from BinaryDecoder<IPv4.Datagram> =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("PPP", "IPv4.Datagram");
+        }
+   }
+}
+
+autostart actor IPv6OverPPP(PPP.Node node)
+{
+    process node accepts f:PPP.Frame where GetPacketTypeValue(f.PacketType) == 0x0057 // 0000-3FFF identifies the network layer protocol of specific packets, IPv6: 0x57
+    {
+        switch (f.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("PPP", "IPv6.Datagram");
+        }
+   }
+}
+
+message Frame
+{
+    optional EthernetLikeAddress EthernetLikeAddress;
+    optional CommonFormat CommonFormat;
+
+    PacketType PacketType;
+    binary Payload;
+    
+    override string ToString()
+    {
+        return PacketTypeToString(GetPacketTypeValue(PacketType));
+    }
+}
+
+Address get Source(this PPP.Frame frame)
+{
+    Address add = new Address{Value = frame.SourceAddress};
+    return add;
+}
+
+Address get Destination(this PPP.Frame frame)
+{
+    Address add = new Address{Value = frame.DestinationAddress};
+    return add;
+}
+
+// Fake type to wrap string type address, and let Source/Destination property return this type.
+type Address
+{
+    string Value;
+    
+    override string ToString()
+    {
+        return Value;
+    }
+}
+
+binary get FlatAddress(this PPP.Address address)
+{
+    return (address.Value.ToBinary() is bin:binary) ? bin : $[];
+}
+
+/* Reference: http://technet.microsoft.com/en-us/library/cc957997.aspx
+ * Captured PPP frames do not contain a Flag character but do contain an Ethernet-like source address and destination address.
+ * This behavior is due to the fact that Network Monitor receives the packets from the Ndiswan.sys driver.
+ */
+type EthernetLikeAddress
+{
+    (string where (value.IndexOf(" SEND") >= 0 || value.IndexOf(" RECV") >= 0)) DestinationAddress with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 6};
+    (string where (value.IndexOf(" SEND") >= 0 || value.IndexOf(" RECV") >= 0)) SourceAddress with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 6};
+}
+
+// rfc 1662 3.1.  Frame Format
+type CommonFormat
+{
+    /* For optional: Captured PPP frames do not contain a Flag character
+     * WORKAROUND: Bug #35910 - Prechecker for the value of an optional feild itself cannot work
+     *optional [|value == 0x7E|] byte Flag;
+     */
+    optional Flag Flag;
+    (byte where value == 0xFF) Address;
+    (byte where value == 0x03) Control;
+}
+
+type Flag
+{
+    byte Flag where value == 0x7E;
+}
+
+ushort GetPacketTypeValue(PacketType pt)
+{
+    if (pt is b:BytePacketType)
+    {
+        return b as ushort;
+    }
+    else
+    {
+      	return pt as ushort;
+    }
+}
+
+// The least significant bit of the least significant octet MUST equal "1".
+pattern BytePacketType = byte where (value & 0x01) == 0x01;
+
+/* The least significant bit of the least significant octet MUST equal "1".
+ * Also, all Protocols MUST be assigned such that the least significant bit 
+ * of the most significant octet equals "0".
+ */
+pattern UshortPacketType = ushort where (value & 0x0101) == 0x0001;
+pattern PacketType = BytePacketType | UshortPacketType;
+
+string get DestinationAddress(this Frame f)
+{
+    if (f.EthernetLikeAddress == nothing)
+    {
+        return (f#PPPDestinationAddress == nothing) ? null : f#PPPDestinationAddress as string;
+    }
+    else
+    {
+        return (f.EthernetLikeAddress as EthernetLikeAddress).DestinationAddress;
+    }
+}
+
+string get SourceAddress(this Frame f)
+{
+    if (f.EthernetLikeAddress == nothing)
+    {
+        return (f#PPPSourceAddress == nothing) ? null : f#PPPSourceAddress as string;
+    }
+    else
+    {
+        return (f.EthernetLikeAddress as EthernetLikeAddress).SourceAddress;
+    }
+}

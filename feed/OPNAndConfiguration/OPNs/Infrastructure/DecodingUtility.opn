@@ -1,0 +1,266 @@
+module DecodingUtility with
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382080", Date = "10/13/2015"}
+        ]
+};
+
+using Utility;
+using Diagnostics;
+using InfrastructureResources;
+
+type StreamDecodingCache
+{
+    // Cache stream data and origins
+    binary Buffer = $[];
+    array<any message> Origins = [];
+
+    // Endpoint and Direction used for dispatching messages
+    any endpoint EPT = null;
+    MessageDirection Direction;
+
+    // The protocol name which is used for reporting decoding failure.
+    internal string ProtocolName;
+
+    // Determine if data matches the bits of message beginning, do not directly return true for all coming segments, even if the protocol is identified by port over TCP.
+    // Return value:
+    //     true:  it is valid data to decode message of current protocol.
+    //     false: it is not valid data to decode message of current protocol.
+    //     null:  byte count of 'Buffer' is not enough to checking, the returning value will not be cached in DC, need to invoke IsCurrentProtocol() to test next time.
+    internal bool?(binary) IsCurrentProtocol with Encoding{Ignore = true};
+
+    // If data in 'Buffer' is sufficient for single message.
+    // Return value:
+    //     positive value:  the expected byte count.
+    //     0:               Buffer is sufficient for single message.
+    //     null:            length comparing is not applicable to check insufficient, or byte count in buffer is not enough to decode 'length' field, 
+    //                            need to invoke this function to test next time.
+    internal uint?(binary) IsSufficientForSingleMsg with Encoding{Ignore = true};
+
+    // Decode a single message
+    internal (optional any message)(stream) DecodeSingleMessage;
+
+    // Decode the last incomplete message before dispatch to top level
+    internal (optional any message)(binary) DecodeIncompleteMessage;
+
+    // Cache the executing result of IsCurrentProtocol() function. 
+    // So that IsCurrentProtocol() will only be called once even if it needs to wait for multiple TCP messages to decode one message of application protocol.
+    internal bool? IsCurProtocol = null with Encoding{Ignore = true};
+
+    // Record the required buffer length to decode single message.
+    // value of 'null' means it's not possible to use 'length' to decide the message boundary for current protocol. 
+    // 'IsSufficientForSingleMsg' needs invoke every time before try decoding.
+    internal uint? BufferLengthNeeded = null with Encoding{Ignore = true};
+
+    // 'Initialized' is designed only for internal use.
+    internal bool Initliazed = false;
+
+    /*
+     * Functions
+     */
+    virtual void Initialize(string protocolName, any endpoint ept, MessageDirection direction, bool?(binary) isCurrentProtocol, 
+        uint?(binary) isSufficientForSingleMsg, (optional any message)(stream) decodeSingleMessage, (optional any message)(binary) decodeIncompleteMessage)
+    {
+        assert Initliazed == false;
+        assert protocolName is StringNotNullOrEmpty;
+        assert ept != null;
+        assert isCurrentProtocol != null;
+        assert isSufficientForSingleMsg != null;
+        assert decodeSingleMessage != null;
+        assert decodeIncompleteMessage != null;
+        ProtocolName = protocolName;
+        EPT = ept;
+        Direction = direction;
+        IsCurrentProtocol = isCurrentProtocol;
+        IsSufficientForSingleMsg = isSufficientForSingleMsg;
+        DecodeSingleMessage = decodeSingleMessage;
+        DecodeIncompleteMessage = decodeIncompleteMessage;
+
+        Initliazed = true;
+    }
+
+    // Return bytes count remaining in 'Buffer'.
+    int BufferCount()
+    {
+        return Buffer == null ? 0 : Buffer.Count;
+    }
+
+    void AddMessage(any message seg, (bool)(any message) isSegmentLost, (binary)(any message) payloadGetter)
+    {
+        assert Initliazed == true;
+        // If detect TCP segment-lost, clear cache first.
+        if (isSegmentLost(seg) && BufferCount() > 0)
+        {
+            ClearExceptionally();
+        }
+        
+        Buffer += payloadGetter(seg);
+        Origins += [seg];
+    }
+
+    virtual void TryDecodeAndDispatchMessage()
+    {
+        assert Initliazed == true;
+        while (BufferCount() > 0)
+        {
+            // IsCurrentProtocol will determine if data matches protocol structure
+            // 1. When Buffer's Count is less than the message identifier length(which means there are no enough remaining bytes for function "IsCurrentProtocol")
+            //     (1)For protocol which use port to identify itself, like LDAP. 
+            //        To avoid being cleared by ClearExceptionally, return true directly. Because we use port to identify this protocol and 
+            //        we have confidence that this frame is current protocol's message.
+            //     (2)For protocol which uses message identifier to identify itself, like RPCH. 
+            //        To avoid being cleared by ClearExceptionally, check whether the current bytes in Buffer match the beginning of the message identifier. 
+            //        e.g., the first few fields in message identifier are expect values or nothing sequentially, and all nothing fields are aligned at the backend.
+            // 2. When Buffer's Count is greater than or equal to the message identifier length, check whether Buffer match the message identifier
+            
+            // Determine if data is current protocol by checking starting identifiers where're specific to each protocol
+
+            if (IsCurProtocol == null)
+            {
+                IsCurProtocol = IsCurrentProtocol(Buffer);
+            }
+
+            if (IsCurProtocol != true)
+            {
+                // null: Data in Buffer is not enough for identifying, need to wait for more data.
+                // false: Invalid data, dispatch current cached segment immediately.
+                if (IsCurProtocol == false)
+                {
+                    ClearIfNotCurrentProtocol();
+                }
+                return;
+            }
+
+            // IsCurProtocol == true until now.
+            
+            // Determine if remaining data is enough to decode one message.
+            if (BufferLengthNeeded == null)
+            {
+                uint? ret = IsSufficientForSingleMsg(Buffer);
+                if (ret == null)
+                {
+                    // Length is not applicable, and data is not sufficient to parse single message.
+                    return;
+                }
+                else if (ret > 0)
+                {
+                    // Data in buffer is not sufficient, cache expected length and keep waiting for more data.
+                    BufferLengthNeeded = ret;
+                    return;
+                }
+                // if ret == 0, data is sufficient and continue parsing and dispatching.
+            }
+            else
+            {
+                if (BufferCount() < BufferLengthNeeded)
+                {
+                    // Data in buffer is not enough, keep waiting for more data.
+                    return;
+                }
+            }
+
+            stream s = Buffer;
+            if (DecodeSingleMessage(s) is msg:any message)
+            {
+                DispatchAfterSucceed(msg, s);
+                ResetAfterSucceed(s);
+            }
+            else
+            {
+                ClearExceptionally();
+            }
+            // Reset the IsCurrentProtocol and BufferLengthNeeded no matter message decoded successfully or not when Buffer sufficient for a single message.
+            IsCurProtocol = null;
+            BufferLengthNeeded = null;
+        }
+    }
+
+    virtual void ClearIfNotCurrentProtocol()
+    {
+        // If cached messages should be dispatched once matching fails immediately.
+        ClearExceptionally();
+    }
+
+    virtual void DispatchAfterSucceed(any message msg, stream s)
+    {
+        msg.Origins = Origins;
+        DispatchMessage(msg);
+    }
+
+    virtual void DispatchMessage(any message msg)
+    {
+        if (Direction is MessageDirection.Accepts)
+        {
+            dispatch EPT accepts msg;
+        }
+        else
+        {
+            dispatch EPT issues msg;
+        }
+    }
+
+    // Reset fields value in the cache when upper layer protocol message decodes successfully.
+    virtual void ResetAfterSucceed(stream s)
+    {
+        assert Initliazed == true;
+        if (s == null || s.BytePosition == s.ByteLength || Buffer == null)
+        {
+            Buffer = $[];
+            Origins = [];
+        }
+        else // Buffer has data, keep the last origin.
+        {
+            Buffer = s.PeekBytes(s.BitPosition);
+            Origins = Origins.Segment(Origins.Count - 1);
+        }
+        IsCurProtocol = null;
+        BufferLengthNeeded = null;
+    }
+
+    /* clear cache in either situation:
+     *      1) TCP annotation #SegmentLost is true
+     *      2) Message decoding fails
+     * Note: Exception MUST NOT be thrown in the function, otherwise clearing job can not be done, and it will mess up the reassembly in this TCP session.
+     */
+    virtual void ClearExceptionally()
+    {
+        assert Initliazed == true;
+        // Try to decode incomplete message first 
+        if (Origins.Count > 0) // Cached segments by DC may all be retransmission segment, in that case, "Buffer.Count == 0"
+        {
+            // first try to decode into incomplete message.
+            if (IsCurProtocol == true && DecodeIncompleteMessage(Buffer) is msg:any message)
+            {
+                msg.Origins = Origins;
+                DisplayTopLevelMessage(msg, Format(REASSEMBLY_INCOMPLETE_MESSAGE, ProtocolName));
+            }
+            else 
+            {
+                foreach (var m in Origins)
+                {
+                    ValidationCheck(false, m, Format(REASSEMBLY_STR_EXCEPTION, ProtocolName));
+                    DisplayTopLevelMessage(m);
+                }
+            }
+            Origins = [];
+            Buffer = $[];
+        }
+        IsCurProtocol = null;
+        BufferLengthNeeded = null;
+    }
+
+    // Invoke in endpoint destructor.
+    // NOTE: If concrete protocol overrides, it must call base.ClearInDestructor()!!!
+    virtual void ClearInDestructor()
+    {
+        ClearExceptionally();
+        IsCurProtocol = null;
+        BufferLengthNeeded = null;
+    }
+}

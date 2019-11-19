@@ -1,0 +1,511 @@
+protocol POP3 with 
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII}, 
+Documentation
+{
+    ProtocolName = "Post Office Protocol Version 3",
+    ShortName = "POP3",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2449"},
+            new Reference{Name = "RFC 1734"},
+            new Reference{Name = "RFC 1939"},
+            new Reference{Name = "RFC 5034"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using IANA;
+using Utility;
+using CoreNetworkingResources;
+
+/*
+ * POP3 Commands
+ * RFC 1939
+ *  QUIT <CRLF>
+ *  STAT <CRLF>
+ *  LIST [<MessageNumber>] <CRLF> (Multiple Line Response)
+ *  RETR [<MessageNumber>] <CRLF> (Multiple Line Response)
+ *  DELE <MessageNumber> <CRLF>
+ *  NOOP <CRLF>
+ *  RSET <CRLF>
+ *  TOP <MessageNumber> <Lines> <CRLF> (Multiple Line Response)
+ *  UIDL [<MessageNumber>] <CRLF> (Multiple Line Response)
+ *  USER <UserName> <CRLF>
+ *  PASS <Password> <CRLF>
+ *  APOP <UserName> <MD5Digest> <CRLF> (Multiple Line Response)
+ * RFC 2449
+ *  CAPA <CRLF>
+ * RFC 1734
+ *  AUTH <Mechanism> <CRLF>
+ */
+endpoint Server over TCP.Server accepts RequestMsg issues ResponseMsg;
+client endpoint Client connected to Server;
+
+const binary CRLFBinary = $[0D0A];
+const binary MultiLineEndSequence = $[0D0A2E0D0A]; // CRLF.CRLF
+
+autostart actor POP3OverTCP(TCP.Server server)
+{
+    Pop3DecodingHelper pop3DecodingHelper = null;
+    
+    process server accepts segment:TCP.Segment{DestinationPort is Port.POP3}
+    {
+        if (pop3DecodingHelper == null)
+        {
+            pop3DecodingHelper = new Pop3DecodingHelper();
+            pop3DecodingHelper.InitializePop3DecodingHelper(new Pop3RequestDecodingCache(), new Pop3ResponseDecodingCache(), server);
+        }
+        pop3DecodingHelper.TryDecode(segment, MessageDirection.Accepts);
+    }
+    
+    process server issues segment:TCP.Segment{SourcePort is Port.POP3}
+    {
+        if (pop3DecodingHelper == null)
+        {
+            pop3DecodingHelper = new Pop3DecodingHelper();
+            pop3DecodingHelper.InitializePop3DecodingHelper(new Pop3RequestDecodingCache(), new Pop3ResponseDecodingCache(), server);
+        }
+        pop3DecodingHelper.TryDecode(segment, MessageDirection.Issues);
+    }
+    
+    ~endpoint(TCP.Server e)
+    {
+        if (pop3DecodingHelper != null)
+        {
+            pop3DecodingHelper.ClearInDestructor();
+        }
+    }
+}
+
+message RequestMsg
+{
+    string Command;
+    string Param;
+    optional binary Payload;
+    
+    override string ToString()
+    {
+        string summary = "RequestMsg, Command: " + (Command as string);
+        if (Param != "")
+        {
+            summary += ", Param: " + Param.ToString();
+        }
+        return summary;
+    }
+}
+
+message ResponseMsg
+{
+    string Status;
+    (string | StatRespType | RetrRespType | array<string | ListRespType | UidlRespType>) Body;
+    optional binary Payload;
+    
+    override string ToString()
+    {
+        return "ResponseMsg, Status: " + Status;
+    }
+}
+
+type StatRespType
+{
+    uint MsgNumber;
+    uint MailDropSize;
+    
+    override string ToString()
+    {
+        return "Number of Messages: " + MsgNumber.ToString() + ", Mail Drop Size: " + MailDropSize.ToString();
+    }
+}
+
+type RetrRespType
+{
+    uint Length;
+    string Unit;
+    
+    override string ToString()
+    {
+        return Length.ToString() + " " + Unit;
+    }
+}
+
+type ListRespType
+{
+    uint MsgNumber;
+    uint MsgSize;
+    
+    override string ToString()
+    {
+        return MsgNumber.ToString() + ": " + MsgSize.ToString();
+    }
+}
+
+type UidlRespType
+{
+    uint MsgNumber;
+    string UniqueId;
+    
+    override string ToString()
+    {
+        return MsgNumber.ToString() + ": " + UniqueId;
+    }
+}
+
+syntax UpAlpha      = regex{[A-Z]};
+syntax LoAlpha      = regex{[a-z]};
+syntax Alpha        = (UpAlpha | LoAlpha);
+syntax Alphas       = regex{[0-9a-zA-Z~`!@#$^&_=|;:'<>,?/[ +-]+};
+syntax Digit        = regex{[0-9]};
+syntax Digits       = regex{[0-9]+};
+syntax CRLF         = "\r\n";
+syntax MultiLineEnd = ".\r\n";
+syntax SP           = " ";
+syntax Chars        = regex{[^\r\n]*};
+syntax Param        = VChars;
+syntax VChars       = regex{[\x21-\x7e]+};
+syntax CChars       = regex{[\x21-\x2d\x2f-\x7f]+}; // printable ASCII, excluding "."
+syntax GChars       = regex{[\x21-\x3b\x3d-\x7f]*}; // printable ASCII, excluding "<"
+syntax RChars       = regex{[\x21-\x2e\x30-\x5c\x5e-\x7f]+}; // printable ASCII, excluding "/" and "]"
+syntax SChars       = regex{[\x21-\x5a\x5c-\x7f]*}; // printable ASCII, excluding "["
+syntax Keyword      = regex{[\x21-\x7e]{3,4}}; // "QUIT" | "STAT" | "LIST" | "NOOP" | "RSET" | "UIDL" | "CAPA" | "AUTH" | "STLS" | "USER" | "RETR" | "DELE" | "TOP" | "PASS" | "APOP";
+
+syntax Command = s1:Keyword s2:(SP s3:Chars => s3)? CRLF =>
+    new RequestMsg
+    {
+        Command = s1,
+        Param = s2.Count > 0 ? s2[0] : "",
+    };
+syntax RetrResponse = s:Status SP len:Digits SP unit:VChars CRLF =>
+    new ResponseMsg
+    {
+        Status = s,
+        Body = new RetrRespType
+        {
+            Length = len as uint,
+            Unit = unit,
+        },
+    };
+syntax SingleLineResponse = s:Status t:(SP t1:Chars => t1)? CRLF =>
+    new ResponseMsg
+    {
+        Status = s,
+        Body = ConvertSingleResponseBody(t),
+    };
+syntax MultiLineResponse[string commandStr] = s:Status p1:(SP p11:Chars => p11)? CRLF p2:(p21:regex{[^\r\n\x2e]*} CRLF => p21)* "." CRLF =>
+    new ResponseMsg
+    {
+        Status = s,
+        Body = ConvertMultiResponseBody(commandStr, p1 + p2),
+    };
+syntax AuthResponse = s:"+" SP p:Chars CRLF =>
+    new ResponseMsg
+    {
+        Status = s,
+        Body = p,
+        Payload = nothing,
+    };
+syntax Status       = "+OK" | "-ERR";
+syntax StatResp     = num:Digits SP size:Digits =>
+    new StatRespType
+    {
+        MsgNumber = num as uint,
+        MailDropSize = size as uint
+    };
+    
+syntax ListElem = s1:Digits SP s2:Digits => new ListRespType{MsgNumber = s1 as uint, MsgSize = s2 as uint};
+syntax UidlElem = s1:Digits SP s2:VChars => new UidlRespType{MsgNumber = s1 as uint, UniqueId = s2};
+
+// ---------------------------------- POP3 Decoding ---------------------------------------
+type Pop3DecodingHelper: TCPDecodingHelper
+{
+    Pop3DecodingContext pop3DecodingContext = null;
+    void InitializePop3DecodingHelper(Pop3RequestDecodingCache acceptsCache, Pop3ResponseDecodingCache issuesCache, TCP.Server server)
+    {
+        pop3DecodingContext = new Pop3DecodingContext();
+        
+        AcceptsCache = acceptsCache;
+        acceptsCache.InitializeContext(server, pop3DecodingContext);
+        IssuesCache = issuesCache;
+        issuesCache.InitializeContext(server, pop3DecodingContext);
+    }
+}
+
+type Pop3DecodingContext
+{
+    array<RequestMsg> CachedRequests = [];
+    int CachedRequestsArrayIndex = 0;
+    
+    RequestMsg PeekTopCachedRequestMessage()
+    {
+        if (CachedRequestsArrayIndex < CachedRequests.Count)
+        {
+            return CachedRequests[CachedRequestsArrayIndex];
+        }
+        
+        return null;
+    }
+    
+    void RemoveTopCachedRequestMessage()
+    {
+        if (CachedRequestsArrayIndex < CachedRequests.Count)
+        {
+            CachedRequestsArrayIndex++;
+        }
+    }
+    
+    void Clear()
+    {
+        CachedRequests = [];
+        CachedRequestsArrayIndex = 0;
+    }
+    
+    void AddRequestMessage(RequestMsg requestMsg)
+    {
+        CachedRequests += [requestMsg];
+    }
+}
+
+type Pop3RequestDecodingCache : TCPTextDecodingCache
+{
+    Pop3DecodingContext pop3DecodingContext;
+    
+    void InitializeContext(TCP.Server server, Pop3DecodingContext pop3DecodingContext)
+    {
+        InitializeTextDecodingCache("POP3", endpoint POP3.Server over server, MessageDirection.Accepts,
+            (x) => true, () => CRLFBinary, DecodeSinglePop3Request, DecodeIncompletePop3Request);
+        
+        this.pop3DecodingContext = pop3DecodingContext;
+    }
+    
+    optional any message DecodeSinglePop3Request(stream s)
+    {
+        if (Command(s) is requestMsg:RequestMsg)
+        {
+            pop3DecodingContext.AddRequestMessage(requestMsg);
+            return requestMsg;
+        }
+        
+        // decode as payload for AUTH scenario
+        if (BinaryDecoder<Blob[s.RemainingByteLength() as uint]>(s) is blob:Blob)
+        {
+            var msg = GenerateRequestPayload(blob.Data);
+            pop3DecodingContext.AddRequestMessage(msg);
+            return msg;
+        }
+        
+        // below code should never be reached
+        return nothing;
+    }
+    
+    optional any message DecodeIncompletePop3Request(binary buffer)
+    {
+        return GenerateRequestPayload(buffer);
+    }
+}
+
+type Pop3ResponseDecodingCache : TCPTextDecodingCache
+{
+    Pop3DecodingContext pop3DecodingContext;
+
+    void InitializeContext(TCP.Server server, Pop3DecodingContext pop3DecodingContext)
+    {
+        InitializeTextDecodingCache("POP3", endpoint POP3.Server over server, MessageDirection.Issues,
+            (x) => true, GetPop3ResponseEndMarkBinary, DecodeSinglePop3Response, DecodeIncompletePop3Response);
+            
+        this.pop3DecodingContext = pop3DecodingContext;
+    }
+    
+    binary GetPop3ResponseEndMarkBinary()
+    {
+        RequestMsg cachedRequest = pop3DecodingContext.PeekTopCachedRequestMessage();
+        if (IsMultiResponse(cachedRequest, Buffer))
+        {
+            // check ending mark CRLF.CRLF
+            return MultiLineEndSequence;
+        }
+        
+        // single line
+        return CRLFBinary;
+    }
+
+    optional any message DecodeSinglePop3Response(stream s)
+    {
+        optional ResponseMsg decodedResponseMessage = nothing;
+        RequestMsg cachedRequest = pop3DecodingContext.PeekTopCachedRequestMessage();
+        pop3DecodingContext.RemoveTopCachedRequestMessage();
+        
+        string commandStr = cachedRequest != null ? cachedRequest.Command.ToUpper() : "";
+        if (IsMultiResponse(cachedRequest, Buffer))
+        {
+            if (commandStr == "RETR")
+            {
+                // Reponse for RETR should decode the length in first line and then decode payload
+                if (RetrResponse(s) is retrResponse:ResponseMsg)
+                {
+                    decodedResponseMessage = retrResponse;
+                    
+                    int payloadStartPosition = s.BytePosition;
+                    int index = Buffer.IndexOf(MultiLineEndSequence, payloadStartPosition);
+                    if (index < 0)
+                    {
+                        // invalid data
+                        return nothing;
+                    }
+                    
+                    /* Decode the payload to the End Mark but not based on the length parameter in RETR reponse,
+                     * because the length may be invalid. 
+                     * And based on End Mark (CRLF.CRLF) will not have issue, since IsSufficient also check the
+                     * End Mark (CRLF.CRLF)
+                     */
+                    int payloadLength = (index + MultiLineEndSequence.Count - payloadStartPosition);
+                    ValidationCheck((retrResponse.Body as RetrRespType).Length == payloadLength, retrResponse, DiagnosisLevel.Warning, RETR_RESPONSE_LENGTH_INVALID);
+
+                    if (BinaryDecoder<Blob[payloadLength as uint]>(s) is blob:Blob)
+                    {
+                        retrResponse.Payload = blob.Data.Segment(0, blob.Data.Count - 3); // ignore .CRLF
+                        retrResponse.AssignFieldEncodingInfo("Payload", (payloadStartPosition << 3), (payloadLength - 3) * 8);
+                    }
+                }
+            }
+            else if (MultiLineResponse(s, commandStr) is multiResponse:ResponseMsg)
+            {
+                decodedResponseMessage = multiResponse;
+            }
+        }
+        else if (SingleLineResponse(s) is singleResponse:ResponseMsg)
+        {
+            decodedResponseMessage = singleResponse;
+        }
+        else if (AuthResponse(s) is authResponse:ResponseMsg)
+        {
+            decodedResponseMessage = authResponse;
+        }
+        
+        return decodedResponseMessage;
+    }
+    
+    optional any message DecodeIncompletePop3Response(binary buffer)
+    {
+        return GenerateResponsePayload(buffer);
+    }
+    
+    override void ClearExceptionally()
+    {
+        base.ClearExceptionally();
+        
+        // clear the cache
+        pop3DecodingContext.Clear();
+    }
+}
+
+bool IsMultiResponse(RequestMsg cachedRequest, binary buffer)
+{
+    if (cachedRequest == null)
+    {
+        return false;
+    }
+    
+    string commandStr = cachedRequest.Command.ToUpper();
+    return (commandStr == "RETR" || commandStr == "TOP" || commandStr == "CAPA" ||
+        ((commandStr == "UIDL" || commandStr == "LIST" || commandStr == "AUTH") && cachedRequest.Param.Count == 0)) &&
+        // multiple line, check the status is +OK (case insensitive)
+        buffer[0] == 0x2B && buffer[1] in [0x4F, 0x6f] && buffer[2] in [0x4B, 0x6B];
+}
+
+/**
+ * Items in Single Line Response of POP3 may have structures.
+ * For STAT command, one line is message number followed by mail drop size;
+ * 
+ * This method is convert the line from string format to a structure
+ */
+(StatRespType | string) ConvertSingleResponseBody(array<string> arrayString)
+{
+    if (arrayString.Count == 0)
+    {
+        return "";
+    }
+    if (StatResp(arrayString[0]) is statRespType:StatRespType)
+    {
+        return statRespType;
+    }
+    
+    return arrayString[0];
+}
+
+/**
+ * Items in Multiple Line Response of POP3 may have structures.
+ * For LIST command, one line is message number followed by message size;
+ * For UIDL command, one line is message number followed by UID;
+ * 
+ * This method is convert the line from string format to a structure
+ */
+array<string | ListRespType | UidlRespType> ConvertMultiResponseBody(string commandStr, array<string> arrayString)
+{
+    array<string | ListRespType | UidlRespType> ret = [];
+
+    foreach (var str in arrayString)
+    {
+        switch (commandStr)
+        {
+            case "LIST" =>
+                if (ListElem(str) is listRespType:ListRespType)
+                {
+                    ret += [listRespType];
+                }
+                else
+                {
+                    ret += [str];
+                }
+            case "UIDL" =>
+                if (UidlElem(str) is uidlRespType:UidlRespType)
+                {
+                    ret += [uidlRespType];
+                }
+                else
+                {
+                    ret += [str];
+                }
+            default =>
+                ret += [str];
+        }
+    }
+    
+    return ret;
+}
+
+RequestMsg GenerateRequestPayload(binary payload)
+{
+    var request = new RequestMsg
+    {
+        Command = "",
+        Param = "",
+        Payload = payload
+    };
+    request.SourceData = payload;
+    request.AssignFieldEncodingInfo("Payload", 0, payload.Count * 8);
+    return request;
+}
+
+ResponseMsg GenerateResponsePayload(binary payload)
+{
+    var response = new ResponseMsg
+    {
+        Status = "",
+        Body = "",
+        Payload = payload
+    };
+    response.SourceData = payload;
+    response.AssignFieldEncodingInfo("Payload", 0, payload.Count * 8);
+    return response;
+}

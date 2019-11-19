@@ -1,0 +1,158 @@
+﻿protocol RMCP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Remote Management and Control Protocol", // There's another protocol "Remote Mail Checking Protocol" (RFC 1339) using the same abbreviation, if they conflict in the future, we need update the Abbr. for both.
+    ShortName = "RMCP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "Alert Standard Format Specification", Version = "2.0", Link = "http://www.dmtf.org/sites/default/files/standards/documents/DSP0136.pdf"}
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="03/08/2013"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+
+endpoint Console over UDP.Host accepts RMCPMessage issues RMCPMessage;
+client endpoint Client connected to Console;
+
+/*
+ * For network frames sent to the managed client, each of these ports is a
+ * destination port. For network frames sent by the managed client, each of
+ * these ports is a source port. The source port in the frames sent to the
+ * managed client becomes the destination port in the frames sent by the
+ * managed client.
+ */
+autostart actor RMCPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where ((d.DestinationPort == Port.AsfRmcp || d.SourcePort == Port.AsfRmcp) && d.Payload.Count >= 4)
+    {
+        switch(d.Payload)
+        {
+            case m:RMCP.RMCPMessage from BinaryDecoder<RMCPMessage> =>
+                dispatch (endpoint Console over host) accepts m;
+            default =>
+                ThrowDecodingException("RMCP", "RMCPMessage");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram where ((d.DestinationPort == Port.AsfSecureRmcp || d.SourcePort == Port.AsfSecureRmcp)&& d.Payload.Count >= 6)
+    {
+        switch(d.Payload)
+        {
+            case m:RMCP.RSPMessage from RSPDecoder =>
+                m.RMCP.Origins += [m];
+                dispatch (endpoint Console over host) accepts m.RMCP;
+            default =>
+                ThrowDecodingException("RMCP", "RSPMessage");
+        }
+    }
+}
+
+optional RSPMessage RSPDecoder(binary payload)
+{
+    stream s = payload;
+    var msg = BinaryDecoder<RSPMessage>(s);
+    if (msg != nothing && s.BytePosition < s.ByteLength - 2) // has trailer
+    {
+        RSPMessage rspMsg = msg as RSPMessage;
+        int reminder = (s.BytePosition + 2) % 4;
+        if (reminder != 0 && s.ByteLength - s.BytePosition > (4 - reminder)) // check and avoid throw exception for decoding pad.
+        {
+            rspMsg.Pad = (BinaryDecoder<Utility.Padding[(4 - reminder) as byte]>(s) as Utility.Padding).Padding as binary;
+        }
+        rspMsg.PadLength = BinaryDecoder<byte>(s) as byte;
+        rspMsg.NextHeader = BinaryDecoder<byte>(s);
+        rspMsg.IntegrityData = BinaryDecoder<binary>(s);
+        return rspMsg;
+    }
+    return msg;
+}
+
+message RSPMessage
+{
+    uint SessionID;
+    uint SequenceNumber;
+    RMCPMessage RMCP;
+    optional binary Pad where ValidationCheckValue(value is nothing || IsZeroValue(value as binary), this, false, ReferenceType.Message, "RSP", "Pad", "binary", "bytes with zero values", (value as binary).ToString()) with Encoding{Ignore = true};
+    optional byte PadLength with Encoding{Ignore = true};
+    optional byte NextHeader with Encoding{Ignore = true};
+    optional binary IntegrityData with Encoding{Ignore = true};
+    
+    invariant (Pad is nothing) || (PadLength is nothing) || (Pad as binary).Count == (PadLength as int);
+    override string ToString()
+    {
+        return "RSPMessage, SessionID: " + SessionID.ToString() + ", SequenceNumber: " + SequenceNumber.ToString() + (NextHeader != 0 ? (", NextHeader: " + NextHeader.ToString()) : "");
+    }
+}
+
+message RMCPMessage
+{
+    byte Version with DisplayInfo{ToText = GetVersionString};
+    byte Reserved;
+    byte SequenceNumber;
+    ClassOfMessage ClassOfMessage;
+    optional [|ClassOfMessage.MessageType != 1|] ([|ClassOfMessage.MessageClass == MessageClass.ASF|] RMCPASFData | binary) RMCPData;
+    
+    override string ToString()
+    {
+        return "RMCPMessage, Version: " + GetVersionString(Version) + ", SequenceNumber: " + SequenceNumber.ToString() + ", MessageClass: " + EnumToString(ClassOfMessage.MessageClass, "RMCP.MessageClass") + (ClassOfMessage.MessageType == 1 ? "(Ack) " : "");
+    }
+}
+
+string GetVersionString(any version)
+{
+    if (!(version is byte))
+    {
+        return "";
+    }
+    byte ver = version as byte;
+    if (ver == 6)
+    {
+        return "ASF RMCP Version 1.0";
+    }
+    else if (ver < 6)
+    {
+        return "Legacy RMCP";
+    }
+    else
+    {
+        return "Reserved for future definition by this specification";
+    }
+}
+
+type ClassOfMessage
+{
+    byte MessageType with BinaryEncoding{Width = 1}, DisplayInfo{ToText = (any e) => e as byte == 1 ? "Acknowledge message" : "Not Acknowledge message"};
+    byte Reserved with BinaryEncoding{Width = 4};
+    MessageClass MessageClass with BinaryEncoding{Width = 3};
+}
+
+pattern MessageClass = enum byte
+{
+    ASF = 0x6,
+    IPMI = 0x7,
+    OEMDefined = 0x8,
+    ...
+};
+
+type RMCPASFData
+{
+    uint IANAEnterpriseNumber;
+    byte MessageType;
+    byte MessageTag;
+    byte Reserved;
+    byte DataLength;
+    binary Data with BinaryEncoding{MaxLength = DataLength};
+}

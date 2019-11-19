@@ -1,0 +1,1477 @@
+protocol DHCPE
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Dynamic Host Configuration Protocol (DHCP) Extensions",
+    ShortName = "DHCPE",
+    DocumentName = "MS-DHCPE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "DHCPE", Version = "21.0", Date = "05/15/2014", ProgramName = ProgramName.WSPP}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "371022", Date = "11/26/2014"}
+        ]
+};
+
+using DHCP;
+using DHCPv6;
+using Utility;
+using DNS;
+using CoreNetworkingResources;
+
+autostart actor DHCPEExtendDHCP(DHCP.Server server) precedes DHCP.Server
+{
+    DhcpOptionExtensionHelper dhcpOptionExtensionHelper = new DhcpOptionExtensionHelper();
+
+    // only extend the DHCP message when there are at least one elements in the DHCP message
+    observe server accepts dhcpMessage:DhcpMessage where dhcpMessage.Options.Option.Count > 0
+    {
+        ExtendDHCPOption(dhcpMessage);
+    }
+
+    // only extend the DHCP message when there are at least one elements in the DHCP message
+    observe server issues dhcpMessage:DhcpMessage where dhcpMessage.Options.Option.Count > 0
+    {
+        ExtendDHCPOption(dhcpMessage);
+    }
+
+    // Extend according to the definition in MS-DHCPE
+    // 1. Extend UserClassOption
+    // 2. Extend VendorInfoData
+    // 3. Reassemble Microsoft Encoding Long Options and decode as correct DHCP Option
+    void ExtendDHCPOption(DhcpMessage dhcpMessage)
+    {
+        // only extend the DHCP message when there are at least one elements in the DHCP message
+        if (dhcpMessage.Options.Option.Count == 0)
+        {
+            return;
+        }
+        
+        // reset before decode
+        dhcpOptionExtensionHelper.newOptionArray = null; // for Microsoft Encoding Long Option scenario
+        dhcpOptionExtensionHelper.index = 0;
+
+        dhcpOptionExtensionHelper.Decode(dhcpMessage.Options);
+        
+        // If newOptionArray is not null, it means that some of Microsoft Encoding Long Options have been reassembled.
+        // newOptionArray contains the options after reassembled.
+        if (dhcpOptionExtensionHelper.newOptionArray != null)
+        {
+            any association = GetFieldAssociation(dhcpMessage.Options, "Option");
+            dhcpMessage.Options.Option = dhcpOptionExtensionHelper.newOptionArray;
+            // assign association
+            AssociateField(dhcpMessage.Options, "Option", association);
+        }
+    }
+}
+
+autostart actor DHCPEExtendDHCPv6(DHCPv6.Server server) precedes DHCPv6.Server
+{
+    observe server issues m:DHCPv6.Messages.Message
+    {
+        m.Options = ExtendDHCPv6Options(m.Options);
+    }
+
+    observe server accepts m:DHCPv6.Messages.Message
+    {
+        m.Options = ExtendDHCPv6Options(m.Options);
+    }
+
+    observe server issues m:DHCPv6.Messages.RelayMessage
+    {
+        m.Options = ExtendDHCPv6Options(m.Options);
+    }
+
+    observe server accepts m:DHCPv6.Messages.RelayMessage
+    {
+        m.Options = ExtendDHCPv6Options(m.Options);
+    }
+
+    // using the code pattern "m.Options = ExtendDHCPv6Options(m.Options)" to optimize on array copy
+    // since DHCPOption is pattern, so cannot use keyword "ref" to avoid array copy
+    array<DHCPOption> ExtendDHCPv6Options(array<DHCPOption> dhcpv6Options)
+    {
+        for (int index = 0; index < dhcpv6Options.Count; index++)
+        {
+            DHCPv6.BaseOption baseOption = dhcpv6Options[index] as DHCPv6.BaseOption;
+            switch (baseOption.OptionCode)
+            {
+                case 15 =>
+                    //  DHCPv6 Option Code 15 (0x000F) - User Class Option
+                    if (baseOption is userClassOption:DHCPv6.UserClassOption
+                        && userClassOption.UserClassData.Count == 1)
+                    {
+                        switch (userClassOption.UserClassData[0].OpaqueData)
+                        {
+                            case dhcpeUserClassOption:DHCPE.DHCPEUserClassOption from BinaryDecoder<DHCPE.DHCPEUserClassOption> =>
+                                dhcpeUserClassOption.OptionCode = baseOption.OptionCode;
+                                dhcpeUserClassOption.OptionLen = baseOption.OptionLen;
+                                dhcpeUserClassOption.UserClassDataLength = userClassOption.UserClassData[0].UserClassLen;
+
+                                dhcpv6Options[index] = dhcpeUserClassOption;
+                            default =>
+                                // do nothing
+                        }
+                    }
+                case 16 =>
+                    // 2.2.5   DHCPv6 Option Code 16 (0x0010) - Vendor Class Option
+                    if (baseOption is vendorClassOption:DHCPv6.VendorClassOption
+                        && vendorClassOption.OptionLen == 0x000E
+                        && vendorClassOption.EnterpriseNum == 0x00000137
+                        && vendorClassOption.VendorClassData.Count == 1
+                        && vendorClassOption.VendorClassData[0].VendorClassLen == 0x0008)
+                    {
+                        switch (vendorClassOption.VendorClassData[0].OpaqueData)
+                        {
+                            case dhcpeVendorClass:DHCPE.DHCPEVendorClass from BinaryDecoder<DHCPE.DHCPEVendorClass> =>
+                                dhcpeVendorClass.OptionCode = baseOption.OptionCode;
+                                dhcpeVendorClass.OptionLen = baseOption.OptionLen;
+                                dhcpeVendorClass.EnterpriseNumber = vendorClassOption.EnterpriseNum;
+                                dhcpeVendorClass.VendorClassDataLength = vendorClassOption.VendorClassData[0].VendorClassLen;
+
+                                dhcpv6Options[index] = dhcpeVendorClass;
+                            default =>
+                                // do nothing
+                        }
+                    }
+                case 17 =>
+                    if (baseOption is vendorSpecificInfoOption:DHCPv6.VendorSpecificInformationOption
+                        && vendorSpecificInfoOption.EnterpriseNum == 0x00000137)
+                    {
+                        for (int subIndex = 0; subIndex < vendorSpecificInfoOption.OptionData.Count; subIndex++)
+                        {
+                            if (vendorSpecificInfoOption.OptionData[subIndex].OptCode == 95)
+                            {
+                                // 2.2.10.2   Vendor-Specific Option Code 0x5F �C Rogue Detection Reply Option
+                                switch (vendorSpecificInfoOption.OptionData[subIndex].OptionData)
+                                {
+                                    case dhcpeRogueDectionReply:DHCPERogueDectionReply from BinaryDecoder<DHCPERogueDectionReply> =>
+                                        dhcpeRogueDectionReply.OptCode = vendorSpecificInfoOption.OptionData[subIndex].OptCode;
+                                        dhcpeRogueDectionReply.OptionLen = vendorSpecificInfoOption.OptionData[subIndex].OptionLen;
+
+                                        vendorSpecificInfoOption.OptionData[subIndex] = dhcpeRogueDectionReply;
+                                }
+                            }
+                        }
+                    }
+            }
+        }
+
+        return dhcpv6Options;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////
+// Extension for Microsoft Encoding Long Option Reassembly
+type OptionsChoiceMELOptionReassembly
+{
+    SubOptionsChoiceMELOptionReassembly Option;
+}
+
+pattern SubOptionsChoiceMELOptionReassembly = 
+    [|RemainingByteLength(stream) >= 3|]
+    (
+    // RFC 2132
+    [|CurrentByte(stream) == 3 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.Router |
+    [|CurrentByte(stream) == 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.TimeServer |
+    [|CurrentByte(stream) == 5 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NameServer |
+    [|CurrentByte(stream) == 6 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.DomainNameServer |
+    [|CurrentByte(stream) == 7 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.LogServer |
+    [|CurrentByte(stream) == 8 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.CookieServer |
+    [|CurrentByte(stream) == 9 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.LPRServer |
+    [|CurrentByte(stream) == 10 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.ImpressServer |
+    [|CurrentByte(stream) == 11 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.ResourceLocationServer |
+    [|CurrentByte(stream) == 12|] DHCPE.HostName |
+    [|CurrentByte(stream) == 14|] DHCPE.MeritDumpFile |
+    [|CurrentByte(stream) == 15|] DHCPE.DomainName |
+    [|CurrentByte(stream) == 17|] DHCPE.RootPath |
+    [|CurrentByte(stream) == 18|] DHCPE.ExtensionsPath |
+    [|CurrentByte(stream) == 21 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 8 == 0|] DHCPE.PolicyFilter |
+    [|CurrentByte(stream) == 25 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 2 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 2 == 0|] DHCPE.PathMTUPlateauTable |
+    [|CurrentByte(stream) == 33 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 8 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 8 == 0|] DHCPE.StaticRoute |
+    [|CurrentByte(stream) == 40|] DHCPE.NetworkInformationServiceDomain |
+    [|CurrentByte(stream) == 41 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetworkInformationServer |
+    [|CurrentByte(stream) == 42 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetworkTimeProtocolServers |
+    [|CurrentByte(stream) == 43|] DHCPE.VendorSpecificInformation |
+    [|CurrentByte(stream) == 44 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetBIOSOverTCPIPNameServer |
+    [|CurrentByte(stream) == 45 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetBIOSOverTCPIPDatagramDistributionServer |
+    [|CurrentByte(stream) == 47 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.NetBIOSOverTCPIPScope |
+    [|CurrentByte(stream) == 48 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.XWindowSystemFontServer |
+    [|CurrentByte(stream) == 49 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.XWindowSystemDisplayManager |
+    [|CurrentByte(stream) == 55 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.ParameterRequestList |
+    [|CurrentByte(stream) == 56 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.MessageOption |
+    [|CurrentByte(stream) == 60 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.VendorClassIdentifier |
+    [|CurrentByte(stream) == 61 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 2|] DHCPE.ClientIdentifier |
+    //  RFC 2132
+    [|CurrentByte(stream) == 64 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.NetworkInformationServicePlusDomain |
+    [|CurrentByte(stream) == 65 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetworkInformationServicePlusServers |
+    [|CurrentByte(stream) == 66 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.TFTPServerName |
+    [|CurrentByte(stream) == 67 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.BootfileName |
+    [|CurrentByte(stream) == 68 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.MobileIPHomeAgent |
+    [|CurrentByte(stream) == 69 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.SimpleMailTransportProtocolServer |
+    [|CurrentByte(stream) == 70 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.PostOfficeProtocolServer |
+    [|CurrentByte(stream) == 71 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NetworkNewsTransportProtocolServer |
+    [|CurrentByte(stream) == 72 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.DefaultWorldWideWebServer |
+    [|CurrentByte(stream) == 73 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.DefaultFingerServer |
+    [|CurrentByte(stream) == 74 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.DefaultInternetRelayChatServer |
+    [|CurrentByte(stream) == 75 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.StreetTalkServer |
+    [|CurrentByte(stream) == 76 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.StreetTalkDirectoryAssistanceServer |
+    //  RFC 3004 
+    [|CurrentByte(stream) == 77|] (DHCPE.UserClassOption | DHCPEUserClassOptionServerToClientMELOptionReassembly | DHCPEUserClassOptionClientToServerMELOptionReassembly | DHCPE.UnknownOption) |
+    //  RFC 2610
+    [|CurrentByte(stream) == 78 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 5 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 1|] DHCPE.SLPDirectoryAgent |
+    [|CurrentByte(stream) == 79 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) > 1|] DHCPE.SLPServiceScope |
+    //  RFC 4702
+    [|CurrentByte(stream) == 81 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 3|] DHCPE.ClientFQDN |
+    // RFC 3046
+    [|CurrentByte(stream) == 82 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 2|] DHCPE.RelayAgentInformation |
+    //  RFC 4174
+    [|CurrentByte(stream) == 83 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 14|] DHCPE.ISNS |
+    //  RFC 2241
+    [|CurrentByte(stream) == 85 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.NDSServer |
+    //  RFC 4280
+    [|CurrentByte(stream) == 88|] DHCPE.BCMCSControllerDomainNameList |
+    [|CurrentByte(stream) == 89 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.BCMCSControllerIPv4Address |
+    //  RFC 3118
+    [|CurrentByte(stream) == 90 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 7|] DHCPE.Authentication |
+    //  RFC 4388
+    [|CurrentByte(stream) == 92 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.AssociatedIp |
+    //  RFC 4578
+    [|CurrentByte(stream) == 97 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.ClientMachineIdentifier |
+    //  RFC 2485
+    [|CurrentByte(stream) == 98|] DHCPE.UserAuthenticationProtocol |
+    //  RFC 4776
+    [|CurrentByte(stream) == 99 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 3|] DHCPE.CivicLocation |
+    //  RFC 4833
+    [|CurrentByte(stream) == 100|] DHCPE.NewTimezonePCode |
+    [|CurrentByte(stream) == 101|] DHCPE.NewTimezoneTCode |
+    [|CurrentByte(stream) == 117|] DHCPE.NameServiceSearch |
+    //  RFC 3397
+    [|CurrentByte(stream) == 119|] DHCPE.DomainSearch |
+    //  RFC 3361
+    [|CurrentByte(stream) == 120 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 1|] DHCPE.SIPServers |
+    //  RFC 3442
+    [|CurrentByte(stream) == 121 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 5|] DHCPE.ClasslessStaticRoute |
+    //  RFC 3495
+    [|CurrentByte(stream) == 122|] DHCPE.CableLabsClientConfiguration |
+    //  RFC 3925
+    [|CurrentByte(stream) == 124|] DHCPE.VIVendorClass |
+    [|CurrentByte(stream) == 125 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) > 3|] DHCPE.VIVendorSpecificInformation |
+    //  RFC 5192
+    [|CurrentByte(stream) == 136 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.PANAAuthenticationAgent |
+    //  RFC 5223
+    [|CurrentByte(stream) == 137|] DHCPE.LoSTServer |
+    //  RFC 5417
+    [|CurrentByte(stream) == 138 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.CAPWAPAccessController |
+    //  RFC 5678
+    [|CurrentByte(stream) == 139|] DHCPE.MoSIPv4Address |
+    //  RFC 6011
+    [|CurrentByte(stream) == 141|] DHCPE.SIPUAConfigurationServiceDomains |
+    [|CurrentByte(stream) == 142 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] IPv4AddressANDSF |
+    //  RFC 5859
+    [|CurrentByte(stream) == 150 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 4 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) % 4 == 0|] DHCPE.TFTPServerAddress |
+    //  RFC 5071
+    [|CurrentByte(stream) == 209|] DHCPE.ConfigurationFile |
+    [|CurrentByte(stream) == 210|] DHCPE.PathPrefix |
+    [|CurrentByte(stream) == 212 && PeekUShort(stream, stream.BitPosition + 8, Endian.Big) >= 18 && (PeekUShort(stream, stream.BitPosition + 8, Endian.Big) - 18) % 4 == 0|] SixRd |
+    //  RFC 5986
+    [|CurrentByte(stream) == 213|] DHCPE.AccessNetworkDomainName |
+    // MS-DHCPE
+    [|CurrentByte(stream) == 249|] DHCPEMicrosoftClasslessStaticRouteOptionMELOptionReassembly |
+    // RFC 2563
+    [|CurrentByte(stream) == 252|] DHCPE.WPAD |
+    DHCPE.UnknownOption);
+
+// Option with Code 3
+type Router : DHCP.Router
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 4
+type TimeServer : DHCP.TimeServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 5
+type NameServer : DHCP.NameServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 6
+type DomainNameServer : DHCP.DomainNameServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 7
+type LogServer : DHCP.LogServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 8
+type CookieServer : DHCP.CookieServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 9
+type LPRServer : DHCP.LPRServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 10
+type ImpressServer : DHCP.ImpressServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 11
+type ResourceLocationServer : DHCP.ResourceLocationServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 12
+type HostName : DHCP.HostName
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 14
+type MeritDumpFile : DHCP.MeritDumpFile
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 15
+type DomainName : DHCP.DomainName
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 16
+type RootPath : DHCP.RootPath
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 18
+type ExtensionsPath : DHCP.ExtensionsPath
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 21
+type PolicyFilter : DHCP.PolicyFilter
+{
+    new ushort Len;
+    new array<DestinationMaskPair> DestinationMaskList with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 25
+type PathMTUPlateauTable : DHCP.PathMTUPlateauTable
+{
+    new ushort Len;
+    new array<ushort> Size with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 33
+type StaticRoute : DHCP.StaticRoute
+{
+    new ushort Len;
+    new array<DestinationRouterPair> DestinationRouterList with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 40
+type NetworkInformationServiceDomain : DHCP.NetworkInformationServiceDomain
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 41
+type NetworkInformationServer : DHCP.NetworkInformationServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 42
+type NetworkTimeProtocolServers : DHCP.NetworkTimeProtocolServers
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 43
+type VendorSpecificInformation : DHCP.VendorSpecificInformation
+{
+    new ushort Len;
+    new array<DHCP.VendorInfoData> Value with Encoding{Decoder = ValueDecoder};
+
+    // Decode vendor information data
+    // Consider Microsoft Encoding Long Option and DHCPE extension vendor information data
+    optional array<DHCP.VendorInfoData> ValueDecoder(stream s)
+    {
+        // assume in Microsoft Encoding Long Option scenario, variable Len will not be 0
+        // and stream contains more than 255 bytes
+
+        VendorInfoDataExtensionHelper helper = new VendorInfoDataExtensionHelper();
+        if (helper.Decode(s))
+        {
+            return helper.vendorInfoData;
+        }
+        return nothing;
+    }
+};
+
+// Option with Code 44
+type NetBIOSOverTCPIPNameServer : DHCP.NetBIOSOverTCPIPNameServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 45
+type NetBIOSOverTCPIPDatagramDistributionServer : DHCP.NetBIOSOverTCPIPDatagramDistributionServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 47
+type NetBIOSOverTCPIPScope : DHCP.NetBIOSOverTCPIPScope
+{
+    new ushort Len;
+    new string NetBIOSScope with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 48
+type XWindowSystemFontServer : DHCP.XWindowSystemFontServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 49
+type XWindowSystemDisplayManager : DHCP.XWindowSystemDisplayManager
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 64
+type NetworkInformationServicePlusDomain : DHCP.NetworkInformationServicePlusDomain
+{
+    new ushort Len;
+    new string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 65
+type NetworkInformationServicePlusServers : DHCP.NetworkInformationServicePlusServers
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 68
+type MobileIPHomeAgent : DHCP.MobileIPHomeAgent
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 69
+type SimpleMailTransportProtocolServer : DHCP.SimpleMailTransportProtocolServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 70
+type PostOfficeProtocolServer : DHCP.PostOfficeProtocolServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 71
+type NetworkNewsTransportProtocolServer : DHCP.NetworkNewsTransportProtocolServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 72
+type DefaultWorldWideWebServer : DHCP.DefaultWorldWideWebServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 73
+type DefaultFingerServer : DHCP.DefaultFingerServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 74
+type DefaultInternetRelayChatServer : DHCP.DefaultInternetRelayChatServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 75
+type StreetTalkServer : DHCP.StreetTalkServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 76
+type StreetTalkDirectoryAssistanceServer : DHCP.StreetTalkDirectoryAssistanceServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 66
+type TFTPServerName : DHCP.TFTPServerName
+{
+    new ushort Len;
+    new string TFTPServer with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 67
+type BootfileName : DHCP.BootfileName
+{
+    new ushort Len;
+    new string BootFileName with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 55
+type ParameterRequestList : DHCP.ParameterRequestList
+{
+    new ushort Len;
+    new array<byte> OptionCodes with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 56
+type MessageOption : DHCP.MessageOption
+{
+    new ushort Len;
+    new string Text with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 60
+type VendorClassIdentifier : DHCP.VendorClassIdentifier
+{
+    new ushort Len;
+    new string VendorClassIdentifier with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 61
+type ClientIdentifier : DHCP.ClientIdentifier
+{
+    new ushort Len;
+    new array<byte> ClientID with BinaryEncoding{Length = (Len - 1)};
+} 
+
+// RFC3046
+// Option with Code 82
+type RelayAgentInformation : DHCP.RelayAgentInformation
+{
+    new ushort Len;
+    new array<RelayAgentSubOptionChoice> AgentInformation with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// http://tools.ietf.org/id/draft-ietf-wrec-wpad-01.txt
+// Option with Code 252
+type WPAD : DHCP.WPAD
+{
+    new ushort Len;
+    new string URL with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// RFC 3004
+// Option with Code 77
+type UserClassOption : DHCP.UserClassOption
+{
+    new ushort Len;
+    new array<DHCP.UserClassData> UserClassData
+        where ValidateUserClassData(value)
+        with BinaryEncoding{WidthForComposedType = Len << 3};
+}
+
+// RFC 2610
+// Option with Code 78
+type SLPDirectoryAgent : DHCP.SLPDirectoryAgent
+{
+    new ushort Length;
+    new array<IPv4Address> A with BinaryEncoding{WidthForComposedType = (Length - 1) * 8};
+}
+
+// Option with Code 79
+type SLPServiceScope : DHCP.SLPServiceScope
+{
+    new ushort Length where (value > 1); // The Length value must include one for the Mandator  byte
+    new array<string> ScopeList with BinaryEncoding{WidthForComposedType = (Length - 1) * 8, TextEncoding = TextEncoding.UTF8};
+}
+
+// RFC 4702
+// Option with Code 81
+type ClientFQDN : DHCP.ClientFQDN
+{
+    new ushort Len;
+    new optional ([|((DHCP.Flags.E as ushort) & (Flag as ushort)) == (DHCP.Flags.E as ushort)|] DNSString | string)
+        DomainName with BinaryEncoding{WidthForComposedType = (Len - 3) << 3, TextEncoding = TextEncoding.ASCII};
+}
+
+// RFC 4174
+// Option with Code 83
+type ISNS : DHCP.ISNS
+{
+    new ushort Length;
+    new optional [|(AdministrativeFlags.H & AdministrativeFlag) == AdministrativeFlags.H && Length >= 18|] IPv4Address B;
+    new optional [|Length > 18|] array<IPv4Address> AdditionalSecondaryiSNSServers with BinaryEncoding{WidthForComposedType = (Length - 18) * 8};
+}
+
+// RFC 2241
+// Option with Code 85
+type NDSServer : DHCP.NDSServer
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// RFC 4280
+// Option with Code 88
+type BCMCSControllerDomainNameList : DHCP.BCMCSControllerDomainNameList
+{
+    new ushort Len;
+    new DNSString BCMCSController with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 89
+type BCMCSControllerIPv4Address : DHCP.BCMCSControllerIPv4Address
+{
+    new ushort Len;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// RFC 3118
+// Option with Code 90
+type Authentication : DHCP.Authentication
+{
+    new ushort Length;
+    new binary AuthenticationInfo with BinaryEncoding{Length = Length - 7};
+}
+
+// Option with Code 92
+type AssociatedIp : DHCP.AssociatedIp
+{
+    new ushort Len;
+    new array<IPv4Address> Addresses with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// Option with Code 97
+type ClientMachineIdentifier : DHCP.ClientMachineIdentifier
+{
+    new ushort Len;
+    new ([|Len == 17|] guid | binary) MachineIdentifier with BinaryEncoding{WidthForComposedType = (Len - 1) * 8};
+}
+
+// RFC 2485
+// Option with Code 98
+type UserAuthenticationProtocol : DHCP.UserAuthenticationProtocol
+{
+    new ushort Length;
+    new string URLList with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Length * 8};
+}
+
+// RFC 4776
+// Option with Code 99
+type CivicLocation : DHCP.CivicLocation
+{
+    new ushort Len;
+    new array<DHCP.CivicAddress> Address with BinaryEncoding{WidthForComposedType = Len << 3};
+}
+
+// RFC 4833
+// Option with Code 100
+type NewTimezonePCode : DHCP.NewTimezonePCode
+{
+    new ushort Len;
+    new string TZPOSIXString with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// Option with Code 101
+type NewTimezoneTCode : DHCP.NewTimezoneTCode
+{
+    new ushort Len;
+    new string TimezonePCode with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+}
+
+// RFC 2937
+// Option with Code 117
+type NameServiceSearch : DHCP.NameServiceSearch
+{
+    new ushort Len;
+    new array<NameServiceSearchOrder> Ns with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// RFC 3397
+// Option with Code 119
+type DomainSearch : DHCP.DomainSearch
+{
+    new ushort Len;
+    new DNSString SeachString with BinaryEncoding{WidthForComposedType = Len << 3};
+}
+
+// RFC 3361
+// Option with Code 120
+type SIPServers : DHCP.SIPServers
+{
+    new ushort Len;
+    new ([|Enc == 0|] DNSString | [|Enc == 1|] array<IPv4Address>) Address with BinaryEncoding{WidthForComposedType = (Len - 1) << 3};
+}
+
+// RFC 3442
+// Option with Code 121
+type ClasslessStaticRoute : DHCP.ClasslessStaticRoute
+{
+    new ushort Len;
+    new array<DestinationRouter> DestinationRouter with BinaryEncoding{WidthForComposedType = Len << 3};
+}
+
+// RFC 3495
+// Option with Code 122
+type CableLabsClientConfiguration : DHCP.CableLabsClientConfiguration
+{
+    new ushort Length;
+    new array<SubOptions> SubOptions with BinaryEncoding{WidthForComposedType = Length << 3};
+}
+
+// RFC 3925
+// Option with Code 124
+type VIVendorClass : DHCP.VIVendorClass
+{
+    new ushort OptionLength;
+    new array<OptionData> OptionData with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+}
+
+// Option with Code 125
+type VIVendorSpecificInformation : DHCP.VIVendorSpecificInformation
+{
+    new ushort OptionLength;
+    new array<OptionData> OptionData with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+}
+
+// RFC 5192
+// Option with Code 136
+type PANAAuthenticationAgent : DHCP.PANAAuthenticationAgent
+{
+    new ushort OptionLength;
+    new array<IPv4Address> IPv4Address with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+}
+
+// RFC 5223
+// Option with Code 137
+type LoSTServer : DHCP.LoSTServer
+{
+    new ushort OptionLength;
+    new DNSString DomainName with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+}
+
+// RFC 5417
+// Option with Code 138
+type CAPWAPAccessController : DHCP.CAPWAPAccessController
+{
+    new ushort OptionLength;
+    new array<IPv4Address> ACIPv4Address with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+}
+
+// RFC 5678
+// Option with Code 139
+type MoSIPv4Address : DHCP.MoSIPv4Address
+{
+    new ushort Length;
+    new array<SubOption> SubOption with BinaryEncoding{WidthForComposedType = Length << 3};
+}
+
+// RFC 6011
+// Option with Code 141
+type SIPUAConfigurationServiceDomains : DHCP.SIPUAConfigurationServiceDomains
+{
+    new ushort Len;
+    new DNSString Searchstring with BinaryEncoding{WidthForComposedType = Len * 8};
+}
+
+// RFC 6153
+// Option with Code 142
+type IPv4AddressANDSF : DHCP.IPv4AddressANDSF
+{
+    new ushort Length;
+    new array<IPv4Address> IPAddress with BinaryEncoding{WidthForComposedType = Length << 3};
+}
+
+// RFC 5859
+// Option with Code 150
+type TFTPServerAddress : DHCP.TFTPServerAddress
+{
+    new ushort Len;
+    new array<IPv4Address> IPv4Address with BinaryEncoding{WidthForComposedType = Len << 3};
+}
+
+// Option with Code 209
+type ConfigurationFile : DHCP.ConfigurationFile
+{
+    new ushort Len;
+    new string ConfigFile with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+}
+
+// Option with Code 210
+type PathPrefix : DHCP.PathPrefix
+{
+    new ushort Len;
+    new string PathPrefix with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+}
+
+// RFC 5969
+// Option with Code 212
+type SixRd : DHCP.SixRd
+{
+    new ushort OptionLength;
+    new array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = (OptionLength - 18) << 3};
+}
+
+// RFC 5986
+// Option with Code 213
+type AccessNetworkDomainName : DHCP.AccessNetworkDomainName
+{
+    new ushort Length;
+    new DNSString DomainName with BinaryEncoding{WidthForComposedType = Length * 8};
+}
+
+type UnknownOption : DHCP.UnknownOption
+{
+    new ushort Len;
+    new binary Value with BinaryEncoding{Length = Len};
+}
+
+//////////////////////////////////////////////////////
+// MS Extended Option
+
+// DHCPE 2.2.6
+// MS-DHCPE User Class Option Sent by DHCPv4 Client to DHCPv4 Server
+// Option with Code 77
+type DHCPEUserClassOptionClientToServer[int Len] : DHCP.BaseOption
+{
+    new byte Code with Encoding{Ignore = true};
+    byte OptionLength with Encoding{Ignore = true};
+    string UserClassData with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+    
+    override string ToString()
+    {
+        return "User Class Option Sent by DHCPv4 Client to DHCPv4 Server";
+    }
+}
+
+// Option with Code 77
+type DHCPEUserClassOptionClientToServerMELOptionReassembly : DHCP.BaseOption
+{
+    ushort OptionLength;
+    string UserClassData with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = OptionLength};
+    
+    override string ToString()
+    {
+        return "User Class Option Sent by DHCPv4 Client to DHCPv4 Server";
+    }
+}
+
+// MS-DHCPE User Class Option Sent by DHCPv4 Server to DHCPv4 Client
+// Option with Code 77
+type DHCPEUserClassOptionServerToClient[int Len] : DHCP.BaseOption
+{
+    new byte Code with Encoding{Ignore = true};
+    byte OptionLength with Encoding{Ignore = true};
+    ushort UserClassBinaryDataLength;
+    binary UserClassBinaryData with BinaryEncoding{Length = UserClassBinaryDataLength};
+    optional [|UserClassBinaryDataLength % 4 != 0|] binary Padding with BinaryEncoding{Length = 4 - UserClassBinaryDataLength % 4};
+    ushort UserClassNameLength;
+    string UserClassName with BinaryEncoding{WidthForComposedType = UserClassNameLength * 8, TextEncoding = TextEncoding.BigEndianUnicode};
+    ushort UserClassDescriptionLength;
+    string UserClassDescription with BinaryEncoding{WidthForComposedType = UserClassDescriptionLength * 8,  TextEncoding = TextEncoding.BigEndianUnicode};
+
+    // check whether decoding to the end of the option data
+    // bug #79825: code should be simpler as below
+    // invariant UserClassBinaryDataLength + (Padding is padding:array<byte> ? padding.Count : 0)
+    // + UserClassNameLength + UserClassDescriptionLength == Len;
+    invariant UserClassBinaryDataLength + GetPaddingLength()
+        + UserClassNameLength + UserClassDescriptionLength + 6 == Len;
+
+    int GetPaddingLength()
+    {
+        return (Padding is padding:binary ? padding.Count : 0);
+    }
+    
+    override string ToString()
+    {
+        return "User Class Option Sent by DHCPv4 Server to DHCPv4 Client";
+    }
+}
+
+// Option with Code 77
+type DHCPEUserClassOptionServerToClientMELOptionReassembly : DHCP.BaseOption
+{
+    ushort OptionLength;
+    ushort UserClassBinaryDataLength;
+    binary UserClassBinaryData with BinaryEncoding{Length = UserClassBinaryDataLength};
+    optional [|UserClassBinaryDataLength % 4 != 0|] binary Padding with BinaryEncoding{Length = 4 - UserClassBinaryDataLength % 4};
+    ushort UserClassNameLength;
+    string UserClassName with BinaryEncoding{WidthForComposedType = UserClassNameLength * 8, TextEncoding = TextEncoding.BigEndianUnicode};
+    ushort UserClassDescriptionLength;
+    string UserClassDescription with BinaryEncoding{WidthForComposedType = UserClassDescriptionLength * 8, TextEncoding = TextEncoding.BigEndianUnicode};
+
+    // check whether decoding to the end of the option data
+    // bug #79825: code should be simpler as below
+    // invariant UserClassBinaryDataLength + (Padding is padding:array<byte> ? padding.Count : 0)
+    // + UserClassNameLength + UserClassDescriptionLength == Len;
+    invariant UserClassBinaryDataLength + GetPaddingLength()
+        + UserClassNameLength + UserClassDescriptionLength + 6 == OptionLength;
+
+    int GetPaddingLength()
+    {
+        return (Padding is padding:binary ? padding.Count : 0);
+    }
+    
+    override string ToString()
+    {
+        return "User Class Option Sent by DHCPv4 Server to DHCPv4 Client";
+    }
+}
+
+// 2.2.8   DHCPv4 Option Code 249 (0xF9) - Microsoft Classless Static Route Option
+// Option with Code 249
+type DHCPEMicrosoftClasslessStaticRouteOption : DHCP.BaseOption
+{
+    new byte Code with Encoding{Ignore = true};
+    byte OptionLength with Encoding{Ignore = true};
+    array<DestinationRouter> DestinationRouter;
+    
+    override string ToString()
+    {
+        return "Microsoft Classless Static Route Option";
+    }
+}
+
+// Option with Code 249 for Microsoft Encoding Long Option Reassembly
+type DHCPEMicrosoftClasslessStaticRouteOptionMELOptionReassembly : DHCP.BaseOption
+{
+    ushort OptionLength;
+    array<DestinationRouter> DestinationRouter with BinaryEncoding{WidthForComposedType = OptionLength * 8};
+}
+
+// DHCPE 2.2.2 DHCPv4 Option Code 43 (0x2B) - Vendor-Specific Information Option
+pattern DHCPEVendorInfoData 
+    = [|stream.RemainingByteLength > 2|]
+    ([|stream.CurrentByte() == 1 && stream.PeekByte(stream.BitPosition + 8) == 4|] DHCPEVendorSpecificInfoMicrosoftDisableNetBIOS |
+    [|stream.CurrentByte() == 2 && stream.PeekByte(stream.BitPosition + 8) == 4|] DHCPEVendorSpecificInfoMicrosoftReleaseDHCPLeaseOnShutdown |
+    [|stream.CurrentByte() == 3 && stream.PeekByte(stream.BitPosition + 8) == 4|] DHCPEVendorSpecificInfoMicrosoftDefaultRouterMetricBase |
+    [|stream.CurrentByte() == 94 && stream.PeekByte(stream.BitPosition + 8) == 0|] DHCPEVendorSpecificInfoRogueDetectionRequest |
+    [|stream.CurrentByte() == 95|] DHCPEVendorSpecificInfoRogueDetectionReply |
+    DHCP.VendorInfoData);
+
+// WORKAROUND: Since it does not support decode pattern directly, we must put the pattern in a type
+type DHCPEVendorInfoDataType
+{
+    DHCPEVendorInfoData VendorInfoData;
+}
+
+// MS-DHCPE 2.2.2.1 Vendor-Specific Option - Microsoft Disable NetBIOS Option
+type DHCPEVendorSpecificInfoMicrosoftDisableNetBIOS : DHCP.VendorInfoData
+{
+    new uint Data;
+}
+
+// MS-DHCPE 2.2.2.2 Vendor-Specific Option - Microsoft Release DHCP Lease on Shutdown Option
+type DHCPEVendorSpecificInfoMicrosoftReleaseDHCPLeaseOnShutdown : DHCP.VendorInfoData
+{
+    new uint Data;
+}
+
+pattern CalculatedMetric = enum uint
+{
+    BasedOnLinkSpeed = 0,
+    GreaterThan200Mbps = 0x0000000A,
+    GreaterThan80Mbps = 0x00000014,
+    GreaterThan20Mbps = 0x00000019,
+    GreaterThan4Mbps = 0x0000001E,
+    GreaterThan500Kbps = 0x00000028,
+    LessThanOrEqualTo500Kbps = 0x00000032,
+    ...
+};
+
+// MS-DHCPE 2.2.2.3 Vendor-Specific Option - Microsoft Default Router Metric Base Option
+type DHCPEVendorSpecificInfoMicrosoftDefaultRouterMetricBase : DHCP.VendorInfoData
+{
+    new CalculatedMetric Data where ValidationCheckEnumValue(InRange<CalculatedMetric>(value), null, false, ReferenceType.Type,
+        "DHCPE", "Data", "DHCPEVendorSpecificInfoMicrosoftDefaultRouterMetricBase", "zero, 0x0000000A, 0x00000014, 0x00000019, 0x0000001E, 0x00000028, 0x00000032", value);
+}
+
+// MS-DHCPE 2.2.2.4 Vendor-Specific Option - Rogue Detection Request Option
+type DHCPEVendorSpecificInfoRogueDetectionRequest : DHCP.VendorInfoData
+{
+    new any Data with Encoding{Ignore = true};
+}
+
+// MS-DHCPE 2.2.2.5 Vendor-Specific Option - Rogue Detection Reply Option
+type DHCPEVendorSpecificInfoRogueDetectionReply : DHCP.VendorInfoData
+{
+    new string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+}
+
+// VendorInfoData for Microsoft Encoding Long Option Reassembly
+pattern DHCPEVendorInfoDataMELOptionReassembly
+    = [|stream.RemainingByteLength > 2 && stream.CurrentByte() == 95|] DHCPEVendorSpecificInfoRogueDetectionReplyMELOptionReassembly |
+    DHCPE.VendorInfoData;
+
+// WORKAROUND: Since it does not support decode pattern directly, we must put the pattern in a type
+type DHCPEVendorInfoDataTypeMELOptionReassembly
+{
+    DHCPEVendorInfoDataMELOptionReassembly VendorInfoData;
+}
+
+// VendorInfoData with UShort type Len
+type VendorInfoData : DHCP.VendorInfoData
+{
+    new ushort Len;
+    new binary Data with BinaryEncoding{Length = Len};
+}
+
+// MS-DHCPE 2.2.2.5 Vendor-Specific Option - Rogue Detection Reply Option
+// For Microsoft Encoding Long Option Reassembly
+type DHCPEVendorSpecificInfoRogueDetectionReplyMELOptionReassembly : DHCP.VendorInfoData
+{
+    new ushort Len;
+    new string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+}
+
+// MS-DHCPE 2.2.4   DHCPv6 Option Code 15 (0x000F) - User Class Option
+// OptionCode = 15
+type DHCPEUserClassOption : DHCPv6.BaseOption
+{
+    new ushort OptionCode with Encoding{Ignore = true};
+    new ushort OptionLen with Encoding{Ignore = true};
+    ushort UserClassDataLength with Encoding{Ignore = true};
+    ushort UserClassBinaryDataLength;
+    binary UserClassBinaryData with BinaryEncoding{Length = UserClassBinaryDataLength};
+    optional [|UserClassBinaryDataLength % 4 != 0|] array<byte> Padding with BinaryEncoding{Length = 4 - UserClassBinaryDataLength % 4};
+    ushort UserClassNameLength;
+    binary UserClassName with BinaryEncoding{Length = UserClassNameLength};
+    ushort UserClassDescriptionLength;
+    binary UserClassDescription with BinaryEncoding{Length = UserClassDescriptionLength};
+}
+
+// MS-DHCPE 2.2.5   DHCPv6 Option Code 16 (0x0010) - Vendor Class Option
+// OptionCode = 16
+type DHCPEVendorClass : DHCPv6.BaseOption
+{
+    new ushort OptionCode with Encoding{Ignore = true};
+    new ushort OptionLen with Encoding{Ignore = true};
+    uint EnterpriseNumber with Encoding{Ignore = true};
+    ushort VendorClassDataLength with Encoding{Ignore = true};
+    string VendorClassDataString
+        where ValidationCheckValue(value == "MSFT 5.0", null, true, ReferenceType.Type, "DHCPv6", "VendorClassDataString", "DHCPEVendorClass", "\"MSFT 5.0\"", value)
+        with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// MS-DHCPE Vendor-Specific Option - Rogue Detection Reply Option
+type DHCPERogueDectionReply : DHCPv6.EncapsulatedVendorSpecificInfoOption
+{
+    new ushort OptCode with Encoding{Ignore = true};
+    new ushort OptionLen with Encoding{Ignore = true};
+    new string OptionData with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+///////////////////////////////////////////////////////////////
+// Utility
+abstract type ExtendOptionHelper<InputType>
+{
+    // get the code of current option
+    abstract byte GetCurrentCode(InputType inputData);
+    // get the code of next option
+    abstract byte GetNextCode(InputType inputData);
+    // move to next option and return false indicate the end
+    abstract bool Next(InputType inputData);
+    // get the data of Microsoft Encoding Long Option
+    abstract optional binary GetMicrosoftEncodingLongOptionData(InputType inputData);
+    // extend the option for the option which is not reassembled from Microsoft Encoding Long Option
+    abstract bool ExtendOption(InputType inputData);
+    // handle when starting reassembling Microsoft Encoding Long Option
+    abstract void OnStartReassembleMicrosoftEncodingLongOption(InputType inputData);
+    // handle when finishing reassembling Microsoft Encoding Long Option
+    abstract bool OnFinishReassembleMicrosoftEncodingLongOption(binary reassembledData);
+    
+    // return false indicate that the extension decoding failed
+    bool Decode(InputType inputData)
+    {
+        // the binary cache and code for Microsoft Encoding Long Option
+        binary reassembledBinary = null;
+        byte reassembledOptionCode = 0;
+
+        do
+        {
+            byte currentCode = GetCurrentCode(inputData);
+            
+            // current code is 250
+            if (currentCode == 250)
+            {
+                if (reassembledBinary != null && GetMicrosoftEncodingLongOptionData(inputData) is b:binary)
+                {
+                    // Reassemble the data in Microsoft Encoding Long Option and move to next
+                    reassembledBinary += b;
+                    continue;
+                }
+
+                // If current options is Microsoft Encoding Long Option and reassembledBinary is null,
+                // it means that the Microsoft Encoding Long Option is the first option in the array.
+                // It is invalid. Return false directly.                
+                return false;
+            }
+
+            if (reassembledBinary != null)
+            {
+                // Current option is not Microsoft Encoding Long Option and reassembledBinary contains cached binary data.
+                // It means that it is the end of the reassembling.
+
+                if (!DecodeReassembledOptionDataAsOption(
+                    reassembledOptionCode,
+                    reassembledBinary.Count as ushort,
+                    reassembledBinary))
+                {
+                    return false;
+                }
+            
+                // Reset the binary
+                reassembledBinary = null;
+            }
+
+            if (GetNextCode(inputData) == 250)
+            {
+                // If next option code is 250, then start Microsoft Encoding Long Option reassembling.
+                reassembledOptionCode = currentCode;
+                if (GetMicrosoftEncodingLongOptionData(inputData) is b:binary)
+                {
+                    reassembledBinary = b;
+                }
+                else
+                {
+                    // If cannot get the binary from Microsoft Encoding Long Option, it is invalid.
+                    // Return false directly.
+                    return false;
+                }
+
+                OnStartReassembleMicrosoftEncodingLongOption(inputData);
+                continue;
+            }
+
+            // Extend the option which is not in Microsoft Encoding Long Option scenario.
+            if (!ExtendOption(inputData))
+            {
+                return false;
+            }
+        } while (Next(inputData));
+
+        if (reassembledBinary != null)
+        {
+            // It is the end of the options array. Reassemble if there is data cached in reassembledBinary
+            if (!DecodeReassembledOptionDataAsOption(
+                reassembledOptionCode,
+                reassembledBinary.Count as ushort,
+                reassembledBinary))
+            {
+                return false;
+            }
+            
+            // reset
+            reassembledBinary = null;
+        }
+
+        return true;
+    }
+
+    bool DecodeReassembledOptionDataAsOption(byte optionCode, ushort optionLen, binary reassembledOptionData)
+    {
+        // Concatenate option code, option length and reassembled option binary for further option decoding.
+        binary reassembledBinary = optionCode.ToBinary() + optionLen.ToBinary(false) + reassembledOptionData;
+        
+        // Decode as Option
+        return OnFinishReassembleMicrosoftEncodingLongOption(reassembledBinary);
+    }
+}
+
+// The helper to extend the option in DHCP message
+type DhcpOptionExtensionHelper : ExtendOptionHelper<OptionsType>
+{
+    array<DHCP.OptionsChoice> newOptionArray = null; // for Microsoft Encoding Long Option scenario
+    int index = 0;
+
+    override bool Next(OptionsType optionType)
+    {
+        // If newOptionArray is not null, it is in Microsoft Encoding Long Option scenario.
+        // Each option, which will not involved in reassembling, should be copied from the old array to new array.
+        if (newOptionArray != null
+            // Do not copy the option which current option code is 250 and next option code is 250.
+            // These options will be reassembled and replaced with new reassembled option.
+            && GetCurrentCode(optionType) != 250
+            && GetNextCode(optionType) != 250)
+        {
+            newOptionArray += [optionType.Option[index]];
+        }
+
+        // Move to next option and return whether there is next option.
+        index++;
+        return index < optionType.Option.Count;
+    }
+
+    override byte GetCurrentCode(OptionsType optionType)
+    {
+        return (optionType.Option[index] as DHCP.BaseOption).Code;
+    }
+
+    override byte GetNextCode(OptionsType optionType)
+    {
+        return index + 1 < optionType.Option.Count ? (optionType.Option[index + 1] as DHCP.BaseOption).Code : 0;
+    }
+
+    override optional binary GetMicrosoftEncodingLongOptionData(OptionsType optionType)
+    {
+        // Assume that current opions is UnknownOption when invoking this function.
+        if (optionType.Option[index] is unknownOption:DHCP.UnknownOption)
+        {
+            return unknownOption.Value;
+        }
+        return nothing;
+    }
+
+    // Extend the option which is not in Microsoft Encoding Long Option scenario.
+    override bool ExtendOption(OptionsType optionType)
+    {
+        DHCP.BaseOption baseOption = optionType.Option[index] as DHCP.BaseOption;
+
+        // handle the conflict definition on code 77
+        if (baseOption.Code == 77 &&
+            baseOption is unknownOption:DHCP.UnknownOption)
+        {
+            switch (unknownOption.Value)
+            {
+                case dhcpeUserClassOptionServerToClient:DHCPEUserClassOptionServerToClient from BinaryDecoder<DHCPEUserClassOptionServerToClient[unknownOption.Len]> =>
+                    dhcpeUserClassOptionServerToClient.Code = unknownOption.Code;
+                    dhcpeUserClassOptionServerToClient.OptionLength = unknownOption.Len;
+
+                    optionType.Option[index] = dhcpeUserClassOptionServerToClient;
+                case dhcpeUserClassOptionClientToServer:DHCPEUserClassOptionClientToServer from BinaryDecoder<DHCPEUserClassOptionClientToServer[unknownOption.Len]> =>
+                    dhcpeUserClassOptionClientToServer.Code = unknownOption.Code;
+                    dhcpeUserClassOptionClientToServer.OptionLength = unknownOption.Len;
+
+                    optionType.Option[index] = dhcpeUserClassOptionClientToServer;
+                default =>
+                    return true;
+            }
+        }
+        else if (baseOption.Code == 249 && baseOption is u:DHCP.UnknownOption)
+        {
+            switch (u.Value)
+            {
+                case dhcpeMicrosoftClasslessStaticRouteOption:DHCPEMicrosoftClasslessStaticRouteOption from BinaryDecoder<DHCPEMicrosoftClasslessStaticRouteOption> =>
+                    dhcpeMicrosoftClasslessStaticRouteOption.Code = u.Code;
+                    dhcpeMicrosoftClasslessStaticRouteOption.OptionLength = u.Len;
+                    optionType.Option[index] = dhcpeMicrosoftClasslessStaticRouteOption;
+            }
+        }
+        // handle the extension in vendor specific information
+        else if (baseOption.Code == 43 &&
+            baseOption is vendorSpecificInformation:DHCP.VendorSpecificInformation)
+        {
+            for (int i = 0; i < vendorSpecificInformation.Value.Count; i++)
+            {
+                switch (vendorSpecificInformation.Value[i].Code)
+                {
+                    case 1 =>
+                        if (vendorSpecificInformation.Value[i].Len == 4)
+                        {
+                            vendorSpecificInformation.Value[i] = new DHCPEVendorSpecificInfoMicrosoftDisableNetBIOS
+                            {
+                                Code = 1,
+                                Len = 4,
+                                Data = BinaryPrimitiveTypeDecoder<uint>(vendorSpecificInformation.Value[i].Data, Endian.Big) as uint,
+                            };
+                        }
+                    case 2 =>
+                        if (vendorSpecificInformation.Value[i].Len == 4)
+                        {
+                            vendorSpecificInformation.Value[i] = new DHCPEVendorSpecificInfoMicrosoftReleaseDHCPLeaseOnShutdown
+                            {
+                                Code = 2,
+                                Len = 4,
+                                Data = BinaryPrimitiveTypeDecoder<uint>(vendorSpecificInformation.Value[i].Data, Endian.Big) as uint,
+                            };
+                        }
+                    case 3 =>
+                        if (vendorSpecificInformation.Value[i].Len == 4)
+                        {
+                            vendorSpecificInformation.Value[i] = new DHCPEVendorSpecificInfoMicrosoftDefaultRouterMetricBase
+                            {
+                                Code = 3,
+                                Len = 4,
+                                Data = BinaryPrimitiveTypeDecoder<uint>(vendorSpecificInformation.Value[i].Data, Endian.Big) as uint,
+                            };
+                        }
+                    case 94 =>
+                        if (vendorSpecificInformation.Value[i].Len == 0)
+                        {
+                            vendorSpecificInformation.Value[i] = new DHCPEVendorSpecificInfoRogueDetectionRequest
+                            {
+                                Code = 94,
+                                Len = 0,
+                            };
+                        }
+                    case 95 =>
+                        if (BinaryStringDecoder(vendorSpecificInformation.Value[i].Data, TextEncoding.ASCII) is s:string)
+                        {
+                            vendorSpecificInformation.Value[i] = new DHCPEVendorSpecificInfoRogueDetectionReply
+                            {
+                                Code = 95,
+                                Len = vendorSpecificInformation.Value[i].Len,
+                                Data = s
+                            };
+                        }
+                    default =>
+                        continue;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    override void OnStartReassembleMicrosoftEncodingLongOption(OptionsType optionType)
+    {
+        if (newOptionArray == null)
+        {
+            // If newOptionArray is null, it meets the first Microsoft Encoding Long Option.
+            // Copy the options into new option array, which will replace original options array.
+            newOptionArray = optionType.Option.Segment(0, index);
+        }
+    }
+
+    override bool OnFinishReassembleMicrosoftEncodingLongOption(binary data)
+    {
+        switch (data)
+        {
+            case choiceType:DHCPE.OptionsChoiceMELOptionReassembly from BinaryDecoder<DHCPE.OptionsChoiceMELOptionReassembly> =>
+                // Assume that newOptionArray is not null, it has been created in OnStartReassembleMicrosoftEncodingLongOption
+                newOptionArray += [choiceType.Option];
+                return true;
+            default =>
+                return false;
+        }
+    }
+}
+
+// The helper to extend vendor info data
+type VendorInfoDataExtensionHelper : ExtendOptionHelper<stream>
+{
+    // stream streamData;
+    array<DHCP.VendorInfoData> vendorInfoData = [];
+
+    override byte GetCurrentCode(stream s)
+    {
+        return s.CurrentByte();
+    }
+
+    override byte GetNextCode(stream s)
+    {
+        byte len = s.PeekByte(s.BitPosition + 8);
+        if (len + 1 < s.RemainingByteLength())
+        {
+            return s.PeekByte(s.BitPosition + len * 8 + 16);
+        }
+        return 0;
+    }
+
+    override bool Next(stream s)
+    {
+        // no need to move the position in stream
+        return s.RemainingByteLength() > 0;
+    }
+
+    override optional binary GetMicrosoftEncodingLongOptionData(stream s)
+    {
+        var v = BinaryDecoder<DHCP.VendorInfoData>(s);
+        if (v is vendorInfoData:DHCP.VendorInfoData)
+        {
+            return vendorInfoData.Data;
+        }
+        return nothing;
+    }
+
+    override bool ExtendOption(stream s)
+    {
+        switch (s)
+        {
+            case dhcpeVendorInfoData:DHCPEVendorInfoDataType from BinaryDecoder<DHCPEVendorInfoDataType> =>
+                vendorInfoData += [dhcpeVendorInfoData.VendorInfoData as DHCP.VendorInfoData];
+                return true;
+            default =>
+                return false;
+        }
+    }
+
+    override void OnStartReassembleMicrosoftEncodingLongOption(stream s)
+    {
+        // did nothing
+    }
+
+    override bool OnFinishReassembleMicrosoftEncodingLongOption(binary reassembledData)
+    {
+        switch (reassembledData)
+        {
+            case dhcpeVendorInfoDataTypeMELOptionReassembly:DHCPEVendorInfoDataTypeMELOptionReassembly
+                from BinaryDecoder<DHCPEVendorInfoDataTypeMELOptionReassembly> =>
+                vendorInfoData += [dhcpeVendorInfoDataTypeMELOptionReassembly.VendorInfoData as DHCP.VendorInfoData];
+                return true;
+            default =>
+                return false;
+        }
+    }
+}

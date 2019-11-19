@@ -1,0 +1,1149 @@
+protocol SCTP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Stream Control Transmission Protocol",
+    ShortName = "SCTP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 4960"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "364075", Date = "05/14/2014"}
+        ]
+};
+
+using Standard;
+using IPv4;
+using Utility;
+using IANA;
+
+// Keep binary format of source and destination address for Packet since upper layer protocols may need these for index of endpoint.
+annotation binary Packet#SctpSourceAddrBin;
+annotation binary Packet#SctpDestinationAddrBin;
+
+// It's used to mark if the message is reassembled from the fragments or not, for summary purposes.
+annotation bool Packet#SctpIsFragment;
+annotation bool Packet#SctpIsReassembed;
+
+// If the message is a fragment, this number means the sequence number of this fragment in buffer except acks.
+// Else if this message is a reassembed message, this number means number of PayloadData messages in its Origins(except acks).
+annotation uint Packet#SctpFragmentedNumber;
+
+annotation uint Packet#SctpPacketTsn;
+annotation uint Packet#SctpPayloadProtocolIdentifier;
+
+// Server side
+endpoint Server[binary LocalAddress, binary RemoteAddress, ushort LocalPort, ushort RemotePort] accepts Packet issues Packet;
+endpoint ReassemblyServer[binary LocalAddress, binary RemoteAddress, ushort LocalPort, ushort RemotePort] accepts Packet issues Packet
+{
+    ushort cNextSsn = 0;
+    ushort sNextSsn = 0;
+    
+    // To keep Packets with PayloadData chunk which need to be reassembed.
+    // Use StreamSequenceNumber(ssn) in PayloadData chunk as first key(ushort) and use TSN in PayloadData chunk as second key(uint).
+    map<ushort, map<uint, Packet>> sFragments = {};
+    map<ushort, map<uint, Packet>> cFragments = {};
+    
+    // To keep fragments' acks while reassemb. Use CumulativeTsnAck in SelectiveAcknowledgement chunk as key(uint).
+    map<uint, Packet> sSelectiveAcknowledgements = {};
+    map<uint, Packet> cSelectiveAcknowledgements = {};
+    
+    // To keep Completed PayloadDataPackets which are waiting to be sorted before dispatch. Use StreamSequenceNumber(ssn) in chunk as key.
+    map<ushort, Packet> cCompletedPayloadDataPackets = {};
+    map<ushort, Packet> sCompletedPayloadDataPackets = {};
+    
+    process this accepts p:Packet
+    {
+        ProcessPacketFromReassemblyServer(p, ref sFragments, ref cFragments, ref sSelectiveAcknowledgements, ref cSelectiveAcknowledgements, 
+            AcceptDispatcher, IssueDispatcher, ref sNextSsn, ref cNextSsn, ref sCompletedPayloadDataPackets, ref cCompletedPayloadDataPackets);
+    }
+    
+    process this issues p:Packet
+    {
+        ProcessPacketFromReassemblyServer(p, ref cFragments, ref sFragments, ref cSelectiveAcknowledgements, ref sSelectiveAcknowledgements, 
+            IssueDispatcher, AcceptDispatcher, ref cNextSsn, ref sNextSsn, ref cCompletedPayloadDataPackets, ref sCompletedPayloadDataPackets);
+    }
+    
+    void AcceptDispatcher(Packet p)
+    {
+        dispatch (endpoint Server[LocalAddress, RemoteAddress, LocalPort, RemotePort]) accepts p;
+    }
+    
+    void IssueDispatcher(Packet p)
+    {
+        dispatch (endpoint Server[LocalAddress, RemoteAddress, LocalPort, RemotePort]) issues p;
+    }
+}
+
+autostart actor ReassemblyServerActor(ReassemblyServer reassemblyServer)
+{
+    // destructor
+    ~endpoint(ReassemblyServer reassemblyServer)
+    {
+        if (reassemblyServer.sFragments.Count > 0)
+        {
+            foreach (ushort ssn in reassemblyServer.sFragments.Keys)
+            {
+                foreach (uint tsn in reassemblyServer.sFragments[ssn].Keys)
+                {
+                    Packet packet = reassemblyServer.sFragments[ssn][tsn];
+                    ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                    DisplayTopLevelMessage(packet);
+                }
+            }
+            reassemblyServer.sFragments = {};
+        }
+        
+        if (reassemblyServer.cFragments.Count > 0)
+        {
+            foreach (ushort ssn in reassemblyServer.cFragments.Keys)
+            {
+                foreach (uint tsn in reassemblyServer.cFragments[ssn].Keys)
+                {
+                    Packet packet = reassemblyServer.cFragments[ssn][tsn];
+                    ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                    DisplayTopLevelMessage(packet);
+                }
+            }
+            reassemblyServer.cFragments = {};
+        }
+        
+        if (reassemblyServer.sSelectiveAcknowledgements.Count > 0)
+        {
+            foreach (uint key in reassemblyServer.sSelectiveAcknowledgements.Keys)
+            {
+                Packet packet = reassemblyServer.sSelectiveAcknowledgements[key];
+                ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                DisplayTopLevelMessage(packet);
+            }
+            reassemblyServer.sSelectiveAcknowledgements = {};
+        }
+        
+        if (reassemblyServer.cSelectiveAcknowledgements.Count > 0)
+        {
+            foreach (uint key in reassemblyServer.cSelectiveAcknowledgements.Keys)
+            {
+                Packet packet = reassemblyServer.cSelectiveAcknowledgements[key];
+                ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                DisplayTopLevelMessage(packet);
+            }
+            reassemblyServer.cSelectiveAcknowledgements = {};
+        }
+        
+        if (reassemblyServer.cCompletedPayloadDataPackets.Count > 0)
+        {
+            foreach (ushort key in reassemblyServer.cCompletedPayloadDataPackets.Keys)
+            {
+                Packet packet = reassemblyServer.cCompletedPayloadDataPackets[key];
+                ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                DisplayTopLevelMessage(packet);
+            }
+            reassemblyServer.cCompletedPayloadDataPackets = {};
+        }
+        
+        if (reassemblyServer.sCompletedPayloadDataPackets.Count > 0)
+        {
+            foreach (ushort key in reassemblyServer.sCompletedPayloadDataPackets.Keys)
+            {
+                Packet packet = reassemblyServer.sCompletedPayloadDataPackets[key];
+                ReportInsufficientData(packet, DiagnosisLevel.Error, "SCTP: Insufficient fragments for full reassembly.");
+                DisplayTopLevelMessage(packet);
+            }
+            reassemblyServer.sCompletedPayloadDataPackets = {};
+        }
+    }
+}
+
+// Client side
+client endpoint Client connected to Server;
+client endpoint ReassemblyClient connected to ReassemblyServer;
+
+// Process message accepts or issues from ReassemblyServer endpoint.
+void ProcessPacketFromReassemblyServer(Packet p, ref map<ushort, map<uint, Packet>> localFragments, 
+    ref map<ushort, map<uint, Packet>> remoteFragments, ref map<uint, Packet> localSelectiveAcknowledgements, 
+    ref map<uint, Packet> remoteSelectiveAcknowledgements, void(Packet) localDispatcher, void(Packet) remoteDispatcher, 
+    ref ushort localNextSsn, ref ushort remoteNextSsn, ref map<ushort, Packet> localCompletedPayloadDataPackets, 
+    ref map<ushort, Packet> remoteCompletedPayloadDataPackets)
+{
+    // Whether this message have PayloadData Chunk.
+    bool isPayloadData = false;
+    // Whether this message have SelectiveAcknowledgement Chunk.
+    bool isSelectiveAcknowledgement = false;
+    
+    // Since message with PayloadData Chunk or SelectiveAcknowledgement Chunk may be stored in buffer,
+    // so use this bool to mark the message whether it need to be dispatched in this function.
+    bool isDispatch = true;
+    
+    // If this message with SelectiveAcknowledgement Chunk, use this var to keep value of CumulativeTsnAck in SelectiveAcknowledgement Chunk.
+    uint cumulativeTsnAck = 0;
+    
+    if (p.Chunks.Count > 0)
+    {
+        if (p.Chunks[0] is ShutdownAssociation
+            || p.Chunks[0] is ShutdownAcknowledgement
+            || p.Chunks[0] is ShutdownComplete)
+        {
+            BufferClean(ref localFragments, ref remoteFragments, ref localSelectiveAcknowledgements, 
+                ref remoteSelectiveAcknowledgements, localDispatcher, remoteDispatcher, ref localNextSsn, 
+                ref localCompletedPayloadDataPackets, ref remoteCompletedPayloadDataPackets);
+        }
+        else
+        {
+            for (int i = 0; i < p.Chunks.Count; i++)
+            {
+                if (p.Chunks[i] is SelectiveAcknowledgement)
+                {
+                    isSelectiveAcknowledgement = true;
+                    cumulativeTsnAck = (p.Chunks[i] as SelectiveAcknowledgement).CumulativeTsnAck;
+                }
+                else if (p.Chunks[i] is PayloadData)
+                {
+                    isPayloadData = true;
+                    p#SctpPacketTsn = (p.Chunks[p.Chunks.Count - 1] as PayloadData).TSN;
+                    p#SctpPayloadProtocolIdentifier = (p.Chunks[p.Chunks.Count - 1] as PayloadData).PayloadProtocolIdentifier;
+                    break;
+                }
+            }
+            if (isSelectiveAcknowledgement)
+            {
+                bool isCompleteAck = false;
+                var keys = remoteCompletedPayloadDataPackets.Keys;
+                foreach (ushort ssn in keys)
+                {
+                    if (cumulativeTsnAck == remoteCompletedPayloadDataPackets[ssn]#SctpPacketTsn)
+                    {
+                        remoteCompletedPayloadDataPackets[ssn].Origins += [p];
+                        remoteNextSsn = (remoteCompletedPayloadDataPackets[ssn].Chunks[remoteCompletedPayloadDataPackets[ssn].Chunks.Count - 1] 
+                            as PayloadData).StreamSequenceNumber + 1 as ushort;
+                        DispatchCompletedPackedByAckTsn(cumulativeTsnAck, ref remoteCompletedPayloadDataPackets, localDispatcher);
+                        isDispatch = false;
+                        isCompleteAck = true;
+                    }
+                }
+                if (!isCompleteAck)
+                {
+                    foreach (ushort ssn in (remoteFragments.Keys))
+                    {
+                        // If message which this SelectiveAcknowledgement ack for is in buffer, then store this ack.
+                        if (cumulativeTsnAck in remoteFragments[ssn])
+                        {
+                            localSelectiveAcknowledgements[cumulativeTsnAck] = p;
+                            isDispatch = false;
+                        }
+                    }
+                }
+            }
+            if (isPayloadData)
+            {
+                ReassembleSCTPFragment(p, ref localFragments, ref remoteSelectiveAcknowledgements, localDispatcher, ref localNextSsn, 
+                    ref localCompletedPayloadDataPackets);
+                isDispatch = false;
+            }
+        }
+    }
+    if (isDispatch)
+    {
+        localDispatcher(p);
+    }
+}
+
+// Reassemble message which with PayloadData chunk.
+void ReassembleSCTPFragment(Packet p, ref map<ushort, map<uint, Packet>> fragments, 
+    ref map<uint, Packet> selectiveAcknowledgements, void(Packet) dispatcher, ref ushort nextSsn, 
+    ref map<ushort, Packet> completedPayloadDataPackets)
+{
+/*          B E                  Description
+ *       ============================================================
+ *       |  1 0 | First piece of a fragmented user message          |
+ *       +----------------------------------------------------------+
+ *       |  0 0 | Middle piece of a fragmented user message         |
+ *       +----------------------------------------------------------+
+ *       |  0 1 | Last piece of a fragmented user message           |
+ *       +----------------------------------------------------------+
+ *       |  1 1 | Unfragmented message                              |
+ *       ============================================================
+ */
+    // Mark this message whether it is a fragmented message. If not, dispatch it.
+    bool needReassemble = false;
+    int playloadDataPointer;
+    ushort ssnOfPacket;
+    bool isOrdered = false;
+    
+    // Use this set to keep Stream Sequence Number in PayloadData chunk since there may be more than one PayloadData chunks
+    // with different Stream Sequence Number in message.
+    set<ushort> reassembStreamSequenceNumber = {};
+    
+    for (playloadDataPointer = 0; playloadDataPointer < p.Chunks.Count; playloadDataPointer++)
+    {
+        if (p.Chunks[playloadDataPointer] is PayloadData)
+        {
+            PayloadData payloadData = p.Chunks[playloadDataPointer] as PayloadData;
+            if (payloadData.U == 0)
+            {
+                isOrdered = true;
+            }
+            else
+            {
+                isOrdered = false;
+            }
+            if (payloadData.B == 1 && payloadData.E == 1)
+            {
+                ssnOfPacket = payloadData.StreamSequenceNumber;
+            }
+            else // this message contains PayloadData chunk which is fragmented.
+            {
+                p#SctpIsFragment = true;
+                needReassemble = true;
+                if (!reassembStreamSequenceNumber[payloadData.StreamSequenceNumber])
+                {
+                    reassembStreamSequenceNumber[payloadData.StreamSequenceNumber] = true;
+                }
+                if (!(payloadData.StreamSequenceNumber in fragments))
+                {
+                    fragments[payloadData.StreamSequenceNumber] = {};
+                }
+                fragments[payloadData.StreamSequenceNumber][payloadData.TSN] = p;
+            }
+        }
+    }
+    if (needReassemble)
+    {
+        foreach (ushort ssn in reassembStreamSequenceNumber)
+        {
+            uint beginNumber;
+            uint endNumber;
+            if (IsReadyToReassemble(fragments[ssn], ref beginNumber, ref endNumber))
+            {
+                Packet packet = new Packet{};
+                binary sourceData = $[];
+                packet#SctpFragmentedNumber = 0;
+                packet#SctpIsReassembed = true;
+                PayloadData payloadData = new PayloadData{};
+                payloadData.UserData = $[];
+                packet.Chunks = [];
+                uint tsnTemp;
+                array<Packet> originsArray = [];
+                
+                for (tsnTemp = beginNumber; tsnTemp <= endNumber; tsnTemp++)
+                {
+                    Packet fragmentPacket = fragments[ssn][tsnTemp];
+                    for (int i = 0; i < fragmentPacket.Chunks.Count; i++)
+                    {
+                        if (fragmentPacket.Chunks[i] is PayloadData)
+                        {
+                            if ((fragmentPacket.Chunks[i] as PayloadData).TSN == tsnTemp)
+                            {
+                                payloadData.UserData += (fragmentPacket.Chunks[i] as PayloadData).UserData;
+                                packet#SctpFragmentedNumber = (packet#SctpFragmentedNumber as uint) + 1;
+                                fragmentPacket#SctpFragmentedNumber = packet#SctpFragmentedNumber;
+                                
+                                // If this PayloadData chunk is the first one, set field value for packet & payloadData
+                                if (tsnTemp == beginNumber)
+                                {
+                                    packet.SourcePort = fragmentPacket.SourcePort;
+                                    packet.DestinationPort = fragmentPacket.DestinationPort;
+                                    packet.VerificationTag = fragmentPacket.VerificationTag;
+                                    packet.Checksum = fragmentPacket.Checksum;
+                                    packet#SctpSourceAddrBin = fragmentPacket#SctpSourceAddrBin;
+                                    packet#SctpDestinationAddrBin = fragmentPacket#SctpDestinationAddrBin;
+                                    packet#SctpPayloadProtocolIdentifier = fragmentPacket#SctpPayloadProtocolIdentifier;
+                                }
+                                
+                                if (tsnTemp == endNumber)
+                                {
+                                    PayloadData payloadDataEnd = fragmentPacket.Chunks[i] as PayloadData;
+                                    
+                                    payloadData.Type = payloadDataEnd.Type;
+                                    payloadData.Reserved = payloadDataEnd.Reserved;
+                                    payloadData.U = payloadDataEnd.U;
+                                    payloadData.B = 1;
+                                    payloadData.E = 1;
+                                    payloadData.StreamIdentifier = payloadDataEnd.StreamIdentifier;
+                                    payloadData.StreamSequenceNumber = payloadDataEnd.StreamSequenceNumber;
+                                    payloadData.PayloadProtocolIdentifier = payloadDataEnd.PayloadProtocolIdentifier;
+                                    payloadData.TSN = payloadDataEnd.TSN;
+                                    
+                                    packet#SctpPacketTsn = payloadData.TSN;
+                                }
+                                
+                                // Set origins for packet, then remove acks
+                                if (!(fragmentPacket in originsArray))
+                                {
+                                    originsArray += [fragmentPacket];
+                                    packet.Origins += [fragmentPacket];
+                                    sourceData += (fragmentPacket.SourceData as binary);
+                                    if (tsnTemp in selectiveAcknowledgements)
+                                    {
+                                        packet.Origins += [selectiveAcknowledgements[tsnTemp]];
+                                        selectiveAcknowledgements = selectiveAcknowledgements.Remove(tsnTemp);
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // If message contains other chunks, just add it to array of Chunks in packet.
+                            packet.Chunks += [fragmentPacket.Chunks[i]];
+                        }
+                    }
+                    // Remove message after reassemble
+                    fragments[ssn] = fragments[ssn].Remove(tsnTemp);
+                }
+                
+                payloadData.Length = (payloadData.UserData.Count + 16) as ushort;
+                packet.Chunks += [payloadData];
+                packet.SourceData = sourceData;
+                
+                packet.AssignFieldEncodingInfo("SourcePort", 0, 16);
+                packet.AssignFieldEncodingInfo("DestinationPort", 16, 16);
+                packet.AssignFieldEncodingInfo("VerificationTag", 32, 32);
+                packet.AssignFieldEncodingInfo("Checksum", 64, 32);
+                
+                if (isOrdered)
+                {
+                    completedPayloadDataPackets[payloadData.StreamSequenceNumber] = packet;
+                    DispatchCompletedPackedBySsn(ref nextSsn, ref completedPayloadDataPackets, dispatcher);
+                }
+                else
+                {
+                    dispatcher(packet);
+                }
+            }
+        }
+    }
+    else
+    {
+        if (isOrdered)
+        {
+            completedPayloadDataPackets[ssnOfPacket] = p;
+            DispatchCompletedPackedBySsn(ref nextSsn, ref completedPayloadDataPackets, dispatcher);
+        }
+        else
+        {
+            dispatcher(p);
+        }
+    }
+}
+
+bool IsReadyToReassemble(map<uint, Packet> fragments, ref uint beginNumber, ref uint endNumber)
+{
+    bool result = false;
+    
+    // Get TSN of first fragmented PayloadData chunk.
+    foreach (uint tsn in (fragments.Keys))
+    {
+        for (uint temp = 0; temp < fragments[tsn].Chunks.Count; temp++)
+        {
+            if (fragments[tsn].Chunks[temp as int] is PayloadData)
+            {
+                PayloadData payloadData = fragments[tsn].Chunks[temp as int] as PayloadData;
+                if (payloadData.B == 1 && payloadData.E == 0)
+                {
+                    beginNumber = tsn;
+                    result = true;
+                    break;
+                }
+            }
+        }
+    }
+    // If first fragmented PayloadData chunk is in buffer.
+    if (result)
+    {
+        result = false;
+        uint temp;
+        for (temp = beginNumber; temp in (fragments.Keys); temp++)
+        {
+            continue;
+        }
+        temp = temp - 1;
+        for (uint i = 0; i < fragments[temp].Chunks.Count; i++)
+        {
+            if (fragments[temp].Chunks[i as int] is PayloadData)
+            {
+                PayloadData payloadData = fragments[temp].Chunks[i as int] as PayloadData;
+                if (payloadData.E == 1 && payloadData.B == 0)
+                {
+                    endNumber = payloadData.TSN;
+                    result = true;
+                    break;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+void DispatchCompletedPackedBySsn(ref ushort nextSsn, ref map<ushort, Packet> completedPayloadDataPackets, 
+    void(Packet) dispatcher)
+{
+    while (nextSsn in completedPayloadDataPackets || IsSsnInCompletedPayloadDataPackets(nextSsn, completedPayloadDataPackets))
+    {
+        if (nextSsn in completedPayloadDataPackets)
+        {
+            dispatcher(completedPayloadDataPackets[nextSsn]);
+            completedPayloadDataPackets = completedPayloadDataPackets.Remove(nextSsn);
+        }
+        nextSsn = (nextSsn + 1) as ushort;
+    }
+}
+
+bool IsSsnInCompletedPayloadDataPackets(ushort ssn, map<ushort, Packet> completedPayloadDataPackets)
+{
+    bool result = false;
+    var keys = completedPayloadDataPackets.Keys;
+    foreach (ushort ssnTemp in keys)
+    {
+        for (int i = 0; i < completedPayloadDataPackets[ssnTemp].Chunks.Count; i++)
+        {
+            if (completedPayloadDataPackets[ssnTemp].Chunks[i] is PayloadData)
+            {
+                if ((completedPayloadDataPackets[ssnTemp].Chunks[i] as PayloadData).StreamSequenceNumber == ssn)
+                {
+                    result = true;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+void DispatchCompletedPackedByAckTsn(uint ackTsn, ref map<ushort, Packet> completedPayloadDataPackets, 
+    void(Packet) dispatcher)
+{
+    ushort ssnEnd;
+    ushort ssnBegin;
+    ushort ssnTemp;
+    
+    foreach (ushort ssn in completedPayloadDataPackets.Keys)
+    {
+        if (completedPayloadDataPackets[ssn]#SctpPacketTsn == ackTsn)
+        {
+            ssnTemp = ssn;
+            break;
+        }
+    }
+    ssnEnd = ssnTemp;
+    while (ssnTemp in completedPayloadDataPackets)
+    {
+        ssnTemp = ssnTemp - 1 as ushort;
+    }
+    ssnBegin = (ssnTemp + 1) as ushort;
+    
+    for (ssnTemp = ssnBegin; ssnTemp <= ssnEnd; ssnTemp = (ssnTemp + 1) as ushort)
+    {
+        dispatcher(completedPayloadDataPackets[ssnTemp]);
+        completedPayloadDataPackets = completedPayloadDataPackets.Remove(ssnTemp);
+    }
+}
+
+void BufferClean(ref map<ushort, map<uint, Packet>> localFragments, 
+    ref map<ushort, map<uint, Packet>> remoteFragments, ref map<uint, Packet> localSelectiveAcknowledgements, 
+    ref map<uint, Packet> remoteSelectiveAcknowledgements, void(Packet) localDispatcher, void(Packet) remoteDispatcher, 
+    ref ushort nextSsn, ref map<ushort, Packet> localCompletedPayloadDataPackets, 
+    ref map<ushort, Packet> remoteCompletedPayloadDataPackets)
+{
+    nextSsn = 0;
+    array<uint> removeKey = [];
+    int temp;
+    
+    foreach (uint localAckKeyForCompletedPacket in localSelectiveAcknowledgements.Keys)
+    {
+        SelectiveAcknowledgement ack = localSelectiveAcknowledgements[localAckKeyForCompletedPacket].Chunks[0] as SelectiveAcknowledgement;
+        foreach (ushort ssnTemp in remoteCompletedPayloadDataPackets.Keys)
+        {
+            if (remoteCompletedPayloadDataPackets[ssnTemp]#SctpPacketTsn == ack.CumulativeTsnAck)
+            {
+                remoteCompletedPayloadDataPackets[ssnTemp].Origins += [localSelectiveAcknowledgements[localAckKeyForCompletedPacket]];
+                removeKey += [localAckKeyForCompletedPacket];
+                break;
+            }
+        }
+    }
+    for (temp = 0; temp < removeKey.Count; temp++)
+    {
+        localSelectiveAcknowledgements = localSelectiveAcknowledgements.Remove(removeKey[temp]);
+    }
+    
+    foreach (uint localAckKeyForFragment in localSelectiveAcknowledgements.Keys)
+    {
+        SelectiveAcknowledgement ack = localSelectiveAcknowledgements[localAckKeyForFragment].Chunks[0] as SelectiveAcknowledgement;
+        var keys = remoteFragments.Keys;
+        foreach (ushort ssnTemp in keys)
+        {
+            if (ack.CumulativeTsnAck in remoteFragments[ssnTemp])
+            {
+                remoteFragments[ssnTemp][ack.CumulativeTsnAck].Origins += [localSelectiveAcknowledgements[localAckKeyForFragment]];
+            }
+        }
+    }
+    localSelectiveAcknowledgements = {};
+    removeKey = [];
+    
+    foreach (uint remoteAckKeyForCompletedPacket in remoteSelectiveAcknowledgements.Keys)
+    {
+        SelectiveAcknowledgement ack = remoteSelectiveAcknowledgements[remoteAckKeyForCompletedPacket].Chunks[0] as SelectiveAcknowledgement;
+        var keys2 = localCompletedPayloadDataPackets.Keys;
+        foreach (ushort ssnTemp in keys2)
+        {
+            if (localCompletedPayloadDataPackets[ssnTemp]#SctpPacketTsn == ack.CumulativeTsnAck)
+            {
+                localCompletedPayloadDataPackets[ssnTemp].Origins += [remoteSelectiveAcknowledgements[remoteAckKeyForCompletedPacket]];
+                removeKey += [remoteAckKeyForCompletedPacket];
+                break;
+            }
+        }
+    }
+    for (temp = 0; temp < removeKey.Count; temp++)
+    {
+        remoteSelectiveAcknowledgements = remoteSelectiveAcknowledgements.Remove(removeKey[temp]);
+    }
+    
+    foreach (uint remoteAckKeyForFragment in remoteSelectiveAcknowledgements.Keys)
+    {
+        SelectiveAcknowledgement ack = remoteSelectiveAcknowledgements[remoteAckKeyForFragment].Chunks[0] as SelectiveAcknowledgement;
+        var keys3 = localFragments.Keys;
+        foreach (ushort ssnTemp in keys3)
+        {
+            if (ack.CumulativeTsnAck in localFragments[ssnTemp])
+            {
+                localFragments[ssnTemp][ack.CumulativeTsnAck].Origins += [remoteSelectiveAcknowledgements[remoteAckKeyForFragment]];
+            }
+        }
+    }
+    remoteSelectiveAcknowledgements = {};
+    
+    foreach (ushort keyForLocalCompletedPayloadDataPackets in localCompletedPayloadDataPackets.Keys)
+    {
+        localDispatcher(localCompletedPayloadDataPackets[keyForLocalCompletedPayloadDataPackets]);
+    }
+    localCompletedPayloadDataPackets = {};
+    
+    foreach (ushort keyForRemoteCompletedPayloadDataPackets in remoteCompletedPayloadDataPackets.Keys)
+    {
+        remoteDispatcher(remoteCompletedPayloadDataPackets[keyForRemoteCompletedPayloadDataPackets]);
+    }
+    remoteCompletedPayloadDataPackets = {};
+    
+    foreach (ushort ssnKeyForLocalFragments in localFragments.Keys)
+    {
+        foreach (uint tsnKeyForLocalFragments in localFragments[ssnKeyForLocalFragments].Keys)
+        {
+            localDispatcher(localFragments[ssnKeyForLocalFragments][tsnKeyForLocalFragments]);
+        }
+    }
+    localFragments = {};
+    
+    foreach (ushort ssnKeyForRemoteFragments in remoteFragments.Keys)
+    {
+        foreach (uint tsnKeyForRemoteFragments in remoteFragments[ssnKeyForRemoteFragments].Keys)
+        {
+            remoteDispatcher(remoteFragments[ssnKeyForRemoteFragments][tsnKeyForRemoteFragments]);
+        }
+    }
+    remoteFragments = {};
+}
+
+autostart actor SctpOverIpv4(IPv4.Node node)
+{
+    set<binary> clientSet = {};
+    
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.SCTP
+    {
+        DecodeAndDispatchSegment(ref clientSet, d.SourceAddress.FlatAddress, d.DestinationAddress.FlatAddress, d.Payload);
+    }
+}
+
+void DecodeAndDispatchSegment(ref set<binary> clientSet, binary sourceAddress, binary destinationAddress, binary payload)
+{
+    switch (payload)
+    {
+        case p:Packet from BinaryDecoder<SCTP.Packet> =>
+            p#SctpSourceAddrBin = sourceAddress;
+            p#SctpDestinationAddrBin = destinationAddress;
+            
+            binary local = MakeBinary(destinationAddress, sourceAddress, p.DestinationPort, p.SourcePort);
+            binary remote = MakeBinary(sourceAddress, destinationAddress, p.SourcePort, p.DestinationPort);
+
+            if ((!(local in clientSet || remote in clientSet)) && p.Chunks.Count > 0)
+            {
+                // To tell whether local is server side or remote is server side.
+                if (p.Chunks[0] is Initiation)
+                {
+                    clientSet[remote] = true;
+                }
+                else if (p.Chunks[0] is InitiationAcknowledgement)
+                {
+                    clientSet[local] = true;
+                }
+                else if (p.Chunks[0] is CookieEcho)
+                {
+                    clientSet[remote] = true;
+                }
+                else if (p.Chunks[0] is CookieAcknowledgement)
+                {
+                    clientSet[local] = true;
+                }
+            }
+            
+            p#SctpIsFragment = false;
+            p#SctpFragmentedNumber = 0;
+            p#SctpPacketTsn = 0;
+            p#SctpIsReassembed = false;
+            
+            if (local in clientSet)
+            {
+                dispatch endpoint ReassemblyServer[sourceAddress,destinationAddress, p.SourcePort, p.DestinationPort] issues p;
+            }
+            else if (remote in clientSet)
+            {
+                dispatch endpoint ReassemblyServer[destinationAddress, sourceAddress, p.DestinationPort, p.SourcePort] accepts p;
+            }
+            // Assume the one with smaller port is server if four-way handshake messages are missing.
+            else if (p.DestinationPort >= p.SourcePort)
+            {
+                dispatch endpoint ReassemblyServer[sourceAddress, destinationAddress, p.SourcePort, p.DestinationPort] issues p;
+            }
+            else
+            {
+                dispatch endpoint ReassemblyServer[destinationAddress, sourceAddress, p.DestinationPort, p.SourcePort] accepts p;
+            }
+        default =>
+            ThrowDecodingException("SCTP");
+    }
+}
+
+/********************************************** Message & Types **********************************************/
+message Packet
+{
+    IANA.Port SourcePort with Visualization{AliasName = "Port"}, DisplayInfo{ToText = (any port) => IANA.PortToServiceNameForAlias(port as ushort)};
+    IANA.Port DestinationPort with Visualization{AliasName = "Port"}, DisplayInfo{ToText = (any port) => IANA.PortToServiceNameForAlias(port as ushort)};
+    uint VerificationTag;
+    uint Checksum;
+    array<ChunkValue> Chunks;
+    
+    override string ToString()
+    {
+        string displayStr = "";
+        if (Chunks.Count == 0)
+        {
+            displayStr = "SCTP Packet, No Chunks.";
+        }
+        else
+        {
+            if (!(this#SctpIsReassembed is nothing) && this#SctpIsReassembed as bool)
+            {
+                displayStr = "[Reassembled, Count: " + (this#SctpFragmentedNumber as string) + "] " ;
+            }
+            else if (!(this#SctpIsFragment is nothing) && this#SctpIsFragment as bool)
+            {
+                displayStr = "[Fragment, No." + (this#SctpFragmentedNumber as string) + "] ";
+            }
+            displayStr += "Chunks: ";
+            if (Chunks.Count == 1)
+            {
+                displayStr += GetChunkName(Chunks[0]);
+            }
+            else 
+            {
+                displayStr += "[";
+                for (int i = 0; i < Chunks.Count; i++)
+                {
+                    if (i != 0)
+                    {
+                        displayStr += ", ";
+                    }
+                    displayStr += GetChunkName(Chunks[i]);
+                }
+                displayStr += "]";
+            }
+        }
+        return displayStr;
+    }
+}
+
+pattern ChunkValue = PayloadData | // 0
+    Initiation                   | // 1
+    InitiationAcknowledgement    | // 2
+    SelectiveAcknowledgement     | // 3
+    HeartbeatRequest             | // 4
+    HeartbeatAcknowledgement     | // 5
+    AbortAssociation             | // 6
+    ShutdownAssociation          | // 7
+    ShutdownAcknowledgement      | // 8
+    OperationError               | // 9
+    CookieEcho                   | // 10
+    CookieAcknowledgement        | // 11
+    EcnEcho                      | // 12
+    Cwr                          | // 13
+    ShutdownComplete;              // 14
+
+/********************************************** Chunk Types **********************************************/
+type PayloadData // 0
+{
+    byte Type where value == 0;
+    byte Reserved with BinaryEncoding{Width = 5};
+    byte U with BinaryEncoding{Width = 1};
+    byte B with BinaryEncoding{Width = 1};
+    byte E with BinaryEncoding{Width = 1};
+    ushort Length;
+    uint TSN;
+    ushort StreamIdentifier;
+    ushort StreamSequenceNumber;
+    uint PayloadProtocolIdentifier;
+    binary UserData with BinaryEncoding{Length = Length - 16};
+}
+
+type Initiation // 1
+{
+    byte Type where value == 1;
+    byte ChunkFlags;
+    ushort ChunkLength;
+    uint InitiateTag;
+    uint AdvertisedReceiverWindowCredit;
+    ushort NumberofOutboundStreams;
+    ushort NumberofInboundStreams;
+    uint InitialTSN;
+    optional [|ChunkLength > 20|] array<InitOptionalOrVariableParameter> OptionalOrVariableParameters;
+}
+
+pattern InitOptionalOrVariableParameter = IPv4AddressParameter | // 5
+    IPv6AddressParameter                                       | // 6
+    CookiePreservative                                         | // 9
+    HostNameAddress                                            | // 11
+    SupportedAddressTypes                                      | // 12
+    EcnParameter;                                                // 32768
+
+type IPv4AddressParameter
+{
+    ushort Type where value == 5;
+    ushort Length where value == 8;
+    IPv4Address IPv4Address;
+}
+
+type IPv6AddressParameter
+{
+    ushort Type where value == 6;
+    ushort Length where value == 20;
+    IPv6Address IPv6Address;
+}
+
+type CookiePreservative
+{
+    ushort Type where value == 9;
+    ushort Length where value == 8;
+    uint SuggestedCookieLifeSpanIncrement;
+}
+
+type HostNameAddress
+{
+    ushort Type where value == 11;
+    ushort Length;
+    string HostName with BinaryEncoding{Length = Length - 4,TextEncoding = TextEncoding.ASCII};
+}
+
+type SupportedAddressTypes
+{
+    ushort Type where value == 12;
+    ushort Length;
+    array<ushort> AddressTypes with BinaryEncoding{Length = ((Length - 4) / 2)};
+}
+
+type InitiationAcknowledgement // 2
+{
+    byte Type where value == 2;
+    byte ChunkFlags;
+    ushort ChunkLength;
+    uint InitiateTag;
+    uint AdvertisedReceiverWindowCredit;
+    ushort NumberOfOutboundStreams;
+    ushort NumberOfInboundStreams;
+    uint InitialTSN;
+    array<InitAckOptionalOrVariableParameter> OptionalOrVariableParameters;
+}
+
+pattern InitAckOptionalOrVariableParameter = StateCookie | // 7
+    IPv4AddressParameter                                 | // 5
+    IPv6AddressParameter                                 | // 6
+    UnrecognizedParameter                                | // 8
+    HostNameAddress                                      | // 11
+    EcnParameter;                                          // 32768
+
+type StateCookie
+{
+    ushort Type where value == 7;
+    ushort Length;
+    binary Value with BinaryEncoding{Length = Length - 4};
+}
+
+type UnrecognizedParameter
+{
+    ushort Type where value == 8;
+    ushort Length;
+    binary Value with BinaryEncoding{Length = Length - 4};
+}
+
+type EcnParameter
+{
+    ushort Type where value == 32768;
+    ushort Length where value == 4;
+}
+
+type SelectiveAcknowledgement // 3
+{
+    byte Type where value == 3;
+    byte ChunkFlags;
+    ushort ChunkLength;
+    uint CumulativeTsnAck;
+    uint AdvertisedReceiverWindowCredit;
+    ushort NumberOfGapAckBlocks;
+    ushort NumberOfDuplicateTsns;
+    array<GapAckBlock> GapAckBlocks with BinaryEncoding{Length = NumberOfGapAckBlocks};
+    array<uint> DuplicateTsns with BinaryEncoding{Length = NumberOfDuplicateTsns};
+}
+
+type GapAckBlock
+{
+    ushort Start;
+    ushort End;
+}
+
+type HeartbeatRequest // 4
+{
+    byte Type where value == 4;
+    byte ChunkFlags;
+    ushort HeartbeatLength;
+    HeartbeatInformation HeartbeatInformationTlv;
+}
+
+type HeartbeatInformation
+{
+    ushort HeartbeatInfoType where value == 1;
+    ushort HBInfoLength;
+    binary SenderSpecificHeartbeatInfo with BinaryEncoding{Length = HBInfoLength - 4};
+}
+
+type HeartbeatAcknowledgement // 5
+{
+    byte Type where value == 5;
+    byte ChunkFlags;
+    ushort HeartbeatAckLength;
+    HeartbeatInformation HeartbeatInformationTlv;
+}
+
+type AbortAssociation // 6
+{
+    byte Type where value == 6;
+    byte Reserved with BinaryEncoding{Width = 7};
+    byte T with BinaryEncoding{Width = 1};
+    ushort Length;
+    optional [|Length > 4|] array<CauseOfError> ErrorCauses;
+}
+
+type ShutdownAssociation // 7
+{
+    byte Type where value == 7;
+    byte ChunkFlags;
+    ushort Length where value == 8;
+    uint CumulativeTsnAck;
+}
+
+type ShutdownAcknowledgement // 8
+{
+    byte Type where value == 8;
+    byte ChunkFlags;
+    ushort Length where value == 4;
+}
+
+type OperationError // 9
+{
+    byte Type where value == 9;
+    byte ChunkFlags;
+    ushort Length;
+    array<CauseOfError> ErrorCauses;
+}
+
+pattern CauseOfError = InvalidStreamIdentifier | // 1
+    MissingMandatoryParameter                  | // 2
+    StaleCookieError                           | // 3
+    OutOfResource                              | // 4
+    UnresolvableAddress                        | // 5
+    UnrecognizedChunkType                      | // 6
+    InvalidMandatoryParameter                  | // 7
+    UnrecognizedParameters                     | // 8
+    NoUserData                                 | // 9
+    CookieReceivedWhileShuttingDown            | // 10
+    RestartOfAnAssociationWithNewAddresses     | // 11
+    UserInitiatedAbort                         | // 12
+    ProtocolViolation;                           // 13
+
+type InvalidStreamIdentifier
+{
+    ushort CauseCode where value == 1;
+    ushort CauseLength where value == 8;
+    ushort StreamIdentifier;
+    ushort Reserved;
+}
+
+type MissingMandatoryParameter
+{
+    ushort CauseCode where value == 2;
+    ushort CauseLength;
+    uint NumberOfMissingParams;
+    array<ushort> MissingParams with BinaryEncoding{Length = NumberOfMissingParams};
+}
+
+type StaleCookieError
+{
+    ushort CauseCode where value == 3;
+    ushort CauseLength where value == 8;
+    uint MeasureOfStaleness;
+}
+
+type OutOfResource
+{
+    ushort CauseCode where value == 4;
+    ushort CauseLength where value == 4;
+}
+
+type UnresolvableAddress
+{
+    ushort CauseCode where value == 5;
+    ushort CauseLength;
+    UnresolvableAddressPattern UnresolvableAddress;
+}
+
+pattern UnresolvableAddressPattern = IPv4AddressParameter |
+    IPv6AddressParameter                                  |
+    HostNameAddress;
+
+type UnrecognizedChunkType
+{
+    ushort CauseCode where value == 6;
+    ushort CauseLength;
+    binary UnrecognizedChunk with BinaryEncoding{Length = CauseLength - 4};
+}
+
+type InvalidMandatoryParameter
+{
+    ushort CauseCode where value == 7;
+    ushort CauseLength where value == 4;
+}
+
+type UnrecognizedParameters
+{
+    ushort CauseCode where value == 8;
+    ushort CauseLength;
+    array<UnrecognizedParameter> UnrecognizedParameters;
+}
+
+type NoUserData 
+{
+    ushort CauseCode where value == 9;
+    ushort CauseLength where value == 8;
+    uint TsnValue;
+}
+
+type CookieReceivedWhileShuttingDown
+{
+    ushort CauseCode where value == 10;
+    ushort CauseLength where value == 4;
+}
+
+type RestartOfAnAssociationWithNewAddresses
+{
+    ushort CauseCode where value == 11;
+    ushort CauseLength;
+    array<NewAddressTlv> NewAddressTlvs;
+}
+
+pattern NewAddressTlv = IPv4AddressParameter | IPv6AddressParameter;
+
+type UserInitiatedAbort
+{
+    ushort CauseCode where value == 12;
+    ushort CauseLength;
+    binary UpperLayerAbortReason with BinaryEncoding{Length = CauseLength - 4};
+}
+
+type ProtocolViolation
+{
+    ushort CauseCode where value == 13;
+    ushort CauseLength;
+    binary AdditionalInformation with BinaryEncoding{Length = CauseLength - 4};
+}
+
+type CookieEcho // 10
+{
+    byte Type where value == 10;
+    byte ChunkFlags;
+    ushort Length;
+    binary Cookie with BinaryEncoding{Length = Length - 4};
+}
+
+type CookieAcknowledgement // 11
+{
+    byte Type where value == 11;
+    byte ChunkFlags;
+    ushort Length where value == 4;
+}
+
+type ShutdownComplete // 14
+{
+    byte Type where value == 14;
+    byte Reserved with BinaryEncoding{Width = 7};
+    byte T with BinaryEncoding{Width = 1};
+    ushort Length where value == 4;
+}
+
+type EcnEcho // 12
+{
+    byte Type where value == 12;
+    byte ChunkFlags where value == 0;
+    ushort Length where value == 8;
+    uint LowestTsnNumber;
+}
+
+type Cwr // 13
+{
+    byte Type where value == 13;
+    byte ChunkFlags where value == 0;
+    ushort Length where value == 8;
+    uint LowestTsnNumber;
+}
+
+/********************************************** functions **********************************************/
+binary MakeBinary(binary sourceAddress, binary destinationAddress, ushort sourcePort, ushort destinationPort)
+{
+    return sourceAddress + destinationAddress + sourcePort.ToBinary() + destinationPort.ToBinary();
+}
+
+// For summary
+string GetChunkName(ChunkValue chunk)
+{
+    switch (chunk)
+    {
+        case payloadData:PayloadData                             => return "Payload Data";
+        case initiation:Initiation                               => return "Initiation";
+        case initiationAcknowledgement:InitiationAcknowledgement => return "Initiation Acknowledgement";
+        case selectiveAcknowledgement:SelectiveAcknowledgement   => return "Selective Acknowledgement";
+        case heartbeatRequest:HeartbeatRequest                   => return "Heartbeat Request";
+        case heartbeatAcknowledgement:HeartbeatAcknowledgement   => return "Heartbeat Acknowledgement";
+        case abortAssociation:AbortAssociation                   => return "Abort Association";
+        case shutdownAssociation:ShutdownAssociation             => return "Shutdown Association";
+        case shutdownAcknowledgement:ShutdownAcknowledgement     => return "Shutdown Acknowledgement";
+        case operationError:OperationError                       => return "Operation Error";
+        case cookieEcho:CookieEcho                               => return "Cookie Echo";
+        case cookieAcknowledgement:CookieAcknowledgement         => return "Cookie Acknowledgement";
+        case ecnEcho:EcnEcho                                     => return "Ecn Echo";
+        case cwr:Cwr                                             => return "Cwr";
+        case shutdownComplete:ShutdownComplete                   => return "Shutdown Complete";
+        default                                                  => return "Unknown Chunk Type";
+    }
+}

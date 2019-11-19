@@ -1,0 +1,2905 @@
+protocol NFS with 
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "NFS: Network File System Protocol Specification",
+    ShortName = "NFS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1094"},
+            new Reference{Name = "RFC 1813"},
+            new Reference{Name = "RFC 3530"},
+            new Reference{Name = "RFC 5661"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "361425", Date = "03/26/2014"}
+        ]
+};
+
+using Utility;
+using UDP;
+using XDR;
+using IANA;
+using SunRPC;
+using TCP;
+
+annotation uint NFSXid;
+annotation ulong NFSProg;
+
+endpoint Server over IntermediateServer provides OperationContract;
+client endpoint Client connected to Server;
+
+endpoint IntermediateServer over SunRPC.Node provides MessageContract consumes MessageContract;
+client endpoint IntermediateClient connected to IntermediateServer;
+
+// SunRPC Over TCP actor
+autostart actor SunRPCOverTCP(TCP.Server server)
+{
+    bool IsSunRPCFlag = false;
+    bool IsSunRPCAssist= false; // Set and used only when port is NFS
+
+    process server accepts s:TCP.Segment where (Port.NFS == s.DestinationPort && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || 
+        IsSunRPCRequest(s.Payload, NFSVers, NFS_PROGRAM, ref IsSunRPCFlag)
+    {
+        var ept = endpoint SunRPC.RecordMarking over server;
+        ept.ExpectedProgram = NFS_PROGRAM;
+        ept.VerSet = NFSVers;
+        dispatch ept accepts s;
+    }
+    
+    process server issues s:TCP.Segment where IsSunRPCFlag || 
+        (Port.NFS == s.SourcePort && IsSunRPC(s.Payload, ref IsSunRPCAssist))
+    {
+        dispatch (endpoint SunRPC.RecordMarking over server) issues s;
+    }
+    
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        ((Port.NFS == s.DestinationPort && IsSunRPC(s.Payload, ref IsSunRPCAssist)) || 
+        IsSunRPCRequest(s.Payload, NFSVers, NFS_PROGRAM, ref IsSunRPCFlag))
+    {
+        var ept = endpoint SunRPC.RecordMarking over server;
+        ept.ExpectedProgram = NFS_PROGRAM;
+        ept.VerSet = NFSVers;
+        dispatch ept accepts s;
+    }
+    
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        (IsSunRPCFlag || (Port.NFS == s.SourcePort && IsSunRPC(s.Payload, ref IsSunRPCAssist)))
+    {
+        dispatch (endpoint SunRPC.RecordMarking over server) issues s;
+    }
+}
+
+// SunRPC Over UDP actor
+autostart actor SunRPCOverUDP(UDP.Host host)
+{
+    set<uint> XidSet = {};
+
+    process host accepts d:UDP.Datagram where ((d.DestinationPort == Port.NFS || d.SourcePort == Port.NFS) && IsSunRPC(d.Payload)) || 
+        (IsSunRPCRequest(d.Payload, NFSVers, NFS_PROGRAM) is isSunRPCRequest:bool && isSunRPCRequest) || 
+        (IsSunRPCResponse(d.Payload, ref XidSet) is isSunRPCResponse:bool && isSunRPCResponse)
+    {
+        if (d.DestinationPort != Port.NFS && d.SourcePort != Port.NFS && isSunRPCRequest)
+        {
+            AddXidSet(d.Payload, ref XidSet, false);
+        }
+        if (d.DestinationPort != Port.NFS && d.SourcePort != Port.NFS && isSunRPCResponse)
+        {
+            RemoveXidSet(d.Payload, ref XidSet, false);
+        }
+        dispatch (endpoint SunRPC.RecordMarking over host) accepts d;
+    }
+    
+    // destructor
+    ~endpoint(UDP.Host host)
+    {
+        XidSet = {};
+    }
+}
+
+/* RFC 1813:
+2.2 Constants
+
+These are the RPC constants needed to call the NFS Version 3
+service.  They are given in decimal.
+    PROGRAM  100003
+    VERSION  3
+ program NFS_PROGRAM {
+         version NFS_V3 {
+            ...
+         } = 3;
+      } = 100003;
+*/
+const uint NFS_PROGRAM = 100003;
+const set<uint> NFSVers = {1, 2, 3, 4}; // NFS RFC1094, NFS RFC1813, NFS RFC3530
+
+autostart actor NFSOverIntermediateServer(IntermediateServer s)
+{
+    map<uint, any> compoundOpBuffer = {};
+    map<uint, any> cbCompoundOpBuffer = {};
+    map<uint, any> nullOpBuffer = {};
+    map<uint, any> cbNullOpBuffer = {};
+    map<uint, any> encryptedOpBuffer = {};
+    
+    ~endpoint(IntermediateServer s)
+    {
+        foreach (var msg in compoundOpBuffer.Values)
+        {
+            DisplayTopLevelMessage((msg as any message));
+        }
+        foreach (var msg in cbCompoundOpBuffer.Values)
+        {
+            DisplayTopLevelMessage((msg as any message));
+        }
+        foreach (var msg in nullOpBuffer.Values)
+        {
+            DisplayTopLevelMessage((msg as any message));
+        }
+        foreach (var msg in cbNullOpBuffer.Values)
+        {
+            DisplayTopLevelMessage((msg as any message));
+        }
+        foreach (var msg in encryptedOpBuffer.Values)
+        {
+            DisplayTopLevelMessage((msg as any message));
+        }
+    }
+    
+    process s accepts msg:MessageContract.Compound
+    {
+        compoundOpBuffer[msg#NFSXid as uint] = msg;
+    }
+    
+    process s issues msg:MessageContract.CompoundRes
+    {
+        uint xid = msg#NFSXid as uint;
+        if (xid in compoundOpBuffer)
+        {
+            OperationContract.CompoundOp compoundOp = new OperationContract.CompoundOp
+                {
+                    Compound4Args = (compoundOpBuffer[xid] as MessageContract.Compound).Compound4Args,
+                    Compound4Res = msg.Compound4Res
+                };
+            compoundOp.Origins = [compoundOpBuffer[xid] as any message, msg as any message];
+            compoundOpBuffer = compoundOpBuffer.Remove(xid);
+            dispatch (endpoint Server over s) accepts compoundOp;
+        }
+        else
+        {
+            ValidationCheck(false, msg, "Incomplete Compound operation due to missing Compound request.");
+        }
+    }
+    
+    process s accepts msg:MessageContract.CbCompound
+    {
+        cbCompoundOpBuffer[msg#NFSXid as uint] = msg;
+    }
+    
+    process s issues msg:MessageContract.CbCompoundRes
+    {
+        uint xid = msg#NFSXid as uint;
+        if (xid in cbCompoundOpBuffer)
+        {
+            OperationContract.CbCompoundOp compoundOp = new OperationContract.CbCompoundOp
+                {
+                    CbCompound4Args = (cbCompoundOpBuffer[xid] as MessageContract.CbCompound).CbCompound4Args,
+                    CbCompound4Res = msg.CbCompound4Res
+                };
+            compoundOp.Origins = [cbCompoundOpBuffer[xid] as any message, msg as any message];
+            cbCompoundOpBuffer = cbCompoundOpBuffer.Remove(xid);
+            dispatch (endpoint Server over s) accepts compoundOp;
+        }
+        else
+        {
+            ValidationCheck(false, msg, "Incomplete Compound operation due to missing Compound request.");
+        }
+    }
+    
+    process s accepts msg:MessageContract.EncryptedArgs
+    {
+        encryptedOpBuffer[msg#NFSXid as uint] = msg;
+    }
+    
+    process s issues msg:MessageContract.EncryptedRes
+    {
+        uint xid = msg#NFSXid as uint;
+        if (xid in encryptedOpBuffer)
+        {
+            OperationContract.EncryptedOp encryptedOp = new OperationContract.EncryptedOp
+            {
+                EncryptedArgs = (encryptedOpBuffer[xid] as MessageContract.EncryptedArgs).EncryptedArgs,
+                EncryptedRes = msg.EncryptedRes
+            };
+            encryptedOp.Origins = [encryptedOpBuffer[xid] as any message, msg as any message];
+            encryptedOpBuffer = encryptedOpBuffer.Remove(xid);
+            dispatch (endpoint Server over s) accepts encryptedOp;
+        }
+        else
+        {
+            ValidationCheck(false, msg, "Incomplete Compound operation due to missing Compound request.");
+        }
+    }
+    
+    process s accepts msg:MessageContract.Null
+    {
+        nullOpBuffer[msg#NFSXid as uint] = msg;
+    }
+    
+    process s issues msg:MessageContract.NullRes
+    {
+        uint xid = msg#NFSXid as uint;
+        if (xid in nullOpBuffer)
+        {
+            OperationContract.NullOp nullOp = new OperationContract.NullOp{};
+            nullOp.Origins = [nullOpBuffer[xid] as any message, msg as any message];
+            nullOpBuffer = nullOpBuffer.Remove(xid);
+            dispatch (endpoint Server over s) accepts nullOp;
+        }
+        else
+        {
+            ValidationCheck(false, msg, "Incomplete Compound operation due to missing Compound request.");
+        }
+    }
+    
+    process s accepts msg:MessageContract.CbNull
+    {
+        cbNullOpBuffer[msg#NFSXid as uint] = msg;
+    }
+    
+    process s issues msg:MessageContract.CbNullRes
+    {
+        uint xid = msg#NFSXid as uint;
+        if (xid in cbNullOpBuffer)
+        {
+            OperationContract.CbNullOp cbNullOp = new OperationContract.CbNullOp{};
+            cbNullOp.Origins = [cbNullOpBuffer[xid] as any message, msg as any message];
+            cbNullOpBuffer = cbNullOpBuffer.Remove(xid);
+            dispatch (endpoint Server over s) accepts cbNullOp;
+        }
+        else
+        {
+            ValidationCheck(false, msg, "Incomplete Compound operation due to missing Compound request.");
+        }
+    }
+}
+
+// Future Reference: implement NFS v2 v3 v4 in the future
+autostart actor NFSOverSunRPC(SunRPC.Node node)
+{
+    map<uint, uint> procedureByXID = {};
+    map<uint, uint> programByXID = {};
+    map<uint, RpcGssServiceT> serviceMappingbyXID = {};
+    
+    // Server request/response
+    process node accepts r:RpcMsg where((r.Body is CallBody) && (((r.Body as CallBody).Prog == RPCProgramNumber.Nfs4 && (r.Body as CallBody).Vers == 4) || (r.Body as CallBody).Prog == 0x40000000))
+    {
+        procedureByXID[r.Xid] = (r.Body as CallBody).Proc;
+        programByXID[r.Xid] = (r.Body as CallBody).Prog;
+        CallBody callbody = r.Body as CallBody;
+        
+        if (((r.Body as CallBody).Cred != nothing) && ((r.Body as CallBody).Cred.Flavor == SunRPC.AuthFlavor.RpcsecGss) && (((r.Body as CallBody).Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service == RpcGssServiceT.RpcGssSvcPrivacy)
+        {
+            serviceMappingbyXID[r.Xid] = (((r.Body as CallBody).Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service;
+            if (serviceMappingbyXID[r.Xid] == RpcGssServiceT.RpcGssSvcPrivacy)
+            {
+                if ((r.Body as CallBody).CallData is RpcGssPrivData)
+                {
+                    switch (((r.Body as CallBody).CallData as RpcGssPrivData).DatabodyPriv)
+                    {
+                        case e: MessageContract.EncryptedArgs from BinaryDecoder<MessageContract.EncryptedArgs> =>
+                            e#NFSXid = r.Xid;
+                            e#NFSProg = RPCProgramNumber.Nfs4;
+                            dispatch (endpoint IntermediateServer over node) accepts e;
+                    }
+                }
+                else
+                {
+                    MessageContract.EncryptedArgs e = new MessageContract.EncryptedArgs{};
+                    e#NFSXid = r.Xid;
+                    e#NFSProg = RPCProgramNumber.Nfs4;
+                    dispatch (endpoint IntermediateServer over node) accepts e;
+                }
+            }
+        }
+        else if (procedureByXID[r.Xid] == 1 && programByXID[r.Xid] == RPCProgramNumber.Nfs4)
+        {
+            binary data = GetSunRPCCallBodyData(callbody);
+            if (data != null)
+            {
+                if (programByXID[r.Xid] == RPCProgramNumber.Nfs4)
+                {
+                    switch (data)
+                    {
+                        case n:MessageContract.Compound from BinaryDecoder<MessageContract.Compound> =>
+                            n#NFSXid = r.Xid;
+                            n#NFSProg = RPCProgramNumber.Nfs4;
+                            dispatch (endpoint IntermediateServer over node) accepts n;
+                        default =>
+                            ThrowDecodingException("NFS: Compound");
+                    }
+                }
+                else if (programByXID[r.Xid] == 0x40000000)
+                {
+                    switch (data)
+                    {
+                        case n:MessageContract.CbCompound from BinaryDecoder<MessageContract.CbCompound> =>
+                            n#NFSXid = r.Xid;
+                            n#NFSProg = 0x40000000;
+                            dispatch (endpoint IntermediateServer over node) accepts n;
+                        default =>
+                            ThrowDecodingException("NFS: CbCompound");
+                    }
+                }
+            }
+        }
+        else if (programByXID[r.Xid] == RPCProgramNumber.Nfs4 && procedureByXID[r.Xid] == 0)
+        {
+            MessageContract.Null n = new MessageContract.Null{};
+            n#NFSXid = r.Xid;
+            dispatch (endpoint IntermediateServer over node) accepts n;
+        }
+        else if (programByXID[r.Xid] == 0x40000000 && procedureByXID[r.Xid] == 0)
+        {
+            MessageContract.CbNull n = new MessageContract.CbNull{};
+            n#NFSXid = r.Xid;
+            dispatch (endpoint IntermediateServer over node) accepts n;
+        }
+    }
+    
+    process node issues r:RpcMsg where ((r.Body is ReplyBody) && (r.Xid in procedureByXID) && (r.Body as ReplyBody).Stat == ReplyStat.MsgAccepted && ((r.Body as ReplyBody).Reply as AcceptedReply).ReplyData != nothing)
+    {
+        ProcessReplyBody(r, IssuesDispatcher);
+    }
+    
+    // accepts Reply from UDP, reverse accept/issues direction for operation set up.
+    process node accepts r:RpcMsg where ((r.Body is ReplyBody) && (r.Xid in procedureByXID) && (r.Body as ReplyBody).Stat == ReplyStat.MsgAccepted && ((r.Body as ReplyBody).Reply as AcceptedReply).ReplyData != nothing)
+    {
+        ProcessReplyBody(r, IssuesDispatcher);
+    }
+    
+    void ProcessReplyBody(RpcMsg r, void(any message) dispatcher)
+    {
+        if ((r.Xid in serviceMappingbyXID) && (serviceMappingbyXID[r.Xid] == RpcGssServiceT.RpcGssSvcPrivacy))
+        {
+            switch (((r.Body as ReplyBody).Reply as AcceptedReply).ReplyData)
+            {
+                case data:RpcGssPrivData =>
+                    switch (data.DatabodyPriv)
+                    {
+                        case e: MessageContract.EncryptedRes from BinaryDecoder<MessageContract.EncryptedRes> =>
+                            e#NFSXid = r.Xid;
+                            dispatcher(e);
+                        default =>
+                            ThrowDecodingException("NFS: EncryptedRes");
+                    }
+                default =>
+                    {
+                        MessageContract.EncryptedRes e = new MessageContract.EncryptedRes{};
+                        e#NFSXid = r.Xid;
+                        e#NFSProg = RPCProgramNumber.Nfs4;
+                        dispatcher(e);
+                    }
+            }
+        }
+        else if (procedureByXID[r.Xid] == 1)
+        {
+            AcceptedReply reply = (r.Body as ReplyBody).Reply as AcceptedReply;
+            binary data;
+            data = GetSunRPCReplyBodyData(reply);
+            if (data != null)
+            {
+                if (programByXID[r.Xid] == RPCProgramNumber.Nfs4)
+                {
+                    switch (data)
+                    {
+                        case n:MessageContract.CompoundRes from BinaryDecoder<MessageContract.CompoundRes> =>
+                            n#NFSXid = r.Xid;
+                            dispatcher(n);
+                        default =>
+                            ThrowDecodingException("NFS: CompoundRes");
+                    }
+                }
+                else if (programByXID[r.Xid] == 0x40000000)
+                {
+                    switch (data)
+                    {
+                        case n:MessageContract.CbCompoundRes from BinaryDecoder<MessageContract.CbCompoundRes> =>
+                            n#NFSXid = r.Xid;
+                            dispatcher(n);
+                        default =>
+                            ThrowDecodingException("NFS: CbCompoundRes");
+                    }
+                }
+            }
+        }
+        else if (procedureByXID[r.Xid] == 0)
+        {
+            if (programByXID[r.Xid] == RPCProgramNumber.Nfs4)
+            {
+                MessageContract.NullRes n = new MessageContract.NullRes{};
+                n#NFSXid = r.Xid;
+                dispatcher(n);
+            }
+            else if (programByXID[r.Xid] == 0x40000000)
+            {
+                MessageContract.CbNullRes n = new MessageContract.CbNullRes{};
+                n#NFSXid = r.Xid;
+                dispatcher(n);
+            }
+        }
+    }
+    
+    void AcceptsDispatcher(any message m)
+    {
+        dispatch (endpoint IntermediateServer over node) accepts m;
+    }
+    
+    void IssuesDispatcher(any message m)
+    {
+        dispatch (endpoint IntermediateServer over node) issues m;
+    }
+}
+
+binary GetSunRPCCallBodyData(CallBody callbody)
+{
+    if (callbody != null)
+    {
+        switch (callbody.CallData)
+        {
+            case rgnD: RpcGssNoneData =>
+                return rgnD.Data;
+            case binaryData: BinaryCallDataType =>
+                return binaryData.Data;
+            case rgiD: RpcGssIntegData =>
+                return rgiD.DatabodyInteg.ProcArg;
+            default =>
+                return null;
+        }
+    }
+    else 
+        return null;
+}
+
+binary GetSunRPCReplyBodyData(AcceptedReply reply)
+{
+    if (reply != null && reply.ReplyData != nothing)
+    {
+        switch (reply.ReplyData)
+        {
+            case rgnD: RpcGssNoneData =>
+                return rgnD.Data;
+            case binaryData: binary =>
+                return binaryData;
+            case rgiD: RpcGssIntegData =>
+                return rgiD.DatabodyInteg.ProcArg;
+            default =>
+                return null;
+        }
+    }
+    else
+        return null;
+}
+
+contract OperationContract
+{
+    accepts operation EncryptedOp
+    {
+        in binary EncryptedArgs;
+        out binary EncryptedRes;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Encrypted Operation";
+        }
+    }
+    
+    // Procedure 0: Null No Operation
+    accepts operation NullOp // 0
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 0: Null - No Operation";
+        }
+    }
+    
+    // Procedure 1: COMPOUND - Compound Operations
+    accepts operation CompoundOp
+    {
+        in Compound4Args Compound4Args;
+        out Compound4Res Compound4Res;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 1: COMPOUND - Compound Operations";
+        }
+    }
+    
+    // Callback Procedure 0: Null No Operation
+    accepts operation CbNullOp // 0
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 0: Null - No Operation";
+        }
+    }
+    
+    // Callback Procedure 1: COMPOUND - Compound Operations
+    accepts operation CbCompoundOp
+    {
+        in CbCompound4Args CbCompound4Args;
+        out CbCompound4Res CbCompound4Res;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 1: COMPOUND - Compound Operations";
+        }
+    }
+}
+
+contract MessageContract
+{
+    accepts message EncryptedArgs
+    {
+        binary EncryptedArgs;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Encrypted Arguments";
+        }
+    }
+    
+    issues message EncryptedRes
+    {
+        binary EncryptedRes;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Encrypted Response";
+        }
+    }
+    
+    accepts message Compound
+    {
+        Compound4Args Compound4Args;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 1: COMPOUND - Compound Arguments";
+        }
+    }
+    
+    issues message CompoundRes
+    {
+        Compound4Res Compound4Res;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 1: COMPOUND - Compound Result";
+        }
+    }
+    
+    accepts message Null
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 0: Null - No Operation Request";
+        }
+    }
+    
+    issues message NullRes
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Procedure 0: Null - No Operation Response";
+        }
+    }
+    
+    accepts message CbCompound
+    {
+        CbCompound4Args CbCompound4Args;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 1: COMPOUND - Compound Arguments";
+        }
+    }
+    
+    issues message CbCompoundRes
+    {
+        CbCompound4Res CbCompound4Res;
+        
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 1: COMPOUND - Compound Result";
+        }
+    }
+    
+    accepts message CbNull
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 0: Null - No Operation Request";
+        }
+    }
+    
+    issues message CbNullRes
+    {
+        override string ToString()
+        {
+            return  "NFSv4 Callback Procedure 0: Null - No Operation Response";
+        }
+    }
+}
+
+// Const
+/* RpcSecGss has a value of '6' - See RFC 2203 */
+const XdrUnsignedInt RpcSecGss = 6;
+
+const XdrUnsignedInt ExchgID4FlagSuppMovedRefer    = 0x00000001;
+const XdrUnsignedInt ExchgID4FlagSuppMovedMigr     = 0x00000002;
+
+const XdrUnsignedInt ExchgID4FlagBindPrincStateID  = 0x00000100;
+
+const XdrUnsignedInt ExchgID4FlagUseNonPNFS        = 0x00010000;
+const XdrUnsignedInt ExchgID4FlagUsePNFSMDS        = 0x00020000;
+const XdrUnsignedInt ExchgID4FlagUsePNFSDS         = 0x00040000;
+
+const XdrUnsignedInt ExchgID4FlagMaskPNFS           = 0x00070000;
+
+const XdrUnsignedInt ExchgID4FlagUPDConfirmedRECA = 0x40000000;
+const XdrUnsignedInt ExchgID4FlagConfirmedR         = 0x80000000;
+
+const XdrUnsignedInt CreateSession4FlagPersist              = 0x00000001;
+const XdrUnsignedInt CreateSession4FlagConnBackChan       = 0x00000002;
+const XdrUnsignedInt CreateSession4FlagConnRDMA            = 0x00000004;
+
+/* Constants used for LayoutReturn and CB_LayoutRECAll */
+const byte Layout4RetRecFile      = 1;
+const byte Layout4RetRecFSID      = 2;
+const byte Layout4RetRecAll       = 3;
+
+// RFC 5661 20.6.  Operation 8: CB_RECAll_Any - Keep Any N Recallable Objects
+const byte Rca4TypeMaskRDataDLG          = 0;
+const byte Rca4TypeMaskWDataDLG          = 1;
+const byte Rca4TypeMaskDirDLG            = 2;
+const byte Rca4TypeMaskFileLayout        = 3;
+const byte Rca4TypeMaskBlkLayout         = 4;
+const byte Rca4TypeMaskObjLayoutMin     = 8;
+const byte Rca4TypeMaskObjLayoutMax     = 9;
+const byte Rca4TypeMaskOtherLayoutMin   = 12;
+const byte Rca4TypeMaskOtherLayoutMax   = 15;
+
+const byte Nfs4DeviceID4Size = 16;
+
+// RFC 5661 3.1.  Basic Constants
+const byte Nfs4FHSize = 128;
+const uint Nfs4VerifierSize = 8;
+const uint Nfs4OpaqueLimit = 1024;
+const uint Nfs4SessionIDSize = 16;
+
+const XDRHyper Nfs4Int64Max = 0x7FFFFFFFFFFFFFFF;
+const XDRUnsignedHyper Nfs4Uint64Max = 0xFFFFFFFFFFFFFFFF;
+const XDRInt Nfs4Int32Max = 0x7FFFFFFF;
+const XdrUnsignedInt Nfs4Uint32Max = 0xFFFFFFFF;
+
+const XDRUnsignedHyper Nfs4MaxFileLen  = 0xFFFFFFFFFFFFFFFF;
+const XDRUnsignedHyper Nfs4MaxFileOff  = 0xFFFFFFFFFFFFFFFE;
+
+// RFC 5661 16.2.  Procedure 1: COMPOUND - Compound Operations
+pattern NFSOpNum4 = enum XdrUnsignedInt
+{
+    OPAccess              = 3,
+    OPClose               = 4,
+    OPCommit              = 5,
+    OPCreate              = 6,
+    OPDelegPurge          = 7,
+    OPDelegReturn         = 8,
+    OPGetAttr             = 9,
+    OPGetFH               = 10,
+    OPLink                = 11,
+    OPLock                = 12,
+    OPLockT               = 13,
+    OPLockU               = 14,
+    OPLookUp              = 15,
+    OPLookUpP             = 16,
+    OPNVerify             = 17,
+    OPOpen                = 18,
+    OPOpenAttr            = 19,
+    OPOpenConfirm         = 20, /* Mandatory not-to-implement */
+    OPOpenDownGrade       = 21,
+    OPPutFH               = 22,
+    OPPutPubFH            = 23,
+    OPPutRootFH           = 24,
+    OPRead                = 25,
+    OPReadDir             = 26,
+    OPReadLink            = 27,
+    OPRemove              = 28,
+    OPRename              = 29,
+    OPRenew               = 30, /* Mandatory not-to-implement */
+    OPRestoreFH           = 31,
+    OPSaveFH              = 32,
+    OPSecInfo             = 33,
+    OPSetAttr             = 34,
+    OPSetClientID         = 35, /* Mandatory not-to-implement */
+    OPSetClientIDConfirm  = 36, /* Mandatory not-to-implement */
+    OPVerify              = 37,
+    OPWrite               = 38,
+    OPReleaseLockOwner    = 39, /* Mandatory not-to-implement */
+
+   /* new operations for NFSv4.1 */
+    OPBackChannelCTL      = 40,
+    OPBindConnToSession   = 41,
+    OPExchangeID          = 42,
+    OPCreateSession       = 43,
+    OPDestroySession      = 44,
+    OPFreeStateID         = 45,
+    OPGetDirDelegation    = 46,
+    OPGetDeviceInfo       = 47,
+    OPGetDeviceList       = 48,
+    OPLayoutCommit        = 49,
+    OPLayoutGet           = 50,
+    OPLayoutReturn        = 51,
+    OPSecInfoNoName       = 52,
+    OPSequence            = 53,
+    OPSetSSV              = 54,
+    OPTestStateID         = 55,
+    OPWantDelegation      = 56,
+    OPDestroyClientID     = 57,
+    OPReclaimComplete     = 58,
+    OPIllegal             = 10044
+};
+
+type Compound4Args
+{
+    XDRString Tag;
+    XdrUnsignedInt MinorVersion;
+    XdrUnsignedInt NFSArgOp4Count;
+    optional [|NFSArgOp4Count > 0|] array<NFSArgOp4> ArgArray with BinaryEncoding{Length = NFSArgOp4Count};
+}
+
+type NFSArgOp4
+{
+    NFSOpNum4 ArgOp;
+    ([|ArgOp == NFSOpNum4.OPAccess|] Access4Args                         |
+    [|ArgOp == NFSOpNum4.OPClose|] Close4Args                            |
+    [|ArgOp == NFSOpNum4.OPCommit|] Commit4Args                          |
+    [|ArgOp == NFSOpNum4.OPCreate|] Create4Args                          |
+    [|ArgOp == NFSOpNum4.OPDelegPurge|] DelegPurge4Args                  |
+    [|ArgOp == NFSOpNum4.OPDelegReturn|] DelegReturn4Args                |
+    [|ArgOp == NFSOpNum4.OPGetAttr|] GetAttr4Args                        |
+    [|ArgOp == NFSOpNum4.OPGetFH|] GetFH4Args                            |
+    [|ArgOp == NFSOpNum4.OPLink|] Link4Args                              |
+    [|ArgOp == NFSOpNum4.OPLock|] Lock4Args                              |
+    [|ArgOp == NFSOpNum4.OPLockT|] LockT4Args                            |
+    [|ArgOp == NFSOpNum4.OPLockU|] LockU4Args                            |
+    [|ArgOp == NFSOpNum4.OPLookUp|] LookUp4Args                          |
+    [|ArgOp == NFSOpNum4.OPLookUpP|] LookUpP4Args                        |
+    [|ArgOp == NFSOpNum4.OPNVerify|] NVerify4Args                        |
+    [|ArgOp == NFSOpNum4.OPOpen|] Open4Args                              |
+    [|ArgOp == NFSOpNum4.OPOpenAttr|] OpenAttr4Args                      |
+    [|ArgOp == NFSOpNum4.OPOpenDownGrade|] OpenDowngrade4Args            |
+    [|ArgOp == NFSOpNum4.OPPutFH|] PutFH4Args                            |
+    [|ArgOp == NFSOpNum4.OPPutPubFH|] PutPubFH4Args                      |
+    [|ArgOp == NFSOpNum4.OPPutRootFH|] PutRootFH4Args                    |
+    [|ArgOp == NFSOpNum4.OPRead|] Read4Args                              |
+    [|ArgOp == NFSOpNum4.OPReadDir|] ReadDir4Args                        |
+    [|ArgOp == NFSOpNum4.OPReadLink|] ReadLink4Args                      |
+    [|ArgOp == NFSOpNum4.OPRemove|] Remove4Args                          |
+    [|ArgOp == NFSOpNum4.OPRename|] Rename4Args                          |
+    [|ArgOp == NFSOpNum4.OPRestoreFH|] RestoreFH4Args                    |
+    [|ArgOp == NFSOpNum4.OPSaveFH|] SaveFH4Args                          |
+    [|ArgOp == NFSOpNum4.OPSecInfo|] SecInfo4Args                        |
+    [|ArgOp == NFSOpNum4.OPSetAttr|] SetAttr4Args                        |
+    [|ArgOp == NFSOpNum4.OPVerify|] Verify4Args                          |
+    [|ArgOp == NFSOpNum4.OPWrite|] Write4Args                            |
+    [|ArgOp == NFSOpNum4.OPBackChannelCTL|] BackChannelCTL4Args          |
+    [|ArgOp == NFSOpNum4.OPBindConnToSession|] BindConnToSession4Args    |
+    [|ArgOp == NFSOpNum4.OPExchangeID|] ExchangeID4Args                  |
+    [|ArgOp == NFSOpNum4.OPCreateSession|] CreateSession4Args            |
+    [|ArgOp == NFSOpNum4.OPDestroySession|] DestroySession4Args          |
+    [|ArgOp == NFSOpNum4.OPFreeStateID|] FreeStateID4Args                |
+    [|ArgOp == NFSOpNum4.OPGetDirDelegation|] GetDirDelegation4Args      |
+    [|ArgOp == NFSOpNum4.OPGetDeviceInfo|] GetDeviceInfo4Args            |
+    [|ArgOp == NFSOpNum4.OPGetDeviceList|] GetDeviceList4Args            |
+    [|ArgOp == NFSOpNum4.OPLayoutCommit|] LayoutCommit4Args              |
+    [|ArgOp == NFSOpNum4.OPLayoutGet|] LayoutGet4Args                    |
+    [|ArgOp == NFSOpNum4.OPLayoutReturn|] LayoutReturn4Args              |
+    [|ArgOp == NFSOpNum4.OPSecInfoNoName|] SecInfoNoName4Args            |
+    [|ArgOp == NFSOpNum4.OPSequence|] Sequence4Args                      |
+    [|ArgOp == NFSOpNum4.OPSetSSV|] SetSSV4Args                          |
+    [|ArgOp == NFSOpNum4.OPTestStateID|] TestStateID4Args                |
+    [|ArgOp == NFSOpNum4.OPWantDelegation|] WantDelegation4Args          |
+    [|ArgOp == NFSOpNum4.OPDestroyClientID|] DestroyClientID4Args        |
+    [|ArgOp == NFSOpNum4.OPReclaimComplete|] ReclaimComplete4Args        |
+    [|ArgOp == NFSOpNum4.OPIllegal|] Illegal4Args) Arguments;
+}
+
+type NFSResOp4
+{
+    NFSOpNum4 ResOp;
+    ([|ResOp == NFSOpNum4.OPAccess|] Access4Res                         |
+    [|ResOp == NFSOpNum4.OPClose|] Close4Res                            |
+    [|ResOp == NFSOpNum4.OPCommit|] Commit4Res                          |
+    [|ResOp == NFSOpNum4.OPCreate|] Create4Res                          |
+    [|ResOp == NFSOpNum4.OPDelegPurge|] DelegPurge4Res                  |
+    [|ResOp == NFSOpNum4.OPDelegReturn|] DelegReturn4Res                |
+    [|ResOp == NFSOpNum4.OPGetAttr|] GetAttr4Res                        |
+    [|ResOp == NFSOpNum4.OPGetFH|] GetFH4Res                            |
+    [|ResOp == NFSOpNum4.OPLink|] Link4Res                              |
+    [|ResOp == NFSOpNum4.OPLock|] Lock4Res                              |
+    [|ResOp == NFSOpNum4.OPLockT|] LockT4Res                            |
+    [|ResOp == NFSOpNum4.OPLockU|] LockU4Res                            |
+    [|ResOp == NFSOpNum4.OPLookUp|] LookUp4Res                          |
+    [|ResOp == NFSOpNum4.OPLookUpP|] LookUpP4Res                        |
+    [|ResOp == NFSOpNum4.OPNVerify|] NVerify4Res                        |
+    [|ResOp == NFSOpNum4.OPOpen|] Open4Res                              |
+    [|ResOp == NFSOpNum4.OPOpenAttr|] OpenAttr4Res                      |
+    [|ResOp == NFSOpNum4.OPOpenDownGrade|] OpenDowngrade4Res            |
+    [|ResOp == NFSOpNum4.OPPutFH|] PutFH4Res                            |
+    [|ResOp == NFSOpNum4.OPPutPubFH|] PutPubFH4Res                      |
+    [|ResOp == NFSOpNum4.OPPutRootFH|] PutRootFH4Res                    |
+    [|ResOp == NFSOpNum4.OPRead|] Read4Res                              |
+    [|ResOp == NFSOpNum4.OPReadDir|] ReadDir4Res                        |
+    [|ResOp == NFSOpNum4.OPReadLink|] ReadLink4Res                      |
+    [|ResOp == NFSOpNum4.OPRemove|] Remove4Res                          |
+    [|ResOp == NFSOpNum4.OPRename|] Rename4Res                          |
+    [|ResOp == NFSOpNum4.OPRestoreFH|] RestoreFH4Res                    |
+    [|ResOp == NFSOpNum4.OPSaveFH|] SaveFH4Res                          |
+    [|ResOp == NFSOpNum4.OPSecInfo|] SecInfo4Res                        |
+    [|ResOp == NFSOpNum4.OPSetAttr|] SetAttr4Res                        |
+    [|ResOp == NFSOpNum4.OPVerify|] Verify4Res                          |
+    [|ResOp == NFSOpNum4.OPWrite|] Write4Res                            |
+    [|ResOp == NFSOpNum4.OPBackChannelCTL|] BackChannelCTL4Res          |
+    [|ResOp == NFSOpNum4.OPBindConnToSession|] BindConnToSession4Res    |
+    [|ResOp == NFSOpNum4.OPExchangeID|] ExchangeID4Res                  |
+    [|ResOp == NFSOpNum4.OPCreateSession|] CreateSession4Res            |
+    [|ResOp == NFSOpNum4.OPDestroySession|] DestroySession4Res          |
+    [|ResOp == NFSOpNum4.OPFreeStateID|] FreeStateID4Res                |
+    [|ResOp == NFSOpNum4.OPGetDirDelegation|] GetDirDelegation4Res      |
+    [|ResOp == NFSOpNum4.OPGetDeviceInfo|] GetDeviceInfo4Res            |
+    [|ResOp == NFSOpNum4.OPGetDeviceList|] GetDeviceList4Res            |
+    [|ResOp == NFSOpNum4.OPLayoutCommit|] LayoutCommit4Res              |
+    [|ResOp == NFSOpNum4.OPLayoutGet|] LayoutGet4Res                    |
+    [|ResOp == NFSOpNum4.OPLayoutReturn|] LayoutReturn4Res              |
+    [|ResOp == NFSOpNum4.OPSecInfoNoName|] SecInfoNoName4Res            |
+    [|ResOp == NFSOpNum4.OPSequence|] Sequence4Res                      |
+    [|ResOp == NFSOpNum4.OPSetSSV|] SetSSV4Res                          |
+    [|ResOp == NFSOpNum4.OPTestStateID|] TestStateID4Res                |
+    [|ResOp == NFSOpNum4.OPWantDelegation|] WantDelegation4Res          |
+    [|ResOp == NFSOpNum4.OPDestroyClientID|] DestroyClientID4Res        |
+    [|ResOp == NFSOpNum4.OPReclaimComplete|] ReclaimComplete4Res        |
+    [|ResOp == NFSOpNum4.OPIllegal|] Illegal4Res) Result;
+}
+
+type Compound4Res
+{
+    NFSStat4 Status;
+    XDRString Tag;
+    XdrUnsignedInt NFSResOp4Count;
+    optional [|NFSResOp4Count > 0|] array<NFSResOp4> ResArray with BinaryEncoding{Length = NFSResOp4Count};
+}
+
+type CbCompound4Args
+{
+    XDRString Tag;
+    XdrUnsignedInt MinorVersion;
+    XdrUnsignedInt CallbackIdent;
+    XdrUnsignedInt NFSCbArgOp4Count;
+    optional [|NFSCbArgOp4Count > 0|] array<NFSCbArgOp4> ArgArray with BinaryEncoding{Length = NFSCbArgOp4Count};
+}
+
+type NFSCbArgOp4
+{
+    NFSCbOpNum4 ArgOp;
+    ([|ArgOp == NFSCbOpNum4.OPCbGetAttr|] CbGetAttr4Args                            |
+    [|ArgOp == NFSCbOpNum4.OPCbRecall|] CbRecall4Args                               |
+    [|ArgOp == NFSCbOpNum4.OPCbLayoutRecall|] CbLayoutRecall4Args                   |
+    [|ArgOp == NFSCbOpNum4.OPCbNotify|] CbNotify4Args                               |
+    [|ArgOp == NFSCbOpNum4.OPCbPushDeleg|] CbPushDeleg4Args                         |
+    [|ArgOp == NFSCbOpNum4.OPCbRecallAny|] CbRecallAny4Args                         |
+    [|ArgOp == NFSCbOpNum4.OPCbRecallableObjAvail|] CbRecallableObjAvail4Args       |
+    [|ArgOp == NFSCbOpNum4.OPCbRecallSlot|] CbRecallSlot4Args                       |
+    [|ArgOp == NFSCbOpNum4.OPCbSequence|] CbSequence4Args                           |
+    [|ArgOp == NFSCbOpNum4.OPCbWantsCancelled|] CbWantsCancelled4Args               |
+    [|ArgOp == NFSCbOpNum4.OPCbNotifyLock|] CbNotifyLock4Args                       |
+    [|ArgOp == NFSCbOpNum4.OPCbNotifyDeviceID|] CbNotifyDeviceID4Args               |
+    [|ArgOp == NFSCbOpNum4.OPCbIllegal|] CbIllegal4Args) Arguments;
+}
+
+type CbCompound4Res
+{
+    NFSStat4 Status;
+    XDRString Tag;
+    XdrUnsignedInt NFSCbResOp4Count;
+    optional [|NFSCbResOp4Count > 0|] array<NFSCbResOp4> ResArray with BinaryEncoding{Length = NFSCbResOp4Count};
+}
+
+type NFSCbResOp4
+{
+    NFSCbOpNum4 ResOp;
+    ([|ResOp == NFSOpNum4.OPGetAttr|] CbGetAttr4Res                               |
+    [|ResOp == NFSCbOpNum4.OPCbRecall|] CbRecall4Res                              |
+    [|ResOp == NFSCbOpNum4.OPCbLayoutRecall|] CbLayoutRecall4Res                  |
+    [|ResOp == NFSCbOpNum4.OPCbNotify|] CbNotify4Res                              |
+    [|ResOp == NFSCbOpNum4.OPCbPushDeleg|] CbPushDeleg4Res                        |
+    [|ResOp == NFSCbOpNum4.OPCbRecallAny|] CbRecallAny4Res                        |
+    [|ResOp == NFSCbOpNum4.OPCbRecallableObjAvail|] CbRecallableObjAvail4Res      |
+    [|ResOp == NFSCbOpNum4.OPCbRecallSlot|] CbRecallSlot4Res                      |
+    [|ResOp == NFSCbOpNum4.OPCbSequence|] CbSequence4Res                          |
+    [|ResOp == NFSCbOpNum4.OPCbWantsCancelled|] CbWantsCancelled4Res              |
+    [|ResOp == NFSCbOpNum4.OPCbNotifyLock|] CbNotifyLock4Res                      |
+    [|ResOp == NFSCbOpNum4.OPCbNotifyDeviceID|] CbNotifyDeviceID4Res              |
+    [|ResOp == NFSCbOpNum4.OPCbIllegal|] CbIllegal4Res) Result;
+}
+
+pattern NFSCbOpNum4 = enum XdrUnsignedInt
+{
+    OPCbGetAttr             = 3,
+    OPCbRecall              = 4,
+   /* Callback operations new to NFSv4.1 */
+    OPCbLayoutRecall        = 5,
+    OPCbNotify              = 6,
+    OPCbPushDeleg           = 7,
+    OPCbRecallAny           = 8,
+    OPCbRecallableObjAvail  = 9,
+    OPCbRecallSlot          = 10,
+    OPCbSequence            = 11,
+    OPCbWantsCancelled      = 12,
+    OPCbNotifyLock          = 13,
+    OPCbNotifyDeviceID      = 14,
+    OPCbIllegal             = 10044
+};
+
+// RFC 5661 18.1.  Operation 3: Access - Check Access Rights
+type Access4Args
+{
+    array<byte> Reserved1 where ValidationCheck(value == [0, 0, 0], null, "Reserved should be zero.") with BinaryEncoding{Length = 3};
+    byte Reserved2 where ValidationCheck(value == 0, null, "Reserved should be zero.") with BinaryEncoding{Width = 2};
+    byte Access4Execute with BinaryEncoding{Width = 1};
+    byte Access4Delete with BinaryEncoding{Width = 1};
+    byte Access4Extend with BinaryEncoding{Width = 1};
+    byte Access4Modify with BinaryEncoding{Width = 1};
+    byte Access4LookUp with BinaryEncoding{Width = 1};
+    byte Access4Read with BinaryEncoding{Width = 1};
+}
+
+type Access4ResOK
+{
+    XdrUnsignedInt Supported;
+    Access4Args Access;
+}
+
+type Access4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Access4ResOK ResOK4;
+}
+
+// RFC 5661 18.2.  Operation 4: Close - Close File
+type Close4Args
+{
+    SeqID4 SeqID;
+    StateID4 OpenStateID;
+}
+
+type Close4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] StateID4 OpenStateID;
+}
+
+// RFC 5661 3.3.12.  stateid4
+type StateID4
+{
+    XdrUnsignedInt SeqID;
+    XdrOpaqueFixed[12] Other;
+}
+
+// RFC 5661 18.3.  Operation 5: Commit - Commit Cached Data
+type Commit4Args
+{
+    XDRUnsignedHyper Offset;
+    XdrUnsignedInt Count;
+}
+
+type Commit4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Commit4ResOK ResOK4;
+}
+
+type Commit4ResOK
+{
+    XdrOpaqueFixed[Nfs4VerifierSize] WriteVerf;
+}
+
+// RFC 5661 18.4.  Operation 6: Create - Create a Non-Regular File Object
+type Create4Args
+{
+    CreateType4 ObjType;
+    Component4 ObjName;
+    FAttr4 CrateAttrs;
+}
+
+type Create4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Create4ResOK ResOK4;
+}
+
+type Create4ResOK
+{
+    ChangeInfo4 CInfo;
+    BitMap4 AttrSet;
+}
+
+type CreateType4
+{
+    NFSFType4 Type;
+    optional [|Type == NFSFType4.NF4LNK|] XDRString LinkData;
+    optional [|Type == NFSFType4.NF4BLK || Type == NFSFType4.NF4CHR|] SpecData4 DevData;
+}
+
+type SpecData4
+{
+    XdrUnsignedInt SpecData1;
+    XdrUnsignedInt SpecData2;
+}
+
+// RFC 5661 3.3.7.  FAttr4
+type FAttr4
+{
+    BitMap4 AttrMask;
+    AttrList4 AttrVals;
+}
+
+type BitMap4
+{
+    XdrUnsignedInt BitmapLength;
+    optional [|BitmapLength > 0|] array<XdrUnsignedInt> BitmapMask with BinaryEncoding{Length = BitmapLength};
+}
+
+// RFC 5661 18.5.  Operation 7: DelegPurge - Purge Delegations Awaiting Recovery
+type DelegPurge4Args
+{
+    XDRUnsignedHyper CliengtID;
+}
+
+type DelegPurge4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.6.  Operation 8: DelegReturn - Return Delegation
+type DelegReturn4Args
+{
+    StateID4 DelegStateID;
+}
+
+type DelegReturn4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.7.  Operation 9: GetAttr - Get Attributes
+type GetAttr4Args
+{
+    BitMap4 AttrRequest;
+}
+
+type GetAttr4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] GetAttr4ResOK ResOK4;
+}
+
+type GetAttr4ResOK
+{
+    FAttr4 ObjAttributes;
+}
+
+// RFC 5661 18.7 18.8.  Operation 10: GetFH - Get Current Filehandle
+type GetFH4Args
+{
+}
+type GetFH4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] GetFH4ResOK ResOK4;
+}
+
+type GetFH4ResOK
+{
+    NFSFH4 Object;
+}
+
+// RFC 5661 18.9.  Operation 11: Link - Create Link to a File
+type Link4Args
+{
+    Component4 NewName;
+}
+
+type Link4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Link4ResOK ResOK4;
+}
+
+type Link4ResOK
+{
+    ChangeInfo4 CInfo;
+}
+
+// RFC 5661 18.10.  Operation 12: Lock - Create Lock
+type Lock4Args
+{
+    NFSLockType4 LockType;
+    XDRBool Reclaim;
+    Offset4 Offset;
+    Length4 Length;
+    Locker4 Locker;
+}
+
+type Locker4
+{
+    XDRBool NewLockOwner;
+    optional [|NewLockOwner is XDRBool.TRUE|] OpenToLockOwner4 OpenOwner;
+    optional [|NewLockOwner is XDRBool.FALSE|] ExistLockOwner4 LockOwner;
+}
+
+type OpenToLockOwner4
+{
+    SeqID4 OpenSeqID;
+    StateID4 OpenStateID;
+    SeqID4 LockSeqID;
+    LockOwner4 LockOwner;
+}
+
+type ExistLockOwner4
+{
+    StateID4 LockStateID;
+    SeqID4 LockSeqID;
+}
+
+type Lock4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Lock4ResOK ResOK4;
+    optional [|Status == NFSStat4.Nfs4ErrDenied|] Lock4Denied Denied;
+}
+
+type Lock4ResOK
+{
+    StateID4 LockStateID;
+}
+
+type Lock4Denied
+{
+    Offset4 Offset;
+    Length4 Length;
+    NFSLockType4 LockType;
+    LockOwner4 Owner;
+}
+
+// RFC 5661 18.11.  Operation 13: LockT - Test for Lock
+type LockT4Args
+{
+    NFSLockType4 LockType;
+    Offset4 Offset;
+    Length4 Length;
+    LockOwner4 Owner;
+}
+
+type LockT4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4ErrDenied|] Lock4Denied Denied;
+}
+
+// RFC 5661 18.12.  Operation 14: LockU - Unlock File
+type LockU4Args
+{
+    NFSLockType4 LockType;
+    SeqID4 SeqID;
+    StateID4 LockStateID;
+    Offset4 Offset;
+    Length4 Length;
+}
+
+type LockU4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] StateID4 LockStateID;
+}
+
+// RFC 5661 18.13.  Operation 15: LookUp - Lookup Filename
+type LookUp4Args
+{
+    Component4 ObjName;
+}
+
+type LookUp4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.14.  Operation 16: LookUpP - Lookup Parent Directory
+type LookUpP4Args
+{
+}
+type LookUpP4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.15.  Operation 17: NVerify - Verify Difference in Attributes
+type NVerify4Args
+{
+    FAttr4 ObjAttributes;
+}
+
+type NVerify4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.16.  Operation 18: Open - Open a Regular File
+type Open4Args
+{
+    SeqID4 SeqID;
+    XdrUnsignedInt ShareAccess;
+    XdrUnsignedInt ShareDeny;
+    OpenOwner4 Owner;
+    OpenFlag4 OpehHow;
+    OpenClaim4 Claim;
+}
+
+type OpenFlag4
+{
+    OpenType4 OpenType;
+    optional [|OpenType == OpenType4.Open4Create|] CreateHow4 How;
+}
+
+pattern OpenType4 = enum XDRInt
+{
+    Open4NoCreate = 0,
+    Open4Create   = 1
+};
+
+type CreateHow4
+{
+    CreateMode4 Mode;
+    optional [|(Mode == CreateMode4.Unchecked4 | Mode == CreateMode4.Guarded4)|] FAttr4 CreateAttrs;
+    optional [|Mode == CreateMode4.Exclusive4|] Verifier4 CreateVerf;
+    optional [|Mode == CreateMode4.Exclusive4_1|] CreatVerfAttr CHCreateBoth;
+}
+
+pattern CreateMode4 = enum XDRInt
+{
+    Unchecked4      = 0,
+    Guarded4        = 1,
+    /* Deprecated in NFSv4.1. */
+    Exclusive4      = 2,
+    /*
+     * New to NFSv4.1. If session is persistent,
+     * Guarded4 MUST be used.  Otherwise, use
+     * Exclusive4_1 instead of Exclusive4.
+     */
+    Exclusive4_1    = 3
+};
+
+type CreatVerfAttr
+{
+    Verifier4 CVAVerf;
+    FAttr4 CVAAttrs;
+}
+
+type OpenClaim4
+{
+    OpenClaimType4 Claim;
+    optional [|Claim == OpenClaimType4.ClaimNull|] Component4 File;
+    optional [|Claim == OpenClaimType4.ClaimPrevious|] OpenDelegationType4 DelegateType;
+    optional [|Claim == OpenClaimType4.ClaimDelegateCur|] OpenClaimDelegateCur4 DelegateCurInfo;
+    optional [|Claim == OpenClaimType4.ClaimDelegatePrev|] Component4 FileDelegatePrev;
+    optional [|Claim == OpenClaimType4.ClaimDelegCurFH|] StateID4 OcDelegateStateID;
+}
+
+pattern OpenClaimType4 = enum XdrUnsignedInt
+{
+    ClaimNull               = 0,
+    ClaimPrevious           = 1,
+    ClaimDelegateCur        = 2,
+    ClaimDelegatePrev       = 3,
+    ClaimFH                 = 4,
+    ClaimDelegCurFH         = 5,
+    ClaimDelegPrevFH        = 6
+};
+
+type OpenClaimDelegateCur4
+{
+    StateID4 DelegateStateID;
+    Component4 File;
+}
+
+type Open4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Open4ResOK Denied;
+}
+
+type Open4ResOK
+{
+    StateID4 StateID;
+    ChangeInfo4 CInfo;
+    ResultFlags RFlags;
+    BitMap4 AttrSet;
+    OpenDelegation4 Delegation;
+}
+
+type ResultFlags
+{
+    byte Reserved1                      with BinaryEncoding{Width = 2};
+    byte Open4ResultMayNotifyLock       with BinaryEncoding{Width = 1};
+    byte Reserved2                      with BinaryEncoding{Width = 1};
+    byte Open4ResultPreserveUnlinked    with BinaryEncoding{Width = 1};
+    byte Open4ResultLocktypePosix       with BinaryEncoding{Width = 1};
+    byte Open4ResultConfirm             with BinaryEncoding{Width = 1};
+    byte Reserved3                      with BinaryEncoding{Width = 1};
+    array<byte> Reserved4               with BinaryEncoding{Length = 3};
+}
+
+type OpenDelegation4
+{
+    OpenDelegationType4 DelegationType;
+    optional [|DelegationType == OpenDelegationType4.OpenDelegateRead|] OpenReadDelegation4 Read;
+    optional [|DelegationType == OpenDelegationType4.OpenDelegateWrite|] OpenWriteDelegation4 Write;
+    optional [|DelegationType == OpenDelegationType4.OpenDelegateNoneExt|] OpenNoneDelegation4 OdWhyNone;
+}
+
+pattern OpenDelegationType4 = enum XDRInt
+{
+    OpenDelegateNone      = 0,
+    OpenDelegateRead      = 1,
+    OpenDelegateWrite     = 2,
+    OpenDelegateNoneExt   = 3 /* new to v4.1 */
+};
+
+type OpenNoneDelegation4
+{
+    WhyNoDelegation4 OndWhy;
+    optional [|OndWhy == WhyNoDelegation4.WND4Contention|] XDRBool OndServerWillPushDeleg;
+    optional [|OndWhy == WhyNoDelegation4.WND4Resource|] XDRBool OndServerWillSignalAvail;
+}
+
+pattern WhyNoDelegation4 = enum XDRInt
+{
+    WND4NotWanted               = 0,
+    WND4Contention              = 1,
+    WND4Resource                = 2,
+    WND4NotSuppFType            = 3,
+    WND4WriteDelegNotSuppFType  = 4,
+    WND4NotSuppUpgrade          = 5,
+    WND4NotSuppDownGrade        = 6,
+    WND4Cancelled               = 7,
+    WND4IsDir                   = 8
+};
+
+type OpenWriteDelegation4
+{
+    StateID4 StateID;
+    XDRBool Recall;
+    NFSSpaceLimit4 SpaceLimit;
+    NFSAce4 Permissions;
+}
+
+type NFSSpaceLimit4
+{
+    LimitBy4 LimitBy;
+    optional [|LimitBy == LimitBy4.NFSLimitSize|] XDRUnsignedHyper FileSize;
+    optional [|LimitBy == LimitBy4.NFSLimitBlocks|] NFSModifiedLimit4 ModBlocks;
+}
+
+pattern LimitBy4 = enum XDRInt
+{
+    NFSLimitSize          = 1,
+    NFSLimitBlocks        = 2
+};
+
+type NFSModifiedLimit4
+{
+    XdrUnsignedInt NumBlocks;
+    XdrUnsignedInt BytesPerBlock;
+}
+
+type NFSAce4
+{
+    AceType4 Type;
+    AceFlag4 Flag;
+    AceMask4 AccessMask;
+    UTF8StrMixed Who;
+}
+
+type OpenReadDelegation4
+{
+    StateID4 StateID;
+    XDRBool Recall;
+    NFSAce4 Permissions;
+}
+
+// RFC 5661 18.17.  Operation 19: OpenAttr - Open Named Attribute Directory
+type OpenAttr4Args
+{
+    XDRBool CreateDir;
+}
+
+type OpenAttr4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.18.  Operation 21: Open_DownGrade - Reduce Open File Access
+type OpenDowngrade4Args
+{
+    StateID4 OpenStateID;
+    SeqID4 SeqID;
+    XdrUnsignedInt ShareAccess;
+    XdrUnsignedInt ShareDeny;
+}
+
+type OpenDowngrade4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] OpenDowngrade4ResOK ResOK4;
+}
+
+type OpenDowngrade4ResOK
+{
+    StateID4 OpenStateID;
+}
+
+// RFC 5661 18.19.  Operation 22: PutFH - Set Current Filehandle
+type PutFH4Args
+{
+    NFSFH4 Object;
+}
+
+type PutFH4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.20.  Operation 23: PutPubFH - Set Public Filehandle
+type PutPubFH4Args
+{
+}
+
+type PutPubFH4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.21.  Operation 24: PutRootFH - Set Root Filehandle
+type PutRootFH4Args
+{
+}
+
+type PutRootFH4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.22.  Operation 25: Read - Read from File
+type Read4Args
+{
+    StateID4 StateID;
+    Offset4 Offset;
+    Count4 Count;
+}
+
+type Read4ResOK
+{
+    XDRBool Eof;
+    XdrOpaqueVariable Data;
+}
+
+type Read4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Read4ResOK ResOK4;
+}
+
+// RFC 5661 18.23.  Operation 26: ReadDir - Read Directory
+type ReadDir4Args
+{
+    NFSCookie4 Cookie;
+    Verifier4 CookieVerf;
+    Count4 DirCount;
+    Count4 MaxCount;
+    BitMap4 AttrRequest;
+}
+
+type ReadDir4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] ReadDir4ResOK ResOK4;
+}
+
+type ReadDir4ResOK
+{
+    Verifier4 CookieVerf;
+    DirList4 Reply;
+}
+
+type DirList4
+{
+    XDRBool IsEntry4;
+    optional [|IsEntry4 is XDRBool.TRUE|] Entry4 Entries;
+    XDRBool Eof;
+}
+
+type Entry4
+{
+    NFSCookie4 Cookie;
+    Component4 Name;
+    FAttr4 Attrs;
+    XDRBool IsNext;
+    optional [|IsNext is XDRBool.TRUE|] Entry4 NextEntry;
+}
+
+// RFC 5661 18.24.  Operation 27: ReadLink - Read Symbolic Link
+type ReadLink4Args
+{
+}
+
+type ReadLink4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] ReadLink4ResOK ResOK4;
+}
+
+type ReadLink4ResOK
+{
+    LinkText4 Link;
+}
+
+// RFC 5661 18.25.  Operation 28: Remove - Remove File System Object
+type Remove4Args
+{
+    Component4 Target;
+}
+
+type Remove4ResOK
+{
+    ChangeInfo4 CInfo;
+}
+
+type Remove4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Remove4ResOK ResOK4;
+}
+
+// RFC 5661 18.26.  Operation 29: Rename - Rename Directory Entry
+type Rename4Args
+{
+    Component4 OldName;
+    Component4 NewName;
+}
+
+type Rename4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Rename4ResOK ResOK4;
+}
+
+type Rename4ResOK
+{
+    ChangeInfo4 SourceCInfo;
+    ChangeInfo4 TargetCInfo;
+}
+
+// RFC 5661 18.27.  Operation 31: RestoreFH - Restore Saved Filehandle
+type RestoreFH4Args
+{
+}
+
+type RestoreFH4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.28.  Operation 32: SaveFH - Save Current Filehandle
+type SaveFH4Args
+{
+}
+
+type SaveFH4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.29.  Operation 33: SecInfo - Obtain Available Security
+type SecInfo4Args
+{
+    Component4 Name;
+}
+
+type SecInfo4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] SecInfo4ResOK ResOK4;
+}
+
+type SecInfo4ResOK
+{
+    XdrUnsignedInt Count;
+    optional [|Count > 0|] array<SecInfo4> SecInfo4 with BinaryEncoding{Length = Count};
+}
+
+type SecInfo4
+{
+    AuthFlavor Flavor;
+    optional [|Flavor == AuthFlavor.RpcSecGss|] RPCSecGssInfo FlavorInfo;
+}
+
+type RPCSecGssInfo
+{
+    SecOID4 OID;
+    Qop4 Qop;
+    RPCGssSvcT Service;
+}
+
+pattern RPCGssSvcT = enum XdrUnsignedInt
+{
+    RPCGssSVCNone = 1,
+    RPCGssSVCIntegrity = 2,
+    RPCGssSVCPrivacy = 3
+};
+
+// RFC 5661 18.30.  Operation 34: SetAttr - Set Attributes
+type SetAttr4Args
+{
+    StateID4 StateID;
+    FAttr4 ObjAttributes;
+}
+
+type SetAttr4Res
+{
+    NFSStat4 Status;
+    BitMap4 AttrsSet;
+}
+
+// RFC 5661 18.31.  Operation 37: Verify - Verify Same Attributes
+type Verify4Args
+{
+    FAttr4 ObjAttributes;
+}
+
+type Verify4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 18.32.  Operation 38: Write - Write to File
+type Write4Args
+{
+    StateID4 StateID;
+    Offset4 Offset;
+    StableHow4 Stable;
+    XdrOpaqueVariable Data;
+}
+
+pattern StableHow4 = enum XdrUnsignedInt
+{
+    Unstable4       = 0,
+    DataSync4       = 1,
+    FileSync4       = 2
+};
+
+type Write4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] Write4ResOK ResOK4;
+}
+
+type Write4ResOK
+{
+    Count4 Count;
+    StableHow4 Committed;
+    Verifier4 WriteVerf;
+}
+
+// RFC 5661 18.33.  Operation 40: BackChannel_CTL - Backchannel Control
+type BackChannelCTL4Args
+{
+    XdrUnsignedInt BcaCbProgram;
+    XdrUnsignedInt SecParmsCount;
+    optional [|SecParmsCount > 0|] array<CallBackSecParms4> BczSecParms with BinaryEncoding{Length = SecParmsCount};
+}
+
+type CallBackSecParms4
+{
+    AuthFlavor CbSecFlavor;
+    optional [|CbSecFlavor == AuthFlavor.AuthSys|] AuthSysParms CbspSysCred;
+    optional [|CbSecFlavor == AuthFlavor.RpcSecGss|] GssCbHandles4 CbspGssHandles;
+}
+
+// From RFC 1831 APPENDIX A: SYSTEM AUTHENTICATION
+type AuthSysParms
+{
+    XdrUnsignedInt Stamp;
+    XDRString MachineName where ValidationCheck(value.Length <= 255, null, "Length of string should be less than TD required " + (255 as string));
+    XdrUnsignedInt UID;
+    XdrUnsignedInt GID;
+    array<XdrUnsignedInt> GIDs with BinaryEncoding{Length = 16};
+}
+
+type GssCbHandles4
+{
+    RPCGssSvcT GcbpService;
+    GssHandle4T GcbpHandleFromServer;
+    GssHandle4T GcbpHandleFromClient;
+}
+
+type GssHandle4T
+{
+    XdrOpaqueVariable Value;
+}
+
+type BackChannelCTL4Res
+{
+    NFSStat4 BcrStatus;
+}
+
+// RFC 5661 18.34.  Operation 41: Bind_Conn_To_Session - Associate Connection with
+type BindConnToSession4Args
+{
+    SessionID4 BctsaSessID;
+    ChannelDirFromClient4 BctsaDir;
+    XDRBool BctsaUseConnInRdmaMode;
+}
+
+pattern ChannelDirFromClient4 = enum XdrUnsignedInt
+{
+    CDFC4Fore             = 1,
+    CDFC4Back             = 2,
+    CDFC4ForeOrBoth     = 3,
+    CDFC4BackOrBoth     = 7
+};
+
+type BindConnToSession4Res
+{
+    NFSStat4 BctsrStatus;
+    optional [|BctsrStatus == NFSStat4.Nfs4OK|] BindConnToSession4ResOK BctsrResOK4;
+}
+
+type BindConnToSession4ResOK
+{
+    SessionID4 BctsaSessID;
+    ChannelDirFromServer4 BctsaDir;
+    XDRBool BctsaUseConnInRdmaMode;
+}
+
+pattern ChannelDirFromServer4 = enum XdrUnsignedInt
+{
+    CDFS4Fore     = 1,
+    CDFS4Back     = 2,
+    CDFS4Both     = 3
+};
+
+// RFC 5661 18.35.  Operation 42: Exchange_ID - Instantiate Client ID
+type ExchangeID4Args
+{
+    ClientOwner4 EiaClientOwner;
+    XdrUnsignedInt EiaFlags;
+    StateProtect4A EiaStateProtect;
+    XdrUnsignedInt EiaClientImplIDCount;
+    optional [|EiaClientImplIDCount > 0|] array<NFSImplID4> EiaClientImplID with BinaryEncoding{Length = EiaClientImplIDCount};
+}
+
+type ClientOwner4
+{
+    Verifier4 CoVerifier;
+    XdrOpaqueVariable CoOwnerID where ValidationCheck(value.Length <= Nfs4OpaqueLimit, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4OpaqueLimit as string));
+}
+
+type StateProtect4A
+{
+    StateProtectHow4 SpaHow;
+    optional [|SpaHow == StateProtectHow4.SP4MachCred|] StateProtectOps4 SpaMachOps;
+    optional [|SpaHow == StateProtectHow4.SP4SSV|] SsvSpParms4 SpaSsvParms;
+}
+
+pattern StateProtectHow4 = enum XdrUnsignedInt
+{
+    SP4None = 0,
+    SP4MachCred = 1,
+    SP4SSV = 2
+};
+
+type StateProtectOps4
+{
+    BitMap4 SpoMustEnforce;
+    BitMap4 SpoMustAllow;
+}
+
+type SsvSpParms4
+{
+    StateProtectOps4 SspOps;
+    SecOID4 SspHashAlgs;
+    SecOID4 SspEncrAlgs;
+    XdrUnsignedInt SspWindow;
+    XdrUnsignedInt SspNumGssHandles;
+}
+
+type ExchangeID4Res
+{
+    NFSStat4 EirStatus;
+    optional [|EirStatus == NFSStat4.Nfs4OK|] ExchangeID4ResOK EirResOK4;
+}
+
+type ExchangeID4ResOK
+{
+    ClientID4 EirClientID;
+    SequenceID4 EirSequenceID;
+    XdrUnsignedInt EiaFlags;
+    StateProtect4R EirStateProtect;
+    ServerOwner4 EirServerOwner;
+    XdrOpaqueVariable EirServerScope where ValidationCheck(value.Length <= Nfs4OpaqueLimit, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4OpaqueLimit as string));
+    XdrUnsignedInt EirServerImplIDCount;
+    optional [|EirServerImplIDCount > 0|] array<NFSImplID4> EirServerImplID with BinaryEncoding{Length = EirServerImplIDCount};
+}
+
+type StateProtect4R
+{
+    StateProtectHow4 SpaHow;
+    optional [|SpaHow == StateProtectHow4.SP4MachCred|] StateProtectOps4 SpaMachOps;
+    optional [|SpaHow == StateProtectHow4.SP4SSV|] SsvProtInfo4 SpaSsvInfo;
+}
+
+type SsvProtInfo4
+{
+    StateProtectOps4 SpiOps;
+    XdrUnsignedInt SpiHashAlg;
+    XdrUnsignedInt SpiEncrAlg;
+    XdrUnsignedInt SpiSsvLen;
+    XdrUnsignedInt SpiWindow;
+    XdrUnsignedInt SpiHandlesCount;
+    optional [|SpiHandlesCount > 0|] array<GssHandle4T> SpiHandles with BinaryEncoding{Length = SpiHandlesCount};
+}
+
+type ServerOwner4
+{
+    XDRUnsignedHyper SoMinorID;
+    XdrOpaqueVariable SoMajorID where ValidationCheck(value.Length <= Nfs4OpaqueLimit, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4OpaqueLimit as string));
+}
+
+// RFC 5661 18.36.  Operation 43: Create_Session - Create New Session and Confirm
+type CreateSession4Args
+{
+    ClientID4 CsaClientID;
+    SequenceID4 CsaSequence;
+    XdrUnsignedInt CsaFlags;
+    ChannelAttrs4 CsaForeChanAttrs;
+    ChannelAttrs4 CsaBackChanAttrs;
+    XdrUnsignedInt CsaCbProgram;
+    XdrUnsignedInt SecParmsCount;
+    optional [|SecParmsCount > 0|] array<CallBackSecParms4> CsaSecParms with BinaryEncoding{Length = SecParmsCount};
+}
+
+type ChannelAttrs4
+{
+    Count4 CaHeaderPadSize;
+    Count4 CaMaxRequestSize;
+    Count4 CaMaxResponseSize;
+    Count4 CaMaxResponseSizeCached;
+    Count4 CaMaxOperations;
+    Count4 CaMaxRequests;
+    XdrUnsignedInt CaRdmaIrdCount;
+    optional [|CaRdmaIrdCount > 0|] array<XdrUnsignedInt> CaRdmaIrd with BinaryEncoding{Length = CaRdmaIrdCount};
+}
+
+type CreateSession4Res
+{
+    NFSStat4 CsrStatus;
+    optional [|CsrStatus == NFSStat4.Nfs4OK|] CreateSession4ResOK CsrResOK4;
+}
+
+type CreateSession4ResOK
+{
+    SessionID4 CsrSessionID;
+    SequenceID4 CsrSequence;
+    XdrUnsignedInt CsaFlags;
+    ChannelAttrs4 CsrForeChanAttrs;
+    ChannelAttrs4 CsrBackChanAttrs;
+}
+
+// RFC 5661 18.37.  Operation 44: Destroy_Session - Destroy a Session
+type DestroySession4Args
+{
+    SessionID4 DsaSessionID;
+}
+
+type DestroySession4Res
+{
+    NFSStat4 DsrStatus;
+}
+
+// RFC 5661 18.38.  Operation 45: Free_StateID - Free Stateid with No Locks
+type FreeStateID4Args
+{
+    StateID4 FsaStateID;
+}
+
+type FreeStateID4Res
+{
+    NFSStat4 FsrStatus;
+}
+
+// RFC 5661 18.39.  Operation 46: Get_Dir_Delegation - Get a Directory Delegation
+type GetDirDelegation4Args
+{
+    XDRBool GddaSignalDelegAvail;
+    BitMap4 GddaNotificationTypes;
+    AttrNotice4 GddaChildAttrDelay;
+    AttrNotice4 GddaDirAttrDelay;
+    BitMap4 GddaChildAttributes;
+    BitMap4 GddaDirAttributes;
+}
+
+pattern AttrNotice4 = NFSTime4;
+
+type GetDirDelegation4Res
+{
+    NFSStat4 GddrStatus;
+    optional [|GddrStatus == NFSStat4.Nfs4OK|] GetDirDelegation4ResNonFatal GddrResNonFatal4;
+}
+
+type GetDirDelegation4ResNonFatal
+{
+    Gddrnf4Status GddrnfStatus;
+    optional [|GddrnfStatus == Gddrnf4Status.GDD4OK|] GetDirDelegation4OK GddrnfResOK4;
+    optional [|GddrnfStatus == Gddrnf4Status.GDD4Unavail|] XDRBool GddrnfWillSignalDelegAvail;
+}
+
+pattern Gddrnf4Status = enum XdrUnsignedInt
+{
+    GDD4OK         = 0,
+    GDD4Unavail    = 1
+};
+
+type GetDirDelegation4OK
+{
+    Verifier4 GddrCookieVerf;
+    StateID4 GddrStateID;
+    BitMap4 GddrNotification;
+    BitMap4 GddrChildAttributes;
+    BitMap4 GddrDirAttributes;
+}
+
+// RFC 5661 18.40.  Operation 47: GetDeviceInfo - Get Device Information
+type GetDeviceInfo4Args
+{
+    DeviceID4 GdiaDeviceID;
+    LayoutType4 GdiaLayoutType;
+    Count4 GdiaMaxCount;
+    BitMap4 GdiaNotifyTypes;
+}
+
+type GetDeviceInfo4Res
+{
+    NFSStat4 GdirStatus;
+    optional [|GdirStatus == NFSStat4.Nfs4OK|] GetDeviceInfo4ResOK GdirResOK4;
+    optional [|GdirStatus == NFSStat4.Nfs4ErrTooSmall|] Count4 GdirMinCount;
+}
+
+type GetDeviceInfo4ResOK
+{
+    DeviceAddr4 GdirDeviceAddr;
+    BitMap4 GdirNotification;
+}
+
+// RFC 5661 18.41.  Operation 48: GetDeviceList - Get All Device Mappings for a File
+type GetDeviceList4Args
+{
+    LayoutType4 GdlaLayoutType;
+    Count4 GdlaMaxDevices;
+    NFSCookie4 GdlaCookie;
+    Verifier4 GdlaCookieVerf;
+}
+
+type GetDeviceList4Res
+{
+    NFSStat4 GdlrStatus;
+    optional [|GdlrStatus == NFSStat4.Nfs4OK|] GetDeviceList4ResOK GdlrResOK4;
+}
+
+type GetDeviceList4ResOK
+{
+    NFSCookie4 GdlrCookie;
+    Verifier4 GdlrCookieVerf;
+    DeviceID4 GdlrDeviceIDList;
+    XDRBool GdlrEof;
+}
+
+// RFC 5661 18.42.  Operation 49: LayoutCommit - Commit Writes Made Using a Layout
+type LayoutCommit4Args
+{
+    Offset4 LocaOffset;
+    Length4 LocaLength;
+    XDRBool LocaReclaim;
+    StateID4 LocaStateID;
+    NewOffset4 LocaLastWriteOffset;
+    NewTime4 LocaTimeModify;
+    LayoutUpdate4 LocaLayoutUpdate;
+}
+
+type NewOffset4
+{
+    XDRBool NoNewOffset;
+    optional [|NoNewOffset is XDRBool.TRUE|] Offset4 NoOffset;
+}
+
+type NewTime4
+{
+    XDRBool NtTimeChanged;
+    optional [|NtTimeChanged is XDRBool.TRUE|] NFSTime4 NtTime;
+}
+
+type LayoutCommit4Res
+{
+    NFSStat4 LocrStatus;
+    optional [|LocrStatus == NFSStat4.Nfs4OK|] LayoutCommit4ResOK LocrResOK4;
+}
+
+type LayoutCommit4ResOK
+{
+    NewSize4 LocrNewSize;
+}
+
+type NewSize4
+{
+    XDRBool NsSizeChanged;
+    optional [|NsSizeChanged is XDRBool.TRUE|] Length4 NsSize;
+}
+
+// RFC 5661 18.43.  Operation 50: LayoutGet - Get Layout Information
+type LayoutGet4Args
+{
+    XDRBool LogaSigalLayoutAvail;
+    LayoutType4 LogaLayoutType;
+    LayoutIOMode4 LogaIOMode;
+    Offset4 LogaOffset;
+    Length4 LogaLength;
+    Length4 LogaMinLength;
+    StateID4 LogaStateID;
+    Count4 LogaMaxCount;
+}
+
+type LayoutGet4Res
+{
+    NFSStat4 LogrStatus;
+    optional [|LogrStatus == NFSStat4.Nfs4OK|] LayoutGet4ResOK LogrResOK4;
+    optional [|LogrStatus == NFSStat4.Nfs4ErrLayoutTryLater|] XDRBool LogrWillSignalLayoutAvail;
+}
+
+type LayoutGet4ResOK
+{
+    XDRBool LogrReturnOnClose;
+    StateID4 LogrStateID;
+    XdrUnsignedInt LogrLayoutCount;
+    optional [|LogrLayoutCount > 0|] array<Layout4> LogrLayout with BinaryEncoding{Length = LogrLayoutCount};
+}
+
+// RFC 5661 18.44.  Operation 51: LayoutReturn - Release Layout Information
+type LayoutReturn4Args
+{
+    XDRBool LoraReclaim;
+    LayoutType4 LoraLayoutType;
+    LayoutIOMode4 LoraIOMode;
+    LayoutReturn4 LoraLayoutreturn;
+}
+
+type LayoutReturn4
+{
+    LayoutReturnType4 LrReturnType;
+    optional [|LrReturnType == LayoutReturnType4.LayoutReturn4File|] LayoutReturnFile4 LrLayout;
+}
+
+pattern LayoutReturnType4 = enum XdrUnsignedInt
+{
+    LayoutReturn4File = Layout4RetRecFile,
+    LayoutReturn4FSID = Layout4RetRecFSID,
+    LayoutReturn4All  = Layout4RetRecAll
+};
+
+type LayoutReturnFile4
+{
+    Offset4 LrfOffset;
+    Length4 LrfLength;
+    StateID4 LrfStateID;
+    XdrOpaqueVariable LrfBody;
+}
+
+type LayoutReturn4Res
+{
+    NFSStat4 LorrStatus;
+    optional [|LorrStatus == NFSStat4.Nfs4OK|] LayoutReturnStateID LorrStateID;
+}
+
+type LayoutReturnStateID
+{
+    XDRBool LrsPresent;
+    optional [|LrsPresent is XDRBool.TRUE|] StateID4 LrsStateID;
+}
+
+// RFC 5661 18.45.  Operation 52: SecInfo_No_Name - Get Security on Unnamed Object
+pattern SecInfoNoName4Args = SecInfoStyle4;
+pattern SecInfoStyle4 = enum XdrUnsignedInt
+{
+    SecInfoStyle4CurrentFH       = 0,
+    SecInfoStyle4Parent           = 1
+};
+
+pattern SecInfoNoName4Res = SecInfo4Res;
+
+// RFC 5661 18.46.  Operation 53: Sequence - Supply Per-Procedure Sequencing and Control
+type Sequence4Args
+{
+    SessionID4 SaSessionID;
+    SequenceID4 SaSequenceID;
+    SlotID4 SaSlotID;
+    SlotID4 SaHighestSlotID;
+    XDRBool SaCacheThis;
+}
+
+type Sequence4Res
+{
+    NFSStat4 SrStatus;
+    optional [|SrStatus == NFSStat4.Nfs4OK|] Sequence4ResOK SrResOK4;
+}
+
+type Sequence4ResOK
+{
+    SessionID4 SrSessionID;
+    SequenceID4 SrSequenceID;
+    SlotID4 SrSlotID;
+    SlotID4 SrHighestSlotID;
+    SlotID4 SrTargetHighestSlotID;
+    SrStatusFlags SrStatusFlags;
+}
+
+type SrStatusFlags
+{
+    uint Reserved                           with BinaryEncoding{Width = 19};
+    byte Seq4StatusDevIDDeleteD             with BinaryEncoding{Width = 1};
+    byte Seq4StatusDevIDCHANGED             with BinaryEncoding{Width = 1};
+    byte Seq4StatusBackChannelFault         with BinaryEncoding{Width = 1};
+    byte Seq4StatusCBPathDownSession        with BinaryEncoding{Width = 1};
+    byte Seq4StatusRestartReclaimNeeded     with BinaryEncoding{Width = 1};
+    byte Seq4StatusLeaseMoved               with BinaryEncoding{Width = 1};
+    byte Seq4StatusRecallableStateRevoked   with BinaryEncoding{Width = 1};
+    byte Seq4StatusAdminStateRevoked        with BinaryEncoding{Width = 1};
+    byte Seq4StatusExpiredSomeStateRevoked  with BinaryEncoding{Width = 1};
+    byte Seq4StatusExpiredAllStateRevoked   with BinaryEncoding{Width = 1};
+    byte Seq4StatusCBGSSContextsExpired     with BinaryEncoding{Width = 1};
+    byte Seq4StatusCBGSSContextsExpiring    with BinaryEncoding{Width = 1};
+    byte Seq4StatusCBPathDown               with BinaryEncoding{Width = 1};
+}
+
+// RFC 5661 18.47.  Operation 54: Set_SSV - Update SSV for a Client ID
+type SetSSV4Args
+{
+    XdrOpaqueVariable SSASSV;
+    XdrOpaqueVariable SSADigest;
+}
+
+type SetSSV4Res
+{
+    NFSStat4 SsrStatus;
+    optional [|SsrStatus == NFSStat4.Nfs4OK|] SetSSV4ResOK SsrResOK4;
+}
+
+type SetSSV4ResOK
+{
+    XdrOpaqueVariable SSADigest;
+}
+
+type SsaDigestInput4
+{
+    Sequence4Args SdiSeqArgs;
+}
+
+type SsrDigestInput4
+{
+    Sequence4Res SdiSeqRes;
+}
+
+// RFC 5661 18.48.  Operation 55: Test_StateID - Test Stateids for Validity
+type TestStateID4Args
+{
+    XdrUnsignedInt TsStateIDsCount;
+    optional [|TsStateIDsCount > 0|] array<StateID4> TsStateIDs with BinaryEncoding{Length = TsStateIDsCount};
+}
+
+type TestStateID4ResOK
+{
+    XdrUnsignedInt TsrStatusCodesCount;
+    optional [|TsrStatusCodesCount > 0|] array<NFSStat4> TsrStatusCodes with BinaryEncoding{Length = TsrStatusCodesCount};
+}
+
+type TestStateID4Res
+{
+    NFSStat4 TsrStatus;
+    optional [|TsrStatus == NFSStat4.Nfs4OK|] TestStateID4ResOK TsrResOK4;
+}
+
+// RFC 5661 18.49.  Operation 56: Want_Delegation - Request Delegation
+type WantDelegation4Args
+{
+    XdrUnsignedInt WdaWant;
+    DelegClaim4 WdaClaim;
+}
+
+type DelegClaim4
+{
+    OpenClaimType4 DcClaim;
+    optional [|DcClaim == OpenClaimType4.ClaimPrevious|] OpenDelegationType4 DcDelegateType;
+}
+
+type WantDelegation4Res
+{
+    NFSStat4 WdrStatus;
+    optional [|WdrStatus == NFSStat4.Nfs4OK|] OpenDelegation4 WdrResOK4;
+}
+
+// RFC 5661 18.50.  Operation 57: Destroy_ClientID - Destroy a Client ID
+type DestroyClientID4Args
+{
+    ClientID4 DcaClientID;
+}
+
+type DestroyClientID4Res
+{
+    NFSStat4 DcrStatus;
+}
+
+// RFC 5661 18.51.  Operation 58: Reclaim_Complete - Indicates Reclaims Finished
+type ReclaimComplete4Args
+{
+    XDRBool RcaOneFs;
+}
+
+type ReclaimComplete4Res
+{
+    NFSStat4 RcrStatus;
+}
+
+// RFC 5661 20.1.  Operation 3: CB_GetAttr - Get Attributes
+type CbGetAttr4Args
+{
+    NFSFH4 FH;
+    BitMap4 AttrRequest;
+}
+
+type CbGetAttr4Res
+{
+    NFSStat4 Status;
+    optional [|Status == NFSStat4.Nfs4OK|] CbGetAttr4ResOK ResOK4;
+}
+
+type CbGetAttr4ResOK
+{
+    FAttr4 ObjAttributes;
+}
+
+// RFC 5661 20.2.  Operation 4: CB_RECAll - Recall a Delegation
+type CbRecall4Args
+{
+    StateID4 StateID;
+    XDRBool Truncate;
+    NFSFH4 FH;
+}
+
+type CbRecall4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 20.3.  Operation 5: CB_LayoutRECAll - Recall Layout from Client
+type CbLayoutRecall4Args
+{
+    LayoutType4 CloraType;
+    LayoutIOMode4 CloraIOMode;
+    XDRBool CloraChanged;
+    LayoutRecall4 CloraRecall;
+}
+
+type LayoutRecall4
+{
+    LayoutRecallType4 LorRecallType;
+    optional [|LorRecallType == LayoutRecallType4.LayoutRecall4File|] LayoutRecallFile4 LorLayout;
+    optional [|LorRecallType == LayoutRecallType4.LayoutRecall4FSID|] FSID4 LorFSID;
+}
+
+pattern LayoutRecallType4 = enum XdrUnsignedInt
+{
+    LayoutRecall4File = Layout4RetRecFile,
+    LayoutRecall4FSID = Layout4RetRecFSID,
+    LayoutRecall4All  = Layout4RetRecAll
+};
+
+type LayoutRecallFile4
+{
+    NFSFH4 LorFH;
+    Offset4 LorOffset;
+    Length4 LorLength;
+    StateID4 LorStateID;
+}
+
+type CbLayoutRecall4Res
+{
+    NFSStat4 ClorrStatus;
+}
+
+// RFC 5661 20.4.  Operation 6: CB_NoTIFY - Notify Client of Directory Changes
+type CbNotify4Args
+{
+    StateID4 CnaStateID;
+    NFSFH4 CnaFH;
+    XdrUnsignedInt Notify4Count;
+    optional [|Notify4Count > 0|] array<Notify4> CnaChanges with BinaryEncoding{Length = Notify4Count};
+}
+
+type Notify4
+{
+    BitMap4 NotifyMask;
+    NotifyList4 NotifyVals;
+}
+
+type NotifyList4
+{
+    XdrOpaqueVariable Value;
+}
+
+type NotifyVerifier4
+{
+    Verifier4 NvOldCookieVerf;
+    Verifier4 NvNewCookieVerf;
+}
+
+type NotifyRename4
+{
+    NotifyRemove4 NrnOldEntry;
+    NotifyAdd4 NrnNewEntry;
+}
+
+type NotifyAttr4
+{
+    NotifyEntry4 NaChangedEntry;
+}
+
+type NotifyAdd4
+{
+    XdrUnsignedInt NotifyRemove4Count;
+    optional [|NotifyRemove4Count > 0|] array<NotifyRemove4> NadOldEntry with BinaryEncoding{Length = NotifyRemove4Count};
+    NotifyEntry4 NadNewEntry;
+    XdrUnsignedInt NFSCookie4Count;
+    optional [|NFSCookie4Count > 0|] array<NFSCookie4> NadNewEntryCookie with BinaryEncoding{Length = NFSCookie4Count};
+    XdrUnsignedInt PrevEntry4Count;
+    optional [|PrevEntry4Count > 0|] array<PrevEntry4> NadPrevEntry with BinaryEncoding{Length = PrevEntry4Count};
+    XDRBool NadLastEntry;
+}
+
+type NotifyRemove4
+{
+    NotifyEntry4 NrmOldEntry;
+    NFSCookie4 NrmOldEntryCookie;
+}
+
+type PrevEntry4
+{
+    NotifyEntry4 PePrevEntry;
+    NFSCookie4 PePrevEntryCookie;
+}
+
+type NotifyEntry4
+{
+    Component4 NeFile;
+    FAttr4 NeAttrs;
+}
+
+pattern NotifyType4 = enum XdrUnsignedInt
+{
+    Notify4ChangeChildAttrs = 0,
+    Notify4ChangeDirAttrs = 1,
+    Notify4RemoveEntry = 2,
+    Notify4AddEntry = 3,
+    Notify4RenameEntry = 4,
+    Notify4ChangeCookieVerifier = 5
+};
+
+type CbNotify4Res
+{
+    StateID4 CnaStateID;
+    NFSFH4 CnaFH;
+    XdrUnsignedInt Notify4Count;
+    optional [|Notify4Count > 0|] array<Notify4> CnaChanges with BinaryEncoding{Length = Notify4Count};
+}
+
+// RFC 5661 20.5.  Operation 7: CB_Push_Deleg - Offer Previously Requested
+type CbPushDeleg4Args
+{
+    NFSFH4 CpdaFH;
+    OpenDelegation4 CpdaDelegation;
+}
+
+type CbPushDeleg4Res
+{
+    NFSStat4 CpdrStatus;
+}
+
+type CbRecallAny4Args
+{
+    XdrUnsignedInt CraaObjectsToKeep;
+    BitMap4 CraaTypeMask;
+}
+
+type CbRecallAny4Res
+{
+    NFSStat4 CrarStatus;
+}
+
+// RFC 5661 20.7.  Operation 9: CB_Recallable_OBJ_AVAIL - Signal Resources for Recallable Objects
+pattern CbRecallableObjAvail4Args = CbRecallAny4Args;
+
+type CbRecallableObjAvail4Res
+{
+    NFSStat4 CroaStatus;
+}
+
+// RFC 5661 20.8.  Operation 10: CB_RECAll_SLOT - Change Flow Control Limits
+type CbRecallSlot4Args
+{
+    SlotID4 RsaTargetHighestSlotID;
+}
+
+type CbRecallSlot4Res
+{
+    NFSStat4 RsrStatus;
+}
+
+// RFC 5661 20.9.  Operation 11: CB_Sequence - Supply Backchannel Sequencing and Control
+type CbSequence4Args
+{
+    SessionID4 CsaSessionID;
+    SequenceID4 CsaSequenceID;
+    SlotID4 CsaSlotID;
+    SlotID4 CsaHighestSlotID;
+    XDRBool CsaCacheThis;
+    XdrUnsignedInt ReferringCallList4Count;
+    optional [|ReferringCallList4Count > 0|] array<ReferringCallList4> CsaReferringCallLists with BinaryEncoding{Length = ReferringCallList4Count};
+}
+
+type ReferringCallList4
+{
+    SessionID4 RclSessionID;
+    XdrUnsignedInt ReferringCall4Count;
+    ReferringCall4 RclReferringCalls with BinaryEncoding{Length = ReferringCall4Count};
+}
+
+type ReferringCall4
+{
+    SequenceID4 RcSequenceID;
+    SlotID4 RcSlotID;
+}
+
+type CbSequence4Res
+{
+    NFSStat4 CsrStatus;
+    optional [|CsrStatus == NFSStat4.Nfs4OK|] CbSequence4ResOK CsrResOK4;
+}
+
+type CbSequence4ResOK
+{
+    SessionID4 CsrSessionID;
+    SequenceID4 CsrSequenceID;
+    SlotID4 CsrSlotID;
+    SlotID4 CsrHighestSlotID;
+    SlotID4 CsrTargetHighestSlotID;
+}
+
+// RFC 5661 20.10.  Operation 12: CB_WantS_CANCELLED - Cancel Pending Delegation Wants
+type CbWantsCancelled4Args
+{
+    XDRBool CwcaContendedWantsCancelled;
+    XDRBool CwcaResourcedWantsCancelled;
+}
+
+type CbWantsCancelled4Res
+{
+    NFSStat4 CwcrStatus;
+}
+
+// RFC 5661 20.11.  Operation 13: CB_NoTIFY_Lock - Notify Client of Possible Lock Availability
+type CbNotifyLock4Args
+{
+    NFSFH4 CnlaFH;
+    LockOwner4 CnlaLockOwner;
+}
+
+type CbNotifyLock4Res
+{
+    NFSStat4 CnlrStatus;
+}
+
+// RFC 5661 20.12.  Operation 14: CB_NoTIFY_DeviceID - Notify Client of Device ID Changes
+type CbNotifyDeviceID4Args
+{
+    XdrUnsignedInt Notify4Count;
+    optional [|Notify4Count > 0|] array<Notify4> CndaChanges with BinaryEncoding{Length = Notify4Count};
+}
+
+type NotifyDeviceIDChange4
+{
+    LayoutType4 NdcLayoutType;
+    DeviceID4 NdcDeviceID;
+    XDRBool NdcImmediate;
+}
+
+type NotifyDeviceIDDelete4
+{
+    LayoutType4 NddLayoutType;
+    DeviceID4 NddDeviceID;
+}
+
+pattern NotifyDeviceIDType4 = enum XdrUnsignedInt
+{
+    NotifyDeviceID4Change = 1,
+    NotifyDeviceID4Delete = 2
+};
+
+type CbNotifyDeviceID4Res
+{
+    NFSStat4 CndrStatus;
+}
+
+// RFC 18.52.  Operation 10044: ILLEGAL - Illegal Operation
+type Illegal4Args
+{
+}
+
+type Illegal4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 20.13.  Operation 10044: CB_Illegal - Illegal Callback Operation
+type CbIllegal4Args
+{
+}
+
+type CbIllegal4Res
+{
+    NFSStat4 Status;
+}
+
+// RFC 5661 6.2.  File Attributes Discussion
+pattern AceType4 = enum XDRInt
+{
+    Ace4AccessAllowedAceType      = 0,
+    Ace4AccessDeniedAceType       = 1,
+    Ace4SystemAuditAceType        = 2,
+    Ace4SystemAlarmAceType        = 3
+};
+
+type AceFlag4
+{
+    byte Ace4InheritOnlyAce          with BinaryEncoding{Width = 1};
+    byte Ace4IdentifierGroup         with BinaryEncoding{Width = 1};
+    byte Ace4FailedAccessAceFlag     with BinaryEncoding{Width = 1};
+    byte Ace4SuccessfulAccessAceFlag with BinaryEncoding{Width = 1};
+    byte Ace4InheritAce              with BinaryEncoding{Width = 1};
+    byte Ace4NopropagateInheritAce   with BinaryEncoding{Width = 1};
+    byte Ace4DirectoryInheritAce     with BinaryEncoding{Width = 1};
+    byte Ace4FileInheritAce          with BinaryEncoding{Width = 1};
+    array<byte> Reserved             with BinaryEncoding{Length = 3};
+}
+
+type AceMask4
+{
+    byte Ace4ReadAttributes                     with BinaryEncoding{Width = 1};
+    byte Ace4DeleteChild                        with BinaryEncoding{Width = 1};
+    byte Ace4Execute                            with BinaryEncoding{Width = 1};
+    byte Ace4WriteNamedAttrs                    with BinaryEncoding{Width = 1};
+    byte Ace4ReadNamedAttrs                     with BinaryEncoding{Width = 1};
+    byte Ace4AddSubdirectoryORAce4AppendData    with BinaryEncoding{Width = 1};
+    byte Ace4AddFileORAce4WriteData             with BinaryEncoding{Width = 1};
+    byte Ace4ListDirectoryORAce4ReadData        with BinaryEncoding{Width = 1};
+    byte Reserved1                              with BinaryEncoding{Width = 11};
+    byte Ace4Synchronize                        with BinaryEncoding{Width = 1};
+    byte Ace4WriteOwner                         with BinaryEncoding{Width = 1};
+    byte Ace4WriteAcl                           with BinaryEncoding{Width = 1};
+    byte Ace4ReadAcl                            with BinaryEncoding{Width = 1};
+    byte Ace4Delete                             with BinaryEncoding{Width = 1};
+    byte Reserved2                              with BinaryEncoding{Width = 8};
+}
+
+// RFC 5661 3.2.  Basic Data Types
+type NFSFH4
+{
+    XdrOpaqueVariable Value where ValidationCheck(value.Length <= Nfs4FHSize, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4FHSize as string));
+}
+pattern Component4 = XDRString;
+pattern LinkText4 = XDRString;
+pattern Offset4 = XDRUnsignedHyper;
+pattern Length4 = XDRUnsignedHyper;
+pattern SeqID4 = XdrUnsignedInt;
+pattern ClientID4 = XDRUnsignedHyper;
+type Verifier4
+{
+    XdrOpaqueFixed[Nfs4VerifierSize] Value;
+}
+pattern UTF8StrMixed = XDRString;
+pattern Count4 = XdrUnsignedInt;
+pattern NFSCookie4 = XDRUnsignedHyper;
+pattern ChangeID4 = XDRUnsignedHyper;
+type SecOID4
+{
+    XdrOpaqueVariable Value;
+}
+pattern Qop4 = XdrUnsignedInt;
+pattern SequenceID4 = XdrUnsignedInt;
+pattern SlotID4  = XdrUnsignedInt;
+type AttrList4
+{
+    XdrOpaqueVariable Value;
+}
+
+type SessionID4
+{
+    XdrOpaqueFixed[Nfs4SessionIDSize] Value;
+}
+
+// 3.3.8 change_info4
+type ChangeInfo4
+{
+    XDRBool Atomic;
+    ChangeID4 Before;
+    ChangeID4 After;
+}
+
+// 3.3.1.  nfstime4
+type NFSTime4
+{
+    XDRHyper Seconds;
+    XdrUnsignedInt NSeconds;
+}
+
+// 3.3.5.  fsid4
+type FSID4
+{
+    XDRUnsignedHyper Major;
+    XDRUnsignedHyper Minor;
+}
+
+// 3.3.13.  layouttype4
+
+pattern LayoutType4 = enum XdrUnsignedInt
+{
+    Layout4NFSV41Files   = 1,
+    Layout4OSD2Objects    = 2,
+    Layout4BlockVolume    = 3
+};
+
+// 3.3.14.  deviceid4
+type DeviceID4
+{
+    XdrOpaqueVariable Value where ValidationCheck(value.Length <= Nfs4DeviceID4Size, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4DeviceID4Size as string));
+}
+
+// 3.3.15.  device_addr4
+type DeviceAddr4
+{
+    LayoutType4 DaLayoutType;
+    XdrOpaqueVariable DaAddrBody;
+}
+
+// 3.3.16.  layout_content4
+type LayoutContent4
+{
+    LayoutType4 LocType;
+    XdrOpaqueVariable LocBody;
+}
+
+// 3.3.17.  layout4
+type Layout4
+{
+    Offset4 LoOffset;
+    Length4 LoLength;
+    LayoutIOMode4 LoIOMode;
+    LayoutContent4 LoContent;
+}
+
+// 3.3.18  layoutupdate4
+type LayoutUpdate4
+{
+    LayoutType4 LouType;
+    XdrOpaqueVariable LouBody;
+}
+
+// 3.3.20.  layoutiomode4
+pattern LayoutIOMode4 = enum XdrUnsignedInt
+{
+    LayoutIOMode4Read      = 1,
+    LayoutIOMode4RW        = 2,
+    LayoutIOMode4Any       = 3
+};
+
+// 3.3.21
+type NFSImplID4
+{
+    XDRString NiiDomain;
+    XDRString NiiName;
+    NFSTime4 NiiDate;
+}
+
+// RFC 5661 5.8.1.2.  Attribute 1: type
+pattern NFSFType4 = enum XdrUnsignedInt
+{
+    NF4REG = 1,
+    NF4Dir = 2,
+    NF4BLK = 3,
+    NF4CHR = 4,
+    NF4LNK = 5,
+    NF4SOCK = 6,
+    NF4FIFO = 7,
+    NF4AttrDir = 8,
+    NF4NameDAttr = 9
+};
+
+// RFC 5661 15.1.  Error Definitions
+pattern NFSStat4 = enum XDRInt
+{
+    Nfs4OK                          = 0,
+    Nfs4ErrAccess                   = 13, // Section 15.1.6.1
+    Nfs4ErrAttrNotSupp              = 10032, // Section 15.1.15.1
+    Nfs4ErrAdminRevoked             = 10047, // Section 15.1.5.1
+    Nfs4ErrBackChanBusy             = 10057, // Section 15.1.12.1
+    Nfs4ErBadChar                   = 10040, // Section 15.1.7.1
+    Nfs4ErrBadHandle                = 10001, // Section 15.1.2.1
+    Nfs4ErrBadIOMode                = 10049, // Section 15.1.10.1
+    Nfs4ErrBadLayout                = 10050, // Section 15.1.10.2
+    Nfs4ErrBadName                  = 10041, // Section 15.1.7.2
+    Nfs4ErrBadOwner                 = 10039, // Section 15.1.15.2
+    Nfs4ErrBadSession               = 10052, // Section 15.1.11.1
+    Nfs4ErrBadSlot                  = 10053, // Section 15.1.11.2
+    Nfs4ErrBadType                  = 10007, // Section 15.1.4.1
+    Nfs4ErrBadXDR                   = 10036, // Section 15.1.1.1
+    Nfs4ErrBadCookie                = 10003, // Section 15.1.1.2
+    Nfs4ErrBadHighSlot              = 10077, // Section 15.1.11.3
+    Nfs4ErrBadRange                 = 10042, // Section 15.1.8.1
+    Nfs4ErrBadSeqID                 = 10026, // Section 15.1.16.1
+    Nfs4ErrBadSessionDigest         = 10051, // Section 15.1.12.2
+    Nfs4ErrBadStateID               = 10025, // Section 15.1.5.2
+    Nfs4ErrCBPathDown               = 10048, // Section 15.1.11.4
+    Nfs4ErrClidNuse                 = 10017, // Section 15.1.13.2
+    Nfs4ErrClientIDBusy             = 10074, // Section 15.1.13.1
+    Nfs4ErrCompleteAlready          = 10054, // Section 15.1.9.1
+    Nfs4ErrConnNotBoundToSession    = 10055, // Section 15.1.11.6
+    Nfs4ErrDeadLock                 = 10045, // Section 15.1.8.2
+    Nfs4ErrDeadSession              = 10078, // Section 15.1.11.5
+    Nfs4ErrDelay                    = 10008, // Section 15.1.1.3
+    Nfs4ErrDelegalReadyWanted       = 10056, // Section 15.1.14.1
+    Nfs4ErrDelegRevoked             = 10087, // Section 15.1.5.3
+    Nfs4ErrDenied                   = 10010, // Section 15.1.8.3
+    Nfs4ErrDirDelegUnavail          = 10084, // Section 15.1.14.2
+    Nfs4ErrDQuot                    = 69, // Section 15.1.4.2
+    Nfs4ErrEncrAlgUnsupp            = 10079, // Section 15.1.13.3
+    Nfs4ErrExist                    = 17, // Section 15.1.4.3
+    Nfs4ErrExpired                  = 10011, // Section 15.1.5.4
+    Nfs4ErrFBig                     = 27, // Section 15.1.4.4
+    Nfs4ErrFHExpired                = 10014, // Section 15.1.2.2
+    Nfs4ErrFileOpen                 = 10046, // Section 15.1.4.5
+    Nfs4ErrGrace                    = 10013, // Section 15.1.9.2
+    Nfs4ErrHashAlgUnsupp            = 10072, // Section 15.1.13.4
+    Nfs4ErrINVAL                    = 22, // Section 15.1.1.4
+    Nfs4ErrIO                       = 5, // Section 15.1.4.6
+    Nfs4ErrISDir                    = 21, // Section 15.1.2.3
+    Nfs4ErrLayoutTryLater           = 10058, // Section 15.1.10.3
+    Nfs4ErrLayoutUnavailable        = 10059, // Section 15.1.10.4
+    Nfs4ErrLeaseMoved               = 10031, // Section 15.1.16.2
+    Nfs4ErrLocked                   = 10012, // Section 15.1.8.4
+    Nfs4ErrLockSheld                = 10037, // Section 15.1.8.5
+    Nfs4ErrLockNotSupp              = 10043, // Section 15.1.8.6
+    Nfs4ErrLockRange                = 10028, // Section 15.1.8.7
+    Nfs4ErrMinorVersMisMatch        = 10021, // Section 15.1.3.2
+    Nfs4ErrMLink                    = 31, // Section 15.1.4.7
+    Nfs4ErrMoved                    = 10019, // Section 15.1.2.4
+    Nfs4ErrNameTooLong              = 63, // Section 15.1.7.3
+    Nfs4ErrNoEnt                    = 2, // Section 15.1.4.8
+    Nfs4ErrNoFileHandle             = 10020, // Section 15.1.2.5
+    Nfs4ErrNoMatchingLayout         = 10060, // Section 15.1.10.5
+    Nfs4ErrNoSpc                    = 28, // Section 15.1.4.9
+    Nfs4ErrNotDir                   = 20, // Section 15.1.2.6
+    Nfs4ErrNotEmpty                 = 66, // Section 15.1.4.10
+    Nfs4ErrNotSupp                  = 10004, // Section 15.1.1.5
+    Nfs4ErrNotOnlyOp                = 10081, // Section 15.1.3.3
+    Nfs4ErrNotSame                  = 10027, // Section 15.1.15.3
+    Nfs4ErrNoGrace                  = 10033, // Section 15.1.9.3
+    Nfs4ErrNXIO                     = 6, // Section 15.1.16.3
+    Nfs4ErrOldStateID               = 10024, // Section 15.1.5.5
+    Nfs4ErrOpenMode                 = 10038, // Section 15.1.8.8
+    Nfs4ErrOPIllegal                = 10044, // Section 15.1.3.4
+    Nfs4ErrOPNotInSession           = 10071, // Section 15.1.3.5
+    Nfs4ErrPerm                     = 1, // Section 15.1.6.2
+    Nfs4ErrPNFSIOHole               = 10075, // Section 15.1.10.6
+    Nfs4ErrPNFSNoLayout             = 10080, // Section 15.1.10.7
+    Nfs4ErrRecallConflict           = 10061, // Section 15.1.14.3
+    Nfs4ErrReclaimBad               = 10034, // Section 15.1.9.4
+    Nfs4ErrReclaimConflict          = 10035, // Section 15.1.9.5
+    Nfs4ErrRejectDeleg              = 10085, // Section 15.1.14.4
+    Nfs4ErrRepTooBig                = 10066, // Section 15.1.3.6
+    Nfs4ErrRepTooBigToCache         = 10067, // Section 15.1.3.7
+    Nfs4ErrReqTooBig                = 10065, // Section 15.1.3.8
+    Nfs4ErrRestoreFH                = 10030, // Section 15.1.16.4
+    Nfs4ErrRetryUnchahedRep         = 10068, // Section 15.1.3.9
+    Nfs4ErrReturnConflict           = 10086, // Section 15.1.10.8
+    Nfs4ErrROFS                     = 30, // Section 15.1.4.11
+    Nfs4ErrSame                     = 10009, // Section 15.1.15.4
+    Nfs4ErrShareDenied              = 10015, // Section 15.1.8.9
+    Nfs4ErrSequencePos              = 10064, // Section 15.1.3.10
+    Nfs4ErrSeqFalseRetry            = 10076, // Section 15.1.11.7
+    Nfs4ErrSeqMisordered            = 10063, // Section 15.1.11.8
+    Nfs4ErrServerFault              = 10006, // Section 15.1.1.6
+    Nfs4ErrStale                    = 70, // Section 15.1.2.7
+    Nfs4ErrStaleClientID            = 10022, // Section 15.1.13.5
+    Nfs4ErrStaleStateID             = 10023, // Section 15.1.16.5
+    Nfs4ErrSymLink                  = 10029, // Section 15.1.2.8
+    Nfs4ErrTooSmall                 = 10005, // Section 15.1.1.7
+    Nfs4ErrTooManyOps               = 10070, // Section 15.1.3.11
+    Nfs4ErrUnknownLayoutType        = 10062, // Section 15.1.10.9
+    Nfs4ErrUnsafeCompound           = 10069, // Section 15.1.3.12
+    Nfs4ErrWrongSec                  = 10016, // Section 15.1.6.3
+    Nfs4ErrWrongCred                = 10082, // Section 15.1.6.4
+    Nfs4ErrWrongType                = 10083, // Section 15.1.2.9
+    Nfs4ErrXDEV                     = 18
+};
+
+// RFC 5661 3.2.  Basic Data Types
+
+// RFC 5661 3.3.10 state_owner4
+type StateOwner4
+{
+    ClientID4 ClientID;
+    XdrOpaqueVariable Owner where ValidationCheck(value.Length <= Nfs4OpaqueLimit, null, "NFS: The Length in type XdrOpaqueVariable should be less than or equal to " + (Nfs4OpaqueLimit as string));
+}
+
+pattern LockOwner4 = StateOwner4;
+pattern OpenOwner4 = StateOwner4;
+
+// RFC 3530 nfs_lock_type4
+pattern NFSLockType4 = enum XDRInt
+{
+    ReadLT   = 1,
+    WriteLT  = 2,
+    ReadWLT  = 3, /* blocking read */
+    WriteWLT = 4 /* blocking write */
+};
+
+// From RFC 5531 8.2.  Authentication, Integrity, and Privacy
+pattern AuthFlavor = enum XdrUnsignedInt
+{
+    AuthNone       = 0,
+    AuthSys        = 1,
+    AuthShort      = 2,
+    AuthDH         = 3,
+    RpcSecGss      = 6
+};

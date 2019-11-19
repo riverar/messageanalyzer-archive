@@ -1,0 +1,226 @@
+protocol WSMID with 
+XmlEncodingDefaults{Namespace = WsmidNamespace},
+Documentation
+{
+    ProtocolName = "WS-Management Identify XML Schema",
+    ShortName = "WSMID",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "WSMID", Version = "1.1.0", Link = "http://www.dmtf.org/sites/default/files/standards/documents/DSP0226_1.1.pdf"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="356548", Date="11/16/2013"}
+        ]
+};
+
+using Utility;
+using Standard;
+using SOAP;
+
+endpoint IdentifyEndpoint
+    over IdentifyIntermediateEndpoint
+    provides IdentifyContract;
+
+endpoint IdentifyIntermediateEndpoint
+    over SOAP.Server
+    provides IdentifyMessageContract;
+
+const string WsmidNamespace = "http://schemas.dmtf.org/wbem/wsman/identity/1/wsmanidentity.xsd";
+
+autostart actor MIDOverSoap(SOAP.Server node)
+{
+    // Identify Request
+    process node accepts soap:SoapMessage where IsIdentify(soap.Body)
+    {
+        switch (soap.Body)
+        {
+            case m:IdentifyMessageContract.Identify from XmlDecoder<IdentifyMessageContract.Identify> =>
+                    dispatch (endpoint IdentifyIntermediateEndpoint over node) accepts m;
+            default =>
+                ThrowDecodingException("WSMID", "IdentifyRequest");
+        }
+    }
+    
+    // IdentifyResponse
+    process node issues soap:SoapMessage where IsIdentify(soap.Body)
+    {
+        switch (soap.Body)
+        {
+            case m:IdentifyMessageContract.IdentifyResponse from XmlDecoder<IdentifyMessageContract.IdentifyResponse> =>
+                dispatch (endpoint IdentifyIntermediateEndpoint over node) issues m;
+            default =>
+                ThrowDecodingException("WSMID", "IdentifyResponse");
+        }
+    }
+}
+
+
+autostart actor IdentifyContractActor(IdentifyIntermediateEndpoint node)
+{
+    IdentifyMessageContract.Identify identifyRequest = null;
+    
+    // Identify Request
+    process node accepts req:IdentifyMessageContract.Identify
+    {
+        if (identifyRequest == null)
+        {
+            identifyRequest = req;
+        }
+        else
+        {
+            ValidationCheck(false, identifyRequest, "Incomplete Identify operation due to missing response.");
+            release identifyRequest;
+            identifyRequest = req;
+        }
+    }
+    
+    // IdentifyResponse
+    process node issues res:IdentifyMessageContract.IdentifyResponse
+    {
+        if (identifyRequest == null)
+        {
+            ReportInsufficientOperation(res, "WSMID", "Identify", true); 
+            reject;
+        }
+        else
+        {
+            var identify = new IdentifyContract.IdentifyOp
+            {
+                Request = identifyRequest,
+                Response = res
+            };
+            identify.Origins = [identifyRequest as any message, res as any message];
+            identifyRequest = null;
+            dispatch (endpoint IdentifyEndpoint over node) accepts identify;
+        }
+    }
+    ~endpoint(IdentifyIntermediateEndpoint node)
+    {
+        if (identifyRequest != null)
+        {
+            ReportInsufficientOperation(identifyRequest, "WSMID", "Identify", false); 
+            release identifyRequest;
+        }
+    }
+}
+
+contract IdentifyContract
+    with XmlEncodingDefaults{Namespace = WsmidNamespace}
+{
+    accepts operation IdentifyOp
+    {
+        in IdentifyMessageContract.Identify Request;
+        out IdentifyMessageContract.IdentifyResponse Response;
+        
+        override string ToString()
+        {
+            string summary = "Identify";
+            if (Response.Response.ToString() is str:string && str != "")
+            {
+                summary += ", " + str;
+            }
+            return summary;
+        }
+    }
+}
+
+contract IdentifyMessageContract
+    with XmlEncodingDefaults{Namespace = WsmidNamespace}
+{
+    // the body of the Identify request operation, which may contain additional vendor-specific
+    // extension content, but is otherwise empty
+    // The presence of this body element constitutes the request.
+    accepts message Identify
+    {
+        IdentifyType Identify with XmlEncoding{Name = "Identify", Namespace = WsmidNamespace};
+        
+        override string ToString()
+        {
+            return "IdentifyRequest";
+        }
+    }
+    
+    issues message IdentifyResponse
+    {
+        IdentifyResponseType Response with XmlEncoding{Name = "IdentifyResponse", Namespace = WsmidNamespace};
+        
+        override string ToString()
+        {
+            string summary = "IdentifyResponse";
+            if (Response.ToString() is str:string && str != "")
+            {
+                summary += ", " + str;
+            }
+            return summary;
+        }
+    }
+}
+
+type IdentifyType
+{
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    optional array<xml> AnyAttributes with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+
+// This type is referenced by CIM Binding Protocol.
+type IdentifyResponseType
+{
+    array<ProtocolVersionType> ProtocolVersions where value.Count > 0 with XmlEncoding{Name = "ProtocolVersion", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    optional ProductVendor ProductVendor with XmlEncoding{Name = "ProductVendor", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    optional ProductVersion ProductVersion with XmlEncoding{Name = "ProductVersion", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    optional IntiativeSupport IntiativeSupports with XmlEncoding{Name = "IntiativeSupport", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    optional array<xml> AnyElements with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Other};
+    optional SecurityProfiles SecurityProfiles with XmlEncoding{Name = "SecurityProfiles", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    optional array<AddressingVersionURI> AddressingVersionURIs with XmlEncoding{Name = "AddressingVersionURI", Kind = XmlKind.Element, Namespace = WsmidNamespace};
+    
+    override string ToString()
+    {
+        // ProtocolVersions.Count must greater than zero.
+        return ProtocolVersions[0] + (ProductVendor != nothing ? (", ProductVendor: " + ProductVendor.ToString()) : ""); 
+    }
+}
+
+pattern ProtocolVersionType = string;
+
+pattern ProtocolVersion = ProtocolVersionType;
+
+pattern ProductVendor = string;
+pattern ProductVersion = string;
+
+pattern InitiativeName = string;
+pattern InitiativeVersion = string; // <xs:pattern value="\d*.\d*.\d*" />
+type IntiativeSupport 
+{
+    InitiativeName InitiativeName;
+    InitiativeVersion InitiativeVersion;
+}
+
+pattern SecurityProfileName = string; // "xs:anyURI" />
+
+type SecurityProfilesType
+{
+    optional array<SecurityProfileName> SecurityProfileNames;
+}
+
+pattern SecurityProfiles = SecurityProfilesType;
+
+pattern AddressingVersionURI = string; // "xs:anyURI" />
+
+bool IsIdentify(xml body)
+{
+    if (body.Children is children:array<xml> && children.Count > 0)
+    {
+        xml x = children[0];
+        if (x.Name is xmlName:XmlName && xmlName.NamespaceUri is ns:string && ns == WsmidNamespace)
+        {
+            return true;
+        }
+    }
+    return false;
+}

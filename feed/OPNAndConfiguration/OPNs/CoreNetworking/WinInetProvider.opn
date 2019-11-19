@@ -1,0 +1,584 @@
+protocol WinInet with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 959"},
+            new Reference{Name = "RFC 1436"},
+            new Reference{Name = "RFC 2616"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382097", Date = "10/12/2015"}
+        ]
+};
+
+using Etw;
+using EtwEvent;
+using HTTP;
+using Utility;
+using CoreNetworkingResources;
+
+const guid EtwProviderIdWinInet = {A70FF94F-570B-4979-BA5C-E59C9FEAB61B};
+
+pattern EventId = enum ushort
+{
+    RequestHeader = 2001,
+    RequestBody = 2002,
+    ResponseHeader = 2003,
+    ResponseBody = 2004
+};
+
+pattern FragmentKind = flags
+{
+    None = 0,
+    Start = 1,
+    End = 2
+};
+
+message Fragment
+{
+    // HTTP session ID
+    uint RequestId;
+
+    // Fragment sequence number
+    uint SequenceNumber;
+    
+    // Fragment flags, combination of FragmentKind
+    uint Flags;
+
+    // Payload length in bytes
+    uint PayloadByteLength;
+
+    // Payload
+    binary Payload with MimeDescription{Format = "text/plain"};
+    
+    override string ToString()
+    {
+        var r = "";
+        var origin = (this.Origins)[0] as EtwProviderMsg;
+        
+        switch (origin.EventRecord.Header.Descriptor.Id)
+        {
+            case EventId.RequestHeader =>
+                r += "Request Header Fragment";
+            case EventId.RequestBody =>
+                r += "Request Body Fragment";
+            case EventId.ResponseHeader =>
+                r += "Response Header Fragment";
+            case EventId.ResponseBody =>
+                r += "Response Body Fragment";
+        }
+        
+        if (Flags == FragmentKind.Start)
+            r += " [Start]";
+        else if (Flags == FragmentKind.End)
+            r += " [End]";
+        else if (Flags == (FragmentKind.Start | FragmentKind.End))
+            r += " [Start|End]";
+            
+        r += ", Request: " + (RequestId as string);
+        r += ", Sequence: " + (SequenceNumber as string);
+        r += ", Length: " + (PayloadByteLength as string);
+        
+        return r;
+    }
+}
+
+message Message
+{
+    binary HeaderBuffer with MimeDescription{Format = "text/plain"};
+    
+    binary BodyBuffer with MimeDescription{Format = "text/plain"};
+    
+    override string ToString()
+    {
+        var origin = (this.Origins)[0] as Fragment;
+        var session = origin.RequestId;
+        return "Message, Request: " 
+            + (session as string)
+            + ", Header: " + (HeaderBuffer.Count as string)
+            + ", Body: " + (BodyBuffer.Count as string);
+    }
+}
+
+// endpoint which receives reassembled WinInet buffer which should be further parsed into HTTP messages
+endpoint Server[uint processId, uint requestId] 
+    accepts Message issues Message
+{
+    // Shared variables for whole connection.
+    ConnectionContext context = new ConnectionContext();
+
+    HttpDecodingCache<HttpContract.Request> inboundCache = 
+        new HttpDecodingCache<HttpContract.Request>().
+            InitializeHttpCache(context, MessageDirection.Accepts, endpoint HTTP.Server over this, false, 
+                TryDecodeRequestHeader, TryDecodeRequestBodyAndDispatch, SetAnnotationForRequest);
+    HttpDecodingCache<HttpContract.Response> outboundCache = 
+        new HttpDecodingCache<HttpContract.Response>().
+            InitializeHttpCache(context, MessageDirection.Issues, endpoint HTTP.Server over this, false, 
+                TryDecodeResponseHeader, TryDecodeResponseBodyAndDispatch, SetAnnotationForResponse);
+    
+    process this accepts m:Message
+    {
+        binary buffer = m.HeaderBuffer;
+        if (m.BodyBuffer != null && m.BodyBuffer.Count > 0)
+            buffer += m.BodyBuffer;
+
+        inboundCache.Buffer = buffer; // 'Buffer' will be used to assign SourceData of decoded message.
+        stream s = buffer;
+        if (TryDecodeRequestHeader(inboundCache, s))
+        {
+            RemoveChunkAndAddContentLength<HttpContract.Request>(inboundCache, true, m.BodyBuffer.Count as uint);
+            if (TryDecodeRequestBodyAndDispatch(inboundCache, s))
+            {
+                inboundCache.ResetAfterSucceed(s, false);
+            }
+            else
+            {
+                ThrowDecodingException("WininetCapture", "HTTP Request");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("WininetCapture", "HTTP Request");
+        }
+    }
+
+    process this issues m:Message
+    {
+        binary buffer = m.HeaderBuffer;
+        if (m.BodyBuffer != null && m.BodyBuffer.Count > 0)
+            buffer += m.BodyBuffer;
+
+        outboundCache.Buffer = buffer; // 'Buffer' will be used to assign SourceData of decoded message.
+        stream s = buffer;
+        if (TryDecodeResponseHeader(outboundCache, s))
+        {
+            RemoveChunkAndAddContentLength<HttpContract.Response>(outboundCache, false, m.BodyBuffer.Count as uint);
+            UpdateContentLengthForCompressedResponse(outboundCache, m.BodyBuffer.Count as uint);
+            if (TryDecodeResponseBodyAndDispatch(outboundCache, s))
+            {
+                outboundCache.ResetAfterSucceed(s, false);
+            }
+            else
+            {
+                ThrowDecodingException("WininetCapture", "HTTP Response");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("WininetCapture", "HTTP Response");
+        }
+    }
+
+    // destructor
+    ~endpoint(Server server)
+    {
+        inboundCache.ClearInDestructor();
+        outboundCache.ClearInDestructor();
+    }
+
+    void SetAnnotationForRequest(HttpContract.Request req)
+    {   
+        req#SourceAddress = "Local";
+    }
+
+    void SetAnnotationForResponse(HttpContract.Response res)
+    {   
+        res#DestinationAddress = "Local";
+    }
+
+    //
+    // The headers captured have the transfer-encoding while the bodies are captured 
+    // without chunk transform.  So we need to update the header to match the body 
+    // that HTTP parser can do the job.  The by-product is that the content-length 
+    // is known and added.
+    //
+    internal void RemoveChunkAndAddContentLength<MsgT>(HttpDecodingCache<MsgT> dc, bool isRequest, uint contentLength)
+    {
+        if (dc.MessageLengthMechanism != MessageLengthMechanismEnum.Chunked)
+        {
+            return;
+        }
+        if (isRequest)
+        {
+            HttpContract.Request req = dc.MsgValue as HttpContract.Request;
+            req.Headers["Transfer-Encoding"] = (req.Headers["Transfer-Encoding"] as array<HTTP.HeaderFieldType>).Filter<HTTP.HeaderFieldType>(IsNotChunked);
+            req.ChunkedMessageBody = nothing;
+            req.Headers["Content-Length"] = contentLength;
+        }
+        else
+        {
+            HttpContract.Response res = dc.MsgValue as HttpContract.Response;
+            res.Headers["Transfer-Encoding"] = (res.Headers["Transfer-Encoding"] as array<HTTP.HeaderFieldType>).Filter<HTTP.HeaderFieldType>(IsNotChunked);
+            res.ChunkedMessageBody = nothing;
+            res.Headers["Content-Length"] = contentLength;
+        }
+        dc.ContentOrChunkLength = contentLength;
+        dc.MessageLengthMechanism = MessageLengthMechanismEnum.ContentLength;
+    }
+    
+    internal bool IsNotChunked(HTTP.HeaderFieldType headerField)
+    {
+        return headerField.Value.ToLower() != "chunked";
+    }
+
+    //
+    // For HTTP response whose body is compressed by server, WinInet will decompress data when 
+    // log to file. So we need to update the Content-Length header field with the real body length 
+    // to make HTTP parser decode message correctly.
+    // 
+    internal void UpdateContentLengthForCompressedResponse(HttpDecodingCache<HttpContract.Response> dc, uint contentLength)
+    {
+        HttpContract.Response res = dc.MsgValue as HttpContract.Response;
+        if (IsResponseCompressed(res))
+        {
+            res.Headers["Content-Encoding"] = (res.Headers["Content-Encoding"] as array<string>).Filter<string>((string s) => s != "gzip" && s != "deflate");
+            res.Headers["Content-Length"] = contentLength;
+            dc.ContentOrChunkLength = contentLength;
+        }
+    }
+}
+
+// endpoint for dispatching WinInet fragments which cannot be successfully reassembled
+endpoint FragmentSink over ReassemblyServer accepts Fragment;
+
+// endpoint for reassembling WinInet fragments into message with continuous HTTP buffer (header + body)
+endpoint ReassemblyServer[uint processId, uint requestId] accepts Fragment
+{
+    binary requestHeaderBuffer = $[];
+    binary requestBodyBuffer = $[];
+    binary responseHeaderBuffer = $[];
+    binary responseBodyBuffer = $[];
+    bool requestHeaderCompleted = false;
+    bool requestBodyCompleted = false;
+    bool responseHeaderCompleted = false;
+    bool responseBodyCompleted = false;
+    int nextRequestHeaderSeq = 0;
+    int nextRequestBodySeq = 0;
+    int nextResponseHeaderSeq = 0;
+    int nextResponseBodySeq = 0;
+    
+    // remember "content-length" in request header if available
+    uint requestBodyContentLength;
+    
+    // remember "content-length" in response header if available
+    uint responseBodyContentLength;
+    
+    // remember the request message which has been dispatched but not completed yet
+    Message dispatchedIncompleteRequest;
+    
+    // tracks whether this endpoint is waiting for request body END fragment to complete
+    bool waitingForRequestBodyToDeleteEndpoint;
+    
+    array<any message> requestOrigins = [];
+    array<any message> responseOrigins = [];
+
+    ~endpoint(ReassemblyServer server)
+    {
+        if (requestOrigins.Count > 0)
+        {
+            if (requestHeaderCompleted)
+            {
+                // dispatch to HTTP parser even incomplete
+                Dispatch(true, true);
+            }
+            else
+            {
+                var ep = endpoint FragmentSink over server;
+                foreach (var m in requestOrigins)
+                    dispatch ep accepts m;
+            }
+        }
+        if (responseOrigins.Count > 0)
+        {
+            if (responseHeaderCompleted)
+            {
+                Dispatch(false, true);
+            }
+            else
+            {
+                var ep = endpoint FragmentSink over server;
+                foreach (var m in responseOrigins)
+                    dispatch ep accepts m;
+            }
+        }
+    }
+    
+    bool CheckHasBody(map<string, any> headers, out uint contentLength)
+    {
+        var hasBody = false;
+        contentLength = 0;
+        
+        var clVal = GetHeaderValue(headers, "content-length");
+        if (clVal != null && clVal is string)
+        {
+            var cl = (clVal as string) as uint;
+            if (cl > 0)
+            {
+                hasBody = true;
+                contentLength = cl;
+            }
+        }
+        
+        var teVal = GetHeaderValue(headers, "transfer-encoding");
+        if (teVal != null && teVal is string)
+        {
+            var teStr = teVal as string;
+            if("chunked" in teStr.ToLower())
+            {
+                hasBody = true;
+            }
+        }
+        
+        return hasBody;
+    }
+    
+    Message Dispatch(bool request, bool destructing)
+    {
+        var ep = endpoint Server[processId, requestId];
+        Message m;
+        if (request)
+        {
+            m = new Message { HeaderBuffer = requestHeaderBuffer, BodyBuffer = requestBodyBuffer };
+            m.Origins = requestOrigins;
+            m.SourceData = requestHeaderBuffer + requestBodyBuffer;
+            m.AssignFieldEncodingInfo("HeaderBuffer", 0, requestHeaderBuffer.Count * 8);
+            m.AssignFieldEncodingInfo("BodyBuffer", requestHeaderBuffer.Count * 8, requestBodyBuffer.Count * 8);
+            
+            if (requestBodyContentLength > 0 && requestBodyBuffer.Count < requestBodyContentLength)
+                ReportInsufficientData(m, DiagnosisLevel.Warning, WININET_INSUFFICIENT_REQUEST_BODY);
+            
+            if (destructing)
+                DisplayTopLevelMessage(m);
+            else
+                dispatch endpoint Server[processId, requestId] accepts m;
+            requestHeaderBuffer = $[];
+            requestBodyBuffer = $[];
+            requestOrigins = [];
+        }
+        else
+        {
+            m = new Message { HeaderBuffer = responseHeaderBuffer, BodyBuffer = responseBodyBuffer };
+            m.SourceData = responseHeaderBuffer + responseBodyBuffer;
+            m.AssignFieldEncodingInfo("HeaderBuffer", 0, responseHeaderBuffer.Count * 8);
+            m.AssignFieldEncodingInfo("BodyBuffer", responseHeaderBuffer.Count * 8, responseBodyBuffer.Count * 8);
+            m.Origins = responseOrigins;
+
+            if (destructing)
+                DisplayTopLevelMessage(m);
+            else
+                dispatch endpoint Server[processId, requestId] issues m;
+            responseHeaderBuffer = $[];
+            responseBodyBuffer = $[];
+            responseOrigins = [];
+        }
+        
+        return m;
+    }
+    
+    process this accepts f:Fragment
+    {
+        var etw = f.Origins[0] as EtwProviderMsg;
+        var isEnd = (f.Flags & FragmentKind.End) != 0;
+        
+        switch (etw.EventRecord.Header.Descriptor.Id)
+        {
+            case EventId.RequestHeader =>
+            {
+                if (requestHeaderCompleted)
+                    throw "WinInet: unexpected request header fragment";
+                    
+                if (f.SequenceNumber == nextRequestHeaderSeq)
+                {
+                    nextRequestHeaderSeq++;
+                    requestHeaderBuffer += f.Payload;
+                    requestOrigins += [f];
+
+                    if (isEnd)
+                    {
+                        requestHeaderCompleted = true;
+                        
+                        var optHeader = RequestHeader(requestHeaderBuffer);
+                        if (optHeader == nothing)
+                            throw "WinInet: failed to decode request header";
+                        var header = optHeader as HttpContract.Request;
+                        var hasBody = CheckHasBody(header.Headers, out requestBodyContentLength);
+
+                        if (!hasBody)
+                        {
+                            requestBodyCompleted = true;
+                        }
+                        
+                        if (requestHeaderCompleted && requestBodyCompleted)
+                            Dispatch(true, false);
+                    }
+                }
+                else
+                {
+                    throw "WinInet: non-consecutive sequence number";
+                }
+            }
+            
+            case EventId.RequestBody =>
+            {
+                if (requestBodyCompleted && !isEnd)
+                    throw "WinInet: unexpected request body fragment";
+                
+                if (f.SequenceNumber == nextRequestBodySeq)
+                {
+                    if (requestBodyCompleted)
+                    {
+                        if (dispatchedIncompleteRequest != null)
+                        {
+                            // request has been dispatched but still new fragment comes, add
+                            // it to origin as it can be the missing END fragment
+                            dispatchedIncompleteRequest.Origins += [f];
+                            dispatchedIncompleteRequest = null;
+
+                            if (waitingForRequestBodyToDeleteEndpoint)
+                                delete this;
+                        }
+                        break;
+                    }
+                    
+                    nextRequestBodySeq++;
+                    requestBodyBuffer += f.Payload;
+                    requestOrigins += [f];
+                    
+                    if (isEnd || 
+                        // if request buffer has reached content-length, mark it ready even if end fragment has come yet
+                        (requestBodyContentLength > 0 && requestBodyBuffer.Count >= requestBodyContentLength))
+                    {
+                        requestBodyCompleted = true;
+                    }
+                    
+                    if (requestHeaderCompleted && requestBodyCompleted)
+                    {
+                        var request = Dispatch(true, false);    
+                        if (!isEnd)
+                            dispatchedIncompleteRequest = request;
+                    }
+                }
+                else
+                {
+                    throw "WinInet: non-consecutive sequence number";
+                }
+            }
+            
+            case EventId.ResponseHeader =>
+            {
+                if (responseHeaderCompleted)
+                    throw "WinInet: unexpected response header fragment";
+                    
+                if (f.SequenceNumber == nextResponseHeaderSeq)
+                {
+                    nextResponseHeaderSeq++;
+                    responseHeaderBuffer += f.Payload;
+                    responseOrigins += [f];
+                    
+                    if (isEnd)
+                    {
+                        responseHeaderCompleted = true;
+                        var optHeader = ResponseHeader(responseHeaderBuffer);
+                        if (optHeader == nothing)
+                            throw "WinInet: failed to decode response header";
+                        var header = optHeader as HttpContract.Response;
+                        CheckHasBody(header.Headers, out responseBodyContentLength); 
+                    }
+                }
+                else
+                {
+                    throw "WinInet: non-consecutive sequence number";
+                }
+            }
+            
+            case EventId.ResponseBody =>
+            {
+                if (responseBodyCompleted)
+                    throw "WinInet: unexpected response body fragment";
+                    
+                if (f.SequenceNumber == nextResponseBodySeq)
+                {
+                    nextResponseBodySeq++;
+                    responseBodyBuffer += f.Payload;
+                    responseOrigins += [f];
+                    
+                    if (isEnd)
+                    {
+                        responseBodyCompleted = true;
+                    }
+                    
+                    if (responseHeaderCompleted && responseBodyCompleted)
+                    {
+                        Dispatch(false, false);              
+                        if (dispatchedIncompleteRequest == null)
+                            delete this;
+                        else
+                            waitingForRequestBodyToDeleteEndpoint = true;
+                    }
+                }
+                else
+                {
+                    throw "WinInet: non-consecutive sequence number";
+                }
+            }
+        }
+    }
+}
+
+// Actor parsing raw Etw messages into WinInet fragments
+autostart actor WinInetOverEtwEvent(EtwEvent.Node etw)
+{
+    process etw accepts m:EtwProviderMsg
+        where m.EventRecord.Header.ProviderId == EtwProviderIdWinInet
+    {
+        var fm = BinaryDecoder<WinInet.Fragment>(m.Payload) as WinInet.Fragment;
+        if (fm == nothing)
+            ThrowDecodingException("WinInet", "Fragment");
+        
+        dispatch endpoint ReassemblyServer[m.EventRecord.Header.ProcessId, fm.RequestId] accepts fm;
+    }
+}
+
+// Utility for getting HTTP header value
+any GetHeaderValue(map<string, any> headers, string headerName)
+{
+    headerName = headerName.ToLower();
+    foreach (var pair in headers)
+    {
+        if (pair.Key.ToLower() == headerName)
+            return pair.Value;
+    }
+    return null;
+}
+
+annotation string WinInet.Message#SourceAddress;
+annotation string WinInet.Message#DestinationAddress;
+
+string get Source(this WinInet.Message msg)
+{
+    if (msg#SourceAddress != nothing)
+        return msg#SourceAddress as string;
+    else
+        return "";
+}
+
+string get Destination(this WinInet.Message msg)
+{
+    if (msg#DestinationAddress != nothing)
+        return msg#DestinationAddress as string;
+    else
+        return "";
+}
+
+string get Network(this WinInet.Message msg)
+{
+    if (msg#SourceAddress != nothing && msg#DestinationAddress != nothing)
+        return (msg.Source == "Local"
+            ? msg.Source + " - " + msg.Destination
+            : msg.Destination + " - " + msg.Source);
+    else
+        return "";
+}

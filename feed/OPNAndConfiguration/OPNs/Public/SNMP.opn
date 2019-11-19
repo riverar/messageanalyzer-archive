@@ -1,0 +1,479 @@
+protocol SNMP with 
+Asn1EncodingDefaults{ EncodingRule = Asn1EncodingRule.BER },
+Documentation
+{
+    ProtocolName = "Simple Network Management Protocol",
+    ShortName = "SNMP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1157"},
+            new Reference{Name = "RFC 1089"},
+            new Reference{Name = "RFC 1441"},
+            new Reference{Name = "RFC 1592"},
+            new Reference{Name = "RFC 1905"},
+            new Reference{Name = "RFC 2573"},
+            new Reference{Name = "RFC 2578"},
+            new Reference{Name = "RFC 2579"},
+            new Reference{Name = "RFC 2580"},
+            new Reference{Name = "RFC 2737"},
+            new Reference{Name = "RFC 3410"},
+            new Reference{Name = "RFC 3411"},
+            new Reference{Name = "RFC 3412"},
+            new Reference{Name = "RFC 3413"},
+            new Reference{Name = "RFC 3414"},
+            new Reference{Name = "RFC 3415"},
+            new Reference{Name = "RFC 3416"},
+            new Reference{Name = "RFC 3417"},
+            new Reference{Name = "RFC 3418"},
+            new Reference{Name = "RFC 3584"},
+            new Reference{Name = "RFC 1420"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "384029", Date = "02/03/2016"}
+        ]
+};
+
+using Standard;
+using Utility;
+using Technologies.ASN1;
+using SMI;
+using UDP;
+using Ethernet;
+using IANA;
+using TCP;
+
+/*
+ * RFC 1157     Version 1
+ * RFC 1905     Version 2
+ * RFC 3412     Version 3
+ */
+
+endpoint Node
+    over UDP.Host | over TCP.Server | over Ethernet.Node
+    accepts Message issues Message;
+
+const set<Port> SNMPPort = {Port.SNMP, Port.SNMPTrap};
+
+// RFC 1157
+autostart actor SNMPOverUDP(UDP.Host host)
+{    
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && (SNMPPort[d.SourcePort] || SNMPPort[d.DestinationPort])
+    {
+        switch (d.Payload)
+        {
+            case m:Message from Asn1BerDecoder<Message> =>
+                dispatch (endpoint Node over host) accepts m;
+            default => 
+                ThrowDecodingException("SNMP");
+        }
+    }
+} 
+
+// RFC 1157
+autostart actor SNMPOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+
+    process server accepts s:TCP.Segment where SNMPPort[s.DestinationPort]
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "SNMP", endpoint Node over server, 
+                                    IsSNMP,
+                                    IsSufficientForSNMP,
+                                    (stream s) => Asn1BerDecoder<Message>(s) as optional any message, 
+                                    (binary b) => nothing);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server issues s:TCP.Segment where SNMPPort[s.SourcePort]
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "SNMP", endpoint Node over server, 
+                                    IsSNMP,
+                                    IsSufficientForSNMP,
+                                    (stream s) => Asn1BerDecoder<Message>(s) as optional any message, 
+                                    (binary b) => nothing);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+bool? IsSNMP(binary b)
+{
+    return b[0] == 0x30;
+}
+
+uint? IsSufficientForSNMP(binary b)
+{
+    if (CalculateAsn1BerLength(b) is snmpLength:uint)
+    {
+        if (snmpLength <= b.Count)
+            return 0;
+        else
+            return snmpLength;
+    }
+    else
+    {
+        return null;
+    }
+}
+
+// RFC 1089
+autostart actor SNMPOverEthernet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType == EtherType.SNMP
+    {
+        switch (f.MacClientData)
+        {
+            case m:Message from Asn1BerDecoder<Message> =>
+                dispatch (endpoint Node over node) accepts m;
+            default => 
+                ThrowDecodingException("SNMP");
+        }
+    }
+} 
+
+message Message
+{
+    enum Integer { Version1 = 0, Version2 = 1, Version3 = 3 } Version;
+    optional OctetString Community with Asn1Encoding{ Flags = Asn1EncodingFlags.OctetStringIsString }; // Version 1, 2
+    optional HeaderData GlobalData; // Version 3
+    optional OctetString SecurityParameters with Asn1Encoding{ Flags = Asn1EncodingFlags.OctetStringIsString }; // Version 3
+    ([|Version == 0|] PdusV1 | [|Version == 1|] PdusV2 | [|Version == 3|] ScopedPduData) Data; 
+    
+    override string ToString()
+    {
+        string summary;
+        if (Version == 0)
+        {
+            PdusV1 p = Data as PdusV1;
+            summary = "Version: 1, Community: " + (Community as string) + ", Data Type: ";
+            switch (Data)
+            {
+                case GetRequestPduV1 =>
+                    summary += SNMPPdusType(0);
+                case GetNextRequestPduV1 =>
+                    summary += SNMPPdusType(1);
+                case GetResponsePduV1 =>
+                    summary += SNMPPdusType(2);
+                case SetRequestPduV1 =>
+                    summary += SNMPPdusType(3);
+                case TrapPduV1 =>
+                    summary += SNMPPdusType(4);
+                default =>;
+            }
+        }
+        else if (Version == 1)
+        {
+            PdusV2 p = Data as PdusV2;
+            summary = "Version: 2, Community: " + (Community as string) + ", Data Type: ";
+            switch (Data)
+            {
+                case GetRequestPduV2 =>
+                    summary += SNMPPdusType(0);
+                case GetNextRequestPduV2 =>
+                    summary += SNMPPdusType(1);
+                case ResponsePduV2 =>
+                    summary += SNMPPdusType(2);
+                case SetRequestPduV2 =>
+                    summary += SNMPPdusType(3);
+                case GetBulkRequestPduV2 =>
+                    summary += SNMPPdusType(5);
+                case InformRequestPduV2 =>
+                    summary += SNMPPdusType(6);
+                case SNMPv2TrapPduV2 =>
+                    summary += SNMPPdusType(7);
+                case ReportPduV2 =>
+                    summary += SNMPPdusType(8);
+                default =>;
+            }
+        }
+        else if (Version == 3)
+        {
+            if (Data is Plaintext)
+            {
+                Plaintext p = Data as Plaintext;
+            
+                summary = "Version: 3, Message Type: ";
+                switch (p.Data)
+                {
+                     case GetRequestPduV2 =>
+                        summary += SNMPPdusType(0);
+                    case GetNextRequestPduV2 =>
+                        summary += SNMPPdusType(1);
+                    case ResponsePduV2 =>
+                        summary += SNMPPdusType(2);
+                    case SetRequestPduV2 =>
+                        summary += SNMPPdusType(3);
+                    case GetBulkRequestPduV3 =>
+                        summary += SNMPPdusType(5);
+                    case InformRequestPduV2 =>
+                        summary += SNMPPdusType(6);
+                    case SNMPv2TrapPduV2 =>
+                        summary += SNMPPdusType(7);
+                    case ReportPduV2 =>
+                        summary += SNMPPdusType(8);
+                    default =>;
+                }
+            }
+            else
+            {
+                summary = "Version: 3, Encrypted PDU";
+            }
+        }
+        else
+        {
+            summary = "Unknown Message Data Type(" + (Version as string) + ")";
+        }
+        return summary;
+    }
+}
+
+// 
+// Version 1
+// RFC 1157, page 16
+pattern PdusV1 = GetRequestPduV1 
+               | GetNextRequestPduV1 
+               | GetResponsePduV1 
+               | SetRequestPduV1 
+               | TrapPduV1;
+
+pattern GetRequestPduV1 = PduV1
+    with Asn1Encoding{ TagNumber = 0, Tagging = Asn1Tagging.Implicit };
+
+pattern GetNextRequestPduV1 = PduV1
+    with Asn1Encoding{ TagNumber = 1, Tagging = Asn1Tagging.Implicit };
+
+pattern GetResponsePduV1 = PduV1
+    with Asn1Encoding{ TagNumber = 2, Tagging = Asn1Tagging.Implicit };
+
+pattern SetRequestPduV1 = PduV1
+    with Asn1Encoding{ TagNumber = 3, Tagging = Asn1Tagging.Implicit };
+    
+type PduV1
+{
+    Integer RequestID;
+    ErrorStatus ErrorStatus;
+    Integer ErrorIndex;
+    VarBindListV1 VarBindList;
+}
+
+pattern ErrorStatus = enum Integer
+{
+    NoError = 0,
+    TooBig = 1,
+    NoSuchName = 2,
+    BadValue = 3,
+    ReadOnly = 4,
+    GenErr = 5
+};
+
+// ObjectName and ObjectSyntax are defined in SMI (RFC 1155).
+type VarBindV1
+{
+    ObjectName Name;
+    ObjectSyntax Value;
+}
+
+pattern VarBindListV1 = array<VarBindV1>;
+
+type TrapPduV1
+{
+    ObjectIdentifier Enterprise;
+    IpAddress AgentAddr; // IpAddress is defined in SMI (RFC 1155).
+    GenericTrapType GenericTrap;
+    Integer SpecificTrap;
+    TimeTicks TimeStamp; // TimeTicks is defined in SMI (RFC 1155).
+    VarBindListV1 VariableBindings;
+} with Asn1Encoding{ TagNumber = 4, Tagging = Asn1Tagging.Implicit };
+
+pattern GenericTrapType = enum Integer
+{
+    ColdStart = 0,
+    WarmStart = 1,
+    LinkDown = 2,
+    LinkUp = 3,
+    AuthenticationFailure = 4,
+    EgpNeighborLoss = 5,
+    EnterpriseSpecific = 6, 
+};
+
+//
+// Version 2
+// RFC 1905
+pattern PdusV2 = GetRequestPduV2 
+               | GetNextRequestPduV2
+               | GetBulkRequestPduV2
+               | ResponsePduV2
+               | SetRequestPduV2
+               | InformRequestPduV2
+               | SNMPv2TrapPduV2
+               | ReportPduV2;
+               
+pattern GetRequestPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 0, Tagging = Asn1Tagging.Implicit };
+
+pattern GetNextRequestPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 1, Tagging = Asn1Tagging.Implicit };
+
+pattern ResponsePduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 2, Tagging = Asn1Tagging.Implicit };
+
+pattern SetRequestPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 3, Tagging = Asn1Tagging.Implicit };
+    
+// -- [4] is obsolete
+    
+pattern GetBulkRequestPduV2 = BulkPduV2
+    with Asn1Encoding{ TagNumber = 5, Tagging = Asn1Tagging.Implicit };
+        
+pattern InformRequestPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 6, Tagging = Asn1Tagging.Implicit };
+    
+pattern SNMPv2TrapPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 7, Tagging = Asn1Tagging.Implicit };
+    
+pattern ReportPduV2 = PduV2
+    with Asn1Encoding{ TagNumber = 8, Tagging = Asn1Tagging.Implicit };
+    
+type PduV2
+{
+    Integer RequestID;
+    ErrorStatusV2 ErrorStatus;
+    Integer ErrorIndex;
+    VarBindListV2 VariableBindings;
+}
+
+pattern ErrorStatusV2 = enum Integer
+{
+    NoError = 0,
+    TooBig = 1, 
+    NoSuchName = 2,
+    BadValue = 3,
+    ReadOnly = 4,
+    GenErr = 5,
+    NoAccess = 6,
+    WrongType = 7,
+    WrongLength = 8,
+    WrongEncoding = 9,
+    WrongValue = 10,
+    NoCreation = 11,
+    InconsistentValue = 12,
+    ResourceUnavailable = 13,
+    CommitFailed = 14,
+    UndoFailed = 15,
+    AuthorizationError = 16,
+    NotWritable = 17,
+    InconsistentName = 18
+};
+
+type BulkPduV2
+{
+    Integer RequestID;
+    Integer NonRepeaters;
+    Integer MaxRepetitions;
+    VarBindListV2 VariableBindings;
+}
+
+pattern VarBindListV2 = array<VarBindV2>;
+
+type VarBindV2
+{
+    ObjectName Name;
+    ValueType Value;
+}
+
+pattern ValueType = Value
+                    | UnSpecified
+                    | NoSuchObject
+                    | NoSuchInstance
+                    | EndOfMibView;
+
+pattern Value = ObjectSyntax;
+
+pattern UnSpecified = Null;
+
+pattern NoSuchObject = Null
+    with Asn1Encoding{ TagNumber = 0, Tagging = Asn1Tagging.Implicit };
+
+pattern NoSuchInstance = Null
+    with Asn1Encoding{ TagNumber = 1, Tagging = Asn1Tagging.Implicit };
+    
+pattern EndOfMibView = Null
+    with Asn1Encoding{ TagNumber = 2, Tagging = Asn1Tagging.Implicit };
+
+//
+// Version 3
+// RFC 3412
+type HeaderData
+{
+    Integer ID;
+    Integer MaxSize;
+    OctetString Flags with Asn1Encoding{ Flags = Asn1EncodingFlags.OctetStringIsString };  // RFC 3412, page 20
+    Integer SecurityModel;
+}
+
+pattern ScopedPduData = Plaintext | EncryptedPDU;
+
+pattern Plaintext = ScopedPDU;
+
+pattern EncryptedPDU = OctetString;
+
+type ScopedPDU
+{
+    OctetString ContextEngineID with Asn1Encoding{ Flags = Asn1EncodingFlags.OctetStringIsString }; 
+    OctetString ContextName with Asn1Encoding{ Flags = Asn1EncodingFlags.OctetStringIsString }; 
+    PdusV3 Data;
+}
+
+// RFC 3416
+pattern PdusV3 = GetRequestPduV2 
+               | GetNextRequestPduV2
+               | GetBulkRequestPduV3
+               | ResponsePduV2
+               | SetRequestPduV2
+               | InformRequestPduV2
+               | SNMPv2TrapPduV2
+               | ReportPduV2;
+               
+pattern GetBulkRequestPduV3 = BulkPduV2
+    with Asn1Encoding{ TagNumber = 5, Tagging = Asn1Tagging.Implicit };
+   
+string SNMPPdusType(ushort tagNum)
+{
+    switch(tagNum)
+    {
+        case 0x00  => return "Get request";
+        case 0x01  => return "Get-next request";
+        case 0x02  => return "Response";
+        case 0x03  => return "Set request";
+        case 0x04  => return "Trap";            // Version 1
+        case 0x05  => return "Get-bulk request";
+        case 0x06  => return "Inform request";  // Version 2, 3
+        case 0x07  => return "SNMPv2 Trap";     // Version 2, 3
+        case 0x08  => return "Report";          // Version 2, 3
+        default    => return "Unhandled SNMP PDUs Type";
+    }
+}

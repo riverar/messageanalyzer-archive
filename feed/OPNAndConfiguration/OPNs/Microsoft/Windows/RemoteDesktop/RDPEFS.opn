@@ -1,0 +1,1997 @@
+protocol RDPEFS with
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: File System Virtual Channel Extension",
+    DocumentName = "MS-RDPEFS",
+    ShortName = "RDPEFS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RDPEFS", Version = "25.0", Date = "09/15/2017", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "383234", Date = "12/23/2015"}
+        ]
+},
+BinaryEncodingDefaults{Endian = Endian.Little};
+
+using Standard;
+using Utility;
+using RDPBCGR;
+using ERREF;
+using InfrastructureResources;
+using RemoteDesktopResources;
+using DTYP;
+using RDPEDYC;
+
+endpoint Server 
+    over RDPBCGR.Server | over RDPEDYC.Server
+    accepts DR_CORE_SERVER_ANNOUNCE_REQ issues DR_CORE_CLIENT_ANNOUNCE_RSP
+    issues DR_CORE_CLIENT_NAME_REQ
+    accepts DR_CORE_USER_LOGGEDON
+    accepts DR_CORE_SERVER_CLIENTID_CONFIRM
+    accepts DR_CORE_CAPABILITY_REQ issues DR_CORE_CAPABILITY_RSP
+    issues DR_CORE_DEVICELIST_ANNOUNCE_REQ accepts DR_CORE_DEVICE_ANNOUNCE_RSP
+    issues DR_DEVICELIST_ANNOUNCE
+    issues DR_DEVICELIST_REMOVE
+    accepts DR_DRIVE_CREATE_REQ issues DR_DRIVE_CREATE_RSP
+    accepts DR_DRIVE_CLOSE_REQ issues DR_DRIVE_CLOSE_RSP
+    accepts DR_DRIVE_READ_REQ issues DR_DRIVE_READ_RSP
+    accepts DR_DRIVE_WRITE_REQ issues DR_DRIVE_WRITE_RSP
+    accepts DR_DRIVE_CONTROL_REQ issues DR_DRIVE_CONTROL_RSP
+    accepts DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ issues DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP
+    accepts DR_DRIVE_SET_VOLUME_INFORMATION_REQ issues DR_DRIVE_SET_VOLUME_INFORMATION_RSP
+    accepts DR_DRIVE_QUERY_INFORMATION_REQ issues DR_DRIVE_QUERY_INFORMATION_RSP
+    accepts DR_DRIVE_SET_INFORMATION_REQ issues DR_DRIVE_SET_INFORMATION_RSP
+    accepts DR_DRIVE_QUERY_DIRECTORY_REQ issues DR_DRIVE_QUERY_DIRECTORY_RSP
+    accepts DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ issues DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP
+    accepts DR_DRIVE_LOCK_REQ issues DR_DRIVE_LOCK_RSP;
+
+client endpoint Client connected to Server;
+
+autostart actor RDPEFSOverRDPBCGR(RDPBCGR.Server server)
+{
+    RDPEFSContext ctx = new RDPEFSContext();
+
+    process server issues vcp:RDPBCGR.VirtualChannelPdu 
+        where (vcp#ChannelName != nothing && vcp#ChannelName == "rdpdr" && 
+            PeekUShort(vcp.virtualChannelData, 0, Endian.Little) != RDPDR_HEADER_Component.RDPDR_CTYP_PRN) // RDPDR_CTYP_PRN means RDPEPC message, which has not been implemented
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPEFS.Server over server;
+        }
+        DecodeAndDispatchEFSIssues(ref ctx, vcp.virtualChannelData);
+    }
+    
+    process server accepts vcp:RDPBCGR.VirtualChannelPdu 
+        where (vcp#ChannelName != nothing && vcp#ChannelName == "rdpdr" && 
+            PeekUShort(vcp.virtualChannelData, 0, Endian.Little) != RDPDR_HEADER_Component.RDPDR_CTYP_PRN) // RDPDR_CTYP_PRN means RDPEPC message, which has not been implemented
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPEFS.Server over server;
+        }
+        DecodeAndDispatchEFSAccepts(ref ctx, vcp.virtualChannelData);
+    }
+
+     ~endpoint(RDPBCGR.Server server)
+    {
+        ctx = null;
+    }
+}
+
+autostart actor RDPEFSOverRDPEDYC(RDPEDYC.Server server)
+{
+    RDPEFSContext ctx = new RDPEFSContext();
+
+    process server issues vcp:RDPEDYC.DVCDataPDU
+        where (vcp#EDYCChannelName != nothing && vcp#EDYCChannelName == "rdpdr" && vcp.Data.Count > 2 &&
+            PeekUShort(vcp.Data, 0, Endian.Little) != RDPDR_HEADER_Component.RDPDR_CTYP_PRN) // RDPDR_CTYP_PRN means RDPEPC message, which has not been implemented
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPEFS.Server over server;
+        }
+        DecodeAndDispatchEFSIssues(ref ctx, vcp.Data);
+    }
+    
+    process server accepts vcp:RDPEDYC.DVCDataPDU
+        where (vcp#EDYCChannelName != nothing && vcp#EDYCChannelName == "rdpdr" && vcp.Data.Count > 2 &&
+            PeekUShort(vcp.Data, 0, Endian.Little) != RDPDR_HEADER_Component.RDPDR_CTYP_PRN) // RDPDR_CTYP_PRN means RDPEPC message, which has not been implemented
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPEFS.Server over server;
+        }
+        DecodeAndDispatchEFSAccepts(ref ctx, vcp.Data);
+    }
+
+     ~endpoint(RDPBCGR.Server server)
+    {
+        ctx = null;
+    }
+}
+
+type RDPEFSContext
+{
+    map<uint, uint> CompletionId_MajorFunction = {};
+    map<uint, uint> CompletionId_MinorFunction = {};
+    map<uint, uint> CompletionId_FsInformationClass = {};
+    bool IfHasAnnounceDeviceList = false;
+    RDPEFS.Server ept = null;
+
+    void AcceptDispatcher(any message msg)
+    {
+        dispatch ept accepts msg;
+    }
+    void IssueDispatcher(any message msg)
+    {
+        dispatch ept issues msg;
+    }
+}
+
+void DecodeAndDispatchEFSAccepts(ref RDPEFSContext ctx, binary bin)
+{
+    if (bin.Count < 4)
+    {
+        ThrowDecodingException("RDPEFS", RDPEFS_DATA_NOT_ENOUGH, []);
+        
+    }
+    void(any message) IssueDispatcher = ctx.IssueDispatcher;
+    ushort component = PeekUShort(bin, 0, Endian.Little);
+    ushort packetId= PeekUShort(bin, 16, Endian.Little);
+    switch (component)
+    {
+        case RDPDR_HEADER_Component.RDPDR_CTYP_CORE =>
+            switch (packetId)
+            {
+                case RDPDR_HEADER_PacketId.PAKID_CORE_CLIENTID_CONFIRM => 
+                    DecodeMessage<DR_CORE_CLIENT_ANNOUNCE_RSP>(IssueDispatcher, bin, "DR_CORE_CLIENT_ANNOUNCE_RSP");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_CLIENT_NAME => 
+                    DecodeMessage<DR_CORE_CLIENT_NAME_REQ>(IssueDispatcher, bin, "DR_CORE_CLIENT_NAME_REQ");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_DEVICELIST_ANNOUNCE => 
+                    if (ctx.IfHasAnnounceDeviceList)
+                    {
+                        DecodeMessage<DR_DEVICELIST_ANNOUNCE>(IssueDispatcher, bin, "DR_DEVICELIST_ANNOUNCE");
+                    }
+                    else // DR_CORE_DEVICELIST_ANNOUNCE_REQ only appeared once in each initialization
+                    {
+                        DecodeMessage<DR_CORE_DEVICELIST_ANNOUNCE_REQ>(IssueDispatcher, bin, "DR_CORE_DEVICELIST_ANNOUNCE_REQ");
+                        ctx.IfHasAnnounceDeviceList = true;
+                    }
+                case RDPDR_HEADER_PacketId.PAKID_CORE_DEVICE_IOCOMPLETION => 
+                    if (bin.Count < 16)
+                    {
+                        ThrowDecodingException("RDPEFS", RDPEFS_DATA_NOT_ENOUGH, []);
+                    }
+                    uint completionId = PeekUInt(bin, 64, Endian.Little);
+                    uint expectedLen;
+                    if (completionId in ctx.CompletionId_MajorFunction.Keys)
+                    {
+                        switch (ctx.CompletionId_MajorFunction[completionId])
+                        {
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_CREATE =>
+                                DecodeMessage<DR_DRIVE_CREATE_RSP>(IssueDispatcher, bin, "DR_DRIVE_CREATE_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_CLOSE =>
+                                DecodeMessage<DR_DRIVE_CLOSE_RSP>(IssueDispatcher, bin, "DR_DRIVE_CLOSE_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_READ =>
+                                DecodeMessage<DR_DRIVE_READ_RSP>(IssueDispatcher, bin, "DR_DRIVE_READ_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_WRITE =>
+                                DecodeMessage<DR_DRIVE_WRITE_RSP>(IssueDispatcher, bin, "DR_DRIVE_WRITE_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_DEVICE_CONTROL =>
+                                DecodeMessage<DR_DRIVE_CONTROL_RSP>(IssueDispatcher, bin, "DR_DRIVE_CONTROL_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_QUERY_VOLUME_INFORMATION =>
+                                assert (completionId in ctx.CompletionId_FsInformationClass.Keys);
+                                uint fsInformationClass = ctx.CompletionId_FsInformationClass[completionId];
+                                ctx.CompletionId_FsInformationClass = ctx.CompletionId_FsInformationClass.Remove(completionId);
+                                DecodeMessage<DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP[fsInformationClass]>(IssueDispatcher, bin, "DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_SET_VOLUME_INFORMATION =>
+                                DecodeMessage<DR_DRIVE_SET_VOLUME_INFORMATION_RSP>(IssueDispatcher, bin, "DR_DRIVE_SET_VOLUME_INFORMATION_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_QUERY_INFORMATION =>
+                                assert completionId in ctx.CompletionId_FsInformationClass.Keys;
+                                uint fsInformationClass = ctx.CompletionId_FsInformationClass[completionId];
+                                ctx.CompletionId_FsInformationClass = ctx.CompletionId_FsInformationClass.Remove(completionId);
+                                DecodeMessage<DR_DRIVE_QUERY_INFORMATION_RSP[fsInformationClass]>(IssueDispatcher, bin, "DR_DRIVE_QUERY_INFORMATION_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_SET_INFORMATION =>
+                                DecodeMessage<DR_DRIVE_SET_INFORMATION_RSP>(IssueDispatcher, bin, "DR_DRIVE_SET_INFORMATION_RSP");
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_DIRECTORY_CONTROL =>
+                                assert completionId in ctx.CompletionId_MinorFunction;
+                                switch (ctx.CompletionId_MinorFunction[completionId])
+                                {
+                                    case DR_DEVICE_IOREQUEST_MinorFunction.IRP_MN_QUERY_DIRECTORY =>
+                                        assert completionId in ctx.CompletionId_FsInformationClass.Keys;
+                                        uint fsInformationClass = ctx.CompletionId_FsInformationClass[completionId];
+                                        ctx.CompletionId_FsInformationClass = ctx.CompletionId_FsInformationClass.Remove(completionId);
+                                        DecodeMessage<DR_DRIVE_QUERY_DIRECTORY_RSP[fsInformationClass]>(IssueDispatcher, bin, "DR_DRIVE_QUERY_DIRECTORY_RSP");
+                                    case DR_DEVICE_IOREQUEST_MinorFunction.IRP_MN_NOTIFY_CHANGE_DIRECTORY =>
+                                        DecodeMessage<DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP>(IssueDispatcher, bin, "DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP");
+                                    default =>
+                                        ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["MinorFunction", ctx.CompletionId_MinorFunction[completionId].ToString()]);
+                                }
+                                ctx.CompletionId_MinorFunction = ctx.CompletionId_MinorFunction.Remove(completionId);
+                            case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_LOCK_CONTROL =>
+                                DecodeMessage<DR_DRIVE_LOCK_RSP>(IssueDispatcher, bin, "DR_DRIVE_LOCK_RSP");
+                            default => 
+                                ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["MajorFunction", ctx.CompletionId_MajorFunction[completionId].ToString()]);
+                        }
+                        ctx.CompletionId_MajorFunction = ctx.CompletionId_MajorFunction.Remove(completionId);
+                    }
+                    else 
+                    {
+                        ThrowDecodingException("RDPEFS", RDPEFS_InvalidCompletionIdMajorFunction, []);
+                    }
+                case RDPDR_HEADER_PacketId.PAKID_CORE_CLIENT_CAPABILITY =>
+                    DecodeMessage<DR_CORE_CAPABILITY_RSP>(IssueDispatcher, bin, "DR_CORE_CAPABILITY_RSP");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_DEVICELIST_REMOVE =>
+                    DecodeMessage<DR_DEVICELIST_REMOVE>(IssueDispatcher, bin, "DR_DEVICELIST_REMOVE");
+                default => 
+                    ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["PacketId", packetId.ToString()]);
+            }
+        default => 
+            ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["Component", component.ToString()]);
+    }
+}
+
+void DecodeAndDispatchEFSIssues(ref RDPEFSContext ctx, binary bin)
+{
+    if (bin.Count < 4)
+    {
+        ThrowDecodingException("RDPEFS", RDPEFS_DATA_NOT_ENOUGH, []);
+    }
+    void(any message) AcceptDispatcher = ctx.AcceptDispatcher;
+    ushort component = PeekUShort(bin, 0, Endian.Little);
+    ushort packetId= PeekUShort(bin, 16, Endian.Little);
+    switch (component)
+    {
+        case RDPDR_HEADER_Component.RDPDR_CTYP_CORE =>
+            switch (packetId)
+            {
+                case RDPDR_HEADER_PacketId.PAKID_CORE_SERVER_ANNOUNCE => 
+                    ctx.IfHasAnnounceDeviceList = false; // DR_CORE_SERVER_ANNOUNCE_REQ indicates a new initialzation
+                    DecodeMessage<DR_CORE_SERVER_ANNOUNCE_REQ>(AcceptDispatcher, bin, "DR_CORE_SERVER_ANNOUNCE_REQ");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_CLIENTID_CONFIRM =>
+                    DecodeMessage<DR_CORE_SERVER_CLIENTID_CONFIRM>(AcceptDispatcher, bin, "DR_CORE_SERVER_CLIENTID_CONFIRM");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_DEVICE_REPLY =>
+                    DecodeMessage<DR_CORE_DEVICE_ANNOUNCE_RSP>(AcceptDispatcher, bin, "DR_CORE_DEVICE_ANNOUNCE_RSP");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_DEVICE_IOREQUEST =>
+                    if (bin.Count < 24)
+                    {
+                        ThrowDecodingException("RDPEFS", RDPEFS_DATA_NOT_ENOUGH, []);
+                    }
+                    uint majorFunction = PeekUInt(bin, 128, Endian.Little);
+                    uint completionId = PeekUInt(bin, 96, Endian.Little);
+                    switch (majorFunction)
+                    {
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_CREATE =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_CREATE_REQ>(AcceptDispatcher, bin, "DR_DRIVE_CREATE_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_CLOSE =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_CLOSE_REQ>(AcceptDispatcher, bin, "DR_DRIVE_CLOSE_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_READ =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_READ_REQ>(AcceptDispatcher, bin, "DR_DRIVE_READ_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_WRITE =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_WRITE_REQ>(AcceptDispatcher, bin, "DR_DRIVE_WRITE_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_DEVICE_CONTROL =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_CONTROL_REQ>(AcceptDispatcher, bin, "DR_DRIVE_CONTROL_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_QUERY_VOLUME_INFORMATION =>
+                            if (bin.Count < 28)
+                            {
+                                ThrowDecodingException("RDPEFS", "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ", RDPEFS_DATA_NOT_ENOUGH, []);
+                            }
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            uint fsInformationClass = PeekUInt(bin, 192, Endian.Little);
+                            ctx.CompletionId_FsInformationClass[completionId] = fsInformationClass;
+                            DecodeMessage<DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ>(AcceptDispatcher, bin, "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_SET_VOLUME_INFORMATION =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_SET_VOLUME_INFORMATION_REQ>(AcceptDispatcher, bin, "DR_DRIVE_SET_VOLUME_INFORMATION_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_QUERY_INFORMATION =>
+                            if (bin.Count < 28)
+                            {
+                                ThrowDecodingException("RDPEFS", "DR_DRIVE_QUERY_INFORMATION_REQ", RDPEFS_DATA_NOT_ENOUGH, []);
+                            }
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            uint fsInformationClass = PeekUInt(bin, 192, Endian.Little);
+                            ctx.CompletionId_FsInformationClass[completionId] = fsInformationClass;
+                            DecodeMessage<DR_DRIVE_QUERY_INFORMATION_REQ>(AcceptDispatcher, bin, "DR_DRIVE_QUERY_INFORMATION_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_SET_INFORMATION =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_SET_INFORMATION_REQ>(AcceptDispatcher, bin, "DR_DRIVE_SET_INFORMATION_REQ");
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_DIRECTORY_CONTROL =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            uint minorFunction  = PeekUInt(bin, 160, Endian.Little);
+                            switch (minorFunction)
+                            {
+                                case DR_DEVICE_IOREQUEST_MinorFunction.IRP_MN_QUERY_DIRECTORY =>
+                                    if (bin.Count < 28)
+                                    {
+                                        ThrowDecodingException("RDPEFS", "DR_DRIVE_QUERY_DIRECTORY_REQ", RDPEFS_DATA_NOT_ENOUGH, []);
+                                    }
+                                    ctx.CompletionId_MinorFunction[completionId] = minorFunction;
+                                    uint fsInformationClass = PeekUInt(bin, 192, Endian.Little);
+                                    ctx.CompletionId_FsInformationClass[completionId] = fsInformationClass;
+                                    DecodeMessage<DR_DRIVE_QUERY_DIRECTORY_REQ>(AcceptDispatcher, bin, "DR_DRIVE_QUERY_DIRECTORY_REQ");
+                                case DR_DEVICE_IOREQUEST_MinorFunction.IRP_MN_NOTIFY_CHANGE_DIRECTORY =>
+                                    ctx.CompletionId_MinorFunction[completionId] = minorFunction;
+                                    DecodeMessage<DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ>(AcceptDispatcher, bin, "DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ");
+                                default => 
+                                    ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["MinorFunction", minorFunction.ToString()]);
+                            }
+                        case DR_DEVICE_IOREQUEST_MajorFunction.IRP_MJ_LOCK_CONTROL =>
+                            ctx.CompletionId_MajorFunction[completionId] = majorFunction;
+                            DecodeMessage<DR_DRIVE_LOCK_REQ>(AcceptDispatcher, bin, "DR_DRIVE_LOCK_REQ");
+                        default => 
+                            ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["MajorFunction", majorFunction.ToString()]);
+                    }
+                case RDPDR_HEADER_PacketId.PAKID_CORE_SERVER_CAPABILITY =>
+                    DecodeMessage<DR_CORE_CAPABILITY_REQ>(AcceptDispatcher, bin, "DR_CORE_CAPABILITY_REQ");
+                case RDPDR_HEADER_PacketId.PAKID_CORE_USER_LOGGEDON =>
+                    DecodeMessage<DR_CORE_USER_LOGGEDON>(AcceptDispatcher, bin, "DR_CORE_USER_LOGGEDON");
+                default => 
+                    ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["PacketId", packetId.ToString()]);
+            }
+        default => 
+            ThrowDecodingException("RDPEFS", UTILITY_INVALID_DATA_WITH_VALUE, ["Component", component.ToString()]);
+    }
+}
+
+void DecodeMessage<T>(void(T) dispatcher, binary bin, string messageName)
+{
+    if (BinaryDecoder<T>(bin) is msg:T)
+    {
+        dispatcher(msg);
+    }
+    else
+    {
+        ThrowDecodingException("RDPEFS", messageName);
+    }
+}
+
+// 2.2.1.1   Shared Header (RDPDR_HEADER)
+type RDPDR_HEADER
+{
+    RDPDR_HEADER_Component Component
+        where ValidationCheckEnumValue(InRange<RDPDR_HEADER_Component>(value), null, true, ReferenceType.Type, 
+            "RDPEFS", "Component", "RDPDR_HEADER", "0x4472, 0x5052", value);
+    RDPDR_HEADER_PacketId PacketId
+        where ValidationCheckEnumValueTooManyItems(InRange<RDPDR_HEADER_PacketId>(value), null, true, 
+            ReferenceType.Type, "RDPEFS", "PacketId", "RDPDR_HEADER", "RDPDR_HEADER", "[MS-RDPEFS]");
+    override string ToString()
+    {
+        return "Component: " + EnumToStringInSummary<RDPDR_HEADER_Component>(Component) + 
+            ", PacketId: " + EnumToStringInSummary<RDPDR_HEADER_PacketId>(PacketId);
+    }
+}
+pattern RDPDR_HEADER_Component = enum ushort
+{
+    RDPDR_CTYP_CORE = 0x4472, 
+    RDPDR_CTYP_PRN = 0x5052,
+    ...
+};
+pattern RDPDR_HEADER_PacketId = enum ushort
+{
+    PAKID_CORE_SERVER_ANNOUNCE = 0x496E,
+    PAKID_CORE_CLIENTID_CONFIRM = 0x4343,
+    PAKID_CORE_CLIENT_NAME = 0x434E,
+    PAKID_CORE_DEVICELIST_ANNOUNCE = 0x4441,
+    PAKID_CORE_DEVICE_REPLY = 0x6472,
+    PAKID_CORE_DEVICE_IOREQUEST = 0x4952,
+    PAKID_CORE_DEVICE_IOCOMPLETION = 0x4943,
+    PAKID_CORE_SERVER_CAPABILITY = 0x5350,
+    PAKID_CORE_CLIENT_CAPABILITY = 0x4350,
+    PAKID_CORE_DEVICELIST_REMOVE = 0x444D,
+    PAKID_PRN_CACHE_DATA = 0x5043,
+    PAKID_CORE_USER_LOGGEDON = 0x554C,
+    PAKID_PRN_USING_XPS = 0x5543,
+    ...
+};
+
+// 2.2.1.2   Capability Header (CAPABILITY_HEADER)
+type CAPABILITY_HEADER
+{
+    CAPABILITY_HEADER_CapabilityType CapabilityType
+        where ValidationCheckEnumValueTooManyItems(InRange<CAPABILITY_HEADER_CapabilityType>(value), null, true, 
+            ReferenceType.Type, "RDPEFS", "CapabilityType", "CAPABILITY_HEADER", "CAPABILITY_HEADER", "[MS-RDPEFS]");
+    ushort CapabilityLength;
+    uint Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + Version.ToString();
+    }
+}
+pattern CAPABILITY_HEADER_CapabilityType = enum ushort
+{
+    CAP_GENERAL_TYPE = 0x0001,
+    CAP_PRINTER_TYPE = 0x0002,
+    CAP_PORT_TYPE = 0x0003,
+    CAP_DRIVE_TYPE = 0x0004,
+    CAP_SMARTCARD_TYPE = 0x0005,
+    ...
+};
+
+// 2.2.1.2.1   Capability Message  (CAPABILITY_SET)
+type CAPABILITY_SET
+{
+    CAPABILITY_HEADER Header;
+    binary capabilityData with BinaryEncoding{Length = Header.CapabilityLength - 8}; // 8 is the length of Header
+    override string ToString()
+    {
+        return Header.ToString();
+    }
+}
+
+// 2.2.1.3   Device Announce Header (DEVICE_ANNOUNCE)
+type DEVICE_ANNOUNCE
+{
+    DEVICE_ANNOUNCE_DeviceType DeviceType
+        where ValidationCheckEnumValueTooManyItems(InRange<DEVICE_ANNOUNCE_DeviceType>(value), null, true, 
+            ReferenceType.Type, "RDPEFS", "DeviceType", "DEVICE_ANNOUNCE", "DEVICE_ANNOUNCE", "[MS-RDPEFS]");
+    uint DeviceId;
+    string PreferredDosName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 8};
+    uint DeviceDataLength;
+    binary DeviceData with BinaryEncoding{Length = DeviceDataLength}; // decode it when implement [MS-RDPEPC]. DeviceDataLength of other device type is 0
+    override string ToString()
+    {
+        return "DeviceType: " + EnumToStringInSummary<DEVICE_ANNOUNCE_DeviceType>(DeviceType) + 
+            ", DeviceId: " + DeviceId.ToString() + ", PreferredDosName: " + PreferredDosName;
+    }
+}
+pattern DEVICE_ANNOUNCE_DeviceType = enum uint
+{
+    RDPDR_DTYP_SERIAL = 0x00000001,
+    RDPDR_DTYP_PARALLEL = 0x00000002,
+    RDPDR_DTYP_PRINT = 0x00000004,
+    RDPDR_DTYP_FILESYSTEM = 0x00000008,
+    RDPDR_DTYP_SMARTCARD = 0x00000020,
+    ...
+};
+
+// 2.2.1.4   Device I/O Request (DR_DEVICE_IOREQUEST)
+type DR_DEVICE_IOREQUEST
+{
+    RDPDR_HEADER Header;
+    uint DeviceId;
+    uint FileId;
+    uint CompletionId;
+    DR_DEVICE_IOREQUEST_MajorFunction MajorFunction
+        where ValidationCheckEnumValueTooManyItems(InRange<DR_DEVICE_IOREQUEST_MajorFunction>(value), null, true, 
+            ReferenceType.Type, "RDPEFS", "MajorFunction", "DR_DEVICE_IOREQUEST", "DR_DEVICE_IOREQUEST", "[MS-RDPEFS]");
+    ([|MajorFunction == 0x0000000C|] DR_DEVICE_IOREQUEST_MinorFunction 
+    | [|MajorFunction != 0x0000000C|] uint) MinorFunction;
+    override string ToString()
+    {
+        return "DeviceId: " + DeviceId.ToString() + ", FileId: " + FileId.ToString();
+    }
+}
+pattern DR_DEVICE_IOREQUEST_MajorFunction = enum uint
+{
+    IRP_MJ_CREATE = 0x00000000,
+    IRP_MJ_CLOSE = 0x00000002,
+    IRP_MJ_READ = 0x00000003,
+    IRP_MJ_WRITE = 0x00000004,
+    IRP_MJ_DEVICE_CONTROL = 0x0000000E,
+    IRP_MJ_QUERY_VOLUME_INFORMATION = 0x0000000A,
+    IRP_MJ_SET_VOLUME_INFORMATION = 0x0000000B,
+    IRP_MJ_QUERY_INFORMATION = 0x00000005,
+    IRP_MJ_SET_INFORMATION = 0x00000006,
+    IRP_MJ_DIRECTORY_CONTROL = 0x0000000C,
+    IRP_MJ_LOCK_CONTROL = 0x00000011,
+    ...
+};
+pattern DR_DEVICE_IOREQUEST_MinorFunction = enum uint
+{
+    IRP_MN_QUERY_DIRECTORY = 0x00000001,
+    IRP_MN_NOTIFY_CHANGE_DIRECTORY = 0x00000002,
+    ...
+};
+
+// 2.2.1.4.1   Device Create Request (DR_CREATE_REQ)
+type DR_CREATE_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    File_Pipe_Printer_Access_Mask DesiredAccess;
+    ulong AllocationSize;
+    FileAttributes FileAttributes;
+    ShareAccess SharedAccess;
+    CreateDisposition CreateDisposition
+        where ValidationCheckEnumValueTooManyItems(InRange<CreateDisposition>(value), null, true, ReferenceType.Type,
+            "RDPEFS", "CreateDisposition", "DR_CREATE_REQ", "SMB2 CREATE Request", "[MS-SMB2]");
+    CreateOptions CreateOptions
+        where ValidationCheckEnumValueTooManyItems(InRange<CreateOptions>(value), null, true, ReferenceType.Type,
+            "RDPEFS", "CreateOptions", "DR_CREATE_REQ", "SMB2 CREATE Request", "[MS-SMB2]");
+    uint PathLength;
+    string Path with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = PathLength};
+    override string ToString()
+    {
+        string summary = DeviceIoRequest.ToString() + ", Da(";
+        summary += (DesiredAccess & 0x00000001) > 0 ? "R" : "";     // FILE_READ_DATA (LIST_DIRECTORY)
+        summary += (DesiredAccess & 0x00000002) > 0 ? "W" : "";     // FILE_WRITE_DATA (ADD_FILE)
+        summary += (DesiredAccess & 0x00000004) > 0 ? "A" : "";     // FILE_APPEND_DATA (ADD_SUBDIRECTORY)
+        summary += (DesiredAccess & 0x00000008) > 0 ? "E" : "";     // FILE_READ_EA
+        summary += (DesiredAccess & 0x00000010) > 0 ? "e" : "";     // FILE_WRITE_eA
+        summary += (DesiredAccess & 0x00000020) > 0 ? "X" : "";     // FILE_EXECUTE (TRAVERSE)
+        summary += (DesiredAccess & 0x00000040) > 0 ? "C" : "";     // FILE_DELETE_CHILD
+        summary += (DesiredAccess & 0x00000080) > 0 ? "r" : "";     // FILE_rEAD_ATTRIBUTES
+        summary += (DesiredAccess & 0x00000100) > 0 ? "w" : "";     // FILE_wRITE_ATTRIBUTES
+        summary += (DesiredAccess & 0x00010000) > 0 ? "D" : "";     // DELETE
+        summary += (DesiredAccess & 0x00020000) > 0 ? "c" : "";     // READ_cONTROL
+        summary += (DesiredAccess & 0x00040000) > 0 ? "d" : "";     // WRITE_dAC
+        summary += (DesiredAccess & 0x00080000) > 0 ? "o" : "";     // WRITE_oWNER
+        summary += (DesiredAccess & 0x00100000) > 0 ? "S" : "";     // SYNCHRONIZE
+        summary += (DesiredAccess & 0x01000000) > 0 ? "s" : "";     // ACCESS_sYSTEM_sECURITY
+        summary += (DesiredAccess & 0x02000000) > 0 ? "M" : "";     // MAXIMUM_ALLOWED
+        summary += "), Sh(";
+        summary += (SharedAccess & ShareAccess.FileShareRead) > 0 ? "R" : "";
+        summary += (SharedAccess & ShareAccess.FileShareWrite) > 0 ? "W" : "";
+        summary += (SharedAccess & ShareAccess.FileShareDelete) > 0 ? "D" : "";
+        summary += "), CreateOptions: ";
+        summary += EnumToStringInSummary<CreateOptions>(CreateOptions) + ", Path: " + Path;
+        return summary;
+    }
+}
+
+// 2.2.1.4.2   Device Close Request (DR_CLOSE_REQ)
+type DR_CLOSE_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    binary Padding with BinaryEncoding{Length = 32};
+    override string ToString()
+    {
+        return DeviceIoRequest.ToString();
+    }
+}
+
+// 2.2.1.4.3   Device Read Request (DR_READ_REQ)
+type DR_READ_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    uint Length;
+    ulong Offset;
+    binary Padding with BinaryEncoding{Length = 20};
+    override string ToString()
+    {
+        return DeviceIoRequest.ToString() + ", Length: " + Length.ToString() + ", Offset: " + Offset.ToString();
+    }
+}
+
+// 2.2.1.4.4   Device Write Request (DR_WRITE_REQ)
+type DR_WRITE_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    uint Length;
+    ulong Offset;
+    binary Padding with BinaryEncoding{Length = 20};
+    binary WriteData with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return DeviceIoRequest.ToString() + ", Length: " + Length.ToString() + ", Offset: " + Offset.ToString();
+    }
+}
+
+// 2.2.1.4.5   Device Control Request (DR_CONTROL_REQ)
+type DR_CONTROL_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    uint OutputBufferLength;
+    uint InputBufferLength;
+    uint IoControlCode;
+    binary Padding with BinaryEncoding{Length = 20};
+    binary InputBuffer with BinaryEncoding{Length = InputBufferLength};
+    override string ToString()
+    {
+        return DeviceIoRequest.ToString() + ", IoControlCode: " + IoControlCode.ToString();
+    }
+}
+
+// 2.2.1.5   Device I/O Response (DR_DEVICE_IOCOMPLETION)
+type DR_DEVICE_IOCOMPLETION
+{
+    RDPDR_HEADER Header;
+    uint DeviceId;
+    uint CompletionId;
+    NTSTATUS IoStatus;
+    override string ToString()
+    {
+        return "DeviceId: " + DeviceId.ToString() + ", IoStatus: " + IoStatus.ToString();
+    }
+}
+
+// 2.2.1.5.1   Device Create Response (DR_CREATE_RSP)
+type DR_CREATE_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint FileId;
+    optional DR_CREATE_RSP_Information Information;
+    override string ToString()
+    {
+        string summary= DeviceIoReply.ToString() + ", FileId: " + FileId.ToString();
+        if (Information != nothing)
+        {
+            summary += ", Information: " + EnumToStringInSummary<DR_CREATE_RSP_Information>(Information as DR_CREATE_RSP_Information);
+        } 
+        return summary;
+    }
+}
+pattern DR_CREATE_RSP_Information = enum byte
+{
+    FILE_SUPERSEDED = 0x00000000,
+    FILE_OPENED = 0x00000001,
+    FILE_OVERWRITTEN = 0x00000003,
+    ...
+};
+
+// 2.2.1.5.2   Device Close Response (DR_CLOSE_RSP)
+type DR_CLOSE_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    binary Padding with BinaryEncoding{Length = 4};
+    override string ToString()
+    {
+        return DeviceIoReply.ToString();
+    }
+}
+
+// 2.2.1.5.3   Device Read Response (DR_READ_RSP)
+type DR_READ_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    binary ReadData with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return DeviceIoReply.ToString() + ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.1.5.4   Device Write Response (DR_WRITE_RSP)
+type DR_WRITE_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    optional byte Padding;
+    override string ToString()
+    {
+        return DeviceIoReply.ToString() + ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.1.5.5   Device Control Response (DR_CONTROL_RSP)
+type DR_CONTROL_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint OutputBufferLength;
+    binary OutputBuffer with BinaryEncoding{Length = OutputBufferLength};
+    override string ToString()
+    {
+        return DeviceIoReply.ToString() + ", OutputBufferLength: " + OutputBufferLength.ToString();
+    }
+}
+
+// 2.2.1.6   RDP_LOCK_INFO
+type RDP_LOCK_INFO
+{
+    ulong Length;
+    ulong Offset;
+
+    override string ToString()
+    {
+        return "RDP_LOCK_INFO, Length: " + Length.ToString() + ", Offset: " + Offset.ToString();
+    }
+}
+
+// 2.2.2.1   Server Device Announce Response (DR_CORE_DEVICE_ANNOUNCE_RSP)
+message DR_CORE_DEVICE_ANNOUNCE_RSP
+{
+    RDPDR_HEADER Header;
+    uint DeviceId;
+    NTSTATUS ResultCode;
+    override string ToString()
+    {
+        return "DR_CORE_DEVICE_ANNOUNCE_RSP, DeviceId: " + DeviceId.ToString() + 
+            ", ResultCode: " + ResultCode.ToString();
+    }
+}
+
+// 2.2.2.2   Server Announce Request (DR_CORE_SERVER_ANNOUNCE_REQ)
+message DR_CORE_SERVER_ANNOUNCE_REQ
+{
+    RDPDR_HEADER Header;
+    ushort VersionMajor where ValidationCheckValue(value == 0x0001, this, true, ReferenceType.Message, 
+        "RDPEFS", "VersionMajor", "DR_CORE_SERVER_ANNOUNCE_REQ", "0x0001", value);
+    DR_CORE_SERVER_ANNOUNCE_REQ_VersionMinor VersionMinor
+        where ValidationCheckEnumValueTooManyItems(InRange<DR_CORE_SERVER_ANNOUNCE_REQ_VersionMinor>(value), this, true, 
+            ReferenceType.Message, "RDPEFS", "VersionMinor", "DR_CORE_SERVER_ANNOUNCE_REQ", "DR_CORE_SERVER_ANNOUNCE_REQ", "[MS-RDPEFS]");
+    uint ClientId;
+    override string ToString()
+    {
+        return "DR_CORE_SERVER_ANNOUNCE_REQ, VersionMinor: " + 
+            EnumToStringInSummary<DR_CORE_SERVER_ANNOUNCE_REQ_VersionMinor>(VersionMinor) + 
+            ", ClientId: " + ClientId.ToString();
+    }
+}
+pattern DR_CORE_SERVER_ANNOUNCE_REQ_VersionMinor = enum ushort
+{
+    $"Windows 10, Windows Server 2016" = 0x000D,
+    $"Windows Vista and later" = 0x000C,
+    $"Windows Server 2003 SP2" = 0x000A,
+    $"Windows XP SP3" = 0x0006,
+    $"Windows XP/SP1/SP2, Windows Server 2003/SP1" = 0x0005,
+    $"Windows 2000" = 0x0002,
+    ...
+};
+
+// 2.2.2.3   Client Announce Reply (DR_CORE_CLIENT_ANNOUNCE_RSP)
+message DR_CORE_CLIENT_ANNOUNCE_RSP
+{
+    RDPDR_HEADER Header;
+    ushort VersionMajor where ValidationCheckValue(value == 0x0001, this, true, ReferenceType.Message, 
+        "RDPEFS", "VersionMajor", "DR_CORE_CLIENT_ANNOUNCE_RSP", "0x0001", value);
+    VersionMinorPattern VersionMinor
+        where ValidationCheckEnumValue(InRange<VersionMinorPattern>(value), this, true, ReferenceType.Message, 
+            "RDPEFS", "VersionMinor", "DR_CORE_CLIENT_ANNOUNCE_RSP", "0x000C, 0x000A, 0x0005, 0x0002", value);
+    uint ClientId;
+    override string ToString()
+    {
+        return "DR_CORE_CLIENT_ANNOUNCE_RSP, VersionMinor: " + 
+            EnumToStringInSummary<VersionMinorPattern>(VersionMinor) + 
+            ", ClientId: " + ClientId.ToString();
+    }
+}
+pattern VersionMinorPattern = enum ushort
+{
+    $"RDP Client 6.0 and 6.1" = 0x000C,
+    $"RDP Client 5.2" = 0x000A,
+    $"RDP Client 5.1" = 0x0005,
+    $"RDP Client 5.0" = 0x0002,
+    ...
+};
+
+// 2.2.2.4   Client Name Request (DR_CORE_CLIENT_NAME_REQ)
+message DR_CORE_CLIENT_NAME_REQ
+{
+    RDPDR_HEADER Header;
+    DR_CORE_CLIENT_NAME_REQ_UnicodeFlag UnicodeFlag
+        where ValidationCheckEnumValue(InRange<DR_CORE_CLIENT_NAME_REQ_UnicodeFlagPatt>(value.UnicodeFlag), this, true, ReferenceType.Message, 
+            "RDPEFS", "UnicodeFlag", "DR_CORE_CLIENT_NAME_REQ", "0x1, 0x0", value.UnicodeFlag);
+    uint CodePage where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "RDPEFS", "CodePage", "DR_CORE_CLIENT_NAME_REQ", value);
+    uint ComputerNameLen;
+    string ComputerName with BinaryEncoding{TextEncoding = (UnicodeFlag.UnicodeFlag == DR_CORE_CLIENT_NAME_REQ_UnicodeFlagPatt.ComputerName_Unicode ? TextEncoding.Unicode : TextEncoding.ASCII), 
+        Length = (UnicodeFlag.UnicodeFlag == DR_CORE_CLIENT_NAME_REQ_UnicodeFlagPatt.ComputerName_Unicode ? (ComputerNameLen / 2) : ComputerNameLen)};
+    override string ToString()
+    {
+        return "DR_CORE_CLIENT_NAME_REQ, ComputerName: " + ComputerName;
+    }
+}
+
+type DR_CORE_CLIENT_NAME_REQ_UnicodeFlag
+{
+    uint Reserved with BinaryEncoding {Width = 31};
+    DR_CORE_CLIENT_NAME_REQ_UnicodeFlagPatt UnicodeFlag with  BinaryEncoding {Width = 1};
+}with BinaryEncoding{Endian = Endian.Little, WidthForComposedType = 32, DecodeAsUnit = true};
+
+pattern DR_CORE_CLIENT_NAME_REQ_UnicodeFlagPatt = enum byte
+{
+    ComputerName_Unicode = 0x1,
+    ComputerName_Ascii = 0x0,
+    ...
+};
+
+// 2.2.2.5   Server User Logged On (DR_CORE_USER_LOGGEDON)
+message DR_CORE_USER_LOGGEDON
+{
+    RDPDR_HEADER Header;
+    override string ToString()
+    {
+        return "DR_CORE_USER_LOGGEDON";
+    }
+}
+
+// 2.2.2.6   Server Client ID Confirm (DR_CORE_SERVER_CLIENTID_CONFIRM)
+message DR_CORE_SERVER_CLIENTID_CONFIRM
+{
+    RDPDR_HEADER Header;
+    ushort VersionMajor where ValidationCheckValue(value == 0x0001, this, true, ReferenceType.Message, 
+        "RDPEFS", "VersionMajor", "DR_CORE_SERVER_CLIENTID_CONFIRM", "0x0001", value);
+    VersionMinorPattern VersionMinor
+        where ValidationCheckEnumValue(InRange<VersionMinorPattern>(value), this, true, ReferenceType.Message, 
+            "RDPEFS", "VersionMinor", "DR_CORE_SERVER_CLIENTID_CONFIRM", "0x000C, 0x000A, 0x0005, 0x0002", value);
+    uint ClientId;
+    override string ToString()
+    {
+        return "DR_CORE_SERVER_CLIENTID_CONFIRM, VersionMinor: " + 
+            EnumToStringInSummary<VersionMinorPattern>(VersionMinor) + 
+            ", ClientId: " + ClientId.ToString();
+    }
+}
+
+// 2.2.2.7   Server Core Capability Request (DR_CORE_CAPABILITY_REQ)
+message DR_CORE_CAPABILITY_REQ
+{
+    RDPDR_HEADER Header;
+    ushort numCapabilities;
+    ushort Padding;
+    array<CapabilityMessagePatt> CapabilityMessage with BinaryEncoding{Length = numCapabilities};
+    override string ToString()
+    {
+        return "DR_CORE_CAPABILITY_REQ, numCapabilities: " + numCapabilities.ToString();
+    }
+}
+pattern CapabilityMessagePatt = [|stream.RemainingByteLength() >= 2 && (PeekByteCompare(stream, stream.BitPosition, CAP_GENERAL_TYPE_BYTEARRAY))|] GENERAL_CAPS_SET | 
+        [|stream.RemainingByteLength() >= 2 && PeekByteCompare(stream, stream.BitPosition, CAP_PRINTER_TYPE_BYTEARRAY)|] PRINTER_CAPS_SET |
+        [|stream.RemainingByteLength() >= 2 && PeekByteCompare(stream, stream.BitPosition, CAP_PORT_TYPE_BYTEARRAY)|] PORT_CAPS_SET |
+        [|stream.RemainingByteLength() >= 2 && PeekByteCompare(stream, stream.BitPosition, CAP_DRIVE_TYPE_BYTEARRAY)|] DRIVE_CAPS_SET |
+        [|stream.RemainingByteLength() >= 2 && PeekByteCompare(stream, stream.BitPosition, CAP_SMARTCARD_TYPE_BYTEARRAY)|] SMARTCARD_CAPS_SET |
+        CAPABILITY_SET;
+
+const array<byte> CAP_GENERAL_TYPE_BYTEARRAY = [0x01, 0x00];
+const array<byte> CAP_PRINTER_TYPE_BYTEARRAY = [0x02, 0x00];
+const array<byte> CAP_PORT_TYPE_BYTEARRAY = [0x03, 0x00];
+const array<byte> CAP_DRIVE_TYPE_BYTEARRAY = [0x04, 0x00];
+const array<byte> CAP_SMARTCARD_TYPE_BYTEARRAY = [0x05, 0x00];
+
+// 2.2.2.7.1   General Capability Set (GENERAL_CAPS_SET)
+type GENERAL_CAPS_SET : CAPABILITY_SET
+{
+    new GENERAL_CAPS_SET_Header Header where ValidationCheckEnumValue(InRange<GENERAL_CAPS_SET_HeaderVersion>(value.Version), null, true, 
+        ReferenceType.Type, "RDPEFS", "Header.Version", "GENERAL_CAPS_SET", "0x00000001, 0x00000002", value.Version);
+    new optional binary capabilityData with Encoding{Ignore = true};
+    uint osType;
+    uint osVersion;
+    ushort protocolMajorVersion where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, 
+        "RDPEFS", "protocolMajorVersion", "GENERAL_CAPS_SET", "1", value);
+    VersionMinorPattern protocolMinorVersion where ValidationCheckEnumValue(InRange<VersionMinorPattern>(value), null, true, 
+        ReferenceType.Type, "RDPEFS", "protocolMinorVersion", "GENERAL_CAPS_SET", "0x000C, 0x000A, 0x0005, 0x0002", value);
+    GENERAL_CAPS_SET_ioCode1 ioCode1  where ValidationCheckCombinationValueTooManyItems(InRange<GENERAL_CAPS_SET_ioCode1>(value), null, true, 
+        ReferenceType.Type, "RDPEFS", "ioCode1", "GENERAL_CAPS_SET", "GENERAL_CAPS_SET", "[MS-RDPEFS]");
+    uint ioCode2 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RDPEFS", "ioCode2", "GENERAL_CAPS_SET", value);
+    GENERAL_CAPS_SET_extendedPDU extendedPDU where ValidationCheckCombinationValue(InRange<GENERAL_CAPS_SET_extendedPDU>(value), null, true, 
+        ReferenceType.Type, "RDPEFS", "extendedPDU", "GENERAL_CAPS_SET", "0x00000001, 0x00000002, 0x00000004", value);
+    GENERAL_CAPS_SET_extraFlags1 extraFlags1 where ValidationCheckCombinationValue(InRange<GENERAL_CAPS_SET_extraFlags1>(value), null, true, 
+        ReferenceType.Type, "RDPEFS", "extraFlags1", "GENERAL_CAPS_SET", "0x00000001", value);
+    uint extraFlags2 where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RDPEFS", "extraFlags2", "GENERAL_CAPS_SET", value);
+    uint SpecialTypeDeviceCap;
+    override string ToString()
+    {
+        return Header.ToString() + ", ioCode1: " + EnumToStringInSummary<GENERAL_CAPS_SET_ioCode1>(ioCode1) + 
+            ", extendedPDU: " + EnumToStringInSummary<GENERAL_CAPS_SET_extendedPDU>(extendedPDU) + 
+            ", SpecialTypeDeviceCap: " + SpecialTypeDeviceCap.ToString();
+    }
+}
+type GENERAL_CAPS_SET_Header : CAPABILITY_HEADER
+{
+    new GENERAL_CAPS_SET_HeaderVersion Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + EnumToStringInSummary<GENERAL_CAPS_SET_HeaderVersion>(Version);
+    }
+}
+pattern GENERAL_CAPS_SET_HeaderVersion = enum uint
+{
+    GENERAL_CAPABILITY_VERSION_01 = 0x00000001,
+    GENERAL_CAPABILITY_VERSION_02 = 0x00000002,
+    ...
+};
+pattern GENERAL_CAPS_SET_ioCode1 = flags uint
+{
+    RDPDR_IRP_MJ_CREATE = 0x00000001
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_CLEANUP = 0x00000002
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_CLOSE = 0x00000004
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_READ = 0x00000008
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_WRITE = 0x00000010
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_FLUSH_BUFFERS = 0x00000020
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_SHUTDOWN = 0x00000040
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_DEVICE_CONTROL = 0x00000080
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_QUERY_VOLUME_INFORMATION = 0x00000100
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_SET_VOLUME_INFORMATION = 0x00000200
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_QUERY_INFORMATION = 0x00000400
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_SET_INFORMATION = 0x00000800
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_DIRECTORY_CONTROL = 0x00001000
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_LOCK_CONTROL = 0x00002000
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_IRP_MJ_QUERY_SECURITY = 0x00004000
+        with Documentation
+            {Description = "Enable Query Security requests (IRP_MJ_QUERY_SECURITY)."},
+    RDPDR_IRP_MJ_SET_SECURITY = 0x00008000
+        with Documentation
+            {Description = "Enable Set Security requests (IRP_MJ_SET_SECURITY)."},
+    ...
+};
+pattern GENERAL_CAPS_SET_extendedPDU = flags uint
+{
+    RDPDR_DEVICE_REMOVE_PDUS = 0x00000001
+        with Documentation
+            {Description = "Allow the client to send Client Drive Device List Remove packets."},
+    RDPDR_CLIENT_DISPLAY_NAME_PDU = 0x00000002
+        with Documentation
+            {Description = "Unused, always set."},
+    RDPDR_USER_LOGGEDON_PDU = 0x00000004
+        with Documentation
+            {Description = "Allow the server to send a Server User Logged On packet."},
+    ...
+};
+pattern GENERAL_CAPS_SET_extraFlags1 = flags uint
+{
+    ENABLE_ASYNCIO = 0x00000001
+        with Documentation
+            {Description = "Optionally present only in the Client Core Capability Response."},
+    ...
+};
+
+// 2.2.2.7.2   Printer Capability Set (PRINTER_CAPS_SET)
+type PRINTER_CAPS_SET : CAPABILITY_SET
+{
+    new PRINTER_CAPS_SET_Header Header where ValidationCheckEnumValue(InRange<PRINTER_CAPS_SET_HeaderVersion>(value.Version), null, true, 
+        ReferenceType.Type, "RDPEFS", "Header.Version", "PRINTER_CAPS_SET", "0x00000001", value.Version);
+    new optional binary capabilityData with Encoding{Ignore = true};
+    override string ToString()
+    {
+        return Header.ToString();
+    }
+}
+type PRINTER_CAPS_SET_Header : CAPABILITY_HEADER
+{
+    new PRINTER_CAPS_SET_HeaderVersion Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + EnumToStringInSummary<PRINTER_CAPS_SET_HeaderVersion>(Version);
+    }
+}
+pattern PRINTER_CAPS_SET_HeaderVersion = enum uint
+{
+    PRINT_CAPABILITY_VERSION_01 = 0x00000001,
+    ...
+};
+
+// 2.2.2.7.3   Port Capability Set (PORT_CAPS_SET)
+type PORT_CAPS_SET : CAPABILITY_SET
+{
+    new PORT_CAPS_SET_Header Header where ValidationCheckEnumValue(InRange<PORT_CAPS_SET_HeaderVersion>(value.Version), null, true, 
+        ReferenceType.Type, "RDPEFS", "Header.Version", "PORT_CAPS_SET", "0x00000001", value.Version);
+    new optional binary capabilityData with Encoding{Ignore = true};
+    override string ToString()
+    {
+        return Header.ToString();
+    }
+}
+type PORT_CAPS_SET_Header : CAPABILITY_HEADER
+{
+    new PORT_CAPS_SET_HeaderVersion Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + EnumToStringInSummary<PORT_CAPS_SET_HeaderVersion>(Version);
+    }
+}
+pattern PORT_CAPS_SET_HeaderVersion = enum uint
+{
+    PORT_CAPABILITY_VERSION_01 = 0x00000001,
+    ...
+};
+
+// 2.2.2.7.4   Drive Capability Set (DRIVE_CAPS_SET)
+type DRIVE_CAPS_SET : CAPABILITY_SET
+{
+    new DRIVE_CAPS_SET_Header Header where ValidationCheckEnumValue(InRange<DRIVE_CAPS_SET_HeaderVersion>(value.Version), null, true, 
+        ReferenceType.Type, "RDPEFS", "Header.Version", "DRIVE_CAPS_SET", "0x00000001, 0x00000002", value.Version);
+    new optional binary capabilityData with Encoding{Ignore = true};
+    override string ToString()
+    {
+        return Header.ToString();
+    }
+}
+type DRIVE_CAPS_SET_Header : CAPABILITY_HEADER
+{
+    new DRIVE_CAPS_SET_HeaderVersion Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + EnumToStringInSummary<DRIVE_CAPS_SET_HeaderVersion>(Version);
+    }
+}
+pattern DRIVE_CAPS_SET_HeaderVersion = enum uint
+{
+    DRIVE_CAPABILITY_VERSION_01 = 0x00000001,
+    DRIVE_CAPABILITY_VERSION_02 = 0x00000002,
+    ...
+};
+
+// 2.2.2.7.5   Smart Card Capability Set (SMARTCARD_CAPS_SET)
+type SMARTCARD_CAPS_SET : CAPABILITY_SET
+{
+    new SMARTCARD_CAPS_SET_Header Header where ValidationCheckEnumValue(InRange<SMARTCARD_CAPS_SET_HeaderVersion>(value.Version), null, true, 
+        ReferenceType.Type, "RDPEFS", "Header.Version", "SMARTCARD_CAPS_SET", "0x00000001", value.Version);
+    new optional binary capabilityData with Encoding{Ignore = true};
+    override string ToString()
+    {
+        return Header.ToString();
+    }
+}
+type SMARTCARD_CAPS_SET_Header : CAPABILITY_HEADER
+{
+    new SMARTCARD_CAPS_SET_HeaderVersion Version;
+    override string ToString()
+    {
+        return "CapabilityType: " + EnumToStringInSummary<CAPABILITY_HEADER_CapabilityType>(CapabilityType) + 
+            ", Version: " + EnumToStringInSummary<SMARTCARD_CAPS_SET_HeaderVersion>(Version);
+    }
+}
+pattern SMARTCARD_CAPS_SET_HeaderVersion = enum uint
+{
+    SMARTCARD_CAPABILITY_VERSION_01 = 0x00000001,
+    ...
+};
+
+// 2.2.2.8   Client Core Capability Response (DR_CORE_CAPABILITY_RSP)
+message DR_CORE_CAPABILITY_RSP
+{
+    RDPDR_HEADER Header;
+    ushort numCapabilities;
+    ushort Padding;
+    array<CapabilityMessagePatt> Capabilitytype with BinaryEncoding{Length = numCapabilities};
+    override string ToString()
+    {
+        return "DR_CORE_CAPABILITY_RSP, numCapabilities: " + numCapabilities.ToString();
+    }
+}
+
+// 2.2.2.9   Client Device List Announce Request (DR_CORE_DEVICELIST_ANNOUNCE_REQ)
+message DR_CORE_DEVICELIST_ANNOUNCE_REQ
+{
+    RDPDR_HEADER Header;
+    uint DeviceCount;
+    array<DEVICE_ANNOUNCE> DeviceList with BinaryEncoding{Length = DeviceCount};
+    override string ToString()
+    {
+        return "DR_CORE_DEVICELIST_ANNOUNCE_REQ, DeviceCount: " + DeviceCount.ToString();
+    }
+}
+
+// 2.2.3.1   Client Device List Announce (DR_DEVICELIST_ANNOUNCE)
+message DR_DEVICELIST_ANNOUNCE
+{
+    RDPDR_HEADER Header;
+    uint DeviceCount;
+    array<DEVICE_ANNOUNCE> DeviceList with BinaryEncoding{Length = DeviceCount};
+    override string ToString()
+    {
+        return "DR_DEVICELIST_ANNOUNCE, DeviceCount: " + DeviceCount.ToString();
+    }
+}
+
+// 2.2.3.2   Client Drive Device List Remove (DR_DEVICELIST_REMOVE)
+message DR_DEVICELIST_REMOVE
+{
+    RDPDR_HEADER Header;
+    uint DeviceCount;
+    array<uint> DeviceIds with BinaryEncoding{Length = DeviceCount};
+    override string ToString()
+    {
+        return "DR_DEVICELIST_REMOVE, DeviceCount: " + DeviceCount.ToString();
+    }
+}
+
+// 2.2.3.3.1   Server Create Drive Request (DR_DRIVE_CREATE_REQ)
+message DR_DRIVE_CREATE_REQ
+{
+    DR_CREATE_REQ DeviceCreateRequest;
+    override string ToString()
+    {
+        return "DR_DRIVE_CREATE_REQ, " + DeviceCreateRequest.ToString();
+    }
+}
+
+// 2.2.3.3.2   Server Close Drive Request (DR_DRIVE_CLOSE_REQ)
+message DR_DRIVE_CLOSE_REQ
+{
+    DR_CLOSE_REQ DeviceCloseRequest;
+    override string ToString()
+    {
+        return "DR_DRIVE_CLOSE_REQ, " + DeviceCloseRequest.ToString();
+    }
+}
+
+// 2.2.3.3.3   Server Drive Read Request (DR_DRIVE_READ_REQ)
+message DR_DRIVE_READ_REQ
+{
+    DR_READ_REQ DeviceReadRequest;
+    override string ToString()
+    {
+        return "DR_DRIVE_READ_REQ, " + DeviceReadRequest.ToString();
+    }
+}
+
+// 2.2.3.3.4   Server Drive Write Request (DR_DRIVE_WRITE_REQ)
+message DR_DRIVE_WRITE_REQ
+{
+    DR_WRITE_REQ DeviceWriteRequest;
+    override string ToString()
+    {
+        return "DR_DRIVE_WRITE_REQ, " + DeviceWriteRequest.ToString();
+    }
+}
+
+// 2.2.3.3.5   Server Drive Control Request (DR_DRIVE_CONTROL_REQ)
+message DR_DRIVE_CONTROL_REQ
+{
+    DR_CONTROL_REQ DeviceControlRequest;
+    override string ToString()
+    {
+        return "DR_DRIVE_CONTROL_REQ, " + DeviceControlRequest.ToString();
+    }
+}
+
+// 2.2.3.3.6   Server Drive Query Volume Information Request (DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ)
+message DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ_FsInformationClass FsInformationClass
+         where ValidationCheckEnumValueTooManyItems(InRange<DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ_FsInformationClass>(value), 
+            this, true, ReferenceType.Message, "RDPEFS", "FsInformationClass", 
+            "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ", "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ", "[MS-RDPEFS]");
+    uint Length;
+    binary Padding with BinaryEncoding{Length = 24};
+    binary QueryVolumeBuffer with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ, " + DeviceIoRequest.ToString() + 
+            ", FsInformationClass: " + 
+            EnumToStringInSummary<DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ_FsInformationClass>(FsInformationClass) + 
+            ", Length: " + Length.ToString();
+    }
+}
+pattern DR_DRIVE_QUERY_VOLUME_INFORMATION_REQ_FsInformationClass = enum uint
+{
+    FileFsVolumeInformation = 0x00000001,
+    FileFsSizeInformation = 0x00000003,
+    FileFsAttributeInformation = 0x00000005,
+    FileFsFullSizeInformation = 0x00000007,
+    FileFsDeviceInformation = 0x00000004,
+    ...
+};
+
+// 2.2.3.3.7   Server Drive Set Volume Information Request (DR_DRIVE_SET_VOLUME_INFORMATION_REQ)
+message DR_DRIVE_SET_VOLUME_INFORMATION_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_SET_VOLUME_INFORMATION_REQ_FsInformationClass FsInformationClass 
+        where ValidationCheckEnumValue(InRange<DR_DRIVE_SET_VOLUME_INFORMATION_REQ_FsInformationClass>(value), this, true, 
+            ReferenceType.Message, "RDPEFS", "FsInformationClass", "DR_DRIVE_SET_VOLUME_INFORMATION_REQ", "0x00000002", value);
+    uint Length;
+    binary Padding with BinaryEncoding{Length = 24};
+    (FileFsLabelInformation | binary) SetVolumeBuffer with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return "DR_DRIVE_SET_VOLUME_INFORMATION_REQ, " + DeviceIoRequest.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+pattern DR_DRIVE_SET_VOLUME_INFORMATION_REQ_FsInformationClass = enum uint
+{
+    FileFsLabelInformation = 0x00000002,
+    ...
+};
+
+// 2.2.3.3.8   Server Drive Query Information Request (DR_DRIVE_QUERY_INFORMATION_REQ)
+message DR_DRIVE_QUERY_INFORMATION_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_QUERY_INFORMATION_REQ_FsInformationClass FsInformationClass 
+        where ValidationCheckEnumValue(InRange<DR_DRIVE_QUERY_INFORMATION_REQ_FsInformationClass>(value), this, true, 
+            ReferenceType.Message, "RDPEFS", "FsInformationClass", "DR_DRIVE_QUERY_INFORMATION_REQ", "0x00000004, 0x00000005, 0x00000023", value);
+    uint Length;
+    binary Padding with BinaryEncoding{Length = 24};
+    binary QueryBuffer with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_INFORMATION_REQ, " + DeviceIoRequest.ToString() + 
+            ", FsInformationClass: " + 
+            EnumToStringInSummary<DR_DRIVE_QUERY_INFORMATION_REQ_FsInformationClass>(FsInformationClass) + 
+            ", Length: " + Length.ToString();
+    }
+}
+pattern DR_DRIVE_QUERY_INFORMATION_REQ_FsInformationClass = enum uint
+{
+    FileBasicInformation = 0x00000004,
+    FileStandardInformation = 0x00000005,
+    FileAttributeTagInformation = 0x00000023,
+    ...
+};
+
+// 2.2.3.3.9   Server Drive Set Information Request (DR_DRIVE_SET_INFORMATION_REQ)
+message DR_DRIVE_SET_INFORMATION_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_SET_INFORMATION_REQ_FsInformationClass FsInformationClass
+        where ValidationCheckEnumValueTooManyItems(InRange<DR_DRIVE_SET_INFORMATION_REQ_FsInformationClass>(value), this, true, ReferenceType.Message,
+            "RDPEFS", "FsInformationClass", "DR_DRIVE_SET_INFORMATION_REQ", "DR_DRIVE_SET_INFORMATION_REQ", "[MS-RDPEFS]");
+    uint Length;
+    binary Padding with BinaryEncoding{Length = 24};
+    ([|FsInformationClass == 0x00000004|] FileBasicInformation | 
+    [|FsInformationClass == 0x00000014|] FileEndOfFileInformation | 
+    [|FsInformationClass == 0x0000000A|] RDP_FILE_RENAME_INFORMATION | 
+    [|FsInformationClass == 0x00000013|] FileAllocationInformation | 
+    binary) SetBuffer with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return "DR_DRIVE_SET_INFORMATION_REQ, " + DeviceIoRequest.ToString() + 
+            ", FsInformationClass: " + 
+            EnumToStringInSummary<DR_DRIVE_SET_INFORMATION_REQ_FsInformationClass>(FsInformationClass) + 
+            ", Length: " + Length.ToString();
+    }
+}
+pattern DR_DRIVE_SET_INFORMATION_REQ_FsInformationClass = enum uint
+{
+    FileBasicInformation = 0x00000004,
+    FileEndOfFileInformation = 0x00000014,
+    FileDispositionInformation = 0x0000000D,
+    FileRenameInformation = 0x0000000A,
+    FileAllocationInformation = 0x00000013,
+    ...
+};
+// 2.2.3.3.9.1   RDP_FILE_RENAME_INFORMATION
+type RDP_FILE_RENAME_INFORMATION
+{
+    byte ReplaceIfExists;
+    byte RootDirectory;
+    uint FileNameLength;
+    binary FileName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = FileNameLength};
+}
+
+// 2.2.3.3.10   Server Drive Query Directory Request (DR_DRIVE_QUERY_DIRECTORY_REQ)
+message DR_DRIVE_QUERY_DIRECTORY_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_QUERY_DIRECTORY_REQ_FsInformationClass FsInformationClass
+        where ValidationCheckEnumValue(InRange<DR_DRIVE_QUERY_DIRECTORY_REQ_FsInformationClass>(value), this, true, 
+            ReferenceType.Message, "RDPEFS", "FsInformationClass", "DR_DRIVE_QUERY_DIRECTORY_REQ", "0x00000001, 0x00000002, 0x00000003, 0x0000000C", value);
+    byte InitialQuery;
+    uint PathLength;
+    binary Padding with BinaryEncoding{Length = 23};
+    string Path with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = PathLength};
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_DIRECTORY_REQ, " + DeviceIoRequest.ToString() + 
+            ", FsInformationClass: " + 
+            EnumToStringInSummary<DR_DRIVE_QUERY_DIRECTORY_REQ_FsInformationClass>(FsInformationClass) + 
+            ", Path: " + Path.ToString();
+    }
+}
+pattern DR_DRIVE_QUERY_DIRECTORY_REQ_FsInformationClass = enum uint
+{
+    FileDirectoryInformation = 0x00000001,
+    FileFullDirectoryInformation = 0x00000002,
+    FileBothDirectoryInformation = 0x00000003,
+    FileNamesInformation = 0x0000000C,
+    ...
+};
+
+// 2.2.3.3.11   Server Drive NotifyChange Directory Request (DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ)
+message DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    byte WatchTree;
+    CompletionFilter CompletionFilter;
+    binary Padding with BinaryEncoding{Length = 27};
+    override string ToString()
+    {
+        return "DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_REQ, " + DeviceIoRequest.ToString() + 
+            ", CompletionFilter: " + EnumToStringInSummary<CompletionFilter>(CompletionFilter);
+    }
+}
+
+// 2.2.3.3.12   Server Drive Lock Control Request (DR_DRIVE_LOCK_REQ)
+message DR_DRIVE_LOCK_REQ
+{
+    DR_DEVICE_IOREQUEST DeviceIoRequest;
+    DR_DRIVE_LOCK_REQ_Operation Operation where ValidationCheckEnumValue(InRange<DR_DRIVE_LOCK_REQ_Operation>(value), this, 
+        true, ReferenceType.Message, "RDPEFS", "Operation", "DR_DRIVE_LOCK_REQ", "0x00000002, 0x00000003, 0x00000004, 0x00000005", value);
+    byte F with BinaryEncoding{Width = 1};
+    uint Padding with BinaryEncoding{Width = 31};
+    uint NumLocks;
+    binary Padding2 with BinaryEncoding{Length = 20};
+    array<RDP_LOCK_INFO> Locks with BinaryEncoding{Length = NumLocks};
+    override string ToString()
+    {
+        return "DR_DRIVE_LOCK_REQ, " + DeviceIoRequest.ToString() + 
+            ", Operation: " + EnumToStringInSummary<DR_DRIVE_LOCK_REQ_Operation>(Operation) + 
+            ", NumLocks:" + NumLocks.ToString();
+    }
+}
+pattern DR_DRIVE_LOCK_REQ_Operation = enum uint
+{
+    RDP_LOWIO_OP_SHAREDLOCK = 0x00000002,
+    RDP_LOWIO_OP_EXCLUSIVELOCK = 0x00000003,
+    RDP_LOWIO_OP_UNLOCK = 0x00000004,
+    RDP_LOWIO_OP_UNLOCK_MULTIPLE = 0x00000005,
+    ...
+};
+
+// 2.2.3.4.1   Client Drive Create Response (DR_DRIVE_CREATE_RSP)
+message DR_DRIVE_CREATE_RSP
+{
+    DR_CREATE_RSP DeviceCreateResponse;
+    override string ToString()
+    {
+        return "DR_DRIVE_CREATE_RSP, " + DeviceCreateResponse.ToString();
+    }
+}
+
+// 2.2.3.4.2   Client Drive Close Response (DR_DRIVE_CLOSE_RSP)
+message DR_DRIVE_CLOSE_RSP
+{
+    DR_CLOSE_RSP DeviceCloseResponse;
+    override string ToString()
+    {
+        return "DR_DRIVE_CLOSE_RSP, " + DeviceCloseResponse.ToString();
+    }
+}
+
+// 2.2.3.4.3   Client Drive Read Response (DR_DRIVE_READ_RSP)
+message DR_DRIVE_READ_RSP
+{
+    DR_READ_RSP DeviceReadResponse;
+    override string ToString()
+    {
+        return "DR_DRIVE_READ_RSP, " + DeviceReadResponse.ToString();
+    }
+}
+
+// 2.2.3.4.4   Client Drive Write Response (DR_DRIVE_WRITE_RSP)
+message DR_DRIVE_WRITE_RSP
+{
+    DR_WRITE_RSP DeviceWriteResponse;
+    override string ToString()
+    {
+        return "DR_DRIVE_WRITE_RSP, " + DeviceWriteResponse.ToString();
+    }
+}
+
+// 2.2.3.4.5   Client Drive Control Response (DR_DRIVE_CONTROL_RSP)
+message DR_DRIVE_CONTROL_RSP
+{
+    DR_CONTROL_RSP DeviceIoResponse;
+    override string ToString()
+    {
+        return "DR_DRIVE_CONTROL_RSP, " + DeviceIoResponse.ToString();
+    }
+}
+
+// 2.2.3.4.6   Client Drive Query Volume Information Response (DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP)
+message DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP[uint FsInformationClass]
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    // Length may be 0 when status is not success, no matter what the value of FsInformationClass is
+    ([|Length != 0 && FsInformationClass == 0x00000005|] FileFsAttributeInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000007|] FileFsFullSizeInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000003|] FileFsSizeInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000001|] FileFsVolumeInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000004|] FileFsDeviceInformation | 
+    binary) Buffer with BinaryEncoding{Length = Length};
+    optional byte Padding;
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_VOLUME_INFORMATION_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.7   Client Drive Set Volume Information Response (DR_DRIVE_SET_VOLUME_INFORMATION_RSP)
+message DR_DRIVE_SET_VOLUME_INFORMATION_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    override string ToString()
+    {
+        return "DR_DRIVE_SET_VOLUME_INFORMATION_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.8   Client Drive Query Information Response (DR_DRIVE_QUERY_INFORMATION_RSP)
+message DR_DRIVE_QUERY_INFORMATION_RSP[uint FsInformationClass]
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    // Length may be 0 when status is not success, no matter what the value of FsInformationClass is
+    ([|Length != 0 && FsInformationClass == 0x00000004|] FileBasicInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000005|] FileStandardInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000023|] FileAttributeTagInformation | 
+    binary) Buffer with BinaryEncoding{Length = Length};
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_INFORMATION_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.9   Client Drive Set Information Response (DR_DRIVE_SET_INFORMATION_RSP)
+message DR_DRIVE_SET_INFORMATION_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    optional byte Padding;
+    override string ToString()
+    {
+        return "DR_DRIVE_SET_INFORMATION_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.10   Client Drive Query Directory Response (DR_DRIVE_QUERY_DIRECTORY_RSP)
+message DR_DRIVE_QUERY_DIRECTORY_RSP[uint FsInformationClass]
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    // Length may be 0 when status is not success, no matter what the value of FsInformationClass is
+    ([|Length != 0 && FsInformationClass == 0x00000001|] FileDirectoryInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000002|] FileFullDirectoryInformation | 
+    [|Length != 0 && FsInformationClass == 0x00000003|] FileBothDirectoryInformation | 
+    [|Length != 0 && FsInformationClass == 0x0000000C|] FileNamesInformation | 
+    binary) Buffer with BinaryEncoding{Length = Length};
+    optional byte Padding;
+    override string ToString()
+    {
+        return "DR_DRIVE_QUERY_DIRECTORY_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.11   Client Drive NotifyChange Directory Response (DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP)
+message DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    uint Length;
+    array<FileNotifyInformation> Buffer with BinaryEncoding{Length = Length};
+    optional byte Padding;
+    override string ToString()
+    {
+        return "DR_DRIVE_NOTIFY_CHANGE_DIRECTORY_RSP, " + DeviceIoReply.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+// 2.2.3.4.12   Client Drive Lock Control Response (DR_DRIVE_LOCK_RSP)
+message DR_DRIVE_LOCK_RSP
+{
+    DR_DEVICE_IOCOMPLETION DeviceIoReply;
+    binary Padding with BinaryEncoding{Length = 5};
+    override string ToString()
+    {
+        return "DR_DRIVE_LOCK_RSP, " + DeviceIoReply.ToString();
+    }
+}
+
+// ---------------------type defined in other TD------------
+pattern File_Pipe_Printer_Access_Mask = flags ULONG // [MS-SMB2] 2.2.13.1.1   File_Pipe_Printer_Access_Mask
+{
+    FileReadData = 0x00000001
+        with Documentation
+            {Description = "This value indicates the right to read data from the file or named pipe."},
+    FileWriteData = 0x00000002
+        with Documentation
+            {Description = "This value indicates the right to write data into the file or named pipe beyond the end of the file."},
+    FileAppendData = 0x00000004
+        with Documentation
+            {Description = "This value indicates the right to append data into the file or named pipe."},
+    FileReadEa = 0x00000008
+        with Documentation
+            {Description = "This value indicates the right to read the extended attributes of the file or named pipe."},
+    FileWriteEa = 0x00000010
+        with Documentation
+            {Description = "This value indicates the right to write or change the extended attributes to the file or named pipe."},
+    FileExecute = 0x00000020
+        with Documentation
+            {Description = "This value indicates the right to execute the file."},
+    FileDeleteChild = 0x00000040
+        with Documentation
+            {Description = "This value indicates the right to delete entries within a directory."},
+    FileReadAttributes = 0x00000080
+        with Documentation
+            {Description = "This value indicates the right to read the attributes of the file."},
+    FileWriteAttributes = 0x00000100
+        with Documentation
+            {Description = "This value indicates the right to change the attributes of the file."},
+    Delete = 0x00010000
+        with Documentation
+            {Description = "This value indicates the right to delete the file."},
+    ReadControl = 0x00020000
+        with Documentation
+            {Description = "This value indicates the right to read the security descriptor for the file or named pipe."},
+    WriteDac = 0x00040000
+        with Documentation
+            {Description = "This value indicates the right to change the discretionary access control list(DACL) in the security descriptor for the file or named pipe. For the DACL data structure, see ACL in [MS-DTYP]."},
+    WriteOwner = 0x00080000
+        with Documentation
+            {Description = "This value indicates the right to change the owner in the security descriptor for the file or named pipe."},
+    Synchronize = 0x00100000
+        with Documentation
+            {Description = "SMB2 clients set this flag to any value.windows sets this flag to the value passed in by the higher-level application."},
+    AccessSystemSecurity = 0x01000000
+        with Documentation
+            {Description = "This value indicates the right to read or change the system access control list(SACL) in the security descriptor for the file or named pipe. For the SACL data structure, see ACL in [MS-DTYP].windows fails the create request with STATUS_ACCESS_DENIED if the caller does not have the SeSecurityPrivilege, as specified in [MS-LSAD] section ."},
+    MaximumAllowed = 0x02000000
+        with Documentation
+            {Description = "This value indicates that the client is requesting an open to the file with the highest level of access the client has on this file. If no access is granted for the client on this file, the server MUST fail the open with STATUS_ACCESS_DENIED."},
+    GenericAll = 0x10000000
+        with Documentation
+            {Description = "This value indicates a request for all the access flags that are previously listed except MAXIMUM_ALLOWED and ACCESS_SYSTEM_SECURITY."},
+    GenericExecute = 0x20000000
+        with Documentation
+            {Description = "This value indicates a request for the following combination of access flags listed above: FILE_READ_ATTRIBUTES| FILE_EXECUTE| SyncHRONIZE| READ_CONTROL."},
+    GenericWrite = 0x40000000
+        with Documentation
+            {Description = "This value indicates a request for the following combination of access flags listed above: FILE_WRITE_DATA| FILE_APPEND_DATA| FILE_WRITE_ATTRIBUTES| FILE_WRITE_EA| SyncHRONIZE| READ_CONTROL."},
+    GenericRead = 0x80000000
+        with Documentation
+            {Description = "This value indicates a request for the following combination of access flags listed above: FILE_READ_DATA| FILE_READ_ATTRIBUTES| FILE_READ_EA| SyncHRONIZE| READ_CONTROL."}
+    ...
+};
+
+pattern ShareAccess = flags ULONG // [MS-SMB2] 2.2.13   SMB2 CREATE Request
+{
+    FileShareRead = 0x00000001
+         with Documentation
+             {Description = "When set, indicates that other opens are allowed to read this file while this open is present. This bit MUST NOT be set for a named pipe or a printer file. Each open creates a new instance of a named pipe. Likewise, opening a printer file always creates a new file."},
+    FileShareWrite = 0x00000002
+         with Documentation
+             {Description = "When set, indicates that other opens are allowed to write this file while this open is present. This bit MUST NOT be set for a named pipe or a printer file. Each open creates a new instance of a named pipe. Likewise, opening a printer file always creates a new file."},
+    FileShareDelete = 0x00000004
+         with Documentation
+             {Description = "When set, indicates that other opens are allowed to delete or rename this file while this open is present. This bit MUST NOT be set for a named pipe or a printer file. Each open creates a new instance of a named pipe. Likewise, opening a printer file always creates a new file."},
+};
+
+pattern CreateDisposition = enum ULONG // [MS-SMB2] 2.2.13   SMB2 CREATE Request
+{
+    FileSupersede = 0x00000000,
+    FileOpen = 0x00000001,
+    FileCreate = 0x00000002,
+    FileOpenIf = 0x00000003,
+    FileOverWrite = 0x00000004,
+    FileOverWriteIf = 0x00000005,
+    ...
+};
+
+pattern CreateOptions = flags ULONG // [MS-SMB2] 2.2.13   SMB2 CREATE Request
+{
+    FileDirectoryFile = 0x00000001
+        with Documentation
+            {Description = "The file being created or opened is a directory file. With this flag, the CreateDisposition field MUST be set to FILE_CREATE, FILE_OPEN_IF, or FILE_OPEN. With this flag, only the following CreateOptions values are valid: FILE_WRITE_THROUGH, FILE_OPEN_FOR_BACKUP_INTENT, FILE_DELETE_ON_CLOSE, and FILE_OPEN_REPARSE_POINT. If the file being created or opened already exists and is not a directory file and FILE_CREATE is specified in the CreateDisposition field, then the server MUST fail the request with STATUS_OBJECT_NAME_COLLISION. If the file being created or opened already exists and is not a directory file and FILE_CREATE is not specified in the CreateDisposition field, then the server MUST fail the request with STATUS_NOT_A_DIRECTORY. The server MUST fail an invalid CreateDisposition field or an invalid combination of CreateOptions flags with STATUS_INVALID_PARAMETER."},
+    FileWriteThrough = 0x00000002
+        with Documentation
+            {Description = "The server MUST propagate writes to this open to persistent storage before returning success to the client on write operations."},
+    FileSequentialOnly = 0x00000004
+        with Documentation
+            {Description = "This indicates that the application intends to read or write at sequential offsets using this handle, so the server SHOULD optimize for sequential access. However, the server MUST accept any access pattern. This flag value is incompatible with the FILE_RANDOM_ACCESS value."},
+    FileNoIntermediateBuffering = 0x00000008
+        with Documentation
+            {Description = "The server or underlying object store SHOULD NOT cache data at intermediate layers and SHOULD allow it to flow through to persistent storage."},
+    FileSynchronousIoAlert = 0x00000010
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server.windows SMB2 clients do NOT initialize this bit. The bit contains the value specified by the caller when requesting the open."},
+    FileSynchronousIoNonalert = 0x00000020
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server.windows SMB2 clients do NOT initialize this bit. The bit contains the value specified by the caller when requesting the open."},
+    FileNonDirectoryFile = 0x00000040
+        with Documentation
+            {Description = "The file being opened MUST NOT be a directory file or the server MUST fail the request with STATUS_FILE_IS_A_DIRECTORY. This flag MUST NOT be used with FILE_DIRECTORY_FILE or the server MUST fail the request with STATUS_INVALID_PARAMETER."},
+    FileCompleteIfOplocked = 0x00000100
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server.windows SMB2 clients do not initialize this bit. The bit contains the value specified by the caller when requesting the open."},
+    FileNoEaKnowledge = 0x00000200
+        with Documentation
+            {Description = "The caller does not understand how to handle extended attributes. If the request includes an SMB2_CREATE_EA_BUFFER create context, then the server MUST fail this request with STATUS_ACCESS_DENIED. If extended attributes with the FILE_NEED_EA flag(see [MS-FSCC] section ) set are associated with the file being opened, then the server MUST fail this request with STATUS_ACCESS_DENIED."},
+    FileRandomAccess = 0x00000800
+        with Documentation
+            {Description = "This indicates that the application intends to read or write at random offsets using this handle, so the server SHOULD optimize for random access. However, the server MUST accept any access pattern. This flag value is incompatible with the FILE_SEQUENTIAL_ONLY value. If both FILE_RANDOM_ACCESS and FILE_SEQUENTIAL_ONLY are set, then FILE_SEQUENTIAL_ONLY is ignored."},
+    FileDeleteOnClose = 0x00001000
+        with Documentation
+            {Description = "The file MUST be automatically deleted when the last open request on this file is closed. When this option is set, the DesiredAccess field MUST include the DELETE flag. This option is often used for temporary files."},
+    FileOpenByFileID = 0x00002000
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and the server MUST fail the request with a STATUS_NOT_SUPPORTED error if this bit is set.windows SMB2 clients do not initialize this bit. The bit contains the value specified by the caller when requesting the open."},
+    FileOpenForBackupIntent = 0x00004000
+        with Documentation
+            {Description = "The file is being opened for backup intent. That is, it is being opened or created for the purposes of either a backup or a restore operation. The server MAY check to ensure that the caller is capable of overriding whatever security checks have been placed on the file to allow a backup or restore operation to occur. The server MAY check for access rights to the file before checking the DesiredAccess field."},
+    FileNoCompression = 0x00008000
+        with Documentation 
+            {Description = "The file cannot be compressed. This bit is ignored when FILE_DIRECTORY_FILE is set in CreateOptions."},
+    FileOpenRemoteInstance = 0x00000400
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server."},
+    FileOpenRequiringOplock = 0x00010000
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server."},
+    FileDisallowExclusive = 0x00020000
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and MUST be ignored by the server."},
+    FileReserveOpfilter = 0x00100000
+        with Documentation
+            {Description = "This bit SHOULD be set to 0 and the server MUST fail the request with a STATUS_NOT_SUPPORTED error if this bit is set.windows SMB2 clients do not initialize this bit. The bit contains the value specified by the caller when requesting the open."},
+    FileOpenReparsePoint = 0x00200000
+        with Documentation
+            {Description = "If the file or directory being opened is a reparse point, open the reparse point itself rather than the target that the reparse point references."},
+    FileOpenNoRecall = 0x00400000
+        with Documentation
+            {Description = "In an HSM(Hierarchical Storage Management) environment, this flag means the file SHOULD NOT be recalled from tertiary storage such as tape. The recall can take several minutes. The caller can specify this flag to avoid those delays."},
+    FileOpenForFreeSpaceQuery = 0x00800000
+        with Documentation
+            {Description = "Open file to query for free space. The client SHOULD set this to 0 and the server MUST ignore it.windows_vista and windows_server_2008-based clients will set this bit when it is requested by the application.windows_vista, windows_server_2008, and windows_7-based clients will set this bit when it is requested by the application."}
+    ...
+};
+
+pattern CompletionFilter =  flags ULONG // [MS-SMB2] 2.2.35   SMB2 CHANGE_NOTIFY Request
+{
+    FileNotifyChangeFileName = 0x00000001,
+    FileNotifyChangeDirName = 0x00000002,
+    FileNotifyChangeAttributes = 0x00000004,
+    FileNotifyChangeSize = 0x00000008,
+    FileNotifyChangeLastWrite = 0x00000010,
+    FileNotifyChangeLastAccess = 0x00000020,
+    FileNotifyChangeCreation = 0x00000040,
+    FileNotifyChangeEa = 0x00000080,
+    FileNotifyChangeSecurity = 0x00000100,
+    FileNotifyChangeStreamName = 0x00000200,
+    FileNotifyChangeStreamSize = 0x00000400,
+    FileNotifyChangeStreamWrite = 0x00000800,
+};
+
+type FileAllocationInformation // [MS-FSCC] 2.4.4   FileAllocationInformation
+{
+    long AllocationSize;
+}
+
+type FileAttributeTagInformation // [MS-FSCC] 2.4.6   FileAttributeTagInformation
+{
+    FileAttributes FileAttributes;
+    ReparseTags ReparseTag;
+}
+pattern ReparseTags = enum uint
+{
+    IOReparseTagReservedZero                    = 0x00000000,
+    IOReparseTagReservedOne                     = 0x00000001,
+    IOReparseTagMountPoint                      = 0xA0000003,
+    IOReparseTagHSM                             = 0xC0000004,
+    IOReparseTagHSM2                            = 0x80000006,
+    IOReparseTagDriverExtender                  = 0x80000005,
+    IOReparseTagSIS                             = 0x80000007,
+    IOReparseTagDFS                             = 0x8000000A,
+    IOReparseTagDFSR                            = 0x80000012,
+    IOReparseTagFilterManager                   = 0x8000000B,
+    IOReparseTagSymlink                         = 0xA000000C,
+    ...
+};
+
+type FileBasicInformation // [MS-FSCC] 2.4.7   FileBasicInformation
+{
+    FILETIME CreationTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME ChangeTime;
+    FileAttributes  FileAttributes;
+    // uint Reserved; // errata on https://msdn.microsoft.com/en-us/library/dn785069.aspx#BKMK_RDPEFS, TD has not been updated
+}
+
+type FileBothDirectoryInformation // [MS-FSCC] 2.4.8   FileBothDirectoryInformation
+{
+    uint NextEntryOffset;
+    uint FileIndex;
+    FILETIME CreationTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME ChangeTime;
+    long EndOfFile;
+    long AllocationSize;
+    FileAttributes FileAttributes;
+    uint FileNameLength;
+    uint EaSize;
+    byte ShortNameLength;
+    string ShortName with BinaryEncoding{Length = (24 / 2)};
+    string FileName  with BinaryEncoding{Length = (FileNameLength / 2)};
+    optional [|NextEntryOffset != 0 && (FileNameLength + 6) % 8 != 0|] binary Padding with BinaryEncoding{Length = ConvertToValidLength((NextEntryOffset - 94 - FileNameLength))};
+}
+
+type FileDirectoryInformation // [MS-FSCC] 2.4.10   FileDirectoryInformation
+{
+    uint NextEntryOffset;
+    uint FileIndex;
+    FILETIME CreationTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME ChangeTime;
+    long EndOfFile;
+    long AllocationSize;
+    FileAttributes FileAttributes;
+    uint FileNameLength;
+    string FileName with BinaryEncoding{Length = (FileNameLength / 2)};
+    optional [|NextEntryOffset != 0 && FileNameLength % 8 != 0|] binary Padding with BinaryEncoding{Length = ConvertToValidLength((NextEntryOffset - 64 - FileNameLength))};
+}
+
+type FileEndOfFileInformation // [MS-FSCC] 2.4.13   FileEndOfFileInformation
+{
+    long EndOfFile where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, ReferenceType.Type, "FSCC", "EndOfFile", "FileEndOfFileInformation", INFRASTRUCTURE_STR_ZERO, value);
+}
+
+type FileFullDirectoryInformation // [MS-FSCC] 2.4.14   FileFullDirectoryInformation
+{
+    uint NextEntryOffset;
+    uint FileIndex;
+    FILETIME CreationTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME ChangeTime;
+    long EndOfFile;
+    long AllocationSize;
+    FileAttributes FileAttributes;
+    uint FileNameLength;
+    uint EaSize;
+    string FileName with BinaryEncoding{Length = (FileNameLength / 2)};
+    optional [|NextEntryOffset != 0 && (FileNameLength + 4) % 8 != 0|] binary Padding with BinaryEncoding{Length = ConvertToValidLength((NextEntryOffset - 68 - FileNameLength))};
+}
+
+type FileNamesInformation // [MS-FSCC] 2.4.26   FileNamesInformation
+{
+    uint NextEntryOffset;
+    uint FileIndex;
+    uint FileNameLength;
+    string FileName with BinaryEncoding{Length = (FileNameLength / 2)};
+    optional [|NextEntryOffset != 0 && ((FileNameLength + 4) % 8) != 0|] binary Padding with BinaryEncoding{Length = ConvertToValidLength((NextEntryOffset - 12 - FileNameLength))};
+}
+
+type FileStandardInformation // [MS-FSCC] 2.4.38   FileStandardInformation
+{
+    long AllocationSize;
+    long EndOfFile where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, ReferenceType.Type, "RDPEFS", "EndOfFile", "FileStandardInformation", INFRASTRUCTURE_STR_ZERO, value);
+    uint NumberOfLinks;
+    BOOLEAN DeletePending;
+    BOOLEAN Directory;
+    // ushort Reserved; // errata on https://msdn.microsoft.com/en-us/library/dn785069.aspx#BKMK_RDPEFS, TD has not been updated
+}
+
+type FileNotifyInformation // [MS-FSCC] 2.4.42   FileNotifyInformation
+{
+    ULONG NextEntryOffset where ValidationCheck(0 == NextEntryOffset % 4, null, DiagnosisLevel.Error, "RDPEFS: The NextEntryOffset field in type FileNotifyInformation must always be an integral multiple of 4.");
+    FileNotifyInformationAction Action
+        where ValidationCheckValueInRange(value >= 0x00000001 && value <= 0x00000005, null, true, ReferenceType.Type, "RDPEFS", "Action", "FileNotifyInformation", 0x00000001, 0x00000005, value);
+    ULONG FileNameLength;
+    string FileName with BinaryEncoding{Length = FileNameLength / 2};
+    optional [|NextEntryOffset > FileNameLength + 12|] array<byte> EntryPadding with BinaryEncoding{Length = NextEntryOffset - FileNameLength - 12};
+
+    override string ToString()
+    {
+        return "FileNotifyInformation, " + EnumToString<FileNotifyInformationAction>(Action) + ", FileName: " + FileName;
+    }
+}
+
+pattern FileNotifyInformationAction = enum ULONG
+{
+    FileActionAdded = 0x00000001,
+    FileActionRemoved = 0x00000002,
+    FileActionModified = 0x00000003,
+    FileActionRenamedOldName = 0x00000004,
+    FileActionRenamedNewName = 0x00000005,
+    ...
+};
+
+type FileFsAttributeInformation // [MS-FSCC] 2.5.1   FileFsAttributeInformation
+{
+    FileSystemAttributes FileSystemAttributes;
+    int MaximumComponentNameLength where ValidationCheckValueInRange(value >= 1 && value <= 510, null, true, 
+        ReferenceType.Type, "RDPEFS", "MaximumComponentNameLength", "FileFsAttributeInformation", 1, 510, value);
+    uint FileSystemNameLength where ValidationCheckGreaterThan(value > 0, null, true, ReferenceType.Type, 
+        "RDPEFS", "FileSystemNameLength", "FileFsAttributeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    string FileSystemName with BinaryEncoding{Length = (FileSystemNameLength / 2)};
+}
+type FileSystemAttributes
+{
+    bool FileSupportsReparsePoints              with BinaryEncoding{Width = 1}; // 0x00000080
+    bool FileSupportsSparseFiles                with BinaryEncoding{Width = 1}; // 0x00000040
+    bool FileVolumeQuotas                       with BinaryEncoding{Width = 1}; // 0x00000020
+    bool FileFileCompression                    with BinaryEncoding{Width = 1}; // 0x00000010
+    bool FilePersistentACLS                     with BinaryEncoding{Width = 1}; // 0x00000008
+    bool FileUnicodeOnDisk                      with BinaryEncoding{Width = 1}; // 0x00000004
+    bool FileCasePreservedNames                 with BinaryEncoding{Width = 1}; // 0x00000002
+    bool FileCaseSensitiveSearch                with BinaryEncoding{Width = 1}; // 0x00000001
+    
+    bool FileVolumeIsCompressed                 with BinaryEncoding{Width = 1}; // 0x00008000
+    byte Reserved1                              with BinaryEncoding{Width = 6};
+    bool FileSupportsRemoteStorage              with BinaryEncoding{Width = 1}; // 0x00000100
+    
+    bool FileSupportsExtendedattribuTES         with BinaryEncoding{Width = 1}; // 0x00800000
+    bool FileSupportsHardlinks                  with BinaryEncoding{Width = 1}; // 0x00400000
+    bool FileSupportsTransactions               with BinaryEncoding{Width = 1}; // 0x00200000
+    bool FileSequentialwriteonce                with BinaryEncoding{Width = 1}; // 0x00100000
+    bool FileReadonlyvolume                     with BinaryEncoding{Width = 1}; // 0x00080000
+    bool FileNamedstreams                       with BinaryEncoding{Width = 1}; // 0x00040000
+    bool FileSupportsencryption                 with BinaryEncoding{Width = 1}; // 0x00020000
+    bool FileSupportsobjectids                  with BinaryEncoding{Width = 1}; // 0x00010000
+    
+    byte Reserved2                              with BinaryEncoding{Width = 5};
+    bool FileSupportIntegrityStreams            with BinaryEncoding{Width = 1}; // 0x04000000
+    bool FileSupportsusnjournal                 with BinaryEncoding{Width = 1}; // 0x02000000
+    bool FileSupportsopenbyfileid               with BinaryEncoding{Width = 1}; // 0x01000000
+}
+
+type FileFsFullSizeInformation // [MS-FSCC] 2.5.4   FileFsFullSizeInformation
+{
+    long TotalAllocationUnits where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, 
+        ReferenceType.Type, "RDPEFS", "TotalAllocationUnits", "FileFsFullSizeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    long CallerAvailableAllocationUnits where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, 
+        ReferenceType.Type, "RDPEFS", "CallerAvailableAllocationUnits", "FileFsFullSizeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    long ActualAvailableAllocationUnits where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, 
+        ReferenceType.Type, "RDPEFS", "ActualAvailableAllocationUnits", "FileFsFullSizeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    uint SectorsPerAllocationUnit;
+    uint BytesPerSector;
+}
+
+type FileFsLabelInformation // [MS-FSCC] 2.5.5   FileFsLabelInformation
+{
+    uint VolumeLabelLength;
+    string VolumeLabel with BinaryEncoding{Length = (VolumeLabelLength / 2)};
+}
+
+type FileFsSizeInformation // [MS-FSCC] 2.5.8   FileFsSizeInformation
+{
+    long TotalAllocationUnits where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, 
+        ReferenceType.Type, "RDPEFS", "TotalAllocationUnits", "FileFsSizeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    long AvailableAllocationUnits where ValidationCheckGreaterThanOrEqualTo(value >= 0, null, true, 
+        ReferenceType.Type, "RDPEFS", "AvailableAllocationUnits", "FileFsSizeInformation", INFRASTRUCTURE_STR_ZERO, value);
+    uint SectorsPerAllocationUnit;
+    uint BytesPerSector;
+}
+
+type FileFsVolumeInformation // [MS-FSCC] 2.5.9   FileFsVolumeInformation
+{
+    FILETIME VolumeCreationTime;
+    uint VolumeSerialNumber;
+    uint VolumeLabelLength;
+    BOOLEAN SupportsObjects;
+    string VolumeLabel with BinaryEncoding{Length = VolumeLabelLength / 2};
+}
+
+type FileFsDeviceInformation // [MS-FSCC] 2.5.10   FileFsDeviceInformation
+{
+    FileDeviceType DeviceType where ValidationCheckEnumValue(InRange<FileDeviceType>(value), null, true, 
+        ReferenceType.Type, "RDPEFS", "DeviceType", "FileFsDeviceInformation", "0x00000002, 0x00000007", value);
+    Characteristics Characteristics;
+}
+pattern FileDeviceType = enum uint
+{
+    FILE_DEVICE_CD_ROM     = 0x00000002,
+    FILE_DEVICE_DISK    = 0x00000007,
+    ...
+};
+pattern Characteristics = flags uint
+{
+    FileVirtualVolume                    = 0x00000040
+        with Documentation
+            {Description = "The volume does not directly reside on storage media, but resides on some other type of media (memory for example)."},
+    FileDeviceIsMounted                  = 0x00000020
+        with Documentation
+            {Description = "A file system is mounted on the device."},
+    FileRemoteDevice                     = 0x00000010
+        with Documentation
+            {Description = "The volume is for a remote file system like SMB or CIFS."},
+    FileWriteOnceMedia                   = 0x00000008
+        with Documentation
+            {Description = "The device supports write-once media."},
+    FileFloppyDiskette                   = 0x00000004
+        with Documentation
+            {Description = "The device is a floppy disk device."},
+    FileReadOnlyDevice                   = 0x00000002
+        with Documentation
+            {Description = "The device cannot be written to."},
+    FileRemovableMedia                   = 0x00000001
+        with Documentation
+            {Description = "The storage device supports removable media."},
+    FileCharacteristicWebdavDevice       = 0x00002000
+        with Documentation
+            {Description = "A web-based Distributed Authoring and Versioning (WebDAV) file system is mounted on the device."},
+    FileCharacteristicTSDevice           = 0x00001000
+        with Documentation
+            {Description = "The device object is part of a Terminal Services device stack."},
+    FileDeviceSecureOpen                 = 0x00000100
+        with Documentation
+            {Description = "By default, volumes do not check the ACL associated with the volume, but instead use the ACLs associated with individual files on the volume."},
+    ...
+};
+
+pattern FileAttributes = flags uint // [MS-FSCC] 2.6   File Attributes
+{
+    FileAttributeNormal                = 0x00000080
+        with Documentation
+            {Description = "A file that does not have other attributes set."},
+    FileAttributeArchive               = 0x00000020
+        with Documentation
+            {Description = "A file or directory that requires to be archived."},
+    FileAttributeDirectory             = 0x00000010
+        with Documentation
+            {Description = "This item is a directory."},
+    FileAttributeSystem                = 0x00000004
+        with Documentation
+            {Description = "A file or directory that the operating system uses a part of or uses exclusively."},
+    FileAttributeHidden                = 0x00000002
+        with Documentation
+            {Description = "A file or directory that is hidden."},
+    FileAttributeReadonly              = 0x00000001
+        with Documentation
+            {Description = "A file or directory that is read-only."},
+    FileAttributeIntegrityStream       = 0x00008000
+        with Documentation
+            {Description = "A file or directory that is configured with integrity support."},
+    FileAttributeEncrypted             = 0x00004000
+        with Documentation
+            {Description = "A file or directory that is encrypted."},
+    FileAttributeNotContentIndexed     = 0x00002000
+        with Documentation
+            {Description = "A file or directory that is not indexed by the content indexing service."},
+    FileAttributeOffline               = 0x00001000
+        with Documentation
+            {Description = "The data in this file is not available immediately."},
+    FileAttributeCompressed            = 0x00000800
+        with Documentation
+            {Description = "A file or directory that is compressed."},
+    FileAttributeReparsePoint          = 0x00000400
+        with Documentation
+            {Description = "A file or directory that has an associated reparse point."},
+    FileAttributeSparseFile            = 0x00000200
+        with Documentation
+            {Description = "A file that is a sparse file."},
+    FileAttributeTemporary             = 0x00000100
+        with Documentation
+            {Description = "A file that is being used for temporary storage."},
+    FileAttributeNoScrubData           = 0x00020000
+        with Documentation
+            {Description = "A file or directory that is configured to be excluded from the data integrity scan."},
+    ...
+};
+
+// workaround the OPN codec issue
+// field length in BinaryEncodingAspect is defined as "uint"
+// however, in runtime, the length will be convert to "int". And also "byte" will be converted to "bit". 
+// In such situation, aspect "WidthForComposedType" in SMB will not affect if value of length is negative.
+// So value of length must be positive after the convertion "(length << 3) as int"
+uint ConvertToValidLength(uint length)
+{
+    return length & 0x0fffffff;
+}

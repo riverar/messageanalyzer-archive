@@ -1,0 +1,334 @@
+protocol SSL
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "The Secure Sockets Layer (SSL) Protocol Version 3.0",
+    ShortName = "SSL",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 6101"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382197", Date = "10/15/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using TLS;
+using TCP;
+using DecodingUtility;
+
+message RecordLayers : TLS.RecordLayers
+{
+    override string ToString()
+    {
+        return base.ToString();
+    }
+}
+
+message IncompleteRecordLayer : TLS.IncompleteRecordLayer
+{
+    override string ToString()
+    {
+        return base.ToString();
+    }
+}
+
+message V2ClientHello : TLS.V2ClientHello
+{
+    override string ToString()
+    {
+        return base.ToString();
+    }
+}
+
+// -------------------------------- SSL Decoding ----------------------------------
+type SSLDecodingHelper : TCPDecodingHelper
+{
+    void InitializeSSLHelper(TLS.Server ept)
+    {
+        SSLOverTCPDecodingCache acceptsCache;
+        SSLOverTCPDecodingCache issuesCahce;
+        InitializeSSLOverTCPDecodingCachePair(ref acceptsCache, ref issuesCahce, ept);
+        AcceptsCache = acceptsCache;
+        IssuesCache = issuesCahce;
+    }
+}
+
+optional any message DecodeIncompleteSSLRecordLayer(binary buffer, ref DecodingCacheContextWrapper contextWrapper, any decodingCache)
+{
+    var dc = decodingCache as DecodingUtility.StreamDecodingCache;
+    if (buffer != null && IsSSLHeader(buffer))
+    {
+        if (IsV2ClientHello(buffer))
+        {
+            contextWrapper.Context.HasChangeCipherSent = false;
+            if (BinaryDecoder<V2ClientHello>(buffer) is v2ClientHello:V2ClientHello)
+            {
+                return v2ClientHello;
+            }
+        }
+        else
+        {
+            stream s = buffer;
+            var res = SSLDecoder(s, contextWrapper.Context);
+            if (res is rls:RecordLayers)
+            {
+                ResetAfterDecodeIncompleteMessage(rls, s, ref contextWrapper, dc);
+                if (contextWrapper.IsInDestructor)
+                {
+                    DisplayTopLevelMessage(rls);
+                }
+                else
+                {
+                    dc.DispatchMessage(rls);
+                }
+            }
+            if (s.RemainingByteLength >= 5 &&
+                IsSSLHeader(s.PeekBytes(s.BitPosition, 5)) &&
+                BinaryDecoder<IncompleteRecordLayer>(dc.Buffer) is m:IncompleteRecordLayer)
+            {
+                return m as any message;
+            }
+        }
+    }
+    return nothing;
+}
+
+type SSLOverTCPDecodingCache : TLSOverTCPDecodingCache
+{    
+    void InitializeSSLCache(any endpoint ept, MessageDirection direction)
+    {
+        base.Initialize("SSL", ept, direction, IsSSLHeaderNullable, IsCompleteTlsRL, DecodeSSLMessage, DecodeIncompleteSSLRecordLayer);
+        Wrapper.Context = new SessionContext();
+        Wrapper.GetPayloadLength = GetTCPSegmentPayloadLength;
+    }
+
+    optional any message DecodeSSLMessage(stream s)
+    {
+        var res = SSLDecoder(s, Wrapper.Context);
+        if (res != nothing)
+        {
+            return res as any message;
+        }
+        return nothing;
+    }
+
+    optional any message DecodeIncompleteSSLRecordLayer(binary buffer)
+    {
+        return DecodeIncompleteSSLRecordLayer(buffer, ref Wrapper, this);
+    }
+}
+
+void InitializeSSLOverTCPDecodingCachePair(ref SSLOverTCPDecodingCache requestCache, ref SSLOverTCPDecodingCache responseCache, TLS.Server server)
+{
+    requestCache = new SSLOverTCPDecodingCache();
+    requestCache.InitializeSSLCache(server, MessageDirection.Accepts);
+        
+    responseCache = new SSLOverTCPDecodingCache();
+    responseCache.InitializeSSLCache(server, MessageDirection.Issues);
+        
+    responseCache.Wrapper.Context.ContextChanged = requestCache.Wrapper.Context.UpdateContext;
+}
+
+type SSLOverHTTPDecodingCache : TLSStreamDecodingCache
+{
+    void InitializeSSLCache(any endpoint ept, MessageDirection direction, int(any message) getPayloadLengthFunc)
+    {
+        assert getPayloadLengthFunc != null;
+
+        base.Initialize("SSL", ept, direction, IsSSLHeaderNullable, IsCompleteTlsRL, DecodeSSLMessage, DecodeIncompleteSSLRecordLayer);
+        Wrapper.Context = new SessionContext();
+        Wrapper.GetPayloadLength = getPayloadLengthFunc;
+    }
+
+    optional any message DecodeSSLMessage(stream s)
+    {
+        var res = SSLDecoder(s, Wrapper.Context);
+        if (res != nothing)
+        {
+            return res as any message;
+        }
+        return nothing;
+    }
+
+    optional any message DecodeIncompleteSSLRecordLayer(binary buffer)
+    {
+        return DecodeIncompleteSSLRecordLayer(buffer, ref Wrapper, this);
+    }
+}
+
+void InitializeSSLOverHTTPDecodingCachePair(ref SSLOverHTTPDecodingCache requestCache, ref SSLOverHTTPDecodingCache responseCache, TLS.Server server, int(any message) getPayloadLength)
+{
+    requestCache = new SSLOverHTTPDecodingCache();
+    requestCache.InitializeSSLCache(server, MessageDirection.Accepts, getPayloadLength);
+        
+    responseCache = new SSLOverHTTPDecodingCache();
+    responseCache.InitializeSSLCache(server, MessageDirection.Issues, getPayloadLength);
+        
+    responseCache.Wrapper.Context.ContextChanged = requestCache.Wrapper.Context.UpdateContext;
+}
+
+bool IsSSLHeader(binary data)
+{
+    return IsSSLHeaderNullable(data) == true;
+}
+bool? IsSSLHeaderNullable(binary data)
+{
+    // according to definition, there should be at least 5 bytes before fragment, ContentType, ProtocolVersion, Length    
+    if (data.Count < 5)
+        return null;
+    
+    // For V2ClientHello message, the highest bit MUST be 1.
+    if ((data[0] & 0x80) != 0)
+    {
+        return IsV2ClientHello(data);
+    }
+    else if (data[1] == 0x03 &&
+            data[2] == 0x00 &&
+            InRange<TLS.ContentType>(data[0])) // Currently, we only support SSL 3.0 [RFC 6101] message parsing.
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+bool IsSslHeaderBySegment(TCP.TCPDecodingCache cache, Segment s)
+{
+    if (cache == null)
+    {
+        return false;
+    }
+
+    binary bin = cache.GetPayloadWithoutOverlapping(s);
+    return bin == null || IsSSLHeader(bin); // bin == null means it is a fully-retransmitted segment
+}
+
+bool IsV2ClientHello(binary data)
+{
+    if (data.Count >= 5 && 
+        ((data[0] & 0x80) != 0) &&
+        data[2] == 1 &&
+        data[3] == 3 &&
+        data[4] == 0)
+    {
+        return true;
+    }
+
+    return false;
+}
+
+optional (RecordLayers | V2ClientHello) SSLDecoder(stream s, TLS.SessionContext context)
+{
+    if (s.RemainingByteLength < 5)
+    {
+        return nothing;
+    }
+    
+    if (IsV2ClientHello(s.PeekBytes(s.BitPosition, 5)))
+    {
+        context.HasChangeCipherSent = false;
+        return (TLS.GetTLSRecordLength(s.PeekBytes(s.BitPosition, 5)) <= s.RemainingByteLength) ? BinaryDecoder<V2ClientHello>(s) : nothing;
+    }
+    
+    array<RecordLayer> recordArray = [];
+    int prePos = s.BitPosition;
+    int startPos = prePos;
+    array<DataChunks> chunks = [];
+    while (s.RemainingByteLength >= 5 && TLS.GetTLSRecordLength(s.PeekBytes(s.BitPosition, 5)) <= s.RemainingByteLength)
+    {
+        if (s.RemainingByteLength >= TLSHelloMessage_Length 
+            && IsUnencryptedHelloMessage(s.PeekBytes(s.BitPosition, 11)))
+        {
+            context.Reset();
+        }
+        
+        var res = BinaryDecoder<RecordLayer[context.IsEncrypted(s.CurrentByte), context.GetMacLength()]>(s);
+        if (res == nothing)
+        {
+            break;
+        }
+        
+        RecordLayer msg = res as RecordLayer;
+        if (msg.$"type" is ContentType.handshake &&
+            msg.fragment is hsArray:array<Handshake>)
+        {
+            foreach (Handshake hs in hsArray)
+            {
+                if (hs.msg_type is HandshakeType.server_hello &&
+                    hs.body is sh:ServerHello)
+                {
+                    context.IsEncryptedCipher = !(sh.cipher_suite in UnencryptedCipher);
+                    context.mac_length = GetMACLength(sh.cipher_suite);
+                    context.HasChangeCipherSent = false;
+                    if (context.ContextChanged != null)
+                    {
+                        context.ContextChanged(context);
+                    }
+                }
+                else if (hs.msg_type is HandshakeType.client_hello)
+                {
+                    context.HasChangeCipherSent = false;
+                }
+            }
+        }
+        else if (msg.$"type" is ContentType.change_cipher_spec)
+        {
+            context.HasChangeCipherSent = true;
+        }
+        
+        recordArray += [msg];
+        chunks += [new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitPosition - prePos}]}];
+        prePos = s.BitPosition;
+    }
+    
+    if (recordArray.Count == 0)
+    {
+        return nothing;
+    }
+    
+    RecordLayers recordLayers = new RecordLayers{records = recordArray};
+    recordLayers.SourceData = s.PeekBytes(startPos, (s.BytePosition - startPos / 8) as int);
+    DataChunks payloadChunk = new DataChunks
+    {
+        DataSource = s, 
+        Chunks = [new BinaryChunk{BitPosition = startPos, BitLength = s.BitPosition - startPos}]
+    };
+    recordLayers.AssociateArrayField("records", chunks);
+    recordLayers.AssociateField("records", payloadChunk);
+    
+    return recordLayers;
+}
+
+// Decoding SSL message and dispatch
+void TryDecodingAndDispatchingSSLMessage(binary bin, TLS.SessionContext context, TLS.Server server, MessageDirection direction)
+{
+    bool isV2ClientHello = IsV2ClientHello(bin);
+        
+    var res = SSLDecoder(bin, context);
+    if (res is rls:RecordLayers)
+    {
+        if (direction == MessageDirection.Accepts)
+        {
+            dispatch server accepts rls;
+        }
+        else
+        {
+            dispatch server issues rls;
+        }
+    }
+    else
+    {
+        ThrowDecodingException("SSL", isV2ClientHello ? "V2ClientHello" : "RecordLayers");
+    }
+}

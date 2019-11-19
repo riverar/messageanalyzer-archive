@@ -1,0 +1,331 @@
+protocol LLDP with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Link Layer Discovery Protocol",
+    ShortName = "LLDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "IEEE Std 802.1AB", Version = "2005 Edition", Link = "http://standards.ieee.org/getieee802/download/802.1AB-2005.pdf"},
+            new Reference{Name = "LLDP-Protocol-00", Version = "2002 Edition", Link = "http://www.ieee802.org/1/files/public/docs2002/lldp-protocol-00.pdf"},
+            new Reference{Name = "Entity MIB (Version 2)", Version = "1999 Edition", Link = " http://datatracker.ietf.org/doc/rfc2737/"},
+            new Reference{Name = "IANA-ADDRESS", Version = "2002 Edition", Link = "http://www.iana.org/assignments/ianaaddressfamilynumbers-mib"},
+            new Reference{Name = "Address Family Numbers", Version = "2011 Edition", Link = " http://www.iana.org/assignments/address-family-numbers/address-family-numbers.xml"},
+        ],
+       
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "356548", Date = "11/16/2013"},
+        ]
+};
+
+using Standard;
+using Ethernet;
+using Utility;
+
+endpoint Node accepts DataUnit;
+
+// Since Bug 36618, change all the "binding" to actor temporarily.
+//binding LLDPOverEhternet:Node over Ethernetnode: Ethernet.Node
+//{
+    //rule Ethernetnode accepts Ethernet.Frame{LengthOrType is $35020, MacClientData is dataunit:DataUnit
+        //from DataUnitDecoder} where value.DestinationAddress.FlatAddress in [$[0180C200000E], $[0180C2000003], $[0180C2000000]]         => Node accepts dataunit;
+//}
+
+const set<binary> LLDPAddress = {$[0180C200000E], $[0180C2000003], $[0180C2000000]};
+
+autostart actor LLDPOverEhternet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType == 35020
+        && LLDPAddress[f.DestinationAddress.FlatAddress]
+    {
+        switch (f.MacClientData)
+        {
+            case dataunit:DataUnit from BinaryDecoder<DataUnit> =>
+                dispatch (endpoint Node over node) accepts dataunit;
+            default => 
+                ThrowDecodingException("LLDP");
+        }
+    }
+}
+
+message DataUnit
+{
+    ChassisIDTLV ChassisID;
+    PortIDTLV PortID;
+    TimeToLiveTLV TimeToLive;
+    array<OptionalTLV> OptionalTLVs where ValidationCheck(CheckOptionalTLVs(value, this), this, "LLDP: The message DataUint cannot be decoded successfully due to that an LLDP PDU should contain exactly one Time To Live TLV.");
+    EndOfLLDPTLV EndOfLLDP;
+           
+    override string ToString()
+    {
+        return "ChassisSubType: " + (ChassisID.ChassisIDInfo as string)
+            + ", PortSubType: " + (PortID.portIDInfo as string)
+            + ", TimeToLive: " + (TimeToLive.TimeToLiveValues as string) + " Sec";
+     }
+}
+
+bool CheckOptionalTLVs(array<OptionalTLV> optionalTLVs, DataUnit dU)
+{
+    int portDescriptionTLVCount = 0;
+    int systemNameTLVCount = 0;
+    int systemDescriptionTLVCount = 0;
+    int systemCapabilitiesTLVCount = 0;
+    int managementAddressTLVCount = 0;
+    bool result = true;
+    foreach (OptionalTLV tlv in optionalTLVs)
+    {
+        if (tlv is TimeToLiveTLV)
+        {
+            result = false;
+        }
+        else if (tlv is PortDescriptionTLV)
+        {
+            portDescriptionTLVCount++;
+        }
+        else if (tlv is SystemNameTLV)
+        {
+            systemNameTLVCount++;
+        }
+        else if (tlv is SystemDescriptionTLV)
+        {
+            systemDescriptionTLVCount++;
+        }
+        else if (tlv is SystemCapabilitiesTLV)
+        {
+            systemCapabilitiesTLVCount++;
+        }
+        else if (tlv is ManagementAddressTLV)
+        {
+            managementAddressTLVCount++;
+        }
+    }
+    
+    if (portDescriptionTLVCount > 1)
+    {
+        ValidationCheck(false, dU, "LLDP: The count of PortDecscriptionTLV should not be greater than 1.");
+    }
+    if (systemNameTLVCount > 1)
+    {
+        ValidationCheck(false, dU, "LLDP: The count of SystemNameTLV should not be greater than 1.");
+    }
+    if (systemDescriptionTLVCount > 1)
+    {
+        ValidationCheck(false, dU, "LLDP: The count of SystemDescriptionTLV should not be greater than 1.");
+    }
+    if (systemCapabilitiesTLVCount > 1)
+    {
+        ValidationCheck(false, dU, "LLDP: The count of SystemCapabilitiesTLV should not be greater than 1.");
+    }
+    if (portDescriptionTLVCount > 1 || systemNameTLVCount > 1 || systemDescriptionTLVCount > 1 || systemCapabilitiesTLVCount > 1)
+    {
+        ValidationCheck(managementAddressTLVCount <= 1, dU, "LLDP: The count of ManagementAddressTLV should be no greater than 1.");
+    }
+    return result;
+}
+
+pattern OptionalTLV = PortDescriptionTLV |
+                      SystemNameTLV |
+                      SystemDescriptionTLV |
+                      SystemCapabilitiesTLV |
+                      ManagementAddressTLV |
+                      OrganizationallySpecificTLV |
+                      TimeToLiveTLV;// or TimeToLiveTLV here is a workaround for data inconsistent with TD.
+                                    // document: exactly one, but it maybe multiple in some capture data.
+                                    // use ValidationCheck for inconsistency alert.
+
+type ReservedTLV
+{
+    TLVHeader Header where (value.TLVType >= 9 && value.TLVType <= 126);
+    optional binary TLVInfo with BinaryEncoding{Length = Header.LengthOfType};
+}
+
+type TLVHeader
+{
+    ushort TLVType with BinaryEncoding{Width = 7};
+    ushort LengthOfType with BinaryEncoding{Width = 9};
+}
+
+type ReservedInfo[ushort Length]
+{
+    optional binary Octets with BinaryEncoding{Length = Length};
+}
+
+type ChassisComponetType[ushort Length]
+{
+    string ChassisName with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type InterfaceType[ushort Length]
+{
+    string InterfaceName with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type LocalAssignType[ushort Length]
+{
+    string LocalValue with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII };
+}
+
+type InterfaceAliasType[ushort Length]
+{
+   string InterfaceAlias with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII };
+}
+
+type PortComponetType[ushort Length]
+{
+     string  PortComponet with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII };
+}
+
+type AgentCircuitIDType[ushort Length]
+{
+     string Octets with BinaryEncoding{Length = Length};
+}
+
+type ChassisIDTLV
+{
+    TLVHeader Header where (value.TLVType == 1 &&  value.LengthOfType <= 255 &&  value.LengthOfType > 0);
+    byte ChassisSubtypeID;
+    optional ([|ChassisSubtypeID == 4 && Header.LengthOfType == 7|] MacAddress |
+            [|ChassisSubtypeID == 5|] NetworkAddress[Header.LengthOfType] |
+            [|ChassisSubtypeID == 1|] ChassisComponetType[(Header.LengthOfType - 1) as ushort] |
+            [|ChassisSubtypeID == 3|] PortComponetType[(Header.LengthOfType - 1) as ushort] |
+            [|ChassisSubtypeID == 6|] InterfaceType[(Header.LengthOfType - 1) as ushort] |
+            [|ChassisSubtypeID == 7|] LocalAssignType[(Header.LengthOfType - 1) as ushort] |
+            [|ChassisSubtypeID == 0 || (ChassisSubtypeID >= 8 && ChassisSubtypeID <= 255)|] ReservedInfo[(Header.LengthOfType - 1) as ushort]) ChassisIDInfo;
+}
+
+type NetworkAddress[ushort LengthOfType]
+{
+    byte IanaAddressFamilyNumber;
+    ([|IanaAddressFamilyNumber == 1|] IPv4Address |
+     [|IanaAddressFamilyNumber == 2|] IPv6Address |
+     binary) NetworkAddress with BinaryEncoding{Length = LengthOfType};
+}
+
+type PortIDTLV
+{
+    TLVHeader Header where (value.TLVType == 2  && value.LengthOfType <= 255 &&  value.LengthOfType > 0);
+    byte PortsubtypeID;
+    optional ([|PortsubtypeID == 1|] InterfaceAliasType[(Header.LengthOfType - 1) as ushort] |
+            [|PortsubtypeID == 2|] PortComponetType[(Header.LengthOfType - 1) as ushort] |
+            [|PortsubtypeID == 3  && Header.LengthOfType == 7|] MacAddress |
+            [|PortsubtypeID == 4|] NetworkAddress[Header.LengthOfType] |
+            [|PortsubtypeID == 5|] InterfaceType[(Header.LengthOfType - 1) as ushort] |
+            [|PortsubtypeID == 6|] AgentCircuitIDType[(Header.LengthOfType - 1) as ushort] |
+            [|PortsubtypeID == 7|] LocalAssignType[(Header.LengthOfType - 1) as ushort] |
+            [|PortsubtypeID == 0 || (PortsubtypeID >= 8 &&  PortsubtypeID <= 255)|] ReservedInfo[(Header.LengthOfType - 1) as ushort]) portIDInfo;
+}
+
+type TimeToLiveTLV
+{
+    TLVHeader Header where (value.TLVType == 3 && value.LengthOfType == 2);
+    ushort TimeToLiveValues with BinaryEncoding{Length = (Header.LengthOfType / 2)as ushort};
+}
+
+type EndOfLLDPTLV
+{
+    TLVHeader Header where (value.TLVType == 0 && value.LengthOfType == 0);
+}
+
+type PortDescriptionTLV
+{
+    TLVHeader Header where (value.TLVType == 4 && value.LengthOfType <= 255);
+    optional string PortDescription with BinaryEncoding{Length = Header.LengthOfType, TextEncoding = TextEncoding.ASCII}; 
+}
+
+type SystemNameTLV
+{
+    TLVHeader Header where (value.TLVType == 5 && value.LengthOfType <= 255);
+    optional string SystemName with BinaryEncoding{Length = Header.LengthOfType, TextEncoding = TextEncoding.ASCII}; 
+}
+
+type SystemDescriptionTLV
+{
+    TLVHeader Header where (value.TLVType == 6 && value.LengthOfType <= 255);
+    optional string SystemDescription with BinaryEncoding{Length = Header.LengthOfType, TextEncoding = TextEncoding.ASCII};
+}
+
+type SystemCapbalitiesIfExisted
+{
+    byte ReservedBits with BinaryEncoding{Width = 8};
+    bool StationOnly with BinaryEncoding{Width = 1};
+    bool DOCSISCable with BinaryEncoding{Width = 1};
+    bool Telephone with BinaryEncoding{Width = 1};
+    bool Rounter with BinaryEncoding{Width = 1};
+    bool WLANAccessPoint with BinaryEncoding{Width = 1};
+    bool Bridge with BinaryEncoding{Width = 1};
+    bool Repeater with BinaryEncoding{Width = 1};
+    bool Other with BinaryEncoding{Width = 1};
+        
+    invariant ValidationCheck(ReservedBits == 0, null, "LLDP: The ReservedBits(8-15) field in type SystemCapbalitiesIfExisted cannot be used.");
+}
+
+/* If the system capabilities field does not indicate the existence of a capability that the enabled capabilities
+field indicates is enabled, the TLV will be interpreted as containing an error and shall be discarded.*/
+type EnabledCapablities[SystemCapbalitiesIfExisted CapbalitiesName]
+{
+    byte ReservedBits with BinaryEncoding{Width = 8};
+    bool StationOnlyEanbled where (!value || (value && CapbalitiesName.StationOnly)) with BinaryEncoding{Width = 1};
+    bool DOCSISCableEanbled where (!value || (value && CapbalitiesName.DOCSISCable)) with BinaryEncoding{Width = 1};
+    bool TelephoneEanbled where (!value || (value && CapbalitiesName.Telephone)) with BinaryEncoding{Width = 1};
+    bool RounterEanbled where (!value || (value && CapbalitiesName.Rounter)) with BinaryEncoding{Width = 1};
+    bool WLANAccessPointEanbled where (!value || (value&& CapbalitiesName.WLANAccessPoint)) with BinaryEncoding{Width = 1};
+    bool BridgeEanbled where (!value || (value && CapbalitiesName.Bridge)) with BinaryEncoding{Width = 1};
+    bool RepeaterEanbled where(!value || (value && CapbalitiesName.Repeater)) with BinaryEncoding{Width = 1};
+    bool OtherEnabled where (!value || (value && CapbalitiesName.Other))with BinaryEncoding{Width = 1};
+    
+    invariant ValidationCheck(ReservedBits == CapbalitiesName.ReservedBits, null, "LLDP: The Reserved(8-15) field in type EnableCapabilities is not unified.");
+} 
+
+type SystemCapabilitiesTLV
+{
+    TLVHeader Header where (value.TLVType == 7 && value.LengthOfType == 4);
+    SystemCapbalitiesIfExisted SystemCapabilitiesName;
+    EnabledCapablities[SystemCapabilitiesName] Capabilities;
+}
+
+type UnknownAddressType[ushort Length]
+{
+    optional binary Octets with BinaryEncoding{Length = Length};
+}
+
+type ManagementAddressTLV
+{
+    TLVHeader Header where (value.TLVType == 8 && value.LengthOfType <= 255 && value.LengthOfType >= 9);
+    byte MAddressLength; 
+    byte AddressSubType;
+    // Future Reference: reference detail ianaAddressFamilyNumbers, there are 33 address fileds types.
+    optional ([|AddressSubType == 1 && MAddressLength == 5|] IPv4Address |
+            [|AddressSubType == 2 && MAddressLength == 17|] IPv6Address |
+            UnknownAddressType[(MAddressLength - 1) as ushort]) MAddress;
+    byte InterfaceSubType;
+    uint InterfaceNumber with BinaryEncoding{Width = 32};
+    byte OIDLength;
+    optional binary objectID with BinaryEncoding{Length = OIDLength as ushort};
+}
+
+type InfoStringType[ushort Length]
+{
+    string Octets with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type InfoBinaryType[ushort Length]
+{
+    optional binary Octets with BinaryEncoding{Length = Length};
+}
+
+type OrganizationallySpecificTLV
+{
+    TLVHeader Header where (value.TLVType == 127 && value.LengthOfType <= 507 && value.LengthOfType >= 4);
+    // Future Reference: XX-XX-XX, standard representation of the OUI is as a string of three octets, using the hexadecimal representation
+    uint UID with BinaryEncoding{Width = 24};
+    byte Subtype;
+    // Future Reference: the detail of Information String, should remove/obsolete InfoBinaryType, InfoStringType
+    optional (InfoBinaryType[(Header.LengthOfType - 4) as ushort] |
+            InfoStringType[(Header.LengthOfType - 4) as ushort]) InformationStringValue;
+}

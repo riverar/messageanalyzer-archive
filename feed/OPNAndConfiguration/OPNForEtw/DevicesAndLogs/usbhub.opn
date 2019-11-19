@@ -1,0 +1,509 @@
+protocol UsbHub;
+using Usb3; // comment this out if we combine UsbHub and Usb3 into one protocol again (circular dependency is OK if we do this)
+
+using Etw;
+using EtwEvent;
+using Standard;
+using UsbSpec;
+using UsbCommon;
+using Microsoft_Windows_USB_USBHUB3; // TODO: #q: Is this OK on traces that don't have this provider? How will the required generated OPN get generated?
+
+//
+// Filters, e.g. type "*UsbIsDisconnect==1" as filter
+//
+bool get UsbIsDisconnect(this UsbHubRequest.Get20PortStatus msg)
+{
+    if (msg.PortStatus.C_PORT_CONNECTION == 1 &&
+        msg.PortStatus.PORT_CONNECTION == 0) {
+
+        return true;    
+
+    } else {
+
+        return false;
+    }
+}
+bool get UsbIsDisconnect(this UsbHubRequest.Get30PortStatus msg)
+{
+    if (msg.PortStatus.C_PORT_CONNECTION == 1 &&
+        msg.PortStatus.PORT_CONNECTION == 0) {
+
+        return true;    
+
+    } else {
+
+        return false;
+    }
+}
+bool get UsbIsConnect(this UsbHubRequest.Get20PortStatus msg)
+{
+    if (msg.PortStatus.C_PORT_CONNECTION == 1 &&
+        msg.PortStatus.PORT_CONNECTION == 1) {
+
+        return true;    
+
+    } else {
+
+        return false;
+    }
+}
+bool get UsbIsConnect(this UsbHubRequest.Get30PortStatus msg)
+{
+    if (msg.PortStatus.C_PORT_CONNECTION == 1 &&
+        msg.PortStatus.PORT_CONNECTION == 1) {
+
+        return true;    
+
+    } else {
+
+        return false;
+    }
+}
+
+type HubAndPort
+{
+    int   DeviceInstance;
+    uint  Port;
+}
+
+endpoint UsbHubGlobals accepts EmptyMessage {
+    array<HubAndPort> Usb3HubUsb2Port = [];
+}
+
+bool IsUsb3HubPortActuallyUsb2(int deviceInstance, uint Port)
+{
+    foreach (HubAndPort port in (endpoint UsbHubGlobals).Usb3HubUsb2Port) {
+
+        if (port.DeviceInstance == deviceInstance && port.Port == Port) {
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+public autostart actor ObservePortProperties(ep_Microsoft_Windows_USB_USBHUB3 node)
+{
+    observe node accepts m:Microsoft_Windows_USB_USBHUB3.Event_7 // USB 2.0/1.1 port information
+    {
+        bool alreadyPresent;
+        HubAndPort newElement;
+       
+        var deviceInstance = GetDeviceInstanceUsb3(UlongFromEtwPointer(m.Fid_UsbDevice));
+
+        if (IsRootHub(deviceInstance)) {
+
+            var usbHubGlobals = endpoint UsbHubGlobals;
+            newElement = new HubAndPort();
+            newElement.DeviceInstance = deviceInstance;
+            newElement.Port = m.Fid_PortNumber;
+            alreadyPresent = false;
+
+            foreach (HubAndPort port in usbHubGlobals.Usb3HubUsb2Port) {
+
+                if (newElement.DeviceInstance == port.DeviceInstance &&
+                    newElement.Port == port.Port) {
+
+                    alreadyPresent = true;
+                    break;
+                }
+            }
+
+            if (!alreadyPresent) {
+                usbHubGlobals.Usb3HubUsb2Port = usbHubGlobals.Usb3HubUsb2Port + [newElement];
+            }
+        }
+    }
+    // TODO: what event is emitted on disable+enable with ETW enabled?
+} 
+
+public autostart actor ProcessHubTransfer (UsbDeviceOpnEndpoint node)
+{
+    //
+    // Control transfers to hubs, that are not parsed as standard requests
+    //
+    process node accepts m:UsbStandardRequest.ControlTransfer where
+        (m.DeviceInstance in (endpoint UsbCommonGlobals).IsHubSet)
+    {
+        UsbStandardRequest.GenericTransfer newGenericMsg = null;
+
+        if (
+            m.SetupPacket.bmRequestType == 0xa3 &&
+            m.SetupPacket.bRequest == UsbStandardSetupRequest.GET_STATUS &&
+            true) {
+
+            //
+            // Get Port Status
+            //
+            // Need to reverse the transfer data to parse it correctly.
+            //
+            if (m.TransferData == null || m.TransferData.Count < 4) {
+                //
+                // Get Port Status is not useful without seeing the status.
+                // TODO: which other messages need this check?
+                //
+                reject;
+                return;
+            }
+            array<byte> transferDataReversed = ([m.TransferData[3], m.TransferData[2], m.TransferData[1], m.TransferData[0]]);
+
+            if (IsBcdUsb3Device(m.DeviceInstance) &&
+                !IsUsb3HubPortActuallyUsb2(m.DeviceInstance, (m.SetupPacket.wIndex as uint))) {
+
+                UsbHubRequest.Get30PortStatus decoded = new UsbHubRequest.Get30PortStatus { };
+                decoded.Port = m.SetupPacket.wIndex as uint;
+                decoded.PortStatus = BinaryDecoder<Usb3PortStatus>(transferDataReversed as binary) as Usb3PortStatus;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else {
+
+                UsbHubRequest.Get20PortStatus decoded = new UsbHubRequest.Get20PortStatus { };
+                decoded.Port = m.SetupPacket.wIndex as uint;
+                decoded.PortStatus = BinaryDecoder<Usb2PortStatus>(transferDataReversed as binary) as Usb2PortStatus;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+            }
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x23 &&
+            (m.SetupPacket.bRequest == UsbStandardSetupRequest.SET_FEATURE ||
+             m.SetupPacket.bRequest == UsbStandardSetupRequest.CLEAR_FEATURE)) {
+
+            //
+            // Set/Clear port feature. Many messages fall under this.
+            //
+            UsbHubPortFeature feature = m.SetupPacket.wValue as UsbHubPortFeature;
+            byte wIndexHighByte = (m.SetupPacket.wIndex >> 8) as byte;
+            byte port = (m.SetupPacket.wIndex & 0xff) as byte;
+
+            if (feature == UsbHubPortFeature.PORT_RESET ||
+                feature == UsbHubPortFeature.BH_PORT_RESET) {
+
+                //
+                // Reset Port
+                //
+                UsbHubRequest.ResetPort decoded = new UsbHubRequest.ResetPort { };
+                decoded.Port = port;
+                decoded.WarmReset = (feature == UsbHubPortFeature.BH_PORT_RESET);
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_POWER) {
+
+                //
+                // Set/Clear PORT_POWER
+                //
+                UsbHubRequest.SetOrClearPortPower decoded = new UsbHubRequest.SetOrClearPortPower { };
+                decoded.Port = port;
+                decoded.SetOrClear = m.SetupPacket.bRequest as UsbStandardSetupRequest;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_ENABLE ||
+                       (feature == UsbHubPortFeature.PORT_LINK_STATE &&
+                        (wIndexHighByte == UsbLinkState.Rx_Detect ||
+                         wIndexHighByte == UsbLinkState.SS_Disabled))) {
+
+                //
+                // Set/Clear PORT_ENABLE
+                //
+                UsbHubRequest.EnableOrDisablePort decoded = new UsbHubRequest.EnableOrDisablePort { };
+                decoded.Port = port;
+                decoded.SetOrClearPortEnable = m.SetupPacket.bRequest as UsbStandardSetupRequest;
+                //
+                // Fake CLEAR_FEATRUE(PORT_ENABLE) for Set PORT_LINK_STATE(SS_Disabled)
+                //
+                if (feature == UsbHubPortFeature.PORT_LINK_STATE &&
+                    wIndexHighByte == UsbLinkState.SS_Disabled) {
+                    decoded.SetOrClearPortEnable = UsbStandardSetupRequest.CLEAR_FEATURE;
+                }
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if ((m.SetupPacket.bRequest == UsbStandardSetupRequest.SET_FEATURE &&
+                        feature == UsbHubPortFeature.PORT_SUSPEND) ||
+                       (m.SetupPacket.bRequest == UsbStandardSetupRequest.SET_FEATURE &&
+                        feature == UsbHubPortFeature.PORT_LINK_STATE &&
+                        wIndexHighByte == UsbLinkState.U3)) {
+
+                //
+                // Set PORT_SUSPEND (USB2) / Set port link state to U3 (USB3)
+                //
+                UsbHubRequest.SuspendPort decoded = new UsbHubRequest.SuspendPort { };
+                decoded.Port = port;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if ((m.SetupPacket.bRequest == UsbStandardSetupRequest.CLEAR_FEATURE &&
+                        feature == UsbHubPortFeature.PORT_SUSPEND) ||
+                       (m.SetupPacket.bRequest == UsbStandardSetupRequest.SET_FEATURE &&
+                        m.SetupPacket.wValue == UsbHubPortFeature.PORT_LINK_STATE &&
+                        m.SetupPacket.wIndex >> 8 == UsbLinkState.U0)) {
+
+                //
+                // Clear PORT_SUSPEND (USB2) / Set port link state to U0 (USB3)
+                //
+                UsbHubRequest.SoftwareResumePort decoded = new UsbHubRequest.SoftwareResumePort { };
+                decoded.Port = (m.SetupPacket.wIndex & 0xff) as uint;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_REMOTE_WAKE_MASK) {
+
+                //
+                // Set Port Remote Wake Mask (or I prefer "Set Port Wake Conditions")
+                //
+                UsbHubRequest.SetPortRemoteWakeMask decoded = new UsbHubRequest.SetPortRemoteWakeMask { };
+                decoded.Port = port;
+                var desc = BinaryDecoder<USB_HUB_30_PORT_REMOTE_WAKE_MASK>([wIndexHighByte] as binary);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on USB_HUB_30_PORT_REMOTE_WAKE_MASK, this is never expected";
+                } else {
+                    decoded.WakeConditions = desc as USB_HUB_30_PORT_REMOTE_WAKE_MASK;
+                }
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_U1_TIMEOUT) {
+
+                //
+                // Set Port U1 Timeout
+                //
+                UsbHubRequest.SetPortU1Timeout decoded = new UsbHubRequest.SetPortU1Timeout { };
+                decoded.Port = port;
+                decoded.U1Timeout_Us = wIndexHighByte;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_U2_TIMEOUT) {
+
+                //
+                // Set Port U2 Timeout
+                //
+                UsbHubRequest.SetPortU2Timeout decoded = new UsbHubRequest.SetPortU2Timeout { };
+                decoded.Port = port;
+                decoded.U2Timeout_256Us = wIndexHighByte;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.C_PORT_CONNECTION ||
+                       feature == UsbHubPortFeature.C_PORT_ENABLE ||
+                       feature == UsbHubPortFeature.C_PORT_SUSPEND ||
+                       feature == UsbHubPortFeature.C_PORT_OVER_CURRENT ||
+                       feature == UsbHubPortFeature.C_PORT_RESET ||
+                       feature == UsbHubPortFeature.C_PORT_LINK_STATE ||
+                       feature == UsbHubPortFeature.C_PORT_CONFIG_ERROR ||
+                       feature == UsbHubPortFeature.C_BH_PORT_RESET) {
+
+                //
+                // Clear port status change
+                //
+                UsbHubRequest.ClearPortChange decoded = new UsbHubRequest.ClearPortChange { };
+                decoded.Port = port;
+                decoded.PortFeature = feature;
+                decoded.SetOrClear = m.SetupPacket.bRequest as UsbStandardSetupRequest;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else if (feature == UsbHubPortFeature.PORT_LINK_STATE) {
+
+                //
+                // Set port link state--other than already called out as an explicit message such as
+                // EnableOrDisablePort
+                //
+                UsbHubRequest.SetPortLinkState decoded = new UsbHubRequest.SetPortLinkState { };
+                decoded.Port = port;
+                decoded.TargetState = wIndexHighByte as UsbLinkState;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+            } else {
+
+                //
+                // Catch-all get/set port feature. Should not be common.
+                //
+                UsbHubRequest.SetOrClearPortFeature decoded = new UsbHubRequest.SetOrClearPortFeature { };
+                decoded.Port = port;
+                decoded.PortFeature = feature;
+                decoded.SetOrClear = m.SetupPacket.bRequest as UsbStandardSetupRequest;
+                newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+            }
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x20 &&
+            (m.SetupPacket.bRequest == UsbStandardSetupRequest.SET_FEATURE ||
+             m.SetupPacket.bRequest == UsbStandardSetupRequest.CLEAR_FEATURE)) {
+
+            //
+            // Set/Clear hub feature. Feature must be hub a status change bit and Set/Clear must be
+            // Clear.
+            //
+            UsbHubRequest.ClearHubChange decoded = new UsbHubRequest.ClearHubChange { };
+            decoded.SetOrClear = m.SetupPacket.bRequest as UsbStandardSetupRequest;
+            decoded.HubFeature = m.SetupPacket.wValue as UsbHubFeature;
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0xa0 &&
+            m.SetupPacket.bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+            m.SetupPacket.wValue >> 8 == UsbHubDescriptorType.HUB) {
+
+            //
+            // Get Hub Descriptor (USB2)
+            //
+            ValidationCheck((m.SetupPacket.wValue & 0xff) == 0, null, "Index must be 0");
+            UsbHubRequest.GetHubDescriptor decoded = new UsbHubRequest.GetHubDescriptor { };
+            if (m.TransferData != null && m.LengthCompleted > 0) {
+                var desc = BinaryDecoder<USB_HUB_DESCRIPTOR>(m.TransferData);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on USB_HUB_DESCRIPTOR, this is never expected";
+                } else {
+                    decoded.HubDescriptor = desc as USB_HUB_DESCRIPTOR;
+                }
+            }
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0xa0 &&
+            m.SetupPacket.bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+            m.SetupPacket.wValue >> 8 == UsbHubDescriptorType.SUPERSPEED_HUB) {
+
+            //
+            // Get Hub Descriptor (USB3)
+            //
+            ValidationCheck((m.SetupPacket.wValue & 0xff) == 0, null, "Index must be 0");
+            UsbHubRequest.GetSuperSpeedHubDescriptor decoded = new UsbHubRequest.GetSuperSpeedHubDescriptor { };
+            if (m.TransferData != null && m.LengthCompleted > 0) {
+                var desc = BinaryDecoder<USB_SUPERSPEED_HUB_DESCRIPTOR>(m.TransferData);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on USB_SUPERSPEED_HUB_DESCRIPTOR, this is never expected";
+                } else {
+                    decoded.HubDescriptor = desc as USB_SUPERSPEED_HUB_DESCRIPTOR;
+                }
+            }
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0xa0 &&
+            m.SetupPacket.bRequest == UsbStandardSetupRequest.GET_STATUS) {
+
+            //
+            // Get Hub Status (USB2 or USB3)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 4, null, "wLength must be 4");
+            UsbHubRequest.GetHubStatus decoded = new UsbHubRequest.GetHubStatus { };
+            if (m.TransferData != null && m.LengthCompleted > 0) {
+                var desc = BinaryDecoder<USB_HUB_STATUS>(m.TransferData);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on USB_HUB_STATUS, this is never expected";
+                } else {
+                    decoded.HubStatus = desc as USB_HUB_STATUS;
+                }
+            }
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x20 &&
+            m.SetupPacket.bRequest == UsbHubSetupRequest.SET_HUB_DEPTH) {
+
+            //
+            // Set Hub Depth (USB3 only)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 0, null, "wLength must be 0");
+            ValidationCheck((m.SetupPacket.wIndex) == 0, null, "wIndex must be 0");
+            ValidationCheck((m.SetupPacket.wValue) <= 4, null, "wValue (Hub Depth) must not be greater than 4");
+            UsbHubRequest.SetHubDepth decoded = new UsbHubRequest.SetHubDepth { };
+            decoded.Depth = m.SetupPacket.wValue;
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0xa3 &&
+            m.SetupPacket.bRequest == UsbHubSetupRequest.GET_PORT_ERR_COUNT) {
+
+            //
+            // Get Port Error Count (USB3 only)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 2, null, "wLength must be 2");
+            ValidationCheck((m.SetupPacket.wIndex) < 256, null, "Port number must be less than 256");
+            UsbHubRequest.GetPortErrorCount decoded = new UsbHubRequest.GetPortErrorCount { };
+            if (m.TransferData != null && m.LengthCompleted > 0) {
+                var desc = BinaryDecoder<ushort>(m.TransferData);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on USB_HUB_STATUS, this is never expected";
+                } else {
+                    decoded.NumberOfLinkErrors = desc as ushort;
+                }
+            }
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x23 &&
+            m.SetupPacket.bRequest == UsbHubSetupRequest.CLEAR_TT_BUFFER) {
+
+            //
+            // Clear TT Buffer (USB2 only)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 0, null, "wLength must be 0");
+            ValidationCheck((m.SetupPacket.wIndex) < 256, null, "Port number must be less than 256");
+            UsbHubRequest.ClearTtBuffer decoded = new UsbHubRequest.ClearTtBuffer { };
+            //
+            // Decode manually:
+            //
+            // Bits   Field
+            // 3..0   Endpoint Number
+            // 10..4  Device Address
+            // 12..11 Endpoint Type
+            // 14..13 Reserved, must be zero
+            // 15     Direction, 1 = IN, 0 = OUT
+            //
+            decoded.EndpointAddressToClear = (m.SetupPacket.wValue & 0x000f) as byte;
+            if ((m.SetupPacket.wValue & 0x8000) != 0) {
+                decoded.DeviceAddress = (decoded.DeviceAddress | 0x80) as byte;
+            }
+            decoded.DeviceAddress = ((m.SetupPacket.wValue & 0x07f0) >> 4) as byte;
+            decoded.EndpointType = ((m.SetupPacket.wValue & 0x1800) >> 11) as UsbTransferType;
+            decoded.Port = m.SetupPacket.wIndex as byte;
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x23 &&
+            m.SetupPacket.bRequest == UsbHubSetupRequest.RESET_TT) {
+
+            //
+            // Reset TT (USB2 only)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 0, null, "wLength must be 0");
+            ValidationCheck((m.SetupPacket.wIndex) < 256, null, "Port number must be less than 256");
+            UsbHubRequest.ResetTt decoded = new UsbHubRequest.ResetTt { };
+            decoded.Port = m.SetupPacket.wIndex as byte;
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else if (
+            m.SetupPacket.bmRequestType == 0x23 &&
+            m.SetupPacket.bRequest == UsbHubSetupRequest.STOP_TT) {
+
+            //
+            // Stop TT (USB2 only)
+            //
+            ValidationCheck((m.SetupPacket.wLength) == 0, null, "wLength must be 0");
+            ValidationCheck((m.SetupPacket.wIndex) < 256, null, "Port number must be less than 256");
+            UsbHubRequest.StopTt decoded = new UsbHubRequest.StopTt { };
+            decoded.Port = m.SetupPacket.wIndex as byte;
+            newGenericMsg = decoded as UsbStandardRequest.GenericTransfer;
+        } else {
+            //
+            // The above list should be complete, but if we see something else, just leave it alone
+            // (don't claim that we've processed it).
+            //
+            reject;
+            return;
+        }
+        CopyGenericTransfer(newGenericMsg, (m as UsbStandardRequest.GenericTransfer));
+        dispatch (endpoint UsbHub[m.DeviceInstance]) accepts newGenericMsg;
+    }
+    observe node accepts m:UsbStandardRequest.BulkOrInterruptTransfer where // TODO: change to "process" when this stops throwing an exception
+        (m.DeviceInstance in (endpoint UsbCommonGlobals).IsHubSet &&
+         m.TransferData != null && m.TransferData.Count >= 1)
+    {
+        //
+        // Hub and/or Port Status Change notification (the only non-control transfer of a hub)
+        //
+        UsbHubRequest.InterruptTransfer decoded = new UsbHubRequest.InterruptTransfer { };
+        if (m.LengthCompleted >= 1) {
+            decoded.HubAndPortStatusChangeBitmap = m.TransferData;
+            decoded.Port = decoded.PortFromBitmap();
+        }
+        CopyGenericTransfer((decoded as UsbStandardRequest.GenericTransfer), (m as UsbStandardRequest.GenericTransfer));
+        dispatch (endpoint UsbHub[m.DeviceInstance]) accepts decoded;
+    }
+}

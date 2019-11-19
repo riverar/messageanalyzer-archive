@@ -1,0 +1,578 @@
+protocol NMF with 
+Documentation
+{
+    ProtocolName = ".NET Message Framing Protocol",
+    ShortName = "NMF",
+    Description = "The .NET Message Framing Protocol defines a format for framing messages"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MC-NMF", Version = "6.0", Date = "05/15/2014", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="376422", Date="04/03/2015"},
+        ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using SOAP;
+using NBFS;
+using InfrastructureResources;
+
+endpoint Server
+    over LowestServer
+    accepts VersionRecord
+    accepts ModeRecord
+    accepts ViaRecord
+    accepts KnownEncodingRecord
+    accepts SizedEnvelopeRecord issues SizedEnvelopeRecord
+    accepts EndRecord issues EndRecord
+    accepts UpgradeRequestRecord
+    issues UpgradeResponseRecord
+    issues PreambleAckRecord
+    accepts PreambleEndRecord
+    accepts PreambleRecord
+{
+    NMF.Encoding nmfEncoding = 0xFF;
+    array<string> dynamicDictionaryInThisSessionAccept = null;
+    array<string> dynamicDictionaryInThisSessionIssue = null;
+    SOAP.Server soapServer = endpoint SOAP.Server over this;
+    void(SoapMessage) Dispatcher;
+
+    observe this accepts s:KnownEncodingRecord
+    {
+        nmfEncoding = s.Encoding;
+    }
+    
+    observe this accepts s:EndRecord
+    {
+        Reset();
+    }
+    
+    observe this issues s:EndRecord
+    {
+        Reset();
+    }
+    
+    observe this accepts s:PreambleRecord
+    {
+        nmfEncoding = s.EnvelopeEncodingRecord.Encoding;
+    }
+    
+    process this accepts s:SizedEnvelopeRecord
+    {
+        Dispatcher = AcceptDispatcher;
+        DecodeAndDispatchSoapMessage(s, nmfEncoding, true);
+    }
+    
+    process this issues s:SizedEnvelopeRecord
+    {
+        Dispatcher = IssueDispatcher;
+        DecodeAndDispatchSoapMessage(s, nmfEncoding, false);
+    }
+    
+    void AcceptDispatcher(SoapMessage m)
+    {
+        dispatch soapServer accepts m;
+    }
+    
+    void IssueDispatcher(SoapMessage m)
+    {
+        dispatch soapServer issues m;
+    }
+    
+    void DecodeAndDispatchSoapMessage(SizedEnvelopeRecord s, NMF.Encoding nmfEncoding, bool isAccepts)
+    {
+        xml xmlValue = null;
+        
+        switch (nmfEncoding)
+        {
+            case NMF.Encoding.BinaryWithInbandDictionary =>
+                xmlValue = DecodDotNetNBFSEBinaryXml(s.Payload, isAccepts);
+            case NMF.Encoding.Binary =>
+                xmlValue = DecodeDotNetBinaryXml(s.Payload, NBFS.DictionaryString, null);
+            case NMF.Encoding.UTF8Soap11 =>
+                xmlValue = BuildXml(s.Payload);
+            default =>
+                if (nmfEncoding == 0xFF)
+                {
+                    // try with NBFSE Encoding
+                    xmlValue = DecodDotNetNBFSEBinaryXml(s.Payload, isAccepts);
+                    if (xmlValue == null)
+                    {
+                        // try with NBFS Encoding
+                        xmlValue = DecodeDotNetBinaryXml(s.Payload, NBFS.DictionaryString, null);
+                    }
+                    if (xmlValue == null)
+                    {
+                        ThrowDecodingException("NMF", UTILITY_ENCODING_NOT_AVAILABLE, [".NET Binary XML"]);
+                    }
+                }
+        }
+        
+        if (xmlValue != null)
+        {
+            SOAP.DecodeSoapFromXml(xmlValue, null, Dispatcher);
+        }
+        else
+        {
+            ThrowDecodingException("NMF", UTILITY_DECODE_FAIL_WITH_ENCODING, [".NET Binary XML", EnumToStringInSummary<NMF.Encoding>(nmfEncoding)]);
+        }
+    }
+    
+    xml DecodDotNetNBFSEBinaryXml(stream s, bool isAccepts)
+    {
+        var dynamicDictionaryInThisFrame = ExtractNbfseDynamicDictionary(s);
+        if (dynamicDictionaryInThisFrame == null)
+        {
+            ThrowDecodingException("nmf", "Extract NBFSE Dynamic Dictionary fails", []);
+        }
+        if (isAccepts)
+        {
+            return DecodDotNetNBFSEBinaryXmlWithNBFSEDynamicDictionary(s, dynamicDictionaryInThisFrame, ref dynamicDictionaryInThisSessionAccept);
+        }
+        else
+        {
+            return DecodDotNetNBFSEBinaryXmlWithNBFSEDynamicDictionary(s, dynamicDictionaryInThisFrame, ref dynamicDictionaryInThisSessionIssue);
+        }
+    }
+    
+    xml DecodDotNetNBFSEBinaryXmlWithNBFSEDynamicDictionary(stream s, array<string> dynamicDictionaryInThisFrame, ref array<string> dynamicDictionaryInThisSession)
+    {
+        if (dynamicDictionaryInThisSession == null)
+        {
+            dynamicDictionaryInThisSession = dynamicDictionaryInThisFrame;
+        }
+        else
+        {
+            foreach (string st in dynamicDictionaryInThisFrame)
+            {
+                if (!(st in dynamicDictionaryInThisSession))
+                {
+                    dynamicDictionaryInThisSession += [st];
+                }
+            }
+        }
+        return DecodeDotNetBinaryXml(s, NBFS.DictionaryString, dynamicDictionaryInThisSession);
+    }
+
+    void Reset()
+    {
+        nmfEncoding = 0xFF;
+        dynamicDictionaryInThisSessionAccept = null;
+        dynamicDictionaryInThisSessionIssue = null;
+    }
+};
+
+endpoint LowestServer
+    over TCP.Server accepts TCP.Segment issues TCP.Segment
+{
+    bool IfUpgradeProtocolNegotiate = false; // Future Reference: if UpgradeProtocol in NMF.UpgradeRequestRecord is "application/negotiate",
+    bool IfUpgradeResponseRecordReceived = false; // the message after UpgradeResponseRecord is NNS which is not implement yet, so do not parse the later messages
+
+    NMFDecodingHelper decodingHelper = null;
+    process this accepts s:TCP.Segment where !(IfUpgradeProtocolNegotiate && IfUpgradeResponseRecordReceived)
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new NMFDecodingHelper();
+            decodingHelper.InitializeNMF(new TCPDecodingCache(), new TCPDecodingCache(), "NMF", endpoint Server over this, IsCurrentProtocolOnAccept, 
+                IsCurrentProtocolOnIssues, IsSufficientForNMF, DecodeSingleNMFMessageOnAccept, DecodeSingleNMFMessageOnIssues, (binary b) => nothing);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process this issues s:TCP.Segment where !(IfUpgradeProtocolNegotiate && IfUpgradeResponseRecordReceived)
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new NMFDecodingHelper();
+            decodingHelper.InitializeNMF(new TCPDecodingCache(), new TCPDecodingCache(), "NMF", endpoint Server over this, IsCurrentProtocolOnAccept, 
+                IsCurrentProtocolOnIssues, IsSufficientForNMF, DecodeSingleNMFMessageOnAccept, DecodeSingleNMFMessageOnIssues, (binary b) => nothing);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    optional any message DecodeSingleNMFMessageOnAccept(stream s)
+    {
+        switch (s.PeekByte(s.BitPosition))
+        {
+            case 0 =>
+                if ((RemainingBitLength(s) > 3 * 8) && PeekByteCompare(s, s.BitPosition + 3 * 8, [0x01]))
+                {
+                    return BinaryDecoder<PreambleRecord>(s) as optional any message;
+                }
+                else
+                {
+                    return BinaryDecoder<VersionRecord>(s) as optional any message;
+                }
+            case 1 =>
+                return BinaryDecoder<ModeRecord>(s) as optional any message;
+            case 2 =>
+                return BinaryDecoder<ViaRecord>(s) as optional any message;
+            case 3 =>
+                return BinaryDecoder<KnownEncodingRecord>(s) as optional any message;
+            case 6 =>
+                return BinaryDecoder<SizedEnvelopeRecord>(s) as optional any message;
+            case 7 =>
+                return BinaryDecoder<EndRecord>(s) as optional any message;
+            case 9 =>
+                if (BinaryDecoder<UpgradeRequestRecord>(s) is req:UpgradeRequestRecord)
+                {
+                    // Future Reference: if UpgradeProtocol in NMF.UpgradeRequestRecord is "application/negotiate",
+                    // the message after UpgradeResponseRecord is NNS which is not implement yet, so do not parse the later messages
+                    if (req.UpgradeProtocol == "application/negotiate")
+                    {
+                        IfUpgradeProtocolNegotiate = true;
+                    }
+                    return req;
+                }
+                return nothing;
+            case 12 =>
+                return BinaryDecoder<PreambleEndRecord>(s) as optional any message;
+            default =>
+                return nothing;
+        }
+    }
+
+    optional any message DecodeSingleNMFMessageOnIssues(stream s)
+    {
+        switch (s.PeekByte(s.BitPosition))
+        {
+            case 6 =>
+                return BinaryDecoder<SizedEnvelopeRecord>(s) as optional any message;
+            case 7 =>
+                return BinaryDecoder<EndRecord>(s) as optional any message;
+            case 10 =>
+                if (BinaryDecoder<UpgradeResponseRecord>(s) is res:UpgradeResponseRecord)
+                {
+                    // Future Reference: if UpgradeProtocol in NMF.UpgradeRequestRecord is "application/negotiate",
+                    // the message after UpgradeResponseRecord is NNS which is not implement yet, so do not parse the later messages
+                    if (IfUpgradeProtocolNegotiate)
+                    {
+                        IfUpgradeResponseRecordReceived = true;
+                    }
+                    return res;
+                }
+                return nothing;
+            case 11 =>
+                return BinaryDecoder<PreambleAckRecord>(s) as optional any message;
+            default =>
+                return nothing;
+        }
+    }
+
+    ~endpoint(LowestServer server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+type NMFDecodingHelper : TCPDecodingHelper
+{
+    void InitializeNMF(TCPDecodingCache acceptsCache, TCPDecodingCache issuesCache,
+        string protocolName, any endpoint ept, 
+        bool?(binary) isCurrentProtocolOnAccept, bool?(binary) isCurrentProtocolOnIssues, 
+        uint?(binary) isSufficientForSingleMsg, (optional any message)(stream) decodeSingleMessageOnAccept, 
+        (optional any message)(stream) decodeSingleMessageOnIssues, (optional any message)(binary) decodeIncompleteMessage)
+    {
+        AcceptsCache = acceptsCache ?? new TCPDecodingCache();
+        AcceptsCache.Initialize(protocolName, ept, MessageDirection.Accepts, isCurrentProtocolOnAccept, 
+            isSufficientForSingleMsg, decodeSingleMessageOnAccept, decodeIncompleteMessage);
+        IssuesCache = issuesCache ?? new TCPDecodingCache();
+        IssuesCache.Initialize(protocolName, ept, MessageDirection.Issues, isCurrentProtocolOnIssues, 
+            isSufficientForSingleMsg, decodeSingleMessageOnIssues, decodeIncompleteMessage);
+    }
+}
+
+bool? IsCurrentProtocolOnAccept(binary bin)
+{
+    if (bin.Count < 1)
+    {
+        return null;
+    }
+    return bin[0] in NMFRecordTypeRequest;
+}
+
+bool? IsCurrentProtocolOnIssues(binary bin)
+{
+    if (bin.Count < 1)
+    {
+        return null;
+    }
+    return bin[0] in NMFRecordTypeResponse;
+}
+
+uint? IsSufficientForNMF(binary bin)
+{
+    uint binaryCount = bin.Count as uint;
+    ulong expectedLen = 0;
+    if (binaryCount > 0)
+    {
+        var recordType = bin[0];
+        // ViaRecord, SizedEnvelopeRecord, UpgradeRequestRecord
+        if ((recordType == 0x02) || (recordType == 0x06) || (recordType == 0x09))
+        {
+            if (LengthDecoder(Segment(bin, 1)) is size:ulong)
+            {
+                if (size >= 0x00 && size <= 0x7F)
+                {
+                    expectedLen = size + 2;
+                }
+                else if (size >= 0x0080 && size <= 0x3FFF)
+                {
+                    expectedLen = size + 3;
+                }
+                else if (size >= 0x004000 && size <= 0x1FFFFF)
+                {
+                    expectedLen = size + 4;
+                }
+                else if (size >= 0x00200000 && size <= 0x0FFFFFFF)
+                {
+                    expectedLen = size + 5;
+                }
+                else if (size >= 0x0010000000 && size <= 0x00FFFFFFFF)
+                {
+                    expectedLen = size + 6;
+                }
+            }
+            return expectedLen > binaryCount ? (expectedLen as uint) : 0;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        return null;
+    }
+}
+
+message VersionRecord
+{
+    RecordTypes RecordType
+        where ValidationCheckValue(value == 0x00, this, true, ReferenceType.Message, "NMF", "RecordType", "VersionRecord", "0x00", value);
+    byte MajorVersion;
+    byte MinorVersion;
+    
+    override string ToString()
+    {
+        return "VersionRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType) +
+            ", MajorVersion: " + MajorVersion.ToString() +
+            ", MinorVersion: " + MinorVersion.ToString();
+    }
+}
+
+message ModeRecord
+{
+    RecordTypes RecordType
+            where ValidationCheckValue(value == 0x01, this, true, ReferenceType.Message, "NMF", "RecordType", "ModeRecord", "0x01", value);
+    Modes Mode;
+    
+    override string ToString()
+    {
+        return "ModeRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType) +
+            ", Modes: " + EnumToStringInSummary<NMF.Modes>(Mode);
+    }
+}
+    
+message ViaRecord
+{
+    RecordTypes RecordType
+            where ValidationCheckValue(value == 0x02, this, true, ReferenceType.Message, "NMF", "RecordType", "ViaRecord", "0x02", value);
+    ulong ViaLength with Standard.Encoding{Decoder = LengthDecoder};
+    string Via with Standard.Encoding{Decoder = DecodeUTF8String, SourcePattern = TypeOf<binary>()},
+                    BinaryEncoding{Length = ViaLength as long};
+
+    override string ToString()
+    {
+        return "ModeRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+
+    optional string DecodeUTF8String(binary a)
+    {
+        var utf8s = BinaryDecoder<UTF8StringWrapper>(a);
+        return utf8s is nothing ? a.ToString() : (utf8s as UTF8StringWrapper).Text;
+    }
+}
+    
+message KnownEncodingRecord
+{
+    RecordTypes RecordType
+            where ValidationCheckValue(value == 0x03, this, true, ReferenceType.Message, "NMF", "RecordType", "ViaRecord", "0x03", value);
+    NMF.Encoding Encoding;
+    
+    override string ToString()
+    {
+        return "KnownEncodingRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message SizedEnvelopeRecord
+{
+    RecordTypes RecordType
+            where ValidationCheckValue(value == 0x06, this, true, ReferenceType.Message, "NMF", "RecordType", "SizedEnvelopeRecord", "0x06", value);
+    ulong Size with Standard.Encoding{Decoder = LengthDecoder};
+    binary Payload with BinaryEncoding{Length = Size as long};
+    
+    override string ToString()
+    {
+        return "SizedEnvelopeRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message EndRecord
+{
+    RecordTypes RecordType
+            where ValidationCheckValue(value == 0x07, this, true, ReferenceType.Message, "NMF", "RecordType", "EndRecord", "0x07", value);
+            
+    override string ToString()
+    {
+        return "EndRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message UpgradeRequestRecord
+{
+    RecordTypes RecordType
+        where ValidationCheckValue(value == 0x09, this, true, ReferenceType.Message, "NMF", "RecordType", "UpgradeRequestRecord", "0x09", value);
+    ulong UpgradeProtocolLength with Standard.Encoding{Decoder = LengthDecoder};
+    string UpgradeProtocol with Standard.Encoding{Decoder = DecodeUTF8String, SourcePattern = TypeOf<binary>()},
+                                BinaryEncoding{Length = UpgradeProtocolLength as long};
+    
+    override string ToString()
+    {
+        return "UpgradeRequestRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+
+    optional string DecodeUTF8String(binary a)
+    {
+        var utf8s = BinaryDecoder<UTF8StringWrapper>(a);
+        return utf8s is nothing ? a.ToString() : (utf8s as UTF8StringWrapper).Text;
+    }
+}
+    
+message UpgradeResponseRecord
+{
+    RecordTypes RecordType
+        where ValidationCheckValue(value == 0x0A, this, true, ReferenceType.Message, "NMF", "RecordType", "UpgradeResponseRecord", "0x0A", value);
+        
+    override string ToString()
+    {
+        return "UpgradeResponseRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message PreambleAckRecord
+{
+    RecordTypes RecordType
+        where ValidationCheckValue(value == 0x0B, this, true, ReferenceType.Message, "NMF", "RecordType", "PreambleAckRecord", "0x0B", value);
+        
+    override string ToString()
+    {
+        return "PreambleAckRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message PreambleEndRecord
+{
+    RecordTypes RecordType
+        where ValidationCheckValue(value == 0x0C, this, true, ReferenceType.Message, "NMF", "RecordType", "PreambleEndRecord", "0x0C", value);
+        
+    override string ToString()
+    {
+        return "PreambleEndRecord, RecordType: " + EnumToStringInSummary<NMF.RecordTypes>(RecordType);
+    }
+}
+    
+message PreambleRecord
+{
+    VersionRecord VersionRecord;
+    ModeRecord ModeRecord;
+    ViaRecord ViaRecord;
+    EnvelopeEncodingRecord EnvelopeEncodingRecord;
+
+    override string ToString()
+    {
+        return "PreambleRecord, Modes: " + EnumToStringInSummary<NMF.Modes>(ModeRecord.Mode) +
+            ", Encoding: " + EnumToStringInSummary<NMF.Encoding>(EnvelopeEncodingRecord.Encoding);
+    }
+}
+
+pattern RecordTypes = enum byte
+{
+    VersionRecord               = 0x00,
+    ModeRecord                  = 0x01,
+    ViaRecord                   = 0x02,
+    KnownEncodingRecord         = 0x03,
+    ExtensibleEncodingRecord    = 0x04,
+    UnsizedEnvelopeRecord       = 0x05,
+    SizedEnvelopeRecord         = 0x06,
+    EndRecord                   = 0x07,
+    FaultRecord                 = 0x08,
+    UpgradeRequestRecord        = 0x09,
+    UpgradeResponseRecord       = 0x0A,
+    PreambleAckRecord           = 0x0B,
+    PreambleEndRecord           = 0x0C,
+    ...
+};
+
+pattern Modes = enum byte
+{
+    SingletonUnsized    = 0x01,
+    Duplex              = 0x02,
+    Simplex             = 0x03,
+    SingletonSized      = 0x04,
+    ...
+};
+
+pattern Encoding = enum byte
+{
+    UTF8Soap11                  = 0x00,
+    UTF16Soap11                 = 0x01,
+    UnicodeSoap11               = 0x02,
+    UTF8Soap12                  = 0x03,
+    UTF16Soap12                 = 0x04,
+    UnicodeSoap12               = 0x05,
+    MTOM                        = 0x06,
+    Binary                      = 0x07,
+    BinaryWithInbandDictionary  = 0x08,
+    ...
+};
+
+pattern EnvelopeEncodingRecord = KnownEncodingRecord;
+
+// 2.2.2   Record Size Encoding
+optional ulong LengthDecoder(stream s)
+{
+    ulong result = 0;
+    int shift = 0;
+    byte curByte = BinaryDecoder<byte>(s) as byte;
+    result = (result | ((((curByte as ulong) & 0x7F) << shift) as ulong));
+    shift = shift + 7;
+    while (curByte >= 0x80)
+    {
+        curByte = BinaryDecoder<byte>(s) as byte; // consume stream
+        result = (result | ((((curByte as ulong) & 0x7F) << shift) as ulong));
+        shift = shift + 7;
+    }
+    return result;
+}
+
+type UTF8StringWrapper
+{
+    string Text;
+} with BinaryEncodingDefaults{TextEncoding = TextEncoding.UTF8};
+
+const set<byte> NMFRecordTypeRequest = {0, 1, 2, 3, 6, 7 , 9, 12};
+const set<byte> NMFRecordTypeResponse = {6, 7 , 10, 11};

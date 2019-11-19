@@ -1,0 +1,3043 @@
+protocol OMADM with
+XmlEncodingDefaults{Namespace = OMADMNamespace},
+Documentation
+{
+    ProtocolName = "OMA Device Management Protocol",
+    ShortName = "OMADM",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "OMA-DMP1.2.1", Version = "1.2.1", Date = "06/17/2008", Link = "http://technical.openmobilealliance.org/Technical/release_program/docs/DM/V1_2_1-20080617-A/OMA-TS-DM_Protocol-V1_2_1-20080617-A.pdf"},
+        new Reference {Name = "OMA-SyncMLRP1.2.2", Version = "1.2.2", Date = "07/24/2009", Link = "http://technical.openmobilealliance.org/Technical/release_program/docs/Common/V1_2_2-20090724-A/OMA-TS-SyncML-RepPro-V1_2_2-20090724-A.pdf"},
+        new Reference {Name = "MS-MDM", Version = "7.0", Date = "09/15/2017", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "", Date = ""}
+    ]
+};
+
+using Diagnostics;
+using XSD;
+using Utility;
+using OthersResources;
+using HTTP;
+using WBXML;
+
+const string OMADMNamespace = "SYNCML:SYNCML1.2";
+const string OMADMRootElementName = "SyncML";
+const string VerDTDValue = "1.2";
+const string VerProtoValue = "DM/1.2";
+const string WBXMLContentType = "application/vnd.syncml.dm+wbxml";
+const string XMLContentType = "application/vnd.syncml.dm+xml";
+
+endpoint Client[string hostname, string sessionID]
+    accepts SyncML issues SyncML
+    accepts Package issues Package
+{
+    void AcceptDispatcher(Package m)
+    {
+        dispatch this accepts m;
+    }
+    
+    void IssueDispatcher(Package m)
+    {
+        dispatch this issues m;
+    }
+    
+    OmadmDecodingCache requestCache = null;
+    OmadmDecodingCache responseCache = null;
+    SessionState State = SessionState.Uninitialized;
+    
+    process this accepts syncML:SyncML
+    {
+        ChangeEndpointState(syncML);
+        
+        // if current state is aborted, it should dispatch the message to TOP level
+        // And reset the cache
+        if (State == SessionState.SessionAborted)
+        {
+            HandleMessageInAbortedState(syncML);
+            return;
+        }
+        
+        // initiliaze request cache
+        if (requestCache == null)
+        {
+            requestCache = new OmadmDecodingCache
+            {
+                Dispatcher = AcceptDispatcher
+            };
+        }
+        
+        // if it is the request with pure Alert 1222, the message should be reassembled in the response
+        if (syncML.IsPureMoreAlert)
+        {
+            responseCache.Add(syncML);
+        }
+        else
+        {
+            requestCache.Add(syncML);
+            requestCache.ReassembleAndDispatch();
+        }
+    }
+    
+    process this issues syncML:SyncML
+    {
+        ChangeEndpointState(syncML);
+        // if current state is aborted, it should dispatch the message to TOP level
+        // And reset the cache
+        if (State == SessionState.SessionAborted)
+        {
+            HandleMessageInAbortedState(syncML);
+            return;
+        }
+        
+        // initiliaze response cache
+        if (responseCache == null)
+        {
+            responseCache = new OmadmDecodingCache
+            {
+                Dispatcher = IssueDispatcher
+            };
+        }
+        responseCache.Add(syncML);
+        responseCache.ReassembleAndDispatch();
+    }
+    
+    ~endpoint(Client client)
+    {
+        if (requestCache != null)
+        {
+            requestCache.Reset(true);
+        }
+        if (responseCache != null)
+        {
+            responseCache.Reset(true);
+        }
+    }
+    
+    void HandleMessageInAbortedState(SyncML syncML)
+    {
+        DisplayTopLevelMessage(syncML);
+        ErrorCodeIf(true, syncML, DiagnosisLevel.Warning, OMADM_AbortedSession);
+        if (syncML.IsAborted)
+        {
+            // reset cache when the session aborted
+            if (requestCache != null)
+            {
+                requestCache.Reset(true);
+            }
+            if (responseCache != null)
+            {
+                responseCache.Reset(true);
+            }
+        }
+    }
+    
+    void ChangeEndpointState(SyncML syncML)
+    {
+        // set the state to aborted if aborted message coming
+        if (syncML.IsAborted)
+        {
+            if (State == SessionState.Uninitialized)
+            {
+                ErrorCodeIf(true, syncML, DiagnosisLevel.Warning, OMADM_InitializationClient);
+            }
+            State = SessionState.SessionAborted;
+            return;
+        }
+        // set the state as established if Client Initialization message coming
+        if (syncML.IsClientInitialization)
+        {
+            State = SessionState.SessionEstablished;
+            return;
+        }
+        // initialize when the message is coming when the state is uninitialized
+        if (State == SessionState.Uninitialized)
+        {
+            State = SessionState.SessionEstablished;
+            ErrorCodeIf(true, syncML, DiagnosisLevel.Warning, OMADM_InitializationClient);
+            return;
+        }
+    }
+}
+
+client endpoint Server connected to Client;
+
+autostart actor OMADMOverHTTP(HTTP.Server server)
+{
+    xml xmlValue;
+    process server accepts req:HttpContract.Request 
+        where req.Method == "POST" && req.Payload.Count > 0 && IsOMADMMessage(req.HTTPContentType)
+    {
+        string host = "";
+        if (req.Uri.Host is h:string)
+        {
+            host = h;
+        }
+        if (!DispatchMessage(req.HTTPContentType, host, req.Payload, IssueDispatcher))
+        {
+            ThrowDecodingException("OMADM", "SyncML");
+        }
+    }
+    
+    process server issues res:HttpContract.Response
+        where res.Payload.Count > 0 && IsOMADMMessage(res.HTTPContentType)
+    {
+        string host = "";
+        if (res#Uri is uri:UriType && uri.Host is h:string)
+        {
+            host = h;
+        }
+        if (!DispatchMessage(res.HTTPContentType, host, res.Payload, AcceptDispatcher))
+        {
+            ThrowDecodingException("OMADM", "SyncML");
+        }
+    }
+    
+    void AcceptDispatcher(string host, SessionID sessionId, SyncML syncML)
+    {
+        dispatch (endpoint OMADM.Client[host, sessionId]) accepts syncML;
+    }
+    
+    void IssueDispatcher(string host, SessionID sessionId, SyncML syncML)
+    {
+        dispatch (endpoint OMADM.Client[host, sessionId]) issues syncML;
+    }
+}
+
+// -------------------------------------Utilities ---------------------------------------//
+bool IsOMADMMessage(HeaderFieldType httpContentType)
+{
+    return httpContentType != null &&
+        (httpContentType.Value.Contains(XMLContentType) || httpContentType.Value.Contains(WBXMLContentType));
+}
+
+bool DispatchMessage(HeaderFieldType httpContentType, string host, binary bin, void(string, SessionID, SyncML) dispatcher)
+{
+    if (httpContentType.Value.Contains(XMLContentType))
+    {
+        switch (bin)
+        {
+            case syncML:SyncML from XmlDecoder<SyncML> =>
+                dispatcher(host, syncML.SyncHdr.SessionID, syncML);
+                return true;
+            default =>
+                return false;
+        }
+        return false;
+    }
+    else if (httpContentType.Value.Contains(WBXMLContentType))
+    {
+        switch (bin)
+        {
+            case document:DocumentType from BinaryDecoder<DocumentType> =>
+                byte codePage = 0;
+                WBXmlSyncMLDecoder syncMLDecoder = SyncMLCodePageDecoders[SyncMLTokens.SyncML] as WBXmlSyncMLDecoder;
+                var v = syncMLDecoder.WBXmlTypeDecoder(ref codePage, ref CodePageDecoders, document.Body);
+                if (v == nothing)
+                {
+                    WBXmlMessage msg = new WBXmlMessage{WBXmlDocument = document};
+                    DisplayTopLevelMessage(msg);
+                    return true;
+                }
+                
+                SyncML syncML = v as SyncML;
+                dispatcher(host, syncML.SyncHdr.SessionID, syncML);
+                return true;
+            default =>
+                return false;
+        }
+    }
+
+    return false;
+}
+
+// -------------------------------------Structures & Types ---------------------------------------//
+message Package
+{
+    SyncHdr SyncHdr;
+    array<SyncBodyChoiceType> SyncBodyChoice;
+    
+    override string ToString()
+    {
+        return "Package, VerDTD: " + SyncHdr.VerDTD +
+            ", VerProto: " + SyncHdr.VerProto +
+            ", SessionID: " + SyncHdr.SessionID +
+            ", Target: " + SyncHdr.Target.ToString() +
+            ", Source: " + SyncHdr.Source.ToString();
+    }
+}
+
+// OMA-DM
+// section 6.2.1
+message SyncML
+{
+    SyncHdr SyncHdr;
+    SyncBody SyncBody;
+    
+    override string ToString()
+    {
+        string summary = "SyncML";
+        if (this.IsPureMoreAlert)
+        {
+            summary = "SyncML with pure Alert 1222";
+        }
+        else if (this.ContainMoreAlert)
+        {
+            summary = "SyncML with Alert 1222";
+        }
+        else if (this.IsAborted)
+        {
+            summary = "SyncML with Aborted Alert";
+        }
+        else if (this.IsClientInitialization)
+        {
+            summary = "Client Initialization SyncML with Final";
+        }
+        else if (this.IsFinal)
+        {
+            summary = "SyncML with Final";
+        }
+        
+        return summary + ", VerDTD: " + SyncHdr.VerDTD +
+            ", VerProto: " + SyncHdr.VerProto +
+            ", SessionID: " + SyncHdr.SessionID +
+            ", Target: " + SyncHdr.Target.ToString() +
+            ", Source: " + SyncHdr.Source.ToString();
+    }
+}
+
+type WBXmlSyncMLDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new SyncML{SyncHdr = null, SyncBody = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is syncML:SyncML)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.SyncHdr =>
+                            syncML.SyncHdr = fieldValue as SyncHdr;
+                        case SyncMLTokens.SyncBody =>
+                            syncML.SyncBody = fieldValue as SyncBody;
+                        default =>
+                            return;
+                    }
+                default =>
+                    return;
+            }
+        }
+    }
+}
+
+// section 6.1.1
+type Archive
+{
+    // empty
+}
+
+type WBXmlArchiveDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Archive();
+    }
+}
+
+
+// section 6.1.2
+type Chal
+{
+    Meta Meta;
+}
+
+type WBXmlChalDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Chal{Meta = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is chal:Chal)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Meta =>
+                            chal.Meta = fieldValue as Meta;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+
+// section 6.1.3
+pattern Cmd = enum string
+{
+    Add = "Add",
+    Alert = "Alert",
+    Atomic = "Atomic",
+    Copy = "Copy",
+    Delete = "Delete",
+    Exec = "Exec",
+    Get = "Get",
+    Map = "Map",
+    Move = "Move",
+    Put = "Put",
+    Replace = "Replace",
+    Results = "Results",
+    Search = "Search",
+    Sequence = "Sequence",
+    Status = "Status",
+    Sync = "Sync",
+    ...
+};
+
+// section 6.1.4
+pattern CmdID = string;
+
+// section 6.1.5
+pattern CmdRef = string;
+
+// section 6.1.6
+type Cred
+{
+    optional Meta Meta;
+    Data Data;
+}
+
+type WBXmlCredDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Cred{Meta = nothing, Data = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is cred:Cred)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Meta =>
+                            cred.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Data =>
+                            cred.Data = fieldValue as Data;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+
+// section 6.1.7
+type Field
+{
+    Item Item;
+}
+
+type WBXmlFieldDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Field{Item = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is field:Field)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Item =>
+                            field.Item = fieldValue as Item;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.8
+type Filter
+{
+    Meta Meta;
+    optional Field Field;
+    optional Record Record;
+    optional FilterType FilterType;
+}
+
+type WBXmlFilterDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Filter{Meta = null, Field = nothing, Record = nothing, FilterType = nothing};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is filter:Filter)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Meta =>
+                            filter.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Field =>
+                            filter.Field = fieldValue as Field;
+                        case SyncMLTokens.Record =>
+                            filter.Record = fieldValue as Record;
+                        case SyncMLTokens.FilterType =>
+                            filter.FilterType = fieldValue as FilterType;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.9
+pattern FilterType = enum string
+{
+    EXCLUSIVE = "EXCLUSIVE",
+    INCLUSIVE = "INCLUSIVE",
+    ...
+};
+
+// section 6.1.10
+type Final
+{
+}
+
+type WBXmlFinalDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Final();
+    }
+}
+
+// section 6.1.11
+pattern Lang = string;
+
+// section 6.1.12
+pattern LocName = string;
+
+// section 6.1.13
+pattern LocURI = XSAnyURI;
+
+// section 6.1.14
+type MoreData
+{
+}
+
+type WBXmlMoreDataDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new MoreData();
+    }
+}
+
+// section 6.1.15
+pattern MsgID = int;
+
+// section 6.1.16
+pattern MsgRef = string;
+
+// section 6.1.17
+type NoResp
+{
+}
+
+type WBXmlNoRespDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new NoResp();
+    }
+}
+
+// section 6.1.18
+type NoResults
+{
+}
+
+type WBXmlNoResultsDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new NoResults();
+    }
+}
+
+// section 6.1.19
+pattern NumberOfChanges = int;
+
+// section 6.1.20
+type Record
+{
+    Item Item;
+}
+
+type WBXmlRecordDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Record{Item = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is record:Record)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Item =>
+                            record.Item = fieldValue as Item;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.21
+pattern RespURI = XSAnyURI;
+
+// section 6.1.22
+pattern SessionID = string;
+
+// section 6.1.23
+type SftDel
+{
+}
+
+type WBXmlSftDelDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new SftDel();
+    }
+}
+
+// section 6.1.24
+type Source
+{
+    LocURI LocURI;
+    optional LocName LocName;
+    
+    override string ToString()
+    {
+        return LocURI;
+    }
+}
+
+type WBXmlSourceDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Source{LocURI = null, LocName = nothing};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is source:Source)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.LocURI =>
+                            source.LocURI = fieldValue as LocURI;
+                        case SyncMLTokens.LocName =>
+                            source.LocName = fieldValue as LocName;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.25
+type SourceParent
+{
+    LocURI LocURI;
+}
+
+type WBXmlSourceParentDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new SourceParent{LocURI = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is sourceParent:SourceParent)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.LocURI =>
+                            sourceParent.LocURI = fieldValue as LocURI;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.26
+pattern SourceRef = string;
+
+// section 6.1.27
+type Target
+{
+    LocURI LocURI with DisplayInfo{ToText = DisplayClassName};
+    optional LocName LocName;
+    optional Filter Filter;
+    
+    override string ToString()
+    {
+        return DisplayClassName(LocURI);
+    }
+}
+
+type WBXmlTargetDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Target{LocURI = null, LocName = nothing, Filter = nothing};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is target:Target)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.LocURI =>
+                            target.LocURI = fieldValue as LocURI;
+                        case SyncMLTokens.LocName =>
+                            target.LocName = fieldValue as LocName;
+                        case SyncMLTokens.Filter =>
+                            target.Filter = fieldValue as Filter;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.28
+type TargetParent
+{
+    LocURI LocURI;
+}
+
+type WBXmlTargetParentDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new TargetParent{LocURI = null};
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is targetParent:TargetParent)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.LocURI =>
+                            targetParent.LocURI = fieldValue as LocURI;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.1.29
+pattern TargetRef = string;
+
+// section 6.1.30
+pattern VerDTD = string;
+
+// section 6.1.31
+pattern VerProto = string;
+
+// section 6.2.2
+type SyncHdr
+{
+    VerDTD VerDTD where ValidationCheckValue(value == VerDTDValue, null, true, ReferenceType.Type, "OMADM", "VerDTD", "SyncHdr", VerDTDValue, value);
+    VerProto VerProto where ValidationCheckValue(value == VerProtoValue, null, true, ReferenceType.Type,
+    "OMADM", "VerProto", "SyncHdr", VerProtoValue, value);
+    SessionID SessionID;
+    MsgID MsgID where ValidationCheckGreaterThanOrEqualTo(value >= 1, null, true, ReferenceType.Type, "OMADM", "MsgID", "SyncHdr", 1, value);
+    Target Target;
+    Source Source;
+    optional RespURI RespURI;
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Meta Meta;
+}
+
+type WBXmlSyncHdrDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new SyncHdr
+        {
+            VerDTD = null,
+            VerProto = null,
+            SessionID = null,
+            Target = null,
+            Source = null,
+            RespURI = nothing,
+            NoResp = nothing,
+            Cred = nothing,
+            Meta = nothing
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is syncHdr:SyncHdr)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.VerDTD =>
+                            syncHdr.VerDTD = fieldValue as VerDTD;
+                        case SyncMLTokens.VerProto =>
+                            syncHdr.VerProto = fieldValue as VerProto;
+                        case SyncMLTokens.SessionID =>
+                            syncHdr.SessionID = fieldValue as SessionID;
+                        case SyncMLTokens.MsgID =>
+                            syncHdr.MsgID = ((fieldValue as optional MsgID) as MsgID);
+                        case SyncMLTokens.Target =>
+                            syncHdr.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            syncHdr.Source = fieldValue as Source;
+                        case SyncMLTokens.NoResp =>
+                            syncHdr.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            syncHdr.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            syncHdr.Meta = fieldValue as Meta;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.2.3
+// Future Reference: use Choice and IsWrapped aspect.
+type SyncBody
+{
+    optional array<Alert> Alert;
+    optional array<Atomic> Atomic;
+    optional array<Copy> Copy;
+    optional array<Exec> Exec;
+    optional array<Get> Get;
+    optional array<Map> Map;
+    optional array<Move> Move;
+    optional array<Put> Put;
+    optional array<Results> Results;
+    optional array<Search> Search;
+    optional array<Sequence> Sequence;
+    optional array<Status> Status;
+    optional array<Sync> Sync;
+    optional array<Add> Add;
+    optional array<Replace> Replace;
+    optional array<Delete> Delete;
+    optional Final Final;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type WBXmlSyncBodyDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new SyncBody
+        {
+            Alert = nothing,
+            Atomic = nothing,
+            Copy = nothing,
+            Exec = nothing,
+            Get = nothing,
+            Map = nothing,
+            Move = nothing,
+            Put = nothing,
+            Results = nothing,
+            Search = nothing,
+            Sequence = nothing,
+            Sync = nothing,
+            Add = nothing,
+            Replace = nothing,
+            Delete = nothing,
+            Final = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is syncBody:SyncBody)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Alert =>
+                            if (syncBody.Alert == nothing)
+                            {
+                                syncBody.Alert = [fieldValue as Alert];
+                            }
+                            else
+                            {
+                                syncBody.Alert = (syncBody.Alert as array<Alert>) + [fieldValue as Alert];
+                            }
+                        case SyncMLTokens.Atomic =>
+                            if (syncBody.Atomic == nothing)
+                            {
+                                syncBody.Atomic = [fieldValue as Atomic];
+                            }
+                            else
+                            {
+                                syncBody.Atomic = (syncBody.Atomic as array<Atomic>) + [fieldValue as Atomic];
+                            }
+                        case SyncMLTokens.Copy =>
+                            if (syncBody.Copy == nothing)
+                            {
+                                syncBody.Copy = [fieldValue as Copy];
+                            }
+                            else
+                            {
+                                syncBody.Copy = (syncBody.Copy as array<Copy>) + [fieldValue as Copy];
+                            }
+                        case SyncMLTokens.Exec =>
+                            if (syncBody.Exec == nothing)
+                            {
+                                syncBody.Exec = [fieldValue as Exec];
+                            }
+                            else
+                            {
+                                syncBody.Exec = (syncBody.Exec as array<Exec>) + [fieldValue as Exec];
+                            }
+                        case SyncMLTokens.Get =>
+                            if (syncBody.Get == nothing)
+                            {
+                                syncBody.Get = [fieldValue as Get];
+                            }
+                            else
+                            {
+                                syncBody.Get = (syncBody.Get as array<Get>) + [fieldValue as Get];
+                            }
+                        case SyncMLTokens.Map =>
+                            if (syncBody.Map == nothing)
+                            {
+                                syncBody.Map = [fieldValue as Map];
+                            }
+                            else
+                            {
+                                syncBody.Map = (syncBody.Map as array<Map>) + [fieldValue as Map];
+                            }
+                        case SyncMLTokens.Move =>
+                            if (syncBody.Move == nothing)
+                            {
+                                syncBody.Move = [fieldValue as Move];
+                            }
+                            else
+                            {
+                                syncBody.Move = (syncBody.Move as array<Move>) + [fieldValue as Move];
+                            }
+                        case SyncMLTokens.Put =>
+                            if (syncBody.Put == nothing)
+                            {
+                                syncBody.Put = [fieldValue as Put];
+                            }
+                            else
+                            {
+                                syncBody.Put = (syncBody.Put as array<Put>) + [fieldValue as Put];
+                            }
+                        case SyncMLTokens.Results =>
+                            if (syncBody.Results == nothing)
+                            {
+                                syncBody.Results = [fieldValue as Results];
+                            }
+                            else
+                            {
+                                syncBody.Results = (syncBody.Results as array<Results>) + [fieldValue as Results];
+                            }
+                        case SyncMLTokens.Search =>
+                            if (syncBody.Search == nothing)
+                            {
+                                syncBody.Search = [fieldValue as Search];
+                            }
+                            else
+                            {
+                                syncBody.Search = (syncBody.Search as array<Search>) + [fieldValue as Search];
+                            }
+                        case SyncMLTokens.Sequence =>
+                            if (syncBody.Sequence == nothing)
+                            {
+                                syncBody.Sequence = [fieldValue as Sequence];
+                            }
+                            else
+                            {
+                                syncBody.Sequence = (syncBody.Sequence as array<Sequence>) + [fieldValue as Sequence];
+                            }
+                        case SyncMLTokens.Status =>
+                            if (syncBody.Status == nothing)
+                            {
+                                syncBody.Status = [fieldValue as Status];
+                            }
+                            else
+                            {
+                                syncBody.Status = (syncBody.Status as array<Status>) + [fieldValue as Status];
+                            }
+                        case SyncMLTokens.Sync =>
+                            if (syncBody.Sync == nothing)
+                            {
+                                syncBody.Sync = [fieldValue as Sync];
+                            }
+                            else
+                            {
+                                syncBody.Sync = (syncBody.Sync as array<Sync>) + [fieldValue as Sync];
+                            }
+                        case SyncMLTokens.Add =>
+                            if (syncBody.Add == nothing)
+                            {
+                                syncBody.Add = [fieldValue as Add];
+                            }
+                            else
+                            {
+                                syncBody.Add = (syncBody.Add as array<Add>) + [fieldValue as Add];
+                            }
+                        case SyncMLTokens.Replace =>
+                            if (syncBody.Replace == nothing)
+                            {
+                                syncBody.Replace = [fieldValue as Replace];
+                            }
+                            else
+                            {
+                                syncBody.Replace = (syncBody.Replace as array<Replace>) + [fieldValue as Replace];
+                            }
+                        case SyncMLTokens.Delete =>
+                            if (syncBody.Delete == nothing)
+                            {
+                                syncBody.Delete = [fieldValue as Delete];
+                            }
+                            else
+                            {
+                                syncBody.Delete = (syncBody.Delete as array<Delete>) + [fieldValue as Delete];
+                            }
+                        case SyncMLTokens.Final =>
+                            syncBody.Final = fieldValue as Final;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+type SyncBodyChoiceType
+{
+    optional Alert Alert;
+    optional Atomic Atomic;
+    optional Copy Copy;
+    optional Exec Exec;
+    optional Get Get;
+    optional Map Map;
+    optional Move Move;
+    optional Put Put;
+    optional Results Results;
+    optional Search Search;
+    optional Sequence Sequence;
+    optional Status Status;
+    optional Sync Sync;
+    optional Add Add;
+    optional Replace Replace;
+    optional Delete Delete;
+    
+    override string ToString()
+    {
+        if (Alert is alert:Alert)
+        {
+            return alert.ToString();
+        }
+        else if (Atomic is atomic:Atomic)
+        {
+            return atomic.ToString();
+        }
+        else if (Copy is copy:Copy)
+        {
+            return copy.ToString();
+        }
+        else if (Exec is exec:Exec)
+        {
+            return exec.ToString();
+        }
+        else if (Get is g:Get)
+        {
+            return g.ToString();
+        }
+        else if (Map is m:Map)
+        {
+            return m.ToString();
+        }
+        else if (Move is move:Move)
+        {
+            return move.ToString();
+        }
+        else if (Put is put:Put)
+        {
+            return put.ToString();
+        }
+        else if (Results is results:Results)
+        {
+            return results.ToString();
+        }
+        else if (Search is search:Search)
+        {
+            return search.ToString();
+        }
+        else if (Sequence is sequence:Sequence)
+        {
+            return sequence.ToString();
+        }
+        else if (Status is status:Status)
+        {
+            return status.ToString();
+        }
+        else if (Sync is sync:Sync)
+        {
+            return sync.ToString();
+        }
+        else if (Add is add:Add)
+        {
+            return add.ToString();
+        }
+        else if (Replace is replace:Replace)
+        {
+            return replace.ToString();
+        }
+        else if (Delete is d:Delete)
+        {
+            return d.ToString();
+        }
+        return base.ToString();
+    }
+} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice};
+
+// section 6.3.1
+pattern Data = string;
+
+// section 6.3.2
+type Item
+{
+    optional Target Target;
+    optional Source Source;
+    optional SourceParent SourceParent;
+    optional TargetParent TargetParent;
+    optional Meta Meta;
+    optional Data Data;
+}
+
+type WBXmlItemDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Item
+        {
+            Target = nothing,
+            Source = nothing,
+            SourceParent = nothing,
+            TargetParent = nothing,
+            Meta = nothing,
+            Data = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is item:Item)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.TargetParent =>
+                            item.TargetParent = fieldValue as TargetParent;
+                        case SyncMLTokens.SourceParent =>
+                            item.SourceParent = fieldValue as SourceParent;
+                        case SyncMLTokens.Target =>
+                            item.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            item.Source = fieldValue as Source;
+                        case SyncMLTokens.Meta =>
+                            item.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Data =>
+                            item.Data = fieldValue as Data;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.3.3
+pattern Meta = string;
+
+// section 6.3.4
+pattern Correlator = string;
+
+// section 6.4.1
+type Status
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Status"));
+    MsgRef MsgRef;
+    CmdRef CmdRef;
+    // TDI
+    Cmd Cmd;
+    // where ValidationCheckEnumValueTooManyItems(InRange<Cmd>(value), null, true, ReferenceType.Type, "OMADM", "Cmd", "Status", "Cmd", "[OMA-DM]");
+    optional array<TargetRef> TargetRef;
+    optional array<SourceRef> SourceRef;
+    optional Cred Cred;
+    optional Chal Chal;
+    Data Data;
+    optional array<Item> Item;
+}
+
+type WBXmlStatusDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Status
+        {
+            CmdID = null,
+            MsgRef = null,
+            CmdRef = null,
+            TargetRef = nothing,
+            SourceRef = nothing,
+            Cred = nothing,
+            Chal = nothing,
+            Data = null,
+            Item = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is status:Status)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            status.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.MsgRef =>
+                            status.MsgRef = fieldValue as MsgRef;
+                        case SyncMLTokens.CmdRef =>
+                            status.CmdRef = fieldValue as CmdRef;
+                        case SyncMLTokens.TargetRef =>
+                            if (status.TargetRef == nothing)
+                            {
+                                status.TargetRef = [fieldValue as TargetRef];
+                            }
+                            else
+                            {
+                                status.TargetRef = (status.TargetRef as array<TargetRef>) + [fieldValue as TargetRef];
+                            }
+                        case SyncMLTokens.SourceRef =>
+                            if (status.SourceRef == nothing)
+                            {
+                                status.SourceRef = [fieldValue as SourceRef];
+                            }
+                            else
+                            {
+                                status.SourceRef = (status.SourceRef as array<SourceRef>) + [fieldValue as SourceRef];
+                            }
+                        case SyncMLTokens.Cred =>
+                            status.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Chal =>
+                            status.Chal = fieldValue as Chal;
+                        case SyncMLTokens.Data =>
+                            status.Data = fieldValue as Data;
+                        case SyncMLTokens.Item =>
+                            if (status.Item == nothing)
+                            {
+                                status.Item = [fieldValue as Item];
+                            }
+                            else
+                            {
+                                status.Item = (status.Item as array<Item>) + [fieldValue as Item];
+                            }
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.1
+type Add
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Add"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlAddDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Add
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is add:Add)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            add.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            add.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            add.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            add.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            add.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.2
+type Alert
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Alert"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Data Data;
+    optional Correlator Correlator;
+    optional array<Item> Item;
+}
+
+type WBXmlAlertDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Alert
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Data = nothing,
+            Correlator = nothing,
+            Item = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is alert:Alert)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            alert.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            alert.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            alert.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Data =>
+                            alert.Data = fieldValue as Data;
+                        case SyncMLTokens.Correlator =>
+                            alert.Correlator = fieldValue as Correlator;
+                        case SyncMLTokens.Item =>
+                            if (alert.Item == nothing)
+                            {
+                                alert.Item = [fieldValue as Item];
+                            }
+                            else
+                            {
+                                alert.Item = (alert.Item as array<Item>) + [fieldValue as Item];
+                            }
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.3
+// Future Reference: use Choice and IsWrapped aspect.
+type Atomic
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Atomic"));
+    optional NoResp NoResp;
+    optional Meta Meta;
+    optional array<Add> Add;
+    optional array<Delete> Delete;
+    optional array<Copy> Copy;
+    optional array<Atomic> Atomic;
+    optional array<Map> Map;
+    optional array<Move> Move;
+    optional array<Replace> Replace;
+    optional array<Sequence> Sequence;
+    optional array<Sync> Sync;
+    optional array<Get> Get;
+    optional array<Exec> Exec;
+    optional array<Alert> Alert;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type WBXmlAtomicDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Atomic
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Meta = nothing,
+            Add = nothing,
+            Copy = nothing,
+            Atomic = nothing,
+            Map = nothing,
+            Move = nothing,
+            Replace = nothing,
+            Sequence = nothing,
+            Sync = nothing,
+            Get = nothing,
+            Exec = nothing,
+            Alert = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is atomic:Atomic)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            atomic.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            atomic.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Meta =>
+                            atomic.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Add =>
+                            if (atomic.Add == nothing)
+                            {
+                                atomic.Add = [fieldValue as Add];
+                            }
+                            else
+                            {
+                                atomic.Add = (atomic.Add as array<Add>) + [fieldValue as Add];
+                            }
+                        case SyncMLTokens.Copy =>
+                            if (atomic.Copy == nothing)
+                            {
+                                atomic.Copy = [fieldValue as Copy];
+                            }
+                            else
+                            {
+                                atomic.Copy = (atomic.Copy as array<Copy>) + [fieldValue as Copy];
+                            }
+                        case SyncMLTokens.Atomic =>
+                            if (atomic.Atomic == nothing)
+                            {
+                                atomic.Atomic = [fieldValue as Atomic];
+                            }
+                            else
+                            {
+                                atomic.Atomic = (atomic.Atomic as array<Atomic>) + [fieldValue as Atomic];
+                            }
+                        case SyncMLTokens.Map =>
+                            if (atomic.Map == nothing)
+                            {
+                                atomic.Map = [fieldValue as Map];
+                            }
+                            else
+                            {
+                                atomic.Map = (atomic.Map as array<Map>) + [fieldValue as Map];
+                            }
+                        case SyncMLTokens.Move =>
+                            if (atomic.Move == nothing)
+                            {
+                                atomic.Move = [fieldValue as Move];
+                            }
+                            else
+                            {
+                                atomic.Move = (atomic.Move as array<Move>) + [fieldValue as Move];
+                            }
+                        case SyncMLTokens.Replace =>
+                            if (atomic.Replace == nothing)
+                            {
+                                atomic.Replace = [fieldValue as Replace];
+                            }
+                            else
+                            {
+                                atomic.Replace = (atomic.Replace as array<Replace>) + [fieldValue as Replace];
+                            }
+                        case SyncMLTokens.Sequence =>
+                            if (atomic.Sequence == nothing)
+                            {
+                                atomic.Sequence = [fieldValue as Sequence];
+                            }
+                            else
+                            {
+                                atomic.Sequence = (atomic.Sequence as array<Sequence>) + [fieldValue as Sequence];
+                            }
+                        case SyncMLTokens.Sync =>
+                            if (atomic.Sync == nothing)
+                            {
+                                atomic.Sync = [fieldValue as Sync];
+                            }
+                            else
+                            {
+                                atomic.Sync = (atomic.Sync as array<Sync>) + [fieldValue as Sync];
+                            }
+                        case SyncMLTokens.Get =>
+                            if (atomic.Get == nothing)
+                            {
+                                atomic.Get = [fieldValue as Get];
+                            }
+                            else
+                            {
+                                atomic.Get = (atomic.Get as array<Get>) + [fieldValue as Get];
+                            }
+                        case SyncMLTokens.Exec =>
+                            if (atomic.Exec == nothing)
+                            {
+                                atomic.Exec = [fieldValue as Exec];
+                            }
+                            else
+                            {
+                                atomic.Exec = (atomic.Exec as array<Exec>) + [fieldValue as Exec];
+                            }
+                        case SyncMLTokens.Alert =>
+                            if (atomic.Alert == nothing)
+                            {
+                                atomic.Alert = [fieldValue as Alert];
+                            }
+                            else
+                            {
+                                atomic.Alert = (atomic.Alert as array<Alert>) + [fieldValue as Alert];
+                            }
+                    default =>
+                        return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.4
+type Copy
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Copy"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Data Data;
+    array<Item> Item;
+}
+
+type WBXmlCopyDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Copy
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Data = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is copy:Copy)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            copy.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            copy.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            copy.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Data =>
+                            copy.Data = fieldValue as Data;
+                        case SyncMLTokens.Item =>
+                            copy.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.5
+type Delete
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Delete"));
+    optional NoResp NoResp;
+    optional Archive Archive;
+    optional SftDel SftDel;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlDeleteDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Delete
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Archive = nothing,
+            SftDel = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+
+        internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is d:Delete)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            d.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            d.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Archive =>
+                            d.Archive = fieldValue as Archive;
+                        case SyncMLTokens.SftDel =>
+                            d.SftDel = fieldValue as SftDel;
+                        case SyncMLTokens.Cred =>
+                            d.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            d.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            d.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.6
+type Exec
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Exec"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Meta Meta;
+    optional Correlator Correlator;
+    array<Item> Item;
+}
+
+type WBXmlExecDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Exec
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Correlator = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is exec:Exec)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            exec.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            exec.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            exec.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            exec.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Correlator =>
+                            exec.Correlator = fieldValue as Correlator;
+                        case SyncMLTokens.Item =>
+                            exec.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.7
+type Get
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Get"));
+    optional NoResp NoResp;
+    optional Lang Lang;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlGetDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Get
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Lang = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is g:Get)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            g.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            g.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Lang =>
+                            g.Lang = fieldValue as Lang;
+                        case SyncMLTokens.Cred =>
+                            g.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            g.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            g.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.8
+type Map
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Map"));
+    Target Target;
+    Source Source;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<MapItem> MapItem;
+}
+
+type WBXmlMapDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Map
+        {
+            CmdID = null,
+            Target = null,
+            Source = null,
+            Cred = nothing,
+            Meta = nothing,
+            MapItem = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is m:Map)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            m.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.Target =>
+                            m.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            m.Source = fieldValue as Source;
+                        case SyncMLTokens.Cred =>
+                            m.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            m.Meta = fieldValue as Meta;
+                        case SyncMLTokens.MapItem =>
+                            m.MapItem += [fieldValue as MapItem];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.9
+type MapItem
+{
+    Target Target;
+    Source Source;
+}
+
+type WBXmlMapItemDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Map
+        {
+            Target = null,
+            Source = null,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is mapItem:MapItem)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.Target =>
+                            mapItem.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            mapItem.Source = fieldValue as Source;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.10
+type Move
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Move"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlMoveDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Move
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is move:Move)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            move.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            move.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            move.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            move.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            move.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.11
+type Put
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Put"));
+    optional NoResp NoResp;
+    optional Lang Lang;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlPutDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Put
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Lang = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is put:Put)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            put.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            put.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Lang =>
+                            put.Lang = fieldValue as Lang;
+                        case SyncMLTokens.Cred =>
+                            put.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            put.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            put.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// section 6.5.12
+type Replace
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Replace"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Meta Meta;
+    array<Item> Item;
+}
+
+type WBXmlReplaceDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Replace
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Meta = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is replace:Replace)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            replace.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            replace.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Cred =>
+                            replace.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Meta =>
+                            replace.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Item =>
+                            replace.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// 6.5.13
+type Results
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Result"));
+    optional MsgRef MsgRef;
+    CmdRef CmdRef;
+    optional Meta Meta;
+    optional TargetRef TargetRef;
+    optional SourceRef SourceRef;
+    array<Item> Item;
+}
+
+type WBXmlResultsDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Results
+        {
+            CmdID = null,
+            MsgRef = nothing,
+            CmdRef = null,
+            Meta = nothing,
+            TargetRef = nothing,
+            SourceRef = nothing,
+            Item = [],
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is results:Results)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            results.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.MsgRef =>
+                            results.MsgRef = fieldValue as MsgRef;
+                        case SyncMLTokens.CmdRef =>
+                            results.CmdRef = fieldValue as CmdRef;
+                        case SyncMLTokens.Meta =>
+                            results.Meta = fieldValue as Meta;
+                        case SyncMLTokens.TargetRef =>
+                            results.TargetRef = fieldValue as TargetRef;
+                        case SyncMLTokens.SourceRef =>
+                            results.SourceRef = fieldValue as SourceRef;
+                        case SyncMLTokens.Item =>
+                            results.Item += [fieldValue as Item];
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// 6.5.14
+type Search
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Search"));
+    optional NoResp NoResp;
+    optional NoResults NoResults;
+    optional Cred Cred;
+    optional Target Target;
+    array<Source> Source;
+    optional Lang Lang;
+    Meta Meta;
+    Data Data;
+}
+
+type WBXmlSearchDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Search
+        {
+            CmdID = null,
+            NoResp = nothing,
+            NoResults = nothing,
+            Cred = nothing,
+            Target = nothing,
+            Source = [],
+            Lang = nothing,
+            Meta = null,
+            Data = null,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is search:Search)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            search.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            search.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.NoResults =>
+                            search.NoResults = fieldValue as NoResults;
+                        case SyncMLTokens.Cred =>
+                            search.Cred = fieldValue as Cred;
+                        case SyncMLTokens.Target =>
+                            search.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            search.Source += [fieldValue as Source];
+                        case SyncMLTokens.Lang =>
+                            search.Lang = fieldValue as Lang;
+                        case SyncMLTokens.Meta =>
+                            search.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Data =>
+                            search.Data = fieldValue as Data;
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// 6.5.15
+// Future Reference: use Choice and IsWrapped aspect.
+type Sequence
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Sequence"));
+    optional NoResp NoResp;
+    optional Meta Meta;
+    optional array<Add> Add;
+    optional array<Delete> Delete;
+    optional array<Copy> Copy;
+    optional array<Atomic> Atomic;
+    optional array<Map> Map;
+    optional array<Move> Move;
+    optional array<Replace> Replace;
+    optional array<Sync> Sync;
+    optional array<Get> Get;
+    optional array<Exec> Exec;
+    optional array<Alert> Alert;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type WBXmlSequenceDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Sequence
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Meta = nothing,
+            Add = nothing,
+            Copy = nothing,
+            Atomic = nothing,
+            Map = nothing,
+            Move = nothing,
+            Replace = nothing,
+            Sync = nothing,
+            Get = nothing,
+            Exec = nothing,
+            Alert = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is sequence:Sequence)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            sequence.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            sequence.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Meta =>
+                            sequence.Meta = fieldValue as Meta;
+                        case SyncMLTokens.Add =>
+                            if (sequence.Add == nothing)
+                            {
+                                sequence.Add = [fieldValue as Add];
+                            }
+                            else
+                            {
+                                sequence.Add = (sequence.Add as array<Add>) + [fieldValue as Add];
+                            }
+                        case SyncMLTokens.Copy =>
+                            if (sequence.Copy == nothing)
+                            {
+                                sequence.Copy = [fieldValue as Copy];
+                            }
+                            else
+                            {
+                                sequence.Copy = (sequence.Copy as array<Copy>) + [fieldValue as Copy];
+                            }
+                        case SyncMLTokens.Atomic =>
+                            if (sequence.Atomic == nothing)
+                            {
+                                sequence.Atomic = [fieldValue as Atomic];
+                            }
+                            else
+                            {
+                                sequence.Atomic = (sequence.Atomic as array<Atomic>) + [fieldValue as Atomic];
+                            }
+                        case SyncMLTokens.Map =>
+                            if (sequence.Map == nothing)
+                            {
+                                sequence.Map = [fieldValue as Map];
+                            }
+                            else
+                            {
+                                sequence.Map = (sequence.Map as array<Map>) + [fieldValue as Map];
+                            }
+                        case SyncMLTokens.Move =>
+                            if (sequence.Move == nothing)
+                            {
+                                sequence.Move = [fieldValue as Move];
+                            }
+                            else
+                            {
+                                sequence.Move = (sequence.Move as array<Move>) + [fieldValue as Move];
+                            }
+                        case SyncMLTokens.Replace =>
+                            if (sequence.Replace == nothing)
+                            {
+                                sequence.Replace = [fieldValue as Replace];
+                            }
+                            else
+                            {
+                                sequence.Replace = (sequence.Replace as array<Replace>) + [fieldValue as Replace];
+                            }
+                        case SyncMLTokens.Sync =>
+                            if (sequence.Sync == nothing)
+                            {
+                                sequence.Sync = [fieldValue as Sync];
+                            }
+                            else
+                            {
+                                sequence.Sync = (sequence.Sync as array<Sync>) + [fieldValue as Sync];
+                            }
+                        case SyncMLTokens.Get =>
+                            if (sequence.Get == nothing)
+                            {
+                                sequence.Get = [fieldValue as Get];
+                            }
+                            else
+                            {
+                                sequence.Get = (sequence.Get as array<Get>) + [fieldValue as Get];
+                            }
+                        case SyncMLTokens.Exec =>
+                            if (sequence.Exec == nothing)
+                            {
+                                sequence.Exec = [fieldValue as Exec];
+                            }
+                            else
+                            {
+                                sequence.Exec = (sequence.Exec as array<Exec>) + [fieldValue as Exec];
+                            }
+                        case SyncMLTokens.Alert =>
+                            if (sequence.Alert == nothing)
+                            {
+                                sequence.Alert = [fieldValue as Alert];
+                            }
+                            else
+                            {
+                                sequence.Alert = (sequence.Alert as array<Alert>) + [fieldValue as Alert];
+                            }
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// 6.5.16
+// Future Reference: use Choice and IsWrapped aspect.
+type Sync
+{
+    CmdID CmdID where ValidationCheck(value != "0", null, DiagnosisLevel.Error, () => Format(OMADM_CmdIDValue, "Sync"));
+    optional NoResp NoResp;
+    optional Cred Cred;
+    optional Target Target;
+    optional Source Source;
+    optional Meta Meta;
+    optional NumberOfChanges NumberOfChanges;
+    optional array<Add> Add;
+    optional array<Atomic> Atomic;
+    optional array<Copy> Copy;
+    optional array<Delete> Delete;
+    optional array<Move> Move;
+    optional array<Sequence> Sequence;
+    optional array<Replace> Replace;
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type WBXmlSyncDecoder : WBXmlDecoderBase
+{
+    internal override any StructConstructor()
+    {
+        return new Sync
+        {
+            CmdID = null,
+            NoResp = nothing,
+            Cred = nothing,
+            Target = nothing,
+            Source = nothing,
+            Meta = nothing,
+            NumberOfChanges = nothing,
+            Add = nothing,
+            Atomic = nothing,
+            Copy = nothing,
+            Delete = nothing,
+            Move = nothing,
+            Sequence = nothing,
+            Replace = nothing,
+        };
+    }
+    
+    internal override void AssignField(any structureValue, byte codePage, byte tokenName, any fieldValue)
+    {
+        if (structureValue is sync:Sync)
+        {
+            switch (codePage)
+            {
+                case OMADMCodePageNumber.SyncMLCodePage =>
+                    switch (tokenName)
+                    {
+                        case SyncMLTokens.CmdID =>
+                            sync.CmdID = fieldValue as CmdID;
+                        case SyncMLTokens.NoResp =>
+                            sync.NoResp = fieldValue as NoResp;
+                        case SyncMLTokens.Target =>
+                            sync.Target = fieldValue as Target;
+                        case SyncMLTokens.Source =>
+                            sync.Source = fieldValue as Source;
+                        case SyncMLTokens.Meta =>
+                            sync.Meta = fieldValue as Meta;
+                        case SyncMLTokens.NumberOfChanges =>
+                            sync.NumberOfChanges = ((fieldValue as optional NumberOfChanges) as NumberOfChanges);
+                        case SyncMLTokens.Add =>
+                            if (sync.Add == nothing)
+                            {
+                                sync.Add = [fieldValue as Add];
+                            }
+                            else
+                            {
+                                sync.Add = (sync.Add as array<Add>) + [fieldValue as Add];
+                            }
+                        case SyncMLTokens.Atomic =>
+                            if (sync.Atomic == nothing)
+                            {
+                                sync.Atomic = [fieldValue as Atomic];
+                            }
+                            else
+                            {
+                                sync.Atomic = (sync.Atomic as array<Atomic>) + [fieldValue as Atomic];
+                            }
+                        case SyncMLTokens.Copy =>
+                            if (sync.Copy == nothing)
+                            {
+                                sync.Copy = [fieldValue as Copy];
+                            }
+                            else
+                            {
+                                sync.Copy = (sync.Copy as array<Copy>) + [fieldValue as Copy];
+                            }
+                        case SyncMLTokens.Delete =>
+                            if (sync.Delete == nothing)
+                            {
+                                sync.Delete = [fieldValue as Delete];
+                            }
+                            else
+                            {
+                                sync.Delete = (sync.Delete as array<Delete>) + [fieldValue as Delete];
+                            }
+                        case SyncMLTokens.Move =>
+                            if (sync.Move == nothing)
+                            {
+                                sync.Move = [fieldValue as Move];
+                            }
+                            else
+                            {
+                                sync.Move = (sync.Move as array<Move>) + [fieldValue as Move];
+                            }
+                        case SyncMLTokens.Sequence =>
+                            if (sync.Sequence == nothing)
+                            {
+                                sync.Sequence = [fieldValue as Sequence];
+                            }
+                            else
+                            {
+                                sync.Sequence = (sync.Sequence as array<Sequence>) + [fieldValue as Sequence];
+                            }
+                        case SyncMLTokens.Replace =>
+                            if (sync.Replace == nothing)
+                            {
+                                sync.Replace = [fieldValue as Replace];
+                            }
+                            else
+                            {
+                                sync.Replace = (sync.Replace as array<Replace>) + [fieldValue as Replace];
+                            }
+                        default =>
+                            return;
+                    }
+                default =>
+                        return;
+            }
+        }
+    }
+}
+
+// Alert code
+const int InitializationMessageAlertCode = 1201;
+const int MoreMessageAlertCode = 1222;
+const int AbortMessageAlertCode = 1223;
+
+// MDM
+// section 3.1.5.1.1, 3.1.5.1.4, 3.1.5.1.5, 3.1.5.1.6, 3.1.5.1.7
+const map<string, string> LocalURIClasses =
+{
+    "./DevInfo"                                                             -> "[DevInfo]",
+    "./cimv2/MDM_AppInstallJob"                                             -> "[MDM_AppInstallJob]",
+    "./cimv2/MDM_Application"                                               -> "[MDM_Application]",
+    "./cimv2/MDM_ApplicationFramework"                                      -> "[MDM_ApplicationFramework]",
+    "./cimv2/MDM_ApplicationSetting"                                        -> "[MDM_ApplicationSetting]",
+    "./cimv2/MDM_BrowserSecurityZones"                                      -> "[MDM_BrowserSecurityZones]",
+    "./cimv2/MDM_BrowserSettings"                                           -> "[MDM_BrowserSettings]",
+    "./cimv2/MDM_Certificate"                                               -> "[MDM_Certificate]",
+    "./cimv2/MDM_CertificateEnrollment"                                     -> "[MDM_CertificateEnrollment]",
+    "./cimv2/MDM_Client"                                                    -> "[MDM_Client]",
+    "./cimv2/MDM_ConfigSetting"                                             -> "[MDM_ConfigSetting]",
+    "./cimv2/MDM_DeviceRegistrationInfo"                                    -> "[MDM_DeviceRegistrationInfo]",
+    "./cimv2/MDM_MgmtAuthority"                                             -> "[MDM_MgmtAuthority]",
+    "./cimv2/MDM_RemoteAppUserCookie"                                       -> "[MDM_RemoteAppUserCookie]",
+    "./cimv2/MDM_RemoteApplication"                                         -> "[MDM_RemoteApplication]",
+    "./cimv2/MDM_Restrictions"                                              -> "[MDM_Restrictions]",
+    "./cimv2/MDM_SecurityStatus"                                            -> "[MDM_SecurityStatus]",
+    "./cimv2/MDM_SideLoader]"                                               -> "[MDM_SideLoader]",
+    "./cimv2/MDM_VpnApplicationTrigger"                                     -> "[MDM_VpnApplicationTrigger]",
+    "./cimv2/MDM_WebApplication"                                            -> "[MDM_WebApplication]",
+    "./cimv2/MDM_WirelessProfile"                                           -> "[MDM_WirelessProfile]",
+    "./cimv2/MDM_WirelessProfileXml"                                        -> "[MDM_WirelessProfileXml]",
+    "./cimv2/MDM_WNSChannel"                                                -> "[MDM_WNSChannel]",
+    "./cimv2/MDM_WNSConfiguration"                                          -> "[MDM_WNSConfiguration]",
+    "./cimv2/MDM_EASPolicy"                                                 -> "[MDM_EASPolicy]",
+    "./cimv2/MSFT_VpnConnection"                                            -> "[MSFT_VpnConnection]",
+    "./cimv2/SoftwareLicensingProduct"                                      -> "[SoftwareLicensingProduct]",
+    "./cimv2/SoftwareLicensingService"                                      -> "[SoftwareLicensingService]",
+    "./cimv2/Win32_Battery"                                                 -> "[Win32_Battery]",
+    "./cimv2/Win32_BIOS"                                                    -> "[Win32_BIOS]",
+    "./cimv2/Win32_ComputerSystem"                                          -> "[Win32_ComputerSystem]",
+    "./cimv2/Win32_ComputerSystemProduct"                                   -> "[Win32_ComputerSystemProduct]",
+    "./cimv2/Win32_CurrentTime"                                             -> "[Win32_CurrentTime]",
+    "./cimv2/Win32_DesktopMonitor"                                          -> "[Win32_DesktopMonitor]",
+    "./cimv2/Win32_DiskDrive"                                               -> "[Win32_DiskDrive]",
+    "./cimv2/Win32_DisplayConfiguration"                                    -> "[Win32_DisplayConfiguration]",
+    "./cimv2/Win32_EncryptableVolume"                                       -> "[Win32_EncryptableVolume]",
+    "./cimv2/Win32_InfraredDevice"                                          -> "[Win32_InfraredDevice]",
+    "./cimv2/Win32_LocalTime"                                               -> "[Win32_LocalTime]",
+    "./cimv2/Win32_LogicalDisk"                                             -> "[Win32_LogicalDisk]",
+    "./cimv2/Win32_NetworkAdapter"                                          -> "[Win32_NetworkAdapter]",
+    "./cimv2/Win32_NetworkAdapterConfiguration"                             -> "[Win32_NetworkAdapterConfiguration]",
+    "./cimv2/Win32_OperatingSystem"                                         -> "[Win32_OperatingSystem]",
+    "./cimv2/Win32_PhysicalMemory"                                          -> "[Win32_PhysicalMemory]",
+    "./cimv2/Win32_PnPDevice"                                               -> "[Win32_PnPDevice]",
+    "./cimv2/Win32_PortableBattery"                                         -> "[Win32_PortableBattery]",
+    "./cimv2/Win32_Processor"                                               -> "[Win32_Processor]",
+    "./cimv2/Win32_QuickFixEngineering"                                     -> "[Win32_QuickFixEngineering]",
+    "./cimv2/Win32_Service"                                                 -> "[Win32_Service]",
+    "./cimv2/Win32_Share"                                                   -> "[Win32_Share]",
+    "./cimv2/Win32_SystemBIOS"                                              -> "[Win32_SystemBIOS]",
+    "./cimv2/Win32_SystemEnclosure"                                         -> "[Win32_SystemEnclosure]",
+    "./cimv2/Win32_TimeZone"                                                -> "[Win32_TimeZone]",
+    "./cimv2/Win32_UTCTime"                                                 -> "[Win32_UTCTime]",
+    "./cimv2/Win32_WindowsUpdateAgentVersion"                               -> "[Win32_WindowsUpdateAgentVersion]",
+    "./cimv2/applications/windowsparentalcontrol/WpcAppOverride"            -> "[WpcAppOverride]",
+    "./cimv2/applications/windowsparentalcontrol/WpcGameOverride"           -> "[WpcGameOverride]",
+    "./cimv2/applications/windowsparentalcontrol/WpcURLOverride"            -> "[WpcURLOverride]",
+    "./cimv2/applications/windowsparentalcontrol/WpcWebSettings"            -> "[WpcWebSettings]",
+    "./cimv2/applications/windowsparentalcontrol/WpcRating"                 -> "[WpcRating]",
+    "./cimv2/applications/windowsparentalcontrol/WpcRatingsDescriptor"      -> "[WpcRatingsDescriptor]",
+    "./cimv2/applications/windowsparentalcontrol/WpcRatingsSystem"          -> "[WpcRatingsSystem]",
+    "./cimv2/applications/windowsparentalcontrol/WpcSystemSettings"         -> "[WpcSystemSettings]",
+    "./cimv2/applications/windowsparentalcontrol/WpcUserSettings"           -> "[WpcUserSettings]",
+    "./cimv2/applications/windowsparentalcontrol/WpcGamesSettings"          -> "[WpcGamesSettings]",
+};
+
+// ------------------------------- Properties --------------------------------------
+bool get IsFinal(this SyncML s)
+{
+    return s.SyncBody.Final != nothing;
+}
+
+bool get IsAborted(this SyncML s)
+{
+    return s.SyncBody.Alert is alertArray:array<Alert> && alertArray.Count > 0 &&
+        alertArray[0].Data is data:Data && data == (AbortMessageAlertCode as string);
+}
+
+bool get IsPureMoreAlert(this SyncML s)
+{
+    return s.SyncBody.Alert is alertArray:array<Alert> && alertArray.Count == 1 &&
+        alertArray[0].Data is data:Data && data == (MoreMessageAlertCode as string) &&
+        // check only Alert 1222
+        (s.SyncBody.Atomic == nothing || (s.SyncBody.Atomic is atomic:array<Atomic> && atomic.Count == 0)) &&
+        (s.SyncBody.Copy == nothing || (s.SyncBody.Copy is copy:array<Copy> && copy.Count == 0)) &&
+        (s.SyncBody.Exec == nothing || (s.SyncBody.Exec is exec:array<Exec> && exec.Count == 0)) &&
+        (s.SyncBody.Map == nothing || (s.SyncBody.Map is mapArray:array<Map> && mapArray.Count == 0)) &&
+        (s.SyncBody.Put == nothing || (s.SyncBody.Put is put:array<Put> && put.Count == 0)) &&
+        (s.SyncBody.Results == nothing || (s.SyncBody.Results is results:array<Results> && results.Count == 0)) &&
+        (s.SyncBody.Search == nothing || (s.SyncBody.Search is search:array<Search> && search.Count == 0)) &&
+        (s.SyncBody.Sequence == nothing || (s.SyncBody.Sequence is sequence:array<Sequence> && sequence.Count == 0)) &&
+        (s.SyncBody.Sync == nothing || (s.SyncBody.Sync is sync:array<Sync> && sync.Count == 0)) &&
+        (s.SyncBody.Add == nothing || (s.SyncBody.Add is add:array<Add> && add.Count == 0)) &&
+        (s.SyncBody.Replace == nothing || (s.SyncBody.Replace is replace:array<Replace> && replace.Count == 0)) &&
+        (s.SyncBody.Delete == nothing || (s.SyncBody.Delete is deleteArray:array<Delete> && deleteArray.Count == 0));
+}
+
+bool get ContainMoreAlert(this SyncML s)
+{
+    if (s.SyncBody.Alert is alertArray:array<Alert>)
+    {
+        foreach (var item in alertArray)
+        {
+            if (item.Data is data:Data && data == (MoreMessageAlertCode as string))
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool get IsClientInitialization(this SyncML s)
+{
+    return s.SyncBody.Alert is alertArray:array<Alert> && alertArray.Count > 0 &&
+        alertArray[0].Data is data:Data && data == (InitializationMessageAlertCode as string);
+}
+
+// ------------------------------- Reassemble ---------------------------------------
+type OmadmDecodingCache
+{
+    Package PackageCache = null;
+    array<any message> Origins = [];
+    bool ReadyToReassemble = false;
+    void(Package) Dispatcher;
+        
+    void Add(SyncML syncML)
+    {
+        if (syncML.IsFinal && !syncML.IsPureMoreAlert)
+        {
+            ReadyToReassemble = true;
+        }
+        // set the origins
+        Origins += [syncML];
+        
+        // initialize Package Cache
+        if (PackageCache == null)
+        {
+            PackageCache = new Package
+            {
+                // assign the header of first message in the package to package header
+                SyncHdr = syncML.SyncHdr,
+                SyncBodyChoice = [],
+            };
+        }
+        
+        if (syncML.IsPureMoreAlert)
+        {
+            // will not reassemble the pure alert information in the package
+            return;
+        }
+        
+        if (syncML.SyncBody.Alert is alert:array<Alert>)
+        {
+            foreach (var item in alert)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Alert = item}];
+            }
+        }
+        if (syncML.SyncBody.Atomic is atomic:array<Atomic>)
+        {
+            foreach (var item in atomic)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Atomic = item}];
+            }
+        }
+        if (syncML.SyncBody.Copy is copy:array<Copy>)
+        {
+            foreach (var item in copy)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Copy = item}];
+            }
+        }
+        if (syncML.SyncBody.Exec is exec:array<Exec>)
+        {
+            foreach (var item in exec)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Exec = item}];
+            }
+        }
+        if (syncML.SyncBody.Get is g:array<Get>)
+        {
+            foreach (var item in g)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Get = item}];
+            }
+        }
+        if (syncML.SyncBody.Map is m:array<Map>)
+        {
+            foreach (var item in m)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Map = item}];
+            }
+        }
+        if (syncML.SyncBody.Move is move:array<Move>)
+        {
+            foreach (var item in move)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Move = item}];
+            }
+        }
+        if (syncML.SyncBody.Put is put:array<Put>)
+        {
+            foreach (var item in put)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Put = item}];
+            }
+        }
+        if (syncML.SyncBody.Results is results:array<Results>)
+        {
+            foreach (var item in results)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Results = item}];
+            }
+        }
+        if (syncML.SyncBody.Search is search:array<Search>)
+        {
+            foreach (var item in search)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Search = item}];
+            }
+        }
+        if (syncML.SyncBody.Sequence is sequence:array<Sequence>)
+        {
+            foreach (var item in sequence)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Sequence = item}];
+            }
+        }
+        if (syncML.SyncBody.Status is status:array<Status>)
+        {
+            foreach (var item in status)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Status = item}];
+            }
+        }
+        if (syncML.SyncBody.Sync is sync:array<Sync>)
+        {
+            foreach (var item in sync)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Sync = item}];
+            }
+        }
+        if (syncML.SyncBody.Add is add:array<Add>)
+        {
+            foreach (var item in add)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Add = item}];
+            }
+        }
+        if (syncML.SyncBody.Replace is replace:array<Replace>)
+        {
+            foreach (var item in replace)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Replace = item}];
+            }
+        }
+        if (syncML.SyncBody.Delete is d:array<Delete>)
+        {
+            foreach (var item in d)
+            {
+                PackageCache.SyncBodyChoice += [new SyncBodyChoiceType{Delete = item}];
+            }
+        }
+    }
+    
+    void ReassembleAndDispatch()
+    {
+        if (ReadyToReassemble)
+        {
+            PackageCache.Origins = Origins;
+            Dispatcher(PackageCache);
+            
+            Reset(false);
+        }
+    }
+    
+    void Reset(bool failed)
+    {
+        if (failed && PackageCache != null)
+        {
+            PackageCache.Origins = Origins;
+            Dispatcher(PackageCache);
+            ReportInsufficientData(PackageCache, DiagnosisLevel.Warning, OMADM_IncompletedData);
+        }
+        PackageCache = null;
+        Origins = [];
+        ReadyToReassemble = false;
+    }
+}
+
+string DisplayClassName(any v)
+{
+    if (v is str:string)
+    {
+        foreach (var key in LocalURIClasses.Keys)
+        {
+            if (str.Count >= key.Count && str.Segment(0, key.Count) == key)
+            {
+                return key + "(" + str + ")";
+            }
+        }
+        return str;
+    }
+    return "";
+}
+
+pattern SessionState = enum
+{
+    Uninitialized,
+    SessionEstablished,
+    SessionAborted,
+};
+
+pattern OMADMCodePageNumber = enum byte
+{
+    SyncMLCodePage = 0x00,
+    MetaInfCodePage = 0x01,
+};
+
+pattern SyncMLTokens = enum byte
+{
+    Add = 0x05,
+    Alert = 0x06,
+    Archive = 0x07,
+    Atomic = 0x08,
+    Chal = 0x09,
+    Cmd = 0x0A,
+    CmdID = 0x0B,
+    CmdRef = 0x0C,
+    Copy = 0x0D,
+    Cred = 0x0E,
+    Data = 0x0F,
+    Delete = 0x10,
+    Exec = 0x11,
+    Final = 0x12,
+    Get = 0x13,
+    Item = 0x14,
+    Lang = 0x15,
+    LocName = 0x16,
+    LocURI = 0x17,
+    Map = 0x18,
+    MapItem = 0x19,
+    Meta = 0x1A,
+    MsgID = 0x1B,
+    MsgRef = 0x1C,
+    NoResp = 0x1D,
+    NoResults = 0x1E,
+    Put = 0x1F,
+    Replace = 0x20,
+    RespURI = 0x21,
+    Results = 0x22,
+    Search = 0x23,
+    Sequence = 0x24,
+    SessionID = 0x25,
+    SftDel = 0x26,
+    Source = 0x27,
+    SourceRef = 0x28,
+    Status = 0x29,
+    Sync = 0x2A,
+    SyncBody = 0x2B,
+    SyncHdr = 0x2C,
+    SyncML = 0x2D,
+    Target = 0x2E,
+    TargetRef = 0x2F,
+    // Reserved for future use. 30 
+    VerDTD = 0x31,
+    VerProto = 0x32,
+    NumberOfChanges = 0x33,
+    MoreData = 0x34,
+    Field = 0x35,
+    Filter = 0x36,
+    Record = 0x37,
+    FilterType = 0x38,
+    SourceParent = 0x39,
+    TargetParent = 0x3A,
+    Move = 0x3B,
+    Correlator = 0x3C,
+};
+
+pattern MetInfTokens = enum byte
+{
+    Anchor = 0x05,
+    EMI = 0x06,
+    Format = 0x07,
+    FreeID = 0x08,
+    FreeMem = 0x09,
+    Last = 0x0A,
+    Mark = 0x0B,
+    MaxMsgSize = 0x0C,
+    Mem = 0x0D,
+    MetInf = 0x0E,
+    Next = 0x0F,
+    NextNonce = 0x10,
+    SharedMem = 0x11,
+    Size = 0x12,
+    Type = 0x13,
+    Version = 0x14,
+    MaxObjSize = 0x15,
+    FieldLevel = 0x16,
+};
+
+// -----------------------------------------------------------------------------------------------
+// WBXML Decoder
+const map<SyncMLTokens, any> SyncMLCodePageDecoders =
+{
+    SyncMLTokens.Add -> new WBXmlAddDecoder(),
+    SyncMLTokens.Alert -> new WBXmlAlertDecoder(),
+    SyncMLTokens.Archive -> new WBXmlArchiveDecoder(),
+    SyncMLTokens.Atomic -> new WBXmlAtomicDecoder(),
+    SyncMLTokens.Chal -> new WBXmlChalDecoder(),
+    SyncMLTokens.Cmd -> new WBXmlStringDecoderType(),
+    SyncMLTokens.CmdID -> new WBXmlStringDecoderType(),
+    SyncMLTokens.CmdRef -> new WBXmlStringDecoderType(),
+    SyncMLTokens.Copy -> new WBXmlCopyDecoder(),
+    SyncMLTokens.Cred -> new WBXmlCredDecoder(),
+    SyncMLTokens.Data -> new WBXmlStringDecoderType(),
+    SyncMLTokens.Delete -> new WBXmlDeleteDecoder(),
+    SyncMLTokens.Exec -> new WBXmlExecDecoder(),
+    SyncMLTokens.Final -> new WBXmlFinalDecoder(),
+    SyncMLTokens.Get -> new WBXmlGetDecoder(),
+    SyncMLTokens.Item -> new WBXmlItemDecoder(),
+    SyncMLTokens.Lang -> new WBXmlStringDecoderType(),
+    SyncMLTokens.LocName -> new WBXmlStringDecoderType(),
+    SyncMLTokens.LocURI -> new WBXmlStringDecoderType(),
+    SyncMLTokens.Map -> new WBXmlMapDecoder(),
+    SyncMLTokens.MapItem -> new WBXmlMapItemDecoder(),
+    SyncMLTokens.Meta -> new WBXmlStringDecoderType(),
+    SyncMLTokens.MsgID -> new WBXmlIntDecoderType(),
+    SyncMLTokens.MsgRef -> new WBXmlStringDecoderType(),
+    SyncMLTokens.NoResp -> new WBXmlNoRespDecoder(),
+    SyncMLTokens.NoResults -> new WBXmlNoResultsDecoder(),
+    SyncMLTokens.Put -> new WBXmlPutDecoder(),
+    SyncMLTokens.Replace -> new WBXmlReplaceDecoder(),
+    SyncMLTokens.RespURI -> new WBXmlStringDecoderType(),
+    SyncMLTokens.Results -> new WBXmlResultsDecoder(),
+    SyncMLTokens.Search -> new WBXmlSearchDecoder(),
+    SyncMLTokens.Sequence -> new WBXmlSequenceDecoder(),
+    SyncMLTokens.SessionID -> new WBXmlStringDecoderType(),
+    SyncMLTokens.SftDel -> new WBXmlSftDelDecoder(),
+    SyncMLTokens.Source -> new WBXmlSourceDecoder(),
+    SyncMLTokens.SourceRef -> new WBXmlStringDecoderType(),
+    SyncMLTokens.Status -> new WBXmlStatusDecoder(),
+    SyncMLTokens.Sync -> new WBXmlSyncDecoder(),
+    SyncMLTokens.SyncBody -> new WBXmlSyncBodyDecoder(),
+    SyncMLTokens.SyncHdr -> new WBXmlSyncHdrDecoder(),
+    SyncMLTokens.SyncML -> new WBXmlSyncMLDecoder(),
+    SyncMLTokens.Target -> new WBXmlTargetDecoder(),
+    SyncMLTokens.TargetRef -> new WBXmlStringDecoderType(),
+    SyncMLTokens.VerDTD -> new WBXmlStringDecoderType(),
+    SyncMLTokens.VerProto -> new WBXmlStringDecoderType(),
+    SyncMLTokens.NumberOfChanges -> new WBXmlIntDecoderType(),
+    SyncMLTokens.MoreData -> new WBXmlMoreDataDecoder(),
+    SyncMLTokens.Field -> new WBXmlFieldDecoder(),
+    SyncMLTokens.Filter -> new WBXmlFilterDecoder(),
+    SyncMLTokens.Record -> new WBXmlRecordDecoder(),
+    SyncMLTokens.FilterType -> new WBXmlFilterDecoder(),
+    SyncMLTokens.SourceParent -> new WBXmlSourceParentDecoder(),
+    SyncMLTokens.TargetParent -> new WBXmlTargetParentDecoder(),
+    SyncMLTokens.Move -> new WBXmlMoveDecoder(),
+    SyncMLTokens.Correlator -> new WBXmlStringDecoderType(),
+};
+
+map<OMADMCodePageNumber, map<SyncMLTokens, any>> CodePageDecoders =
+{
+    OMADMCodePageNumber.SyncMLCodePage -> SyncMLCodePageDecoders,
+};

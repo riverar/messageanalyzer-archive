@@ -1,0 +1,598 @@
+protocol OAuth2 with
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "The OAuth 2.0 Authorization Framework",
+    ShortName = "OAuth2",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "RFC6749"},
+        new Reference{Name = "RFC7521"},
+        new Reference{Name = "RFC7523"},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "382114", Date = "10/10/2015"},
+    ]
+};
+
+using HTTP;
+using Standard;
+using Utility;
+using Diagnostics;
+using JWT;
+using CoreNetworkingResources;
+using X509;
+
+const string OAuth2AuthrizeUri = "/authorize";
+const string OAuth2TokenUri = "/token";
+
+endpoint AuthorizationServer
+    over HTTP.Server
+    accepts mutable AuthorizationRequest issues mutable AuthorizationResponse
+    accepts mutable AccessTokenRequest issues mutable AccessTokenResponse
+    issues ErrorResponse
+    provides VirtualOperation;
+
+autostart actor OAuth2OverHTTP(HTTP.Server server)
+{
+    // request
+    process server accepts httpReq:HttpContract.Request where IsOAuth2Request(httpReq)
+    {
+        // if the returned value is nothing, exception has already been thrown in decoder.
+        var req = DecodeOAuth2FromHttpRequest(httpReq);
+        if (req != nothing)
+        {
+            var oauth2Server = endpoint AuthorizationServer over server;
+            MessageDispatcher(req as (AuthorizationRequest | AccessTokenRequest), oauth2Server);
+        }
+        else
+        {
+            reject;
+        }
+    }
+    // response
+    process server issues httpRes:HttpContract.Response where IsOAuth2Response(httpRes)
+    {
+        // if the returned value is nothing, exception has already been thrown in decoder.
+        var res = DecodeOAuth2FromHttpResponse(httpRes);
+        if (res != nothing)
+        {
+            if (res is errRes:ErrorResponse)
+            {
+                ErrorCodeIf(true, errRes, errRes.$"error");
+            }
+            var oauth2Server = endpoint AuthorizationServer over server;
+            MessageDispatcher(res as (AuthorizationRequest | AuthorizationResponse | AccessTokenResponse | ErrorResponse), oauth2Server);
+        }
+        else
+        {
+            reject;
+        }
+    }
+}
+
+bool IsOAuth2Request(HttpContract.Request httpReq)
+{
+    if (httpReq.Uri.AbsPath is absPath:string)
+    {
+        if ((absPath.Contains(OAuth2AuthrizeUri) && (httpReq.Method == "GET" || httpReq.Method == "POST" )) || 
+            (absPath.Contains(OAuth2TokenUri) && httpReq.Method == "POST" && httpReq.Payload.Count > 0))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsOAuth2Response(HttpContract.Response httpRes)
+{
+    if (httpRes#Uri is uri:UriType && uri.AbsPath is absPath:string && httpRes#HttpMethod is method:string)
+    {
+        if ((absPath.Contains(OAuth2AuthrizeUri) && (method == "GET" || method == "POST" )) || 
+            (absPath.Contains(OAuth2TokenUri) && method == "POST"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void MessageDispatcher(optional (AuthorizationRequest | AccessTokenRequest | AuthorizationResponse | AccessTokenResponse | ErrorResponse) m, AuthorizationServer server)
+{
+    if (m is authReq:AuthorizationRequest)
+    {
+        dispatch server accepts authReq;
+    }
+    else if (m is tokenReq:AccessTokenRequest)
+    {
+        dispatch server accepts tokenReq;
+    }
+    else if (m is authRes:AuthorizationResponse)
+    {
+        dispatch server issues authRes;
+    }
+    else if (m is tokenRes:AccessTokenResponse)
+    {
+        dispatch server issues tokenRes;
+    }
+    else if (m is errRes:ErrorResponse)
+    {
+        dispatch server issues errRes;
+    }
+}
+
+optional (AuthorizationRequest | AccessTokenRequest) DecodeOAuth2FromHttpRequest(HttpContract.Request httpReq)
+{
+    var absPath = httpReq.Uri.AbsPath as string;
+    // AuthorizationRequest
+    if (absPath.Contains(OAuth2AuthrizeUri))
+    {
+        if (httpReq.Method == "GET")
+        {
+            if (httpReq.Uri.Query is para:map<string, string>)
+            {
+                para = ParsePercentEncodedQuery(para);
+                var authReq = DecodeAuthorizationRequest(para);
+                return authReq;
+            }
+        }
+        // User's credential is "POST"-ed to authorization server.
+        else if (httpReq.Method == "POST")
+        {
+            string httpPalyad = ASCIIText(httpReq.Payload) as string;
+            if (QueryParameters(httpPalyad) is paras:map<string, string>)
+            {
+                var authReq = DecodeAuthorizationRequest(paras);
+                return authReq;
+            }
+        }
+    }
+    // AccessTokenRequest is POST-ed to authorization server
+    else if (absPath.Contains(OAuth2TokenUri))
+    {
+        string httpPalyad = ASCIIText(httpReq.Payload) as string;
+        var tokenReq = DecodeAccessTokenRequest(httpPalyad);
+        return tokenReq;
+    }
+    return nothing;
+}
+
+optional (AuthorizationResponse | AuthorizationRequest | AccessTokenResponse | ErrorResponse) DecodeOAuth2FromHttpResponse(HttpContract.Response httpRes)
+{
+    // AuthorizationRequest or AuthorizationResponse
+    if (httpRes.StatusCode == 302)
+    {
+        if (("Location" in httpRes.Headers) && httpRes.Headers["Location"] is uri:UriType)
+        {
+            if (uri.Query is uriQuery:map<string, string>)
+            {
+                uriQuery = ParsePercentEncodedQuery(uriQuery);
+                if ("error" in uriQuery.Keys) // Error response for authorization request is transferred in "Location" header field
+                {
+                    var errRes = DecodeErrorResponseFromUri(uriQuery);
+                    return errRes;
+                }
+                else if ("code" in uriQuery.Keys)
+                {
+                    var authRes = DecodeAuthorizationResponse(uriQuery);
+                    return authRes;
+                }
+                else
+                {
+                    var authReq = DecodeAuthorizationRequest(uriQuery);
+                    return authReq;
+                }
+            }
+            else
+            {
+                ThrowDecodingException("OAuth2");
+            }
+        }
+    }
+    // AccessTokenResponse
+    else
+    {
+         if (httpRes.StatusCode == 200)
+         {
+             var tokenRes = JsonDecoder<AccessTokenResponse>(httpRes.Payload);
+             if (tokenRes == nothing)
+             {
+                 ThrowDecodingException("OAuth2", "AccessTokenResponse");
+             }
+             return tokenRes;
+         }
+         else if (httpRes.StatusCode == 400 && httpRes.Headers.ContentTypeContains("application/json"))
+         {
+            var errRes = JsonDecoder<ErrorResponse>(httpRes.Payload as stream);
+            if (errRes == nothing)
+            {
+                ThrowDecodingException("OAuth2", "ErrorResponse");
+            }
+            return errRes;
+         }
+    }
+    return nothing;
+}
+
+optional string AssignField(ref map<string, string> paras, string fieldName)
+{
+    if (paras.Keys[fieldName] && paras[fieldName].ToString() is result:string)
+    {
+        paras = paras.Remove(fieldName);
+        return result;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+string AssignFieldOrReportError(ref map<string, string> paras, string fieldName, string typeName)
+{
+    if (paras.Keys[fieldName] && paras[fieldName].ToString() is result:string)
+    {
+        paras = paras.Remove(fieldName);
+        return result;
+    }
+    else
+    {
+        ValidationCheck(false, null, () => Format(OAUTH2_STR_FIELD_MUST_EXIST, fieldName, typeName));
+        return "";
+    }
+}
+
+optional string AssignFieldOrReportError(ref map<string, string> paras, string fieldName, string typeName, string grantType)
+{
+    if (paras.Keys[fieldName] && paras[fieldName].ToString() is result:string)
+    {
+        paras = paras.Remove(fieldName);
+        return result;
+    }
+    else
+    {
+        ValidationCheck(false, null, () => Format(OAUTH2_STR_FIELD_MUST_EXIST_WHEN_GRANT_TYPE, fieldName, typeName, grantType));
+        return nothing;
+    }
+}
+
+AuthorizationRequest DecodeAuthorizationRequest(map<string, string> paras)
+{
+    paras = ParsePercentEncodedQuery(paras);
+    var authReq = new AuthorizationRequest{};
+    // required filed
+    authReq.response_type = AssignFieldOrReportError(ref paras, "response_type", "AuthorizationRequest");
+    ValidationCheckValue(InRange<AuthorizationType>(authReq.response_type), authReq, true, ReferenceType.Message, "OAuth2", "response_type", "AuthorizationRequest", "code or token", authReq.response_type);
+    authReq.client_id = AssignFieldOrReportError(ref paras, "client_id", "AuthorizationRequest");
+    // optional field
+    var redirectUri = AssignField(ref paras, "redirect_uri");
+    authReq.redirect_uri = redirectUri != nothing ? ParseUri(redirectUri as string) : nothing;
+    authReq.scope = AssignField(ref paras, "scope");
+    authReq.state = AssignField(ref paras, "state");
+    if(paras.Count() > 0)
+    {
+        authReq.otherParameters = paras;
+    }
+    return authReq;
+}
+
+optional AuthorizationResponse DecodeAuthorizationResponse(map<string, string> uriQuery)
+{
+    map<string, string> paras = ParsePercentEncodedQuery(uriQuery);
+    var authRes = new AuthorizationResponse{};
+    // required filed
+    authRes.code = AssignFieldOrReportError(ref paras, "code", "AuthorizationResponse");
+    // optional field
+    authRes.state = AssignField(ref paras, "state");
+    if(paras.Count() > 0)
+    {
+        authRes.otherParameters = paras;
+    }
+    return authRes;
+}
+
+optional ErrorResponse DecodeErrorResponseFromUri(map<string, string> uriQuery)
+{
+    map<string, string> paras = ParsePercentEncodedQuery(uriQuery);
+    var errRes = new ErrorResponse{};
+    // required filed
+    errRes.$"error" = AssignFieldOrReportError(ref paras, "error", "ErrorResponse");
+    // optional field
+    errRes.error_description = paras.Keys["error_description"] ? paras["error_description"].ToString() : nothing;
+    errRes.error_uri = paras.Keys["error_uri"] ? ParseUri(paras["error_uri"].ToString()) : nothing;
+    errRes.state = paras.Keys["state"] ? paras["state"].ToString() : nothing;
+    return errRes;
+}
+
+optional AccessTokenRequest DecodeAccessTokenRequest(string uriQuery)
+{
+    if (QueryParameters(uriQuery) is o:map<string, string>)
+    {
+        map<string, string> paras = ParsePercentEncodedQuery(o);
+        var tokenReq = new AccessTokenRequest{};
+        // required filed
+        tokenReq.grant_type = AssignFieldOrReportError(ref paras, "grant_type", "AccessTokenRequest");
+        switch (tokenReq.grant_type)
+        {
+            case GrantType.AuthorizationCodeGrant =>
+                tokenReq.code = AssignFieldOrReportError(ref paras, "code", "AuthorizationCodeGrant");
+                var redirectUri = AssignFieldOrReportError(ref paras, "redirect_uri", "AccessTokenRequest", "AuthorizationCodeGrant");
+                tokenReq.redirect_uri = redirectUri != nothing ? ParseUri(redirectUri as string) : redirectUri;
+                tokenReq.client_id = AssignFieldOrReportError(ref paras, "client_id", "AccessTokenRequest", "AuthorizationCodeGrant");
+                tokenReq.client_assertion_type = AssignField(ref paras, "client_assertion_type");
+
+            case GrantType.ResourceOwnerPasswordCredentialsGrant =>
+                tokenReq.username = AssignFieldOrReportError(ref paras, "username", "ResourceOwnerPasswordCredentialsGrant");
+                tokenReq.password = AssignFieldOrReportError(ref paras, "password", "ResourceOwnerPasswordCredentialsGrant");
+                tokenReq.scope = AssignField(ref paras, "scope");
+            case GrantType.ClientCredentialsGrant =>
+                tokenReq.scope = AssignField(ref paras, "scope");
+            case GrantType.RefreshToken =>
+                tokenReq.refresh_token = AssignFieldOrReportError(ref paras, "refresh_token", "RefreshToken");
+                tokenReq.scope = AssignField(ref paras, "scope");
+            case GrantType.JWTBearerToken =>
+                tokenReq.scope = AssignField(ref paras, "scope");
+                var assertion = AssignField(ref paras, "assertion");
+                tokenReq.assertion = assertion != nothing ? DecodeJWT<JWS_Header, JWT_Claims, JWE_Header>(assertion as string) : nothing;
+        }
+        if(paras.Count() > 0)
+        {
+            tokenReq.otherParameters = paras;
+        }
+        return tokenReq;
+    }
+    else 
+    {
+        return nothing;
+    }
+}
+
+// RFC6749 4.1.1, 4.2.1
+message AuthorizationRequest
+{
+    // parameters in HTTP GET URI query part.
+    AuthorizationType response_type;
+    string client_id;
+    optional UriType redirect_uri;
+    optional string scope;
+    optional string state;
+    optional array<ParameterExtension> parameterExtensions;
+    optional map<string, string> otherParameters;
+
+    override string ToString()
+    {
+        return "AuthorizationRequest, response_type: " + EnumToString(response_type, "OAuth2.AuthorizationType") + 
+                ", client_id: " + client_id +
+                (redirect_uri != nothing ? (", redirect_uri: " + redirect_uri.ToString()) : "");
+    }
+}
+
+type ParameterExtension
+{
+}
+
+pattern AuthorizationType = enum string
+{
+    Code = "code",
+    Token = "token",
+    ...
+};
+
+// RFC6749 4.1.2
+message AuthorizationResponse
+{
+    // parameters in Location URI query part.
+    string code;
+    optional string state;
+    optional array<ParameterExtension> parameterExtensions;
+    optional map<string, string> otherParameters;
+
+    override string ToString()
+    {
+        return "AuthorizationResponse, authorization code is returned by authorization server.";
+    }
+}
+
+// RFC6749. 4.1.3,  4.3.2, 4.4.2
+message AccessTokenRequest
+{
+    // in HTTP post payload, the format is like Uri query.
+    GrantType grant_type;
+    // code exist only for "authorization_code" type
+    optional string code;
+    // "client_assertion_type" and "client_assertion" maybe exist for "authorization_code" type 
+    // rfc7521, section-4.2
+    optional string client_assertion_type;
+    optional string client_assertion;
+    optional (UriType | string) redirect_uri;
+    optional string client_id;
+    // below 2 fields exist only for "password" type.
+    optional string username;
+    optional string password;
+    // "refresh_token" exists only for "refresh_token" type.
+    optional string refresh_token;
+    optional string scope;
+    // "assertion" exists only for "JWTBearerToken" type.
+    optional (JSONWebToken | string) assertion; // The value of the "assertion" parameter MUST contain a single JWT
+    optional array<ParameterExtension> parameterExtensions;
+    optional map<string, string> otherParameters;
+
+    override string ToString()
+    {
+        string summary = "AccessTokenRequest, grant_type: " + EnumToString(grant_type, "OAuth2.GrantType");
+        summary += username != nothing ? (", username: " + username.ToString()) : "";
+        summary += password != nothing ? (", password: " + password.ToString()) : "";
+        summary += redirect_uri != nothing ? (", redirect_uri: " + redirect_uri.ToString()) : "";
+        return summary;
+    }
+}
+
+pattern GrantType = enum string
+{
+    AuthorizationCodeGrant                  = "authorization_code",
+    ImplicitGrant                           = "token",
+    ResourceOwnerPasswordCredentialsGrant   = "password",
+    ClientCredentialsGrant                  = "client_credentials",
+    RefreshToken                            = "refresh_token",
+    // RFC7523
+    JWTBearerToken                          = "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    ...
+};
+
+// RFC6749. 4.1.4, 4.2.2,  4.3.3, 4.4.3
+message AccessTokenResponse
+{
+    // HTTP payload, in json format.
+    optional string access_token;
+    optional string token_type;
+    optional uint expires_in;
+    optional string refresh_token;
+    optional string scope;
+    optional string state;
+    optional array<ParameterExtension> parameterExtensions;
+
+    override string ToString()
+    {
+        return "AccessTokenResponse" + 
+                (token_type != nothing ? (", token_type: " + token_type.ToString()) : "") +
+                (expires_in != nothing ? (", expires_in: " + expires_in.ToString()) : "") +
+                (refresh_token != nothing ? ", refresh_token exists" : "");
+    }
+}
+
+// RFC6749 5.2, 7.2
+message ErrorResponse
+{
+    // parameters in Location URI query part or HTTP in payload in Json format.
+    string $"error";
+    optional string error_description;
+    optional UriType error_uri;
+    optional string state;
+    
+    override string ToString()
+    {
+        return "ErrorResponse, error: " + $"error" + 
+            (error_description != nothing ? ", error_description" + error_description.ToString() : "");
+    }
+}
+
+contract VirtualOperation
+{
+    issues virtual operation Authorization
+    {
+        in string response_type = EnumToString(respType, "OAuth2.AuthorizationType");
+        in string client_id = clientId;
+        in optional UriType redirect_uri = redirectUri;
+        out string code = authCode;
+        
+        override string ToString()
+        {
+            return "Authorization, response_type: " + response_type +
+                    ", client_id: " + client_id +
+                    (redirect_uri != nothing ? (", redirect_uri: " + redirect_uri.ToString()) : "");
+        }
+    }
+    =
+    accepts AuthorizationRequest{response_type == "code", response_type is respType:string, client_id is clientId:string, redirect_uri is var redirectUri}
+    issues AuthorizationResponse{code is authCode:string};
+    
+    issues virtual operation AuthorizationError
+    {
+        in string response_type = EnumToString(respType, "OAuth2.AuthorizationType");
+        in string client_id = clientId;
+        in optional UriType redirect_uri = redirectUri;
+        out string $"error" = err;
+        out optional string error_description = errDescription;
+        
+        override string ToString()
+        {
+            return "AuthorizationError error: " + $"error" +
+                    ", response_type: " + response_type +
+                    ", client_id: " + client_id +
+                    (redirect_uri != nothing ? (", redirect_uri: " + redirect_uri.ToString()) : "");
+        }
+    }
+    =
+    accepts AuthorizationRequest{response_type == "token", response_type is respType:string, client_id is clientId:string, redirect_uri is var redirectUri}
+    issues ErrorResponse{$"error" is err:string, error_description is var errDescription}; 
+    
+    issues virtual operation AccessToken
+    {
+        in string grant_type = EnumToString(grantType, "OAuth2.GrantType");
+        in optional string username = userName;
+        in optional string password = psw;
+        in optional (UriType | string) redirect_uri = redirectUri;
+        out string access_token = accessToken;
+        out string token_type = tokenType;
+        out optional uint expires_in = expiresIn;
+        out optional string refresh_token = refreshToken;
+        
+        override string ToString()
+        {
+            return "AccessToken, grant_type: " + grant_type +
+                    (username != nothing ? (", username: " + username.ToString()) : "") +
+                    (password != nothing ? (", password: " + password.ToString()) : "") +
+                    (token_type != nothing ? (", token_type: " + token_type.ToString()) : "");
+        }
+    }
+    = 
+    accepts AccessTokenRequest{grant_type is grantType:string, username is var userName, password is var psw, redirect_uri is var redirectUri}
+    issues AccessTokenResponse{access_token is accessToken:string, token_type is tokenType:string, expires_in is var expiresIn, refresh_token is var refreshToken};
+    
+    issues virtual operation AccessTokenError
+    {
+        in string grant_type = EnumToString(grantType, "OAuth2.GrantType");
+        in optional string username = userName;
+        in optional string password = psw;
+        in optional (UriType | string) redirect_uri = redirectUri;
+        out string $"error" = err;
+        out optional string error_description = errDescription;
+        
+        override string ToString()
+        {
+            return "AccessToken error: " + $"error" +
+                    ", grant_type: " + grant_type +
+                    (username != nothing ? (", username: " + username.ToString()) : "") +
+                    (password != nothing ? (", password: " + password.ToString()) : "");
+        }
+    }
+    = 
+    accepts AccessTokenRequest{grant_type is grantType:string, username is var userName, password is var psw, redirect_uri is var redirectUri}
+    issues ErrorResponse{$"error" is err:string, error_description is var errDescription};
+    
+    issues virtual operation ImplictGrant
+    {
+        in string response_type = EnumToString(respType, "OAuth2.AuthorizationType");
+        in string client_id = clientId;
+        in optional UriType redirect_uri = redirectUri;
+        out string access_token = accessToken;
+        out string token_type = tokenType;
+        out optional uint expires_in = expiresIn;
+        out optional string refresh_token = refreshToken;
+        
+        override string ToString()
+        {
+            return "ImplictGrant, response_type: " + response_type +
+                    ", client_id: " + client_id +
+                    (redirect_uri != nothing ? (", redirect_uri: " + redirect_uri.ToString()) : "");
+        }
+    }
+    =
+    accepts AuthorizationRequest{response_type == "token", response_type is respType:string, client_id is clientId:string, redirect_uri is var redirectUri} 
+    issues AccessTokenResponse{access_token is accessToken:string, token_type is tokenType:string, expires_in is var expiresIn, refresh_token is var refreshToken};
+}
+
+// [OIDCCore]: http://openid.net/specs/openid-connect-core-1_0.html#IDToken
+type IDToken_JWT_Claims:JWT_Claims
+{
+    optional string auth_time;
+    optional string nonce;
+    optional string acr;
+    optional string amr;
+    optional string azp;
+}

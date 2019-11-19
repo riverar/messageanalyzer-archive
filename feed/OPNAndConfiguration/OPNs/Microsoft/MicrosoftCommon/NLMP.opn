@@ -1,0 +1,445 @@
+protocol NLMP with 
+    BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "NT LAN Manager (NTLM) Authentication Protocol",
+    ShortName = "NLMP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-NLMP", Version = "27.0", Date = "06/30/2015", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "381981", Date = "10/08/2015"}
+        ]
+};
+
+using Standard;
+using DTYP;
+using Utility;
+
+endpoint Server 
+    accepts NegotiateMessage issues ChallengeMessage 
+    accepts AuthenticateMessage;
+    
+client endpoint Client connected to Server;
+
+pattern NlmpMessage = NegotiateMessage | ChallengeMessage | AuthenticateMessage;
+
+// The bit position of input stream should be the start of the nlmp messages.
+optional NlmpMessage NlmpDecoder(stream s)
+{
+    // Return nothing if the message has a bad header .
+    if (s.RemainingByteLength() < 24) // 24 is the mandatory length of the header.
+    {
+        return nothing;
+    }
+    
+    // Typecasting the messageType, and diff the three messages.
+    var messageType = s.PeekUInt(s.BitPosition + 64, Endian.Little);
+    switch (messageType)
+    {
+        case $1 =>
+            return BinaryDecoder<NegotiateMessage>(s);
+        case $2 =>
+            return BinaryDecoder<ChallengeMessage>(s);
+        case $3 =>
+            return BinaryDecoder<AuthenticateMessage>(s);
+        default =>
+            return nothing;
+    }
+}
+
+long GetMinimalFieldOffset(AuthenticateMessage m)
+{
+    uint offset1 = MinWithoutZero(m.LmChallengeResponseBufferOffset, m.NtChallengeResponseBufferOffset);
+    uint offset2 = MinWithoutZero(m.DomainNameBufferOffset, m.UserNameBufferOffset);
+    uint offset3 = MinWithoutZero(m.WorkstationBufferOffset, m.EncryptedRandomSessionKeyBufferOffset);
+    return MinWithoutZero(MinWithoutZero(offset1, offset2), offset3);
+}
+
+// if x == 0 then return y, else if y == 0 return x, else return x < y ? x : y
+uint MinWithoutZero(uint x, uint y)
+{
+    return (x - 1) < (y - 1) ? x : y;
+}
+
+message NegotiateMessage
+{
+    string Signature 
+        where value == "NTLMSSP"
+        with BinaryEncoding{Length = 8, TextEncoding = TextEncoding.ASCII};
+    uint MessageType where value == 1;
+
+    NegotiateFlags NegotiateFlags;
+
+    ushort DomainNameLen;
+    ushort DomainNameMaxLen;
+    uint DomainNameBufferOffset;
+
+    ushort WorkstationLen;
+    ushort WorkstationMaxLen;
+    uint WorkstationBufferOffset;
+    optional [|(NegotiateFlags & NLMP.NegotiateFlags.NTLMSSP_NEGOTIATE_VERSION) > 0|] Version version;
+    
+    // Payload part
+    optional [|DomainNameLen > 0|] string DomainName with Encoding{Offset = DomainNameBufferOffset, Size = DomainNameLen}, BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional [|WorkstationLen > 0|] string WorkstationName with Encoding{Offset = WorkstationBufferOffset, Size = WorkstationLen}, BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    
+    override string ToString()
+    {
+        return "NegotiateMessage" + (DomainName == nothing ? "" : (", DomainName: " + (DomainName as string))) + (WorkstationName == nothing ? "" : (", WorkstationName: " + (WorkstationName as string))) + ", NegotiateFlags: " + EnumToString(NegotiateFlags, "NLMP.NegotiateFlags");
+    }
+}
+
+message ChallengeMessage
+{
+    string Signature 
+        where value == "NTLMSSP"
+        with BinaryEncoding{Length = 8, TextEncoding = TextEncoding.ASCII};
+    uint MessageType where value == 2;
+
+    ushort TargetNameLen;
+    ushort TargetNameMaxLen;
+    uint TargetNameBufferOffset;
+
+    NegotiateFlags NegotiateFlags;
+    ulong ServerChallenge;
+    binary Reserved with BinaryEncoding{Length = 8};
+    
+    ushort TargetInfoLen;
+    ushort TargetInfoMaxLen;
+    uint TargetInfoBufferOffset;
+    optional [|(NegotiateFlags & NLMP.NegotiateFlags.NTLMSSP_NEGOTIATE_VERSION) > 0|] Version version;
+    
+    // Payload part
+    optional [|TargetNameLen > 0|] string TargetName with Encoding{Offset = TargetNameBufferOffset, Size = TargetNameLen}, BinaryEncoding{TextEncoding = IsUnicode(NegotiateFlags) ? TextEncoding.UTF16 : TextEncoding.ASCII};
+    optional [|TargetInfoLen > 0|] array<AVPair> TargetInfo with Encoding{Decoder = AVPairArrayDecoder, Offset = TargetInfoBufferOffset, Size = TargetInfoLen};
+    
+    override string ToString()
+    {
+        return "ChallengeMessage" + (TargetName == nothing ? "" : (", TargetName: " + (TargetName as string))) + ", NegotiateFlags: " + EnumToString(NegotiateFlags, "NLMP.NegotiateFlags");
+    }
+}
+
+message AuthenticateMessage
+{
+    string Signature 
+        where value == "NTLMSSP"
+        with BinaryEncoding{Length = 8, TextEncoding = TextEncoding.ASCII};
+    uint MessageType where value == 3;
+
+    ushort LmChallengeResponseLen;
+    ushort LmChallengeResponseMaxLen;
+    uint LmChallengeResponseBufferOffset;
+    
+    ushort NtChallengeResponseLen;
+    ushort NtChallengeResponseMaxLen;
+    uint NtChallengeResponseBufferOffset;
+    
+    ushort DomainNameLen;
+    ushort DomainNameMaxLen;
+    uint DomainNameBufferOffset;
+    
+    ushort UserNameLen;
+    ushort UserNameMaxLen;
+    uint UserNameBufferOffset;
+    
+    ushort WorkstationLen;
+    ushort WorkstationMaxLen;
+    uint WorkstationBufferOffset;
+    
+    ushort EncryptedRandomSessionKeyLen;
+    ushort EncryptedRandomSessionKeyMaxLen;
+    uint EncryptedRandomSessionKeyBufferOffset;
+    
+    NegotiateFlags NegotiateFlags;
+    
+    optional [|(NegotiateFlags & NLMP.NegotiateFlags.NTLMSSP_NEGOTIATE_VERSION) > 0|] Version version;
+    optional [|GetMinimalFieldOffset(this) - 16 >= stream.BytePosition|] binary MIC with BinaryEncoding{Length = 16};
+    
+    // Payload part
+    optional [|LmChallengeResponseLen > 0|] 
+        // The NTLM authentication version is not negotiated by the protocol. If the NtChallengeResponseLen == 24, it implied that it is using NTLM v1
+        ([|LmChallengeResponseLen == 24|]([|NtChallengeResponseLen == 24|] LMResponse | LMv2Response) |
+        // LmChallengeResponseLen is 1 in case of anonymous authentication, when the value of LmChallengeResponse is $[00]
+         [|LmChallengeResponseLen == 1|] binary) LmChallengeResponse 
+            with Encoding{Offset = LmChallengeResponseBufferOffset, Size = LmChallengeResponseLen};
+    optional [|NtChallengeResponseLen > 0|] ([|NtChallengeResponseLen == 24|] NTLMResponse | NTLMv2Response) NtChallengeResponse 
+        with Encoding{Offset = NtChallengeResponseBufferOffset, Size = NtChallengeResponseLen};
+    optional [|DomainNameLen > 0|] string DomainName 
+        with Encoding{Offset = DomainNameBufferOffset, Size = DomainNameLen}, BinaryEncoding{TextEncoding = IsUnicode(NegotiateFlags) ? TextEncoding.UTF16 : TextEncoding.ASCII};
+    optional [|WorkstationLen > 0|] string WorkstationName
+        with Encoding{Offset = WorkstationBufferOffset, Size = WorkstationLen}, BinaryEncoding{TextEncoding = IsUnicode(NegotiateFlags) ? TextEncoding.UTF16 : TextEncoding.ASCII};
+    optional [|UserNameLen > 0|] string UserName
+        with Encoding{Offset = UserNameBufferOffset, Size = UserNameLen}, BinaryEncoding{TextEncoding = IsUnicode(NegotiateFlags) ? TextEncoding.UTF16 : TextEncoding.ASCII};
+    optional [|EncryptedRandomSessionKeyLen > 0|] binary EncryptedRandomSessionKey 
+        with Encoding{Offset = EncryptedRandomSessionKeyBufferOffset, Size = EncryptedRandomSessionKeyLen};
+    
+    override string ToString()
+    {
+        return "AuthenticateMessage" + (DomainName == nothing ? "" : (", DomainName: " + (DomainName as string))) + (WorkstationName == nothing ? "" : (", WorkstationName: " + (WorkstationName as string))) + (UserName == nothing ? "" : (", UserName: " + (UserName as string))) + ", NegotiateFlags: " + EnumToString(NegotiateFlags, "NLMP.NegotiateFlags");
+    }
+}
+
+bool IsNLMPv2SessionSecurity(NegotiateFlags negFlags)
+{
+    return (negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY) > 0;
+}
+
+bool IsUnicode(NegotiateFlags negFlags)
+{
+    return (negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_UNICODE) > 0 && (negFlags & NegotiateFlags.NTLM_NEGOTIATE_OEM) == 0;
+}
+
+type Version
+{
+    Version_ProductMajorVersion ProductMajorVersion where ValidationCheckEnumValue(InRange<Version_ProductMajorVersion>(value), null, false, ReferenceType.Type, "NLMP", "ProductMajorVersion", "Version", "0x05, 0x06", value);
+    Version_ProductMinorVersion ProductMinorVersion  where ValidationCheckEnumValue(InRange<Version_ProductMinorVersion>(value), null, false, ReferenceType.Type, "NLMP", "ProductMinorVersion", "Version", "0x00, 0x01, 0x02", value);
+    ushort ProductBuild;
+    binary Reserved with BinaryEncoding{Length = 3};
+    Version_NTLMRevisionCurrent NTLMRevisionCurrent where ValidationCheckEnumValue(InRange<Version_NTLMRevisionCurrent>(value), null, false, ReferenceType.Type, "NLMP", "NTLMRevisionCurrent", "Version", "0x0F", value);
+}
+
+pattern Version_ProductMajorVersion = enum byte
+{
+    WINDOWS_MAJOR_VERSION_5     = 0x05,
+    WINDOWS_MAJOR_VERSION_6     = 0x06,
+    WINDOWS_MAJOR_VERSION_10    = 0x0A,
+    ...
+};
+
+pattern Version_ProductMinorVersion = enum byte
+{
+    WINDOWS_MINOR_VERSION_0 = 0x00,
+    WINDOWS_MINOR_VERSION_1 = 0x01,
+    WINDOWS_MINOR_VERSION_2 = 0x02,
+    WINDOWS_MINOR_VERSION_3 = 0x03,
+    ...
+};
+
+pattern Version_NTLMRevisionCurrent = enum byte
+{
+    NTLMSSP_REVISION_W2K3 = 0x0F,
+    ...
+};
+
+pattern NegotiateFlags = flags uint
+{
+    NTLMSSP_NEGOTIATE_56                        = 0x80000000,
+    NTLMSSP_NEGOTIATE_KEY_EXCH                  = 0x40000000,
+    NTLMSSP_NEGOTIATE_128                       = 0x20000000,
+    NTLMSSP_NEGOTIATE_VERSION                   = 0x02000000,
+    NTLMSSP_NEGOTIATE_TARGET_INFO               = 0x00800000,
+    NTLMSSP_REQUEST_NON_NT_SESSION_KEY          = 0x00400000,
+    NTLMSSP_NEGOTIATE_IDENTIFY                  = 0x00100000,
+    NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY  = 0x00080000,
+    NTLMSSP_TARGET_TYPE_SERVER                  = 0x00020000,
+    NTLMSSP_TARGET_TYPE_DOMAIN                  = 0x00010000,
+    NTLMSSP_NEGOTIATE_ALWAYS_SIGN               = 0x00008000,
+    NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED  = 0x00002000,
+    NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED       = 0x00001000,
+    NTLMSSP_ANONYMOUS_CONNECTIONS               = 0x00000800,
+    NTLMSSP_NEGOTIATE_NTLM                      = 0x00000200,
+    NTLMSSP_NEGOTIATE_LM_KEY                    = 0x00000080,
+    NTLMSSP_NEGOTIATE_DATAGRAM                  = 0x00000040,
+    NTLMSSP_NEGOTIATE_SEAL                      = 0x00000020,
+    NTLMSSP_NEGOTIATE_SIGN                      = 0x00000010,
+    NTLMSSP_REQUEST_TARGET                      = 0x00000004,
+    NTLM_NEGOTIATE_OEM                          = 0x00000002,
+    NTLMSSP_NEGOTIATE_UNICODE                   = 0x00000001,
+    ...
+} with DisplayInfo{ToText = NegotiateFlagsToText};
+
+string NegotiateFlagsToText(any data)
+{
+    string summary = "" + Utility.DecToHexFormat(data as uint);
+    if (data is negFlags:NegotiateFlags)
+    {
+        summary += (IsNLMPv2SessionSecurity(negFlags) ? " (NTLM v2 session security, " : " (NTLM v1, ") + 
+            ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_128) > 0 ? "128-bit encryption, " : ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_56) > 0 ? "56-bit encryption, " : "No encryption, ")) + 
+            ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_ALWAYS_SIGN) > 0 ? ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_SEAL) > 0 ? "Always Sign & Seal)" : "Always Sign)") : ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_SIGN) > 0 ? ((negFlags & NegotiateFlags.NTLMSSP_NEGOTIATE_SEAL) > 0 ? "Sign & Seal)" : "Sign)") : "No Sign or Seal)"));
+    }
+    else
+    {
+        summary += " (Unknown NegotiateFlags)";
+    }
+    return summary;
+}
+
+type AVPair
+{
+    AvId AvId;
+    ushort AvLen;
+    optional [|AvLen > 0|] 
+    ([|(AvId == 0x1)
+    || (AvId == 0x2) 
+    || (AvId == 0x3) 
+    || (AvId == 0x4) 
+    || (AvId == 0x5) 
+    || (AvId == 0x9)|] string 
+    | [|(AvId == 0x6)|] uint 
+    | [|(AvId == 0x7)|] FILETIME 
+    | [|(AvId == 0x8)|] Single_Host_Data
+    | [|(AvId == 0xA)|] binary) Value with BinaryEncoding{WidthForComposedType = (AvLen * 8)};
+}
+
+optional array<AVPair> AVPairArrayDecoder(stream s)
+{
+    array<AVPair> avPairs = [];
+    while (s.RemainingByteLength > 0)
+    {
+        var a = BinaryDecoder<AVPair>(s);
+        if (a == nothing)
+        {
+            break;
+        }
+        AVPair avPair = a as AVPair;
+        avPairs += [avPair];
+        if (avPair.AvId == 0)
+        {
+            break;
+        }
+    }
+    
+    return avPairs.Count == 0 ? nothing : avPairs;
+}
+
+pattern AvId = enum ushort
+{
+    MsvAvEOL = 0,
+    MsvAvNbComputerName = 1,
+    MsvAvNbDomainName = 2,
+    MsvAvDnsComputerName = 3,
+    MsvAvDnsDomainName = 4,
+    MsvAvDnsTreeName = 5,
+    MsvAvFlags = 6,
+    MsvAvTimestamp = 7,
+    MsAvRestrictions = 8,
+    MsvAvTargetName = 9,
+    MsvChannelBindings = 10,
+    ...
+};
+
+type LMResponse
+{
+    array<byte> Response with BinaryEncoding{Length = 24};
+}
+
+type LMv2Response
+{
+    array<byte> Response with BinaryEncoding{Length = 16};
+    array<byte> ChallengeFromClient with BinaryEncoding{Length = 8};
+}
+
+type NTLMResponse
+{
+    array<byte> Response with BinaryEncoding{Length = 24};
+}
+
+type NTLMv2Response
+{
+    array<byte> Response with BinaryEncoding{Length = 16};
+    NTLMv2ClientChallenge NTLMv2ClientChallenge;
+}
+
+type NTLMv2ClientChallenge
+{
+    byte ResponseVersion;
+    byte HiResponseVersion;
+    array<byte> Z1 with BinaryEncoding{Length = 6};
+    FILETIME Time;
+    array<byte> ClientChallenge with BinaryEncoding{Length = 8};
+    array<byte> Z2 with BinaryEncoding{Length = 4};
+    array<AVPair> AVPair with Encoding{Decoder = AVPairArrayDecoder};
+}
+
+type NLMPEmpty{};
+
+//
+// 2.2.2.2   Single_Host_Data
+//
+type Single_Host_Data
+{
+    uint Size;
+    int Z4;
+    Single_Host_Data_DataPresent DataPresent 
+        where ValidationCheckCombinationValueIncludeZero(InRange<Single_Host_Data_DataPresent>(value), null, true, ReferenceType.Type, "NLMP", "DataPresent", "Single_Host_Data", "0x00000001", value);
+    optional [|(DataPresent & Single_Host_Data_DataPresent.I) > 0|] binary CustomData with BinaryEncoding{Length = 4};
+    binary MachineID with BinaryEncoding{Length = 32};
+}
+
+pattern Single_Host_Data_DataPresent = flags uint
+{
+    I = 0x00000001,
+    ...
+};
+
+type NTLMSSP_MESSAGE_SIGNATURE
+{
+    uint Version where ValidationCheckValue(value == 0x00000001, null, true, ReferenceType.Type, "NLMP", "Version", "NTLMSSP_MESSAGE_SIGNATURE", "0x00000001", value);
+    binary RandomPad with BinaryEncoding{Length = 4};
+    binary Checksum with BinaryEncoding{Length = 4};
+    uint SqlNum;
+}
+
+type NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity
+{
+    uint Version where ValidationCheckValue(value == 0x00000001, null, true, ReferenceType.Type, "NLMP", "Version", "NTLMSSP_MESSAGE_SIGNATURE", "0x00000001", value);
+    binary Checksum with BinaryEncoding{Length = 8};
+    uint SqlNum;
+}
+
+// Type for LDAP.SaslMessage.Buffer Decoding.
+// The Windows implemention of LDAP will encoding the nlmp encrypted message as follows.
+// But this type is not mentioned in TD, so it should be ignored when do TDGen.
+type NtlmSealedMessage
+{
+    NTLMSSP_MESSAGE_SIGNATURE Signature;
+    binary EncryptedMessage;
+}
+
+const binary NLMPInitialBinary = $[4E544C4D53535000];
+bool IsNLMP(binary bin)
+{
+    return bin.Count > 8 && bin.Segment(0, 8) == NLMPInitialBinary;
+}
+
+string GetSummaryInfo(optional NlmpMessage nlmp)
+{
+    if (nlmp is AuthenticateMessage)
+    {
+        var auth = nlmp as AuthenticateMessage;
+        string ntlmStr = auth.NtChallengeResponseLen == 24 ? "NTLM v2" : (IsNLMPv2SessionSecurity(auth.NegotiateFlags) ? "NTLM v1 with extended session security" : "NTLM v1");
+        string user = (auth.DomainName != nothing ? (auth.DomainName.ToString() + @"\") : "") + 
+            (auth.UserName != nothing ? auth.UserName.ToString() : "");
+        return ntlmStr + ", " + UserTitle + user;
+    }
+    else
+    {
+        return "NTLM";
+    }
+}
+
+const string UserTitle = "User: ";
+// This method is only worked with the summary string generated by GetSummaryInfo in NLMP.opn
+string GetUserInfoFromSummary(string summary)
+{
+    if (summary.IndexOf(UserTitle) is idx:int &&
+        idx >= 0)
+    {
+        return summary.Segment(idx + UserTitle.Count);
+    }
+
+    return "";
+}
+
+bool IsNLMPSignature(binary bin)
+{
+    return bin.Count > 4 && bin.Segment(0, 4) == $[01000000];
+}

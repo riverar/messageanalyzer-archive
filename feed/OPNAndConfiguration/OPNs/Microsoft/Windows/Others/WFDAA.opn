@@ -1,0 +1,246 @@
+protocol WFDAA
+    with BinaryEncodingDefaults{Endian = Endian.Little, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Wi-Fi Direct (WFD) Application to Application Protocol",
+    ShortName = "WFDAA",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-WFDAA", Version = "6.0", Date = "06/01/2017", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "369414", Date = "10/22/2014"}
+        ]
+};
+
+using Standard;
+using WiFi;
+using Utility;
+using WPS;
+
+endpoint Node over WiFi.Node accepts AppWFDAcceptHeader;
+
+autostart actor WFDAAOverWiFiNode(WiFi.Node node) follows WPSOverWiFiNode
+{
+    binary data =  null;
+    
+    observe node accepts m:WiFiMessage where (m.Body is frame:WiFi.ProbeResponseFrame)
+    {
+        frame.InformationElements = ExtendWfdaaIE(frame.InformationElements);
+    }
+    
+    observe node accepts m:WiFiMessage where (m.Body is frame:WiFi.BeaconFrame)
+    {
+        frame.InformationElements = ExtendWfdaaIE(frame.InformationElements);
+    }
+    
+    process node accepts m:WiFiMessage where TryGetDataFromWiFiMessage(m, out data)
+    {
+        switch (data)
+        {
+            case h:AppWFDAcceptHeader from BinaryDecoder<AppWFDAcceptHeader> =>
+                dispatch (endpoint WFDAA.Node over node) accepts h;
+            default =>
+                ThrowDecodingException("WFDAA", "AppWFDAcceptHeader");
+        }
+    }
+    
+    bool TryGetDataFromWiFiMessage(WiFi.WiFiMessage msg, out binary data)
+    {
+        // clear data
+        data = null;
+        
+        if ((msg.MacHeader as MacHeaderBase).FrameControl.Type != MessageType.Data || (msg#IsEncrypted is b:bool && b))
+        {
+            return false;
+        }
+        // get the data from WiFi message
+        if (msg.Body is body:binary && body is bin:AppWFDAcceptHeaderBinaryMatchPattern)
+        {
+            data = bin;
+            return true;
+        }
+        return false;
+    }
+    
+    // check whether WiFi IE contains WFDAA extension
+    array<WiFi.InformationField> ExtendWfdaaIE(array<WiFi.InformationField> elements)
+    {
+        for (int indexOfElements = 0; indexOfElements < elements.Count; indexOfElements++)
+        {
+            if (elements[indexOfElements] is wpsIE:WPS.WPSInformationElement)
+            {
+                var dataElements = wpsIE.DataElement;
+                for (int indexOfDataElements = 0; indexOfDataElements < dataElements.Count; indexOfDataElements++)
+                {
+                    if (dataElements[indexOfDataElements] is vendorExtension:VendorExtension &&
+                        vendorExtension.VendorID == 0x000137 &&
+                        vendorExtension.VendorData is bin:binary &&
+                        bin.Count >= 2)
+                    {
+                        ushort attributeType = (((bin.PeekByte(0) as ushort) << 8) + bin.PeekByte(1 * 8)) as ushort;
+                        if (attributeType == 0x100E)
+                        {
+                            switch (bin)
+                            {
+                                case appWFDDiscoveryMetadataIE:AppWFDDiscoveryMetadataIE from BinaryDecoder<AppWFDDiscoveryMetadataIE> =>
+                                    appWFDDiscoveryMetadataIE.ID = nothing;
+                                    appWFDDiscoveryMetadataIE.Length = nothing;
+                                    appWFDDiscoveryMetadataIE.VendorID = nothing;
+                                    appWFDDiscoveryMetadataIE.VendorData = nothing;
+                                    appWFDDiscoveryMetadataIE.VendorExtensionAttributeType = vendorExtension.ID;
+                                    appWFDDiscoveryMetadataIE.cbLength1 = vendorExtension.Length;
+                                    appWFDDiscoveryMetadataIE.WPSOUI = vendorExtension.VendorID;
+
+                                    dataElements[indexOfDataElements] = appWFDDiscoveryMetadataIE;
+                                default =>
+                                    // skip this VendorSpecificInformation
+                                    continue;
+                            }
+                        }
+                        else if (attributeType == 0x1008 || attributeType == 0x1010)
+                        {
+                            switch (bin)
+                            {
+                                case appWFDDiscoveryPrimaryIE:AppWFDDiscoveryPrimaryIE from BinaryDecoder<AppWFDDiscoveryPrimaryIE> =>
+                                    appWFDDiscoveryPrimaryIE.ID = nothing;
+                                    appWFDDiscoveryPrimaryIE.Length = nothing;
+                                    appWFDDiscoveryPrimaryIE.VendorID = nothing;
+                                    appWFDDiscoveryPrimaryIE.VendorData = nothing;
+                                    appWFDDiscoveryPrimaryIE.VendorExtensionAttributeType = vendorExtension.ID;
+                                    appWFDDiscoveryPrimaryIE.cbLength1 = vendorExtension.Length;
+                                    appWFDDiscoveryPrimaryIE.WPSOUI = vendorExtension.VendorID;
+
+                                    dataElements[indexOfDataElements] = appWFDDiscoveryPrimaryIE;
+                                default =>
+                                    // skip this VendorSpecificInformation
+                                    continue;
+                            }
+                        }
+                    }
+                }
+                wpsIE.DataElement = dataElements;
+                elements[indexOfElements] = wpsIE;
+            }
+        }
+        return elements;
+    }
+}
+
+// ------------------------------------ Messages & Types ----------------------------------------
+// 2.2.1   AppWFDAcceptHeader Message
+message AppWFDAcceptHeader
+{
+    ulong SessionId;
+    ulong ConnectionType where ValidationCheckZero(value == 0, this, true, ReferenceType.Message,
+        "WFDAA", "ConnectionType", "AppWFDAcceptHeader", value);
+
+    override string ToString()
+    {
+        return "AppWFDAcceptHeader, SessionId: " + SessionId.ToString();
+    }
+}
+// 2.2.3   AppWFDDiscoveryMetadataIE Message
+type AppWFDDiscoveryMetadataIE : VendorExtension
+{
+    new optional ushort ID with Encoding{Ignore = true};
+    new optional ushort Length with Encoding{Ignore = true};
+    new optional uint VendorID with Encoding{Ignore = true};
+    new optional binary VendorData with Encoding{Ignore = true};
+    ushort VendorExtensionAttributeType with Encoding{Ignore = true};
+    ushort cbLength1 with Encoding{Ignore = true};
+    uint WPSOUI with Encoding{Ignore = true};
+
+    ushort MetadataAttributeType
+        where ValidationCheckValue(value == 0x100E, null, true, ReferenceType.Type, "WFDAA", "MetadataAttributeType", "AppWFDDiscoveryMetadataIE", 0x100E, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort cbLength2
+        where ValidationCheckLessThanOrEqualTo(value <= 32, null, true, ReferenceType.Type,
+            "WFDAA", "cbLength2", "AppWFDDiscoveryMetadataIE", 32, cbLength2)
+        with BinaryEncoding{Endian = Endian.Big};
+    binary Metadata with BinaryEncoding{Length = cbLength2};
+}
+
+type AppWFDDiscoveryPrimaryIE : VendorExtension
+{
+    new optional ushort ID with Encoding{Ignore = true};
+    new optional ushort Length with Encoding{Ignore = true};
+    new optional uint VendorID with Encoding{Ignore = true};
+    new optional binary VendorData with Encoding{Ignore = true};
+    ushort VendorExtensionAttributeType with Encoding{Ignore = true};
+    ushort cbLength1 with Encoding{Ignore = true};
+    uint WPSOUI with Encoding{Ignore = true};
+    DisplayNameAttributeTypeEnum DisplayNameAttributeType
+        where ValidationCheckEnumValue(InRange<DisplayNameAttributeTypeEnum>(value), null, true, ReferenceType.Type,
+            "WFDAA", "DisplayNameAttributeType", "AppWFDDiscoveryPrimaryIE", "0x1008, 0x1010", value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort cbLength3 with BinaryEncoding{Endian = Endian.Big};
+    string DisplayName with BinaryEncoding{Length = cbLength3};
+
+    PeerIdAttributeTypeEnum PeerIdAttributeType
+        where ValidationCheckEnumValue(InRange<PeerIdAttributeTypeEnum>(value), null, true, ReferenceType.Type,
+            "WFDAA", "PeerIdAttributeType", "AppWFDDiscoveryPrimaryIE", "0x100B, 0x100C", value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort cbLength2 with BinaryEncoding{Endian = Endian.Big};
+    binary PeerId with BinaryEncoding{Length = cbLength2};
+
+    ushort RoleAttributeType
+        where ValidationCheckValue(value == 0x100D, null, true, ReferenceType.Type, "WFDAA", "RoleAttributeType", "AppWFDDiscoveryPrimaryIE", 0x100D, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort cbLength4 
+        where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "WFDAA", "cbLength4", "AppWFDDiscoveryPrimaryIE", 1, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    RoleEnum Role
+        where ValidationCheckEnumValue(InRange<RoleEnum>(value), null, true, ReferenceType.Type,
+            "WFDAA", "Role", "AppWFDDiscoveryPrimaryIE", "0x01, 0x02, 0x03", value);
+    
+    ushort VersionAttributeType
+        where ValidationCheckValue(value == 0x100F, null, true, ReferenceType.Type, "WFDAA", "VersionAttributeType", "AppWFDDiscoveryPrimaryIE", 0x100F, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort cbLength5
+        where ValidationCheckValue(value == 2, null, true, ReferenceType.Type, "WFDAA", "cbLength5", "AppWFDDiscoveryPrimaryIE", 2, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    ushort Version with DisplayInfo{ToText = DisplayVersion};
+};
+
+pattern PeerIdAttributeTypeEnum = enum ushort
+{
+    WFDA2Av1 = 0x100B,
+    WFDA2Av2 = 0x100C,
+    ...
+};
+
+pattern DisplayNameAttributeTypeEnum = enum ushort
+{
+    WFDA2Av1 = 0x1008,
+    WFDA2Av2 = 0x1010,
+    ...
+};
+
+pattern RoleEnum = enum byte
+{
+    Peer = 0x01,
+    Host = 0x02,
+    Client = 0x03,
+    ...
+};
+
+// check 8th ~ 16th byte is 0
+pattern AppWFDAcceptHeaderBinaryMatchPattern = binary where value.Count >= 16 &&
+    (value[8] | value[9] | value[10] | value[11] | value[12] | value[13] | value[14] | value[15]) == 0;
+// ------------------------------------ Utilities ----------------------------------------
+string DisplayVersion(any input)
+{
+    if (input is n:ushort)
+    {
+        return (n >> 8).ToString() + "." + (n & 0x0F).ToString();
+    }
+    
+    return "Invalid Version";
+}

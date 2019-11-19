@@ -1,0 +1,669 @@
+protocol MSASHTTP with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Exchange ActiveSync: HTTP Protocol",
+    ShortName = "MS-ASHTTP",
+    DocumentName = "MS-ASHTTP",
+    ProtocolType = "Block",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2016 Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-ASHTTP", Version = "16.0"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="14/09/2015"},
+        ]
+};
+
+using Diagnostics;
+using HTTP;
+using Standard;
+using Utility;
+
+// Used to provide the interface to access the ASHTTP response type. e.g, post or options
+annotation string ASHTTPContract.Response#OperationName;
+annotation string ASHTTPContract.Response#CmdName;
+annotation string ASHTTPContract.Request#CmdName;
+
+const string ExchangeActiveSyncURL = "/Microsoft-Server-ActiveSync";
+
+pattern ASHttpHeaderFieldValueType = (HeaderFieldType | array<string> | array<HeaderFieldType> | string | HTTP.Credentials | array<HTTP.Credentials> | any);
+pattern ASHttpHeadersType = map<string, ASHttpHeaderFieldValueType>;
+
+pattern CommandCodes = enum byte
+{
+    Sync = 0,
+    SendMail = 1,
+    SmartForward = 2,
+    SmartReply = 3,
+    GetAttachment = 4,
+    FolderSync = 9,
+    FolderCreate = 10,
+    FolderDelete = 11, 
+    FolderUpdate = 12,
+    MoveItems = 13,
+    GetItemEstimate = 14,
+    MeetingResponse = 15,
+    Search = 16,
+    Settings = 17,
+    Ping = 18,
+    ItemOperations = 19,
+    Provision = 20,
+    ResolveRecipients = 21,
+    ValidateCert = 22
+};
+
+pattern CommandTags = enum byte
+{
+    AttachmentName = 0,
+    CollectionId = 1,
+    ItemId = 3,
+    LongId = 4,
+    Occurrence = 6,
+    Options = 7,
+    User = 8
+};
+
+// plain-text-query        = command-spec '&' user-spec '&' device-id-spec '&' device-type-spec *('&' parameter-spec)
+// 
+// command-spec            = "Cmd=" command-name
+// user-spec               = "User=" user-name
+// device-id-spec          = "DeviceId=" device-id
+// device-type-spec        = "DeviceType=" device-type
+// parameter-spec          = parameter-name "=" parameter-value
+// command-name            = 1*ALPHA
+// user-name               = 1*VCHAR
+// device-id               = 1*32(ALPHA / DIGIT)
+// device-type             = 1*VCHAR
+// parameter-name          = 1*ALPHA
+// parameter-value         = 1*VCHAR
+//
+// RFC5234: http://www.ietf.org/rfc/rfc5234.txt
+// VCHAR          =  %x21-7E ; visible (printing) characters
+// ALPHA          =  %x41-5A / %x61-7A   ; A-Z / a-z
+// DIGIT          =  %x30-39; 0-9
+syntax PlainTextQuery = cmd:CommandSpec "&" user:UserSpec "&" devId:DeviceIdSpec "&" devType:DeviceTypeSpec s2:("&" s1:ParameterSpec => s1)*
+                        => new PlainTextQueryValueType
+                        {
+                            Command = cmd,
+                            UserName = user,
+                            DeviceId = devId,
+                            DeviceType = devType,
+                            Parameters = s2 as optional array<PlainParameterType>
+                        };
+    
+syntax CommandSpec = "Cmd=" s:CommandName => s;
+syntax UserSpec = "User=" s:UserName => s;
+syntax DeviceIdSpec = "DeviceId=" s:DeviceId => s;
+syntax DeviceTypeSpec = "DeviceType=" s:DeviceType => s;
+syntax ParameterSpec = s1:ParameterName "=" s2:ParameterValue
+                       => new PlainParameterType
+                        {
+                            Name = s1,
+                            Value = s2
+                        };
+
+syntax CommandName = s:(Alpha)+ => ConvertStringArrayToString(s);
+syntax UserName = s:(VChar)+ => ConvertStringArrayToString(s);
+syntax DeviceId  = s:((Alpha|Digit) repeat [1,32]) => ConvertStringArrayToString(s);
+syntax DeviceType = s:(VChar)+ => ConvertStringArrayToString(s);
+syntax ParameterName = s:(Alpha)+ => ConvertStringArrayToString(s);
+syntax ParameterValue = s:(VChar)+ => ConvertStringArrayToString(s);
+
+syntax VChar = regex{[\x21-\x25\x27-\x7e]}; // exclude the '&'
+syntax Alpha = regex{[a-zA-Z]};
+syntax Digit = regex{[0-9]};
+
+endpoint Server over HTTP.Server accepts ASHTTPContract.Request issues ASHTTPContract.Response;
+client endpoint Client connected to Server;
+
+autostart actor ActorOverHttpServer(HTTP.Server node)
+{
+    string method;
+    process node accepts httpReq:HttpContract.Request where IsEASUri(httpReq.Uri)
+        && (httpReq.Method == "POST" || httpReq.Method == "OPTIONS")
+    {
+        ASHTTPContract.Request msg = ASHTTPRequestDecoder(httpReq);
+        method = httpReq.Method;
+        msg#CmdName = GetCmdTypeFromUri(httpReq.Uri, httpReq.Method);
+        dispatch (endpoint Server over node) accepts msg;
+    }
+
+    process node issues httpRes:HttpContract.Response where IsEASUri(httpRes#Uri)
+    {
+        ASHTTPContract.Response msg = ASHTTPResponseDecoder(httpRes);
+        msg#OperationName = method;
+        msg#CmdName = GetCmdTypeFromUri(httpRes#Uri, method);
+        dispatch (endpoint Server over node) issues msg;
+    }
+}
+
+contract ASHTTPContract
+{
+    message Request
+    {
+        RequestLineType RequestLine;
+        ASHttpHeadersType Headers;
+        optional binary Body;
+        override string ToString()
+        {
+            string summary = RequestLine.Method + " Request";
+            
+            if (RequestLine.QueryValue != nothing)
+            {
+                summary += ", " + RequestLine.QueryValue.ToString();
+            }
+            
+            return summary;
+        }
+    }
+    
+    message Response
+    {
+        StatusLineType StatusLine;
+        ASHttpHeadersType Headers;
+        optional binary Body;
+
+        override string ToString()
+        {
+            assert this#OperationName != nothing;
+            string httpMethod = this#OperationName as string;
+            string summary = httpMethod + " Response";
+
+            // If response don't contain error code.
+            if (StatusLine.Status < 400)
+            {
+                if (this#CmdName != nothing)
+                {
+                    string cmdType = this#CmdName as string;
+                    summary += ", " + cmdType + " Command";
+                }
+                
+                // POST
+                if ("MS-Server-ActiveSync" in Headers)
+                {
+                    summary += ", Reply from ActiveSync Server " + (Headers["MS-Server-ActiveSync"] as string);
+                }
+            }
+            else
+            {
+                summary += ", " + StatusLine.ToString();
+            }
+            
+            return summary;
+        }
+    }
+}
+
+type RequestLineType
+{
+    string Method;
+    string Uri;
+    optional (PlainTextQueryValueType | Base64EncodedQueryValueType) QueryValue;
+
+    override string ToString()
+    {
+        return Method + " " + Uri;
+    }
+}
+
+type StatusLineType
+{
+    string Version; 
+    uint Status;
+    string Reason;
+    
+    override string ToString()
+    {
+        return Format("{0} {1} {2}", Version, Status, Reason);
+    }
+}
+
+type PlainTextQueryValueType
+{
+    optional string Command;
+    string UserName;
+    string DeviceId;
+    string DeviceType;
+    optional array<PlainParameterType> Parameters;
+    
+    override string ToString()
+    {
+        if(Command != nothing)
+            return Format("{0} Command from {1} Device whose ID is {2}",
+                          Command,
+                          DeviceType,
+                          DeviceId
+                         );
+        else
+            return Format("from {0} Device whose ID is {1}",
+                          DeviceType,
+                          DeviceId
+                         );
+                     
+    }
+}
+
+type Base64EncodedQueryValueType
+{
+    byte ProtocolVersion;
+    CommandCodes CommandCode;
+    short Locale;
+    byte DeviceIdLength;
+    string DeviceID with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DeviceIdLength as uint};
+    byte PolicyKeyLength;
+    optional [|PolicyKeyLength > 0|] uint PolicyKey;
+    byte DeviceTypeLength;
+    string DeviceType with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DeviceTypeLength as uint};
+    optional array<EncodedParameterType> CommandParameters;
+    override string ToString()
+    {
+        return Format("{0} Command from {1} Device whose ID is {2}",
+                      EnumToString(CommandCode, "MSASHTTP.CommandCodes"),
+                      DeviceType,
+                      DeviceID
+                     );
+    }
+}
+
+type EncodedParameterType
+{
+    CommandTags Tag;
+    byte Length;
+    binary Value with BinaryEncoding{Length = Length as uint}; 
+}
+
+type PlainParameterType
+{
+    string Name;
+    string Value;
+}
+
+ASHttpHeadersType DecodeRequestHeader(HTTP.HttpHeadersType httpHeaders)
+{
+    ASHttpHeadersType ashttpRequestHeaders = {};
+    
+    if (httpHeaders == nothing)
+        return ashttpRequestHeaders;
+        
+    if ("Authorization" in httpHeaders)
+        ashttpRequestHeaders["Authorization"] = httpHeaders["Authorization"] as (HTTP.Credentials | array<HTTP.Credentials>);
+
+    if ("Content-Type" in httpHeaders)
+        ashttpRequestHeaders["Content-Type"] = httpHeaders["Content-Type"] as HTTP.HeaderFieldType;
+    
+    if ("MS-ASAcceptMultiPart" in httpHeaders)
+        ashttpRequestHeaders["MS-ASAcceptMultiPart"] = httpHeaders["MS-ASAcceptMultiPart"] as string;
+    
+    if ("MS-ASProtocolVersion" in httpHeaders)
+        ashttpRequestHeaders["MS-ASProtocolVersion"] = httpHeaders["MS-ASProtocolVersion"] as string;
+            
+    if ("User-Agent" in httpHeaders)
+        ashttpRequestHeaders["User-Agent"] = httpHeaders["User-Agent"] as string;
+    
+    if ("X-MS-PolicyKey" in httpHeaders)
+        ashttpRequestHeaders["X-MS-PolicyKey"] = httpHeaders["X-MS-PolicyKey"] as string;
+        
+    if ("Cookie" in httpHeaders)
+        ashttpRequestHeaders["Cookie"] = httpHeaders["Cookie"] as string;
+        
+    return ashttpRequestHeaders;
+}
+    
+ASHttpHeadersType DecodeResponseHeader(HTTP.HttpHeadersType httpHeaders)
+{
+    ASHttpHeadersType ashttpResponseHeaders = {};
+    
+    if (httpHeaders == nothing)
+        return ashttpResponseHeaders;
+        
+    if ("Cache-Control" in httpHeaders)
+        ashttpResponseHeaders["Cache-Control"] = httpHeaders["Cache-Control"] as array<string>;
+        
+    if ("Content-Encoding" in httpHeaders)
+        ashttpResponseHeaders["Content-Encoding"] = httpHeaders["Content-Encoding"] as array<string>;
+        
+    if ("Content-Length" in httpHeaders)
+        ashttpResponseHeaders["Content-Length"] = httpHeaders["Content-Length"] as uint;
+        
+    if ("Content-Type" in httpHeaders)
+        ashttpResponseHeaders["Content-Type"] = httpHeaders["Content-Type"] as HTTP.HeaderFieldType;
+        
+    if ("MS-Server-ActiveSync" in httpHeaders)
+        ashttpResponseHeaders["MS-Server-ActiveSync"] = httpHeaders["MS-Server-ActiveSync"] as string;
+        
+    if ("X-MS-Location" in httpHeaders)
+        ashttpResponseHeaders["X-MS-Location"] = httpHeaders["X-MS-Location"] as string;
+        
+    if ("X-MS-RP" in httpHeaders)
+        ashttpResponseHeaders["X-MS-RP"] = httpHeaders["X-MS-RP"] as string;
+    
+    if ("MS-ASProtocolVersions" in httpHeaders)
+        ashttpResponseHeaders["MS-ASProtocolVersions"] = httpHeaders["MS-ASProtocolVersions"] as string;
+    
+    if ("MS-ASProtocolCommands" in httpHeaders)
+        ashttpResponseHeaders["MS-ASProtocolCommands"] = httpHeaders["MS-ASProtocolCommands"] as string;
+        
+    if ("X-MS-Credential-Service-Url" in httpHeaders)
+        ashttpResponseHeaders["X-MS-Credential-Service-Url"] = httpHeaders["X-MS-Credential-Service-Url"] as string;
+        
+    if ("X-MS-Credentials-Expire" in httpHeaders)
+        ashttpResponseHeaders["X-MS-Credentials-Expire"] = httpHeaders["X-MS-Credentials-Expire"] as string;
+        
+    if ("Set-Cookie" in httpHeaders)
+    {
+        if (httpHeaders["Set-Cookie"] is string)
+        {
+            ashttpResponseHeaders["Set-Cookie"] = httpHeaders["Set-Cookie"] as string;
+        }
+        else
+        {
+            ashttpResponseHeaders["Set-Cookie"] = httpHeaders["Set-Cookie"] as array<string>;
+        }
+    }
+        
+    return ashttpResponseHeaders;
+}
+    
+ASHTTPContract.Request ASHTTPRequestDecoder(HTTP.HttpContract.Request httpRequest)
+{
+    ASHTTPContract.Request request = new ASHTTPContract.Request();
+    
+    // body
+    request.Body = httpRequest.Payload;
+  
+    // headers
+    request.Headers = DecodeRequestHeader(httpRequest.Headers);
+
+    // request line
+    RequestLineType requestLine = new RequestLineType();
+    requestLine.Method = httpRequest.Method;
+    requestLine.Uri = httpRequest.Uri.AbsPath as string;
+
+    // parse query value
+    string httpQueryValue = GetHTTPQueryValue(httpRequest.Uri);
+    if (httpQueryValue != "")
+    {
+        if (IsPlainTextQueryValue(httpQueryValue))
+        {
+            switch(httpRequest.Uri.Query)
+            {
+                case string =>
+                    requestLine.QueryValue = PlainTextQuery(httpQueryValue) as PlainTextQueryValueType;
+                case map<string, string> =>
+                    any queryString = httpRequest.Uri.Query;
+                    map<string,string> innerParam = (queryString as optional map<string, string>) as map<string, string>;
+                    PlainTextQueryValueType queryValue =  new PlainTextQueryValueType
+                        {
+                            UserName = innerParam["User"],
+                            DeviceId = innerParam["DeviceId"],
+                            DeviceType = innerParam["DeviceType"],
+                        };
+                    
+                    if (requestLine.Method == "POST")
+                    {
+                         queryValue.Command = innerParam["Cmd"];
+                    }
+                    else
+                    {
+                        queryValue.Command = nothing;
+                    }
+                        
+                    if (innerParam.Count > 4)
+                    {
+                        array<PlainParameterType> parameters  = [];
+
+                        foreach (string key in innerParam.Keys)
+                        {
+                            if (key == "Cmd" || key == "User" || key == "DeviceId" || key == "DeviceType")
+                                continue;
+                            
+                            PlainParameterType item = new PlainParameterType
+                            {
+                                Name = key,
+                                Value = innerParam[key],
+                            };
+
+                            parameters += [item];
+                        }
+                        
+                        queryValue.Parameters = parameters;
+                    }
+                    
+                        
+                    requestLine.QueryValue = queryValue;
+            }
+        }
+        else
+        {
+            binary decodedBytes = Base64Decode(httpQueryValue);
+            requestLine.QueryValue = BinaryDecoder<Base64EncodedQueryValueType>(decodedBytes as stream) as Base64EncodedQueryValueType;
+        }
+    }
+    
+    request.RequestLine = requestLine; 
+
+    return request;
+}
+
+ASHTTPContract.Response ASHTTPResponseDecoder(HTTP.HttpContract.Response httpResponse)
+{
+    ASHTTPContract.Response response = new ASHTTPContract.Response();
+
+    // body
+    response.Body = httpResponse.Payload;
+    
+    // headers                                                
+    response.Headers = DecodeResponseHeader(httpResponse.Headers);
+    
+    // status line
+    response.StatusLine = new StatusLineType
+                          {
+                            Version = httpResponse.Version.ToString(), 
+                            Status = httpResponse.StatusCode,
+                            Reason =  httpResponse.ReasonPhrase
+                          };
+    return response;
+}
+
+bool IsPlainTextQueryValue(string queryStr)
+{
+    return queryStr.Contains("&");
+}
+
+//
+// Utility functions
+//
+// Decode a base64 encoded string to original binary stream.
+// e.g. binary bytes = Base64Decode("jQkJBAUxNDFJRAACU1A=");
+// Refer to: http://zh.wikipedia.org/wiki/Base64
+// Future: Wait for supporting of BASE64. Once PEF raises this feature, the following routine needs to be removed.
+binary Base64Decode(string base64Str)
+{
+    if (base64Str == "")
+        return $[];
+    
+    string trimStr = base64Str.Replace("=", "");
+    string base64hash = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    
+    int i = 0;
+    int prev = -1;
+    int cur = -1;
+    int mod = 0;
+    array<byte> resultArr = [];
+    binary bin = $[];
+    
+    while (i < trimStr.Count)
+    {
+        cur = base64hash.IndexOf(trimStr[i] as string);
+        mod = i % 4;
+        
+        switch (mod)
+        {
+            case 1 => resultArr += [((prev << 2) | (cur >> 4)) as byte];
+            case 2 => resultArr += [(((prev & 0xf) << 4) | (cur >> 2)) as byte];
+            case 3 => resultArr += [(((prev & 0x3) << 6) | (cur)) as byte];
+            default => ; // do nothing
+        }
+        
+        prev = cur;
+        i++;
+    }
+
+    bin = resultArr as binary;
+    return bin;
+}
+
+// Determine if the given uri is exchange active sync endpoint
+// e.g. /Microsoft-Server-ActiveSync/XXXXX should be a exchange active sync url.
+bool IsEASUri(optional UriType uri)
+{
+    if (uri == nothing)
+        return false; 
+    
+    UriType tmpUriType = uri as UriType;
+    
+    if (tmpUriType.AbsPath == nothing)
+        return false;
+        
+    return (tmpUriType.AbsPath as string) == ExchangeActiveSyncURL;
+}
+
+// Get the active sync command defined in [MS-ASHTTP] or [MS-ASCMD] by using the given http uri
+// e.g Sync/FolderSync command
+optional string GetCmdTypeFromUri(optional UriType uri, string method)
+{
+    string httpMethod = method;
+    
+    if (httpMethod == "OPTIONS")
+        return nothing;
+        
+    if (httpMethod == "POST")
+    {
+        string httpQueryValue = GetHTTPQueryValue(uri as UriType);
+        
+        if (httpQueryValue != "")
+        {
+            if (IsPlainTextQueryValue(httpQueryValue))
+            {
+                UriType localUri = uri as UriType;
+                switch(localUri.Query)
+                {
+                    case string =>
+                        var queryValue = PlainTextQuery(httpQueryValue) as PlainTextQueryValueType;
+                        return queryValue.Command;
+                    case map<string, string> =>
+                        any queryString = localUri.Query;
+                        map<string,string> innerParam = (queryString as optional map<string, string>) as map<string, string>;
+                        return innerParam["Cmd"];
+                }
+            }
+            else
+            {
+                binary decodedBytes = Base64Decode(httpQueryValue);
+                var queryValue = BinaryDecoder<Base64EncodedQueryValueType>(decodedBytes as stream) as Base64EncodedQueryValueType;
+                return EnumToString(queryValue.CommandCode, "MSASHTTP.CommandCodes");
+            }
+        }
+    }
+    
+    return "Unknown";
+}
+
+// Get the number of times a specified char appears in a source string
+// e.g. int count = GetKeyCharCount(fooStr, ',');
+int GetKeyCharCount(string source, char key)
+{
+    int count = 0;
+
+    foreach (char c in source)
+    {
+        if (c == key)
+            count++;
+    }
+    
+    return count;
+}
+
+//
+// Private functions
+//
+string GetHTTPQueryValue(UriType httpUri)
+{
+    string fullUriText = httpUri.ToString();
+    int queryIndex = fullUriText.IndexOf("?");
+
+    if (queryIndex < 0 || (queryIndex == fullUriText.Count - 1))
+        return "";
+        
+    return fullUriText.Segment(queryIndex + 1); 
+}
+
+optional string GetQueryValueFormat(RequestLineType reqLine)
+{
+    optional string result;
+
+    if (reqLine.QueryValue != nothing)
+    {
+        if (reqLine.QueryValue is PlainTextQueryValueType)
+        {
+            result = "Base64";
+        }
+        else
+        {
+            result = "PlainText";
+        }
+    }
+    
+    return result;
+}
+        
+optional string GetQueryValueCommand(RequestLineType reqLine)
+{
+    optional string result;
+
+    if (reqLine.QueryValue != nothing)
+    {
+        if (reqLine.QueryValue is PlainTextQueryValueType)
+        {
+            result = (reqLine.QueryValue as PlainTextQueryValueType).Command;
+        }
+        else
+        {
+            CommandCodes tmpCmdCode = (reqLine.QueryValue as Base64EncodedQueryValueType).CommandCode; 
+            result = EnumToString(tmpCmdCode, "MSASHTTP.CommandCodes");
+        }
+    }
+    
+    return result;
+}
+
+optional string GetServerVersion(ref HTTP.HttpHeadersType headers)
+{            
+    optional string result;
+
+    if ("MS-Server-ActiveSync" in headers)
+    {
+        result = headers["MS-Server-ActiveSync"] as string;
+    }
+    
+    return result;
+}
+
+optional string GetHttpHeaderStringValue(ref HTTP.HttpHeadersType headers, string headerName)
+{
+    optional string result;
+
+    if (headerName in headers)
+    {
+        result = headers[headerName] as string;
+    }
+    
+    return result;
+}

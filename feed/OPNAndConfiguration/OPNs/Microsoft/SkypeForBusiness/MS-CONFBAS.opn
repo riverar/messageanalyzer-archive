@@ -1,0 +1,900 @@
+protocol MSCONFBAS with
+Documentation
+{
+    ProtocolName = "Centralized Conference Control Protocol: Basic Architecture and Signaling",
+    ShortName = "MS-CONFBAS",
+    DocumentName = "MS-CONFBAS",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-CONFBAS", Version = "7.3"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision {Class=RevisionClass.Major, Version="1.0.0", Date="05/19/2015"},
+        ]
+};
+
+using Diagnostics;
+using HTTP;
+using SIP;
+using Standard;
+using SkypeforBusinessShared;
+
+endpoint Server 
+	over SIP.Server 
+	accepts RequestMessage issues ResponseMessage
+	accepts ConfbasHttpRequestMessage issues ConfbasHttpResponseMessage;
+	
+client endpoint Client connected to Server;
+string eventHeader = "";
+autostart actor ActorOverSIP(SIP.Server node)
+{		
+    process node accepts sipMsg:SIP.Request
+    {       	
+		string messageType = GetConfbasMessageReqType(sipMsg);
+
+		if (messageType == "FocusSignalingResponseMessage")
+		{
+			ResponseMessage rspMsg = new FocusSignalingResponseMessage(sipMsg);
+			dispatch (endpoint Server over node) issues rspMsg;
+		}
+		else
+		{
+			RequestMessage msg;
+			switch (messageType)
+			{				
+				case ("FocusSignalingRequestMessage") =>
+				{
+					msg = new FocusSignalingRequestMessage(sipMsg);
+				}
+				case ("FocusSubscriptionRequestMessage") =>
+				{
+					eventHeader = "FocusSubscriptionRequestMessage";
+					msg = new FocusSubscriptionRequestMessage(sipMsg);				
+				}		
+				case ("ConferenceStateNotificationMessage") =>
+				{
+					msg = new ConferenceStateNotificationMessage(sipMsg);
+				}
+				default =>
+				{
+					reject;
+				}			
+			}	
+			dispatch (endpoint Server over node) accepts msg;	
+		}		
+    }
+	
+	process node issues sipMsg:SIP.Request
+    {       	
+		string messageType = GetConfbasMessageReqType(sipMsg);
+
+		if (messageType == "FocusSignalingResponseMessage")
+		{
+			ResponseMessage rspMsg = new FocusSignalingResponseMessage(sipMsg);
+			dispatch (endpoint Server over node) issues rspMsg;
+		}
+		else
+		{
+			RequestMessage msg;
+			switch (messageType)
+			{				
+				case ("FocusSignalingRequestMessage") =>
+				{
+					msg = new FocusSignalingRequestMessage(sipMsg);
+				}
+				case ("FocusSubscriptionRequestMessage") =>
+				{
+					eventHeader = "FocusSubscriptionRequestMessage";
+					msg = new FocusSubscriptionRequestMessage(sipMsg);				
+				}		
+				case ("ConferenceStateNotificationMessage") =>
+				{
+					msg = new ConferenceStateNotificationMessage(sipMsg);
+				}
+				default =>
+				{
+					reject;
+				}			
+			}	
+			dispatch (endpoint Server over node) accepts msg;	
+		}		
+    }
+	
+	process node issues sipMsg:SIP.Response
+    {  
+		string messageType = GetConfbasMessageRspType(sipMsg);
+		ResponseMessage msg;
+		
+		switch (messageType)
+		{
+			case ("FocusSignalingResponseMessage") =>
+			{
+				msg = new FocusSignalingResponseMessage(sipMsg);					
+			}
+			case ("FocusSubscriptionResponseMessage") =>
+			{
+				msg = new FocusSubscriptionResponseMessage(sipMsg);
+				eventHeader = "";
+			}
+			default =>
+			{
+				reject;
+			}
+		}		
+		dispatch (endpoint Server over node) issues msg;				
+	}	
+
+	process node accepts sipMsg:SIP.Response where (GetConfbasMessageRspType(sipMsg) != null)
+    {  
+		string messageType = GetConfbasMessageRspType(sipMsg);
+		ResponseMessage msg;
+		
+		switch (messageType)
+		{
+			case ("FocusSignalingResponseMessage") =>
+			{
+				msg = new FocusSignalingResponseMessage(sipMsg);					
+			}
+			case ("FocusSubscriptionResponseMessage") =>
+			{
+				msg = new FocusSubscriptionResponseMessage(sipMsg);
+				eventHeader = "";
+			}
+			default =>
+			{
+				reject;
+			}
+		}		
+		dispatch (endpoint Server over node) issues msg;				
+	}	
+}
+
+// There are also HTTP based messages used for conferencing. See protocol section 2.2.6
+autostart actor ActorOverHTTP(HTTP.Server node)
+{	
+    process node accepts req:HttpContract.Request where (IsConfbaseHttpMessage(req.Headers))
+    {       	
+		ConfbasHttpRequestMessage msg = new ConfbasHttpRequestMessage(req);
+		dispatch (endpoint Server over node) accepts msg;		
+    }
+	
+	process node issues rsp:HttpContract.Response where (IsConfbaseHttpMessage(rsp.Headers))
+    {       	
+		ConfbasHttpResponseMessage msg = new ConfbasHttpResponseMessage(rsp);
+		dispatch (endpoint Server over node) issues msg;		
+    }
+}
+
+string GetConfbasMessageReqType(SIP.Request sipMsg)
+{	
+	if (sipMsg.Body == nothing)
+	{
+		if ((TryGetHeaderValue("Event", sipMsg.Headers) == "conference") && (sipMsg.Method == "SUBSCRIBE"))		
+		{
+			return "FocusSubscriptionRequestMessage";
+		}
+	}
+	else if (((sipMsg.Method == "INVITE") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/cccp+xml")) 
+		|| ((sipMsg.Method == "INFO") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/cccp+xml")))
+	{			
+		xml tempBody = BuildXml(sipMsg.Body as binary); 
+			
+		if (tempBody == null)
+		{
+			return null;			
+		}
+		else
+		{	 
+			array<xml> requestElements = tempBody select xpath{//request};
+
+			if ((requestElements != null) && (requestElements.Count != 0))			
+			{
+				return "FocusSignalingRequestMessage";
+			}
+			else
+			{
+				array<xml> responseElements = tempBody select xpath{//response};
+
+				if ((responseElements != null) && (responseElements.Count != 0))
+				{
+					return "FocusSignalingResponseMessage";
+				}
+			}
+		}
+	}
+	else if (sipMsg.Method == "UPDATE")			
+	{ 
+		array<string> supportedArray = TryGetHeaderValues("Supported", sipMsg.Headers);
+			
+		if ((supportedArray == null) || (supportedArray.Count == 0))
+		{
+			return null;
+		}
+		else
+		{
+			foreach (string support in supportedArray)
+			{
+				if (support == "timer")
+				{
+					return "FocusSignalingRequestMessage";
+				}
+			}
+		}
+	}	
+	else if ((sipMsg.Method == "BENOTIFY") && 
+		(TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/conference-info+xml") && 
+		(TryGetHeaderValue("Event", sipMsg.Headers) == "conference"))
+	{
+		return "ConferenceStateNotificationMessage";
+	}			
+	return null;
+}
+
+string GetConfbasMessageRspType(SIP.Response sipMsg)
+{
+	string cSeq = TryGetHeaderValue("CSeq", sipMsg.Headers);
+	
+	if (((cSeq == "INVITE") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/cccp+xml")) 
+		|| ((cSeq == "UPDATE") && (sipMsg.Body == nothing))
+		|| ((cSeq == "INFO") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/cccp+xml")))
+	{
+		return "FocusSignalingResponseMessage";
+	}
+	else if ((cSeq == "SUBSCRIBE") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/conference-info+xml")
+		|| ((eventHeader == "FocusSubscriptionRequestMessage") && (cSeq == "SUBSCRIBE"))) 
+	{
+		return "FocusSubscriptionResponseMessage";
+	}	
+	return null;
+}
+
+bool IsConfbaseHttpMessage(HttpHeadersType httpHeaders)
+{
+	if ("Accept" in httpHeaders)
+	{		
+		array<HTTP.HeaderFieldType> acceptHeaderArray = httpHeaders["Accept"] as array<HTTP.HeaderFieldType>;
+
+		if (acceptHeaderArray != null && acceptHeaderArray.Count != 0)
+		{
+			foreach (HTTP.HeaderFieldType header in acceptHeaderArray)
+			{	
+				if (header.Value == "Application/vnd.microsoft.lync.meeting+xml")
+				{
+					return true;  
+				}
+			}
+		}			
+	}			
+	else if ("Content-Type" in httpHeaders)
+	{
+		HTTP.HeaderFieldType tempHeader= httpHeaders["Content-Type"] as HTTP.HeaderFieldType;
+
+		if ((tempHeader != null) && (tempHeader.Value == "Application/vnd.microsoft.lync.meeting+xml"))
+		{
+			return true;
+		}
+	}	 
+	return false;
+}
+
+message RequestMessage : SipRequestMessage
+{	
+	RequestMessage(SIP.Request sipReqMsg)
+	{
+		InitializeSIPReq(sipReqMsg, ["From", "To", "CSeq"], this);
+	}
+	
+	override string ToString()
+	{ 
+		return "Request";
+	}
+}
+
+message FocusSignalingRequestMessage : RequestMessage
+{		
+	FocusSignalingRequestMessage(SIP.Request sipReqMsg)
+	{
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Authenticate", "Authentication-Info", "WWW-Authenticate", "Proxy-Authorization", "Proxy-Authenticate", "Content-Type", "Ms-Keep-Alive", "Contact", "Supported", "Session-Expires", "Require"]);
+	}
+	
+	override string ToString()
+	{
+		if (this.Method == "INVITE")
+		{			
+			if (this.Body == nothing || this.Body == null)
+			{
+				return "Focus Signaling Dialog Establishment";
+			}
+
+			xml tempBody = this.Body as xml;
+			
+			if (tempBody == null)
+			{
+				return "Focus Signaling Dialog Establishment";
+			}
+
+			array<xml> bodyXmls = tempBody select xpath{//request};
+
+			if (bodyXmls == null || bodyXmls.Count == 0)
+			{
+				return "Focus Signaling Dialog Establishment";
+			}
+			else if (bodyXmls.Count > 1)
+			{
+				return "Invalid Message: More Than One request Element in Message Body";
+			}
+
+			array<xml> childrenOfBodyXmls = bodyXmls[0].Children;
+
+			if (childrenOfBodyXmls == null || childrenOfBodyXmls.Count == 0)
+			{
+				return "Focus Signaling Dialog Establishment Invalid Message: Missing Conference Control Element in Message Body";
+			}
+			else if (childrenOfBodyXmls.Count > 1)
+			{
+				return "Focus Signaling Dialog Establishment Invalid Message: More Than One Conference Control Element in Message Body";
+			}
+
+			optional XmlName name = childrenOfBodyXmls[0].Name;
+
+			if (name == nothing)
+			{
+				return "Focus Signaling Dialog Establishment";
+			}
+
+			XmlName tempName = name as XmlName;
+
+			if (tempName == null)		
+			{
+				return "Focus Signaling Dialog Establishment";
+			}
+
+			switch (tempName.LocalName)
+			{
+				case ("addUser") =>
+				{
+					return "Focus Signaling Dialog Establishment, addUser Request";	
+				}
+				case ("endorseUser") =>
+				{
+					return "Focus Signaling Dialog Establishment, endorseUser Request";	
+				}
+				case ("modifyUserRoles") =>
+				{
+					return "Focus Signaling Dialog Establishment, modifyUserRoles Request";	
+				}
+				default =>
+				{
+					return "Focus Signaling Dialog Establishment";
+				}						
+			}
+		}		
+			
+		if (this.Method == "UPDATE")	
+		{
+			return "Focus Signaling Dialog Update";			
+		}
+		else if (this.Method == "INFO")
+		{			
+			if (this.Body == nothing || this.Body == null)
+			{
+				return "Focus Signaling Conference Control Request";
+			}
+
+			xml tempBody = this.Body as xml;
+
+			if (tempBody == null)
+			{
+				return "Focus Signaling Conference Control Request";
+			}
+
+			array<xml> bodyXmls = tempBody select xpath{//request};
+
+			if (bodyXmls == null || bodyXmls.Count == 0)
+			{
+				return "Focus Signaling Conference Control Request";
+			}
+			else if (bodyXmls.Count > 1)
+			{
+				return "Invalid Message: More Than One request Element in Message Body";
+			}
+
+			array<xml> childrenOfBodyXmls = bodyXmls[0].Children;
+
+			if (childrenOfBodyXmls == null || childrenOfBodyXmls.Count == 0)
+			{
+				return "Focus Signaling Conference Control Request Invalid Message: Missing Conference Control Element in Message Body";
+			}
+			else if (childrenOfBodyXmls.Count > 1)
+			{
+				return "Focus Signaling Conference Control Request, Multiple Purpose Request";
+			}
+
+			optional XmlName name = childrenOfBodyXmls[0].Name;
+
+			if (name == nothing)
+			{
+				return "Focus Signaling Conference Control Request";
+			}
+
+			XmlName tempName = name as XmlName;
+
+			if (tempName == null)		
+			{
+				return "Focus Signaling Conference Control Request";
+			}
+
+			switch (tempName.LocalName)
+			{
+				case ("modifyUserRoles") =>
+				{	
+					return "Focus Signaling Conference Control, modifyUserRoles Request";	
+				}
+				case ("modifyConferenceLock") =>
+				{
+					return "Focus Signaling Conference Control, modifyConferenceLock Request";	
+				}
+				case ("deleteUser") =>
+				{
+					return "Focus Signaling Conference Control, deleteUser Request";	
+				}
+				case ("deleteConference") =>
+				{
+					return "Focus Signaling Conference Control, deleteConference Request";	
+				}
+				case ("addUser") =>
+				{
+					array<xml> joiningMethodXmls = tempBody select xpath{//addUser/user/endpoint/joining-method};
+
+					if (joiningMethodXmls == null || joiningMethodXmls.Count == 0)
+					{
+						return "Invalid Request Message: Missing joining-method Element for endpoint Element in Message Body";
+					}
+					else
+					{
+						foreach (xml joiningMethodXml in joiningMethodXmls)
+						{
+							string joiningMethod = null;							
+							joiningMethod = joiningMethodXml.Value as string;
+
+							if (joiningMethod == null)
+							{
+								return "Invalid Request Message: Value of joining-method Element for endpoint Element in Message Body is not string";
+							}
+							else if (joiningMethod == "dialed-in")
+							{
+								joiningMethod =  "Dial-In";
+								return "Focus Signaling Conference Control, addUser Dial-out Request";
+							}
+							else if (joiningMethod == "dialed-out")
+							{
+								joiningMethod =  "Dial-Out";
+								return "Focus Signaling Conference Control, addUser Dial-in Request";
+							}							
+						}
+						return "Focus Signaling Conference Control Request";
+					}					
+				}	
+				case ("getConference") =>
+				{
+					return "Focus Signaling Conference Control, getConference Request";	
+				}
+				case ("setLobbyAccess") =>
+				{
+					return "Focus Signaling Conference Control, setLobbyAccess Request";	
+				}
+				case ("modifyEndpoint") =>
+				{
+					return "Focus Signaling Conference Control, modifyEndpoint Request";	
+				}
+				case ("modifyConferenceAnnouncements") =>
+				{
+					return "Focus Signaling Conference Control, modifyConferenceAnnouncements Request";			
+				}
+				case ("modifyConference") =>
+				{
+					return "Focus Signaling Conference Control, modifyConference Request";
+				}
+				default =>
+				{
+					return "Focus Signaling Conference Control Request";	
+				}
+			}			
+		}
+		return "Focus Signaling Request";	
+	}	
+}
+
+message FocusSubscriptionRequestMessage : RequestMessage
+{	
+	FocusSubscriptionRequestMessage(SIP.Request sipReqMsg)
+	{		
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Contact", "Accept", "Supported", "Require", "Content-Type", "ms-telemetry-id"]);
+	}
+	
+	override string ToString()
+	{
+		return "Focus Subscription Request";
+	}
+}
+
+message ConferenceStateNotificationMessage : RequestMessage
+{	
+	ConferenceStateNotificationMessage(SIP.Request sipReqMsg)
+	{	
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Content-Type"]);
+	}
+	
+	override string ToString()
+	{
+		return "Conference State Notification";		
+	}
+}
+
+message ResponseMessage : SipResponseMessage
+{
+	ResponseMessage(SIP.Response sipRspMsg)
+	{
+		InitializeSIPRsp(sipRspMsg, ["From", "To", "CSeq"], this);
+	}
+
+	ResponseMessage(SIP.Request sipReqMsg)
+	{		
+		InitializeSIPReq(sipReqMsg, ["From", "To", "CSeq"], this);
+	}
+
+	override string ToString()
+	{ 
+		return Format("{0} {1}", this.StatusCode, this.ReasonPhrase);
+	}	
+}
+	
+message FocusSignalingResponseMessage : ResponseMessage
+{			
+	FocusSignalingResponseMessage(SIP.Response sipRspMsg)
+	{
+		base.ResponseMessage(sipRspMsg);
+		this.Headers += GetHeaders(sipRspMsg.Headers, ["Authenticate", "Authentication-Info", "WWW-Authenticate", "Proxy-Authorization", "Proxy-Authenticate", "Content-Type", "Ms-Keep-Alive", "Contact", "Allow", "Require"]);
+	}
+
+	FocusSignalingResponseMessage(SIP.Request sipReqMsg)
+	{
+		base.ResponseMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Authenticate", "Authentication-Info", "WWW-Authenticate", "Proxy-Authorization", "Proxy-Authenticate", "Content-Type", "Ms-Keep-Alive", "Contact", "Allow", "Require"]);
+	}
+	
+	override string ToString()
+	{			
+		string cseq = TryGetHeaderValue("CSeq", this.Headers);
+		string commonSummary = null; 	
+		
+		if ((this.StatusCode == 0) && (this.ReasonPhrase == null))
+		{	
+			commonSummary = "";
+		}
+		else
+		{
+			commonSummary = Format(", {0} {1}", this.StatusCode, this.ReasonPhrase);
+		}
+		
+		if (cseq == "INVITE")
+		{			
+			if (this.Body == nothing || this.Body == null)
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+			
+			xml tempBody = this.Body as xml;
+
+			if (tempBody == null)
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+
+			array<xml> bodyXmls = tempBody select xpath{//response};
+
+			if (bodyXmls == null || bodyXmls.Count == 0)
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+			else if (bodyXmls.Count > 1)
+			{
+				return "Invalid Message: More Than One response Element in Message Body";
+			}
+
+			array<xml> childrenOfBodyXmls = bodyXmls[0].Children;
+
+			if (childrenOfBodyXmls == null || childrenOfBodyXmls.Count == 0)
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+			else if (childrenOfBodyXmls.Count > 1)
+			{
+				return "Focus Signaling Dialog Establishment Invalid Message: More Than One Conference Control Element in Message Body" + commonSummary;
+			}
+
+			optional XmlName name = childrenOfBodyXmls[0].Name;
+
+			if (name == nothing)
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+
+			XmlName tempName = name as XmlName;
+
+			if (tempName == null)		
+			{
+				return "Focus Signaling Dialog Establishment" + commonSummary;
+			}
+
+			switch (tempName.LocalName)
+			{
+				case ("addUser") =>
+				{
+					return "Focus Signaling Dialog Establishment, addUser Response" + commonSummary;	
+				}
+				case ("endorseUser") =>
+				{
+					return "Focus Signaling Dialog Establishment, endorseUser Response" + commonSummary;		
+				}
+				case ("modifyUserRoles") =>
+				{
+					return "Focus Signaling Dialog Establishment, modifyUserRoles Response" + commonSummary;	
+				}
+				default => 
+				{
+					return "Focus Signaling Dialog Establishment" + commonSummary;
+				}
+			}							
+		}
+		else if (cseq == "UPDATE")
+		{
+			return "Focus Signaling Dialog Update Response" + commonSummary;	
+		}	
+		else if (cseq == "INFO")
+		{
+			if (this.Body == nothing || this.Body == null)
+			{
+				return "Focus Signaling Conference Control Response" + commonSummary;
+			}
+
+			xml tempBody = this.Body as xml;
+
+			if (tempBody == null)
+			{
+				return "Focus Signaling Conference Control Response" + commonSummary;
+			}
+
+			array<xml> bodyXmls = tempBody select xpath{//response};
+
+			if (bodyXmls == null || bodyXmls.Count == 0)
+			{
+				return "Focus Signaling Conference Control Response Invalid Message: Missing Conference Control Element in Message Body" + commonSummary;
+			}
+			else if (bodyXmls.Count > 1)
+			{
+				return "Focus Signaling Conference Control Response Invalid Message: More Than One response Element in Message Body" + commonSummary;
+			}
+
+			array<xml> childrenOfBodyXmls = bodyXmls[0].Children;
+
+			if (childrenOfBodyXmls == null || childrenOfBodyXmls.Count == 0)
+			{
+				return "Focus Signaling Conference Control Response" + commonSummary;
+			}
+			else if (childrenOfBodyXmls.Count > 1)
+			{
+				return "Focus Signaling Conference Control Response, Multiple Purpose Response" + commonSummary;
+			}
+
+			optional XmlName name = childrenOfBodyXmls[0].Name;
+
+			if (name == nothing)
+			{
+				return "Focus Signaling Conference Control Response" + commonSummary;
+			}
+
+			XmlName tempName = name as XmlName;
+
+			if (tempName == null)		
+			{
+				return "Focus Signaling Conference Control Response" + commonSummary;
+			}
+
+			switch (tempName.LocalName)
+			{
+				case ("modifyUserRoles") =>
+				{
+					return "Focus Signaling Conference Control, modifyUserRoles Response" + commonSummary;
+				}
+				case ("modifyConferenceLock") =>
+				{
+					return "Focus Signaling Conference Control, modifyConferenceLock Response" + commonSummary;
+				}
+				case ("deleteUser") =>
+				{
+					return "Focus Signaling Conference Control, deleteUser Response" + commonSummary;
+				}
+				case ("deleteConference") =>
+				{
+					return "Focus Signaling Conference Control, deleteConference Response" + commonSummary;
+				}
+				case ("addUser") =>
+				{
+					array<xml> joiningMethodXmls = tempBody select xpath{//addUser/user/endpoint/joining-method};
+
+					if (joiningMethodXmls == null || joiningMethodXmls.Count == 0)
+					{
+						return "Invalid Response Message: Missing joining-method Element for endpoint Element in Message Body" + commonSummary;
+					}
+					else
+					{
+						foreach (xml joiningMethodXml in joiningMethodXmls)
+						{
+							string joiningMethod = null;
+							joiningMethod = joiningMethodXml.Value as string;
+
+							if (joiningMethod == null)
+							{
+								return "Invalid Response Message: Value of joining-method Element for endpoint Element in Message Body is not string" + commonSummary;
+							}
+							else if (joiningMethod == "dialed-in")
+							{
+								joiningMethod =  "Dial-In";
+								return "Focus Signaling Conference Control, addUser Dial-out Response" + commonSummary;
+							}
+							else if (joiningMethod == "dialed-out")
+							{
+								joiningMethod =  "Dial-Out";
+								return "Focus Signaling Conference Control, addUser Dial-in Response" + commonSummary;
+							}							
+						}
+						return "Focus Signaling Conference Control Response" + commonSummary;
+					}	
+				}	
+				case ("getConference") =>
+				{
+					return "Focus Signaling Conference Control, getConference Response" + commonSummary;
+				}
+				case ("setLobbyAccess") =>
+				{
+					return "Focus Signaling Conference Control, setLobbyAccess Response" + commonSummary;
+				}
+				case ("modifyEndpoint") =>
+				{
+					return "Focus Signaling Conference Control, modifyEndpoint Response" + commonSummary;	
+				}
+				case ("modifyConferenceAnnouncements") =>
+				{
+					return "Focus Signaling Conference Control, modifyConferenceAnnouncements Response" + commonSummary;		
+				}
+				case ("modifyConference") =>
+				{
+					return "Focus Signaling Conference Control, modifyConference Response" + commonSummary;						
+				}
+				default =>
+				{
+					return "Focus Signaling Conference Control Response" + commonSummary;
+				}
+			}					
+		}
+		return "Focus Signaling Response" + commonSummary;
+	}	
+}
+
+message FocusSubscriptionResponseMessage : ResponseMessage
+{
+	FocusSubscriptionResponseMessage(SIP.Response sipRspMsg)
+	{
+		base.ResponseMessage(sipRspMsg);
+	}
+	override string ToString()
+	{
+		return Format("Focus Subscription Response, {0} {1}", this.StatusCode, this.ReasonPhrase);
+	}	
+}
+
+message ConfbasHttpRequestMessage
+{
+	string Method;
+	HTTP.UriType Uri;	
+	optional HTTP.HttpHeadersType Headers;
+	optional xml Body;
+
+	ConfbasHttpRequestMessage(HttpContract.Request reqMsg)
+	{
+		this.Method = reqMsg.Method;
+		this.Uri = reqMsg.Uri;
+		HTTP.HttpHeadersType headers = reqMsg.Headers;	
+		HTTP.HttpHeadersType tempHeaders = {};
+		
+		if ("Accept" in headers)
+		{
+			tempHeaders += {"Accept" -> headers["Accept"] as array<HTTP.HeaderFieldType>};
+		}
+
+		if (tempHeaders == {})
+		{
+			this.Headers = nothing;
+		}
+		else
+		{
+			this.Headers = tempHeaders;
+		}
+		
+		optional binary bodyBinary = reqMsg.Payload;
+
+		if (bodyBinary == nothing || bodyBinary == null)
+		{
+			this.Body = nothing;
+		}
+        else
+        {
+            this.Body = BuildXml(bodyBinary as binary);
+        }
+	}
+		
+	override string ToString()
+	{ 
+		return "HTTP Join Meeting Request";
+	}
+}
+
+message ConfbasHttpResponseMessage
+{
+	uint StatusCode;
+	string ReasonPhrase;
+	optional HTTP.HttpHeadersType Headers;
+	optional xml Body;
+
+	ConfbasHttpResponseMessage(HttpContract.Response rspMsg)
+	{
+		this.StatusCode = rspMsg.StatusCode;
+		this.ReasonPhrase = rspMsg.ReasonPhrase;
+		HTTP.HttpHeadersType headers = rspMsg.Headers;	
+		HTTP.HttpHeadersType tempHeaders = {};
+		
+		if ("Content-Type" in headers)
+		{
+			HTTP.HeaderFieldType tempHeader = headers["Content-Type"] as HTTP.HeaderFieldType;
+			if (tempHeader != null)
+			{		
+				tempHeaders += {"Content-Type" -> tempHeader};
+			}
+		}
+
+		if (tempHeaders == {})
+		{
+			this.Headers = nothing;
+		}
+		else
+		{
+			this.Headers = tempHeaders;
+		}
+				
+		optional binary bodyBinary = rspMsg.Payload;
+
+		if (bodyBinary == nothing || bodyBinary == null)
+		{
+			this.Body = nothing;
+		}
+        else
+        {
+            this.Body = BuildXml(bodyBinary as binary);
+        }
+	}
+		
+	override string ToString()
+	{ 
+		return Format("HTTP Join Meeting Response, {0} {1}", this.StatusCode, this.ReasonPhrase);
+	}
+}

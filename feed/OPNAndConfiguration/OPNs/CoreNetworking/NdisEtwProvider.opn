@@ -1,0 +1,927 @@
+protocol NdisEtwProvider
+    with OPNAuthoring
+    {
+        Copyright = "(c) Microsoft Corporation",
+        References = 
+            [
+            ],
+        RevisionSummary = 
+            [
+                new Revision{Class = RevisionClass.Major, Version = "382201", Date = "10/19/2015"}
+            ]
+    };
+
+using Ethernet;
+using Etw;
+using EtwEvent;
+using Utility;
+using IPv4;
+using IPv6;
+
+endpoint NdisEtwNode accepts NdisEtwVirtualDataMessage
+{
+    // Decoding WIN7 in-box NDIS provider event message to Ethernet protocol message based on keyword.
+    process this accepts m:NdisEtwVirtualDataMessage
+        where (m#IsNdisEtwMetaData == nothing || !(m#IsNdisEtwMetaData as bool))
+            // 0x00000001 NdisMedium802_3 
+            // 0x00000008 NdisMediumWan
+            && (m#EtwKeywords != nothing && ((m#EtwKeywords as ulong) & (NdisMedium.NdisMedium802_3 | NdisMedium.NdisMediumWan)) != 0)
+            && !m.IsSessionTruncated
+    {
+        switch (m.Payload)
+        {
+            case f:Ethernet.Frame from BinaryDecoder<Ethernet.Frame[false]> =>
+                dispatch (endpoint Ethernet.Node) accepts f;
+            default => 
+                ThrowDecodingException("NdisEtwProvider", "Ethernet.Frame");
+        }
+    }
+
+    process this accepts m:NdisEtwVirtualDataMessage
+        where (m#IsNdisEtwMetaData == nothing || !(m#IsNdisEtwMetaData as bool))
+            // 0x00000200 NdisMediumWirelessWan
+            && m#EtwKeywords != nothing && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumIP) != 0)
+    {
+        if (!DecodeMediumIPMessage(m.Payload))
+        {
+            ThrowDecodingException("NdisEtwProvider", "NDIS ETW Medium IP Message");
+        }
+    }
+}
+
+endpoint NdisEtwReassemblyNode provides NdisEtwContract
+{
+    map<uint, map<ulong, binary>> ndisFragments = {};
+    map<uint, map<ulong, array<any message>>> fragOrigins = {};
+    
+    map<uint, map<ulong, binary>> vmSwitchFragments = {};
+    map<uint, map<ulong, array<any message>>> vmSwitchOrigins = {};
+
+    process this accepts m:NdisEtwContract.EventPacketMetadata
+    {
+        var msg = new NdisEtwVirtualDataMessage
+        {
+            Payload = m.Metadata
+        };
+        msg#IsNdisEtwMetaData = true;
+        msg#EtwKeywords = m#EtwKeywords;
+        msg.Origins = [m];
+        msg.SourceData = msg.Payload;
+        msg.AssignFieldEncodingInfo("Payload", 0, msg.Payload.Count * 8);
+        var ep = endpoint NdisEtwNode;
+        dispatch ep accepts msg;
+    }
+    
+    // This is the in-box ndis fragment
+    process this accepts m:NdisEtwContract.EventPacketFragment
+    {
+        if (!ReassembleNdisEtwFragments(m, m.MiniportIfIndex, m.Fragment, ref ndisFragments, ref fragOrigins))
+            reject;
+    }    
+    
+    // This is the in-box ndis VM Switch fragment 
+    process this accepts m:NdisEtwContract.EventVMSwitchPacketFragment
+    {
+        if (!ReassembleNdisEtwFragments(m, m.MiniportIfIndex, m.Fragment, ref vmSwitchFragments, ref vmSwitchOrigins))
+            reject;
+    }
+    
+    bool ReassembleNdisEtwFragments(
+        any message fragment,
+        uint miniportIfIndex,
+        binary payload,
+        ref map<uint, map<ulong, binary>> fragments,
+        ref map<uint, map<ulong, array<any message>>> origins)
+    {
+        ulong keywords = 0;
+        if (fragment#EtwKeywords == nothing)
+        {
+            throw "NdisEtwProvider: Unrecoverable reassembly failure due to no Keyword is attached as annotation to the NdisEtwMessage.";
+        }
+        else
+        {
+            keywords = fragment#EtwKeywords as ulong;
+        }
+        
+        if ((keywords & 0xc0000000) == 0xc0000000) // KW_PACKET_START | KW_PACKET_END 0xc0000000
+        {
+            // This message is complete
+            var msg = new NdisEtwVirtualDataMessage 
+            {
+                Payload = payload
+            };
+            msg#EtwKeywords = keywords;
+            msg.Origins = [fragment];
+            msg.SourceData = msg.Payload;
+            msg.AssignFieldEncodingInfo("Payload", 0, msg.Payload.Count * 8);
+            dispatch endpoint NdisEtwNode accepts msg;
+        }
+        else
+        {
+            ulong fragmentSetID = (fragment#EtwThreadID | ((fragment#ProcessorNum as ulong) << 32)) as ulong;
+            if (!(miniportIfIndex in fragments))
+            {
+                fragments[miniportIfIndex] = {};
+                origins[miniportIfIndex] = {};
+            }
+            
+            if ((keywords & 0x80000000) == 0) // KW_PACKET_END 0x80000000
+            {
+                if ((keywords & 0x40000000) != 0) // KW_PACKET_START 0x40000000
+                {
+                    // This is the first fragment
+                    if ((fragmentSetID in fragments[miniportIfIndex]))
+                    {
+                        ValidationCheck(false, fragment, "NdisEtwProvider: Previous reassembly was not completed.");
+                    }
+                    fragments[miniportIfIndex][fragmentSetID] = payload;
+                    origins[miniportIfIndex][fragmentSetID] = [fragment];
+                }
+                else
+                {
+                    // This is a middle fragment
+                    if (!(fragmentSetID in fragments[miniportIfIndex]))
+                    {
+                        // When miss the start fragments. 
+                        ValidationCheck(false, fragment, "NdisEtwProvider: First fragment is missing.");
+                        return false;
+                    }
+                    else
+                    {
+                        // Out of order is not handled.
+                        fragments[miniportIfIndex][fragmentSetID] += payload;
+                        origins[miniportIfIndex][fragmentSetID] += [fragment];
+                    }
+                }
+            }
+            else
+            {
+                // this is the last fragment
+                if (!(fragmentSetID in fragments[miniportIfIndex]))
+                {
+                    ValidationCheck(false, fragment, "NdisEtwProvider: Previous fragments are incomplete.");
+                    return false;
+                }
+                else
+                {
+                    fragments[miniportIfIndex][fragmentSetID] += payload;
+                    origins[miniportIfIndex][fragmentSetID] += [fragment];
+                    // Reassemble and dispatch
+                    var msg = new NdisEtwVirtualDataMessage 
+                    {
+                        Payload = fragments[miniportIfIndex][fragmentSetID]
+                    };
+                    msg#EtwKeywords = (keywords | 0xc0000000);
+                    msg.Origins = origins[miniportIfIndex][fragmentSetID];
+                    msg.SourceData = msg.Payload;
+                    msg.AssignFieldEncodingInfo("Payload", 0, msg.Payload.Count * 8);
+                    // Remove key from cache map
+                    fragments[miniportIfIndex] = fragments[miniportIfIndex].Remove(fragmentSetID);
+                    origins[miniportIfIndex] = origins[miniportIfIndex].Remove(fragmentSetID);
+                
+                    dispatch endpoint NdisEtwNode accepts msg;
+                }
+            }
+        }
+        return true;
+    }
+}
+
+autostart actor NdisEtwReassemblyNodeActor(NdisEtwReassemblyNode ndisEtwReassemblyNode)
+{
+    // destructor
+    ~endpoint(NdisEtwReassemblyNode ndisEtwReassemblyNode)
+    {
+        if (ndisEtwReassemblyNode.fragOrigins.Count > 0)
+        {
+            foreach (var maps in ndisEtwReassemblyNode.fragOrigins.Values) // maps type is map<ulong, array<any message>>
+            {
+                if (maps.Count > 0)
+                {
+                    foreach (array<any message> messages in maps.Values)
+                    {
+                        foreach (var msg in messages)
+                        {
+                            ReportInsufficientData(msg, DiagnosisLevel.Error, "NdisEtwProvider: Incomplete NdisEtwProvider payload for full reassembly, due to missing contiguous messages.");
+                            DisplayTopLevelMessage(msg);
+                        }
+                    }
+                }
+            }
+            ndisEtwReassemblyNode.ndisFragments = {};
+            ndisEtwReassemblyNode.fragOrigins = {};
+        }
+        
+        if (ndisEtwReassemblyNode.vmSwitchOrigins.Count > 0)
+        {
+            foreach (var maps in ndisEtwReassemblyNode.vmSwitchOrigins.Values) // maps type is map<ulong, array<any message>>
+            {
+                if (maps.Count > 0)
+                {
+                    foreach (var messages in maps.Values) // messages type is array<any message>
+                    {
+                        foreach (var msg in messages)
+                        {
+                            ReportInsufficientData(msg, DiagnosisLevel.Error, "NdisEtwProvider: Incomplete NdisEtwProvider payload for full reassembly, due to missing contiguous messages.");
+                            DisplayTopLevelMessage(msg);
+                        }
+                    }
+                }
+            }
+            ndisEtwReassemblyNode.vmSwitchFragments = {};
+            ndisEtwReassemblyNode.vmSwitchOrigins = {};
+        }
+    }
+}
+
+// This actor decode all the events for NdisEtwProvider and dispatch the decoded events
+// Put all the decoding logic into one rule may perform more efficient
+autostart actor EtwEventToNdisEtwProvider(EtwEvent.Node node)
+{
+    process node accepts m:EtwProviderMsg
+        where value.EventRecord.Header.ProviderId == EtwProviderIdNdis
+    {
+        var eventId = m.EventRecord.Header.Descriptor.Id;
+        switch (eventId)
+        {
+            case 1001 =>
+                NdisEtwContract.EventPacketFragment msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventPacketFragment>(m.Payload, "EventPacketFragment", ref msg);
+                msg#EtwKeywords = m.EventRecord.Header.Descriptor.Keywords;
+                msg#EtwThreadID = m.EventRecord.Header.ThreadId;
+                msg#ProcessorNum = m.EventRecord.BufferContext.ProcessorNumber;
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1002 =>
+                NdisEtwContract.EventPacketMetadata msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventPacketMetadata>(m.Payload, "EventPacketMetadata", ref msg);
+                msg#EtwKeywords = m.EventRecord.Header.Descriptor.Keywords;
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1003 =>
+                NdisEtwContract.EventVMSwitchPacketFragment msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventVMSwitchPacketFragment>(m.Payload, "EventVMSwitchPacketFragment", ref msg);
+                msg#EtwKeywords = m.EventRecord.Header.Descriptor.Keywords;
+                msg#EtwThreadID = m.EventRecord.Header.ThreadId;
+                msg#ProcessorNum = m.EventRecord.BufferContext.ProcessorNumber;
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1011 =>
+                NdisEtwContract.EventCaptureRules msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventCaptureRules>(m.Payload, "EventCaptureRules", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1012 =>
+                NdisEtwContract.EventDriverLoad msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventDriverLoad>(m.Payload, "EventDriverLoad", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1013 =>
+                NdisEtwContract.EventDriverUnload msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventDriverUnload>(m.Payload, "EventDriverUnload", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+            
+            case 1014 =>
+                NdisEtwContract.EventLayerLoad msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventLayerLoad>(m.Payload, "EventLayerLoad", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1015 =>
+                NdisEtwContract.EventLayerUnload msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventLayerUnload>(m.Payload, "EventLayerUnload", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 1016 =>
+                NdisEtwContract.EventCaptureRule msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventCaptureRule>(m.Payload, "EventCaptureRule", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 2001 =>
+                NdisEtwContract.EventDriverLoadError msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventDriverLoadError>(m.Payload, "EventDriverLoadError", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 2002 =>
+                NdisEtwContract.EventLayerLoadError msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventLayerLoadError>(m.Payload, "EventLayerLoadError", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 2003 =>
+                NdisEtwContract.EventRuleLoadError msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventRuleLoadError>(m.Payload, "EventRuleLoadError", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 3001 =>
+                NdisEtwContract.EventStartLayerLoad msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventStartLayerLoad>(m.Payload, "EventStartLayerLoad", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 3002 =>
+                NdisEtwContract.EventEndLayerLoad msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventEndLayerLoad>(m.Payload, "EventEndLayerLoad", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5000 =>
+                NdisEtwContract.EventRxPacketStart msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventRxPacketStart>(m.Payload, "EventRxPacketStart", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5001 =>
+                NdisEtwContract.EventRxPacketComplete msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventRxPacketComplete>(m.Payload, "EventRxPacketComplete", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5002 =>
+                NdisEtwContract.EventTxPacketStart msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventTxPacketStart>(m.Payload, "EventTxPacketStart", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5003 =>
+                NdisEtwContract.EventTxPacketComplete msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventTxPacketComplete>(m.Payload, "EventTxPacketComplete", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5100 =>
+                NdisEtwContract.EventStateRundown msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventStateRundown>(m.Payload, "EventStateRundown", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            case 5101 =>
+                NdisEtwContract.EventPktSourceInfo msg;
+                BinaryDecodeWithErrorOnFail<NdisEtwContract.EventPktSourceInfo>(m.Payload, "EventPktSourceInfo", ref msg);
+                var ep = endpoint NdisEtwReassemblyNode;
+                dispatch ep accepts msg;
+                
+            default =>
+                ThrowDecodingException("NdisEtwEvent " + (eventId as string));
+        }
+    }
+}
+
+void BinaryDecodeWithErrorOnFail<T>(binary payload, string msgName, ref T decodedMsg)
+{
+    switch (payload)
+    {
+        case t:T from BinaryDecoder =>
+            decodedMsg = t;
+        default =>
+            ThrowDecodingException(msgName);
+    }
+}
+
+bool DecodeMediumIPMessage(binary binaryValue)
+{
+    if (binaryValue.Count <= 0)
+    {
+        return false;
+    }
+    else
+    {
+        // Check IP version. According to the definition in IPv4 and IPv6, version of IP is 4 bit width
+        byte ipVersion = (binaryValue[0] >> 4) as byte;
+
+        if (ipVersion == 4)
+        {
+            switch (binaryValue)
+            {
+                case d:IPv4.Datagram from BinaryDecoder =>
+                    DispatchIPv4DatagramToReassemblyNode(d);
+                    return true;
+                default => 
+                    return false;
+            }
+        }
+        // IPv6
+        else if (ipVersion == 6)
+        {
+            switch (binaryValue)
+            {
+                case d:IPv6.Datagram from IPv6Decoder =>
+                    DispatchIPv6DatagramToReassemblyNode(d);
+                    return true;
+                default =>
+                    return false;
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+}
+
+contract NdisEtwContract
+{
+    accepts message EventPacketFragment
+    {
+        uint MiniportIfIndex;
+        
+        uint LowerIfIndex;
+        
+        uint FragmentSize;
+        
+        binary Fragment
+            with Standard.BinaryEncoding {Length = FragmentSize};
+        
+        override string ToString()
+        {
+            string summary = "Packet Fragment";
+            if (GetFragMark(this#EtwKeywords as ulong) != "")
+            {
+                summary += ", " + GetFragMark(this#EtwKeywords as ulong);
+            }
+            summary += ", MiniportIfIndex: " + (MiniportIfIndex as string) + ", LowerIfIndex: " + (LowerIfIndex as string) + ", FragmentSize: " + (FragmentSize as string);
+            return summary;
+        }
+    }
+    
+    accepts message EventPacketMetadata
+    {
+        uint MiniportIfIndex;
+        
+        uint LowerIfIndex;
+        
+        uint MetadataSize;
+        
+        binary Metadata
+            with Standard.BinaryEncoding {Length = MetadataSize};
+        
+        override string ToString()
+        {
+            return "Packet Metadata, MetadataSize: " + (MetadataSize as string) +
+                " bytes";
+        }
+    }
+    
+    accepts message EventVMSwitchPacketFragment
+    {
+        uint MiniportIfIndex;
+        
+        uint LowerIfIndex;
+        
+        uint SourcePortId;
+        
+        string SourcePortName;
+        
+        string SourceNicName;
+        
+        string SourceNicType;
+        
+        uint DestinationCount;
+        
+        array<Destination> Destinations
+            with BinaryEncoding{ Length = DestinationCount };
+        
+        uint FragmentSize;
+        
+        binary Fragment
+            with Standard.BinaryEncoding {Length = FragmentSize};
+        
+        uint OobDataSize;
+        
+        optional binary OobData
+            with BinaryEncoding{ Length = OobDataSize };
+        
+        override string ToString()
+        {
+            string summary = "VmSwitch Packet Fragment";
+            if (GetFragMark(this#EtwKeywords as ulong) != "")
+            {
+                summary += ", " + GetFragMark(this#EtwKeywords as ulong);
+            }
+            summary += ", MiniportIfIndex: " + (MiniportIfIndex as string) + ", LowerIfIndex: " + (LowerIfIndex as string) + ", FragmentSize: " + (FragmentSize as string);
+            return summary;
+        }
+    }
+    
+    accepts message EventCaptureRules
+    {
+        uint RulesCount;
+        
+        override string ToString()
+        {
+            return "Capture Rules, RulesCount: " + (RulesCount as string);
+        }
+    }
+    
+    accepts message EventDriverLoad
+    {
+        string FriendlyName;
+        
+        string UniqueName;
+        
+        string ServiceName;
+        
+        string Version;
+        
+        override string ToString()
+        {
+            return  "Driver Load, FriendlyName: " +
+                (FriendlyName as string) + ", UniqueName: " +
+                (UniqueName as string) + ", ServiceName: " +
+                (ServiceName as string);
+        }
+    }
+    
+    accepts message EventDriverUnload
+    {
+        string FriendlyName;
+        
+        string UniqueName;
+        
+        string ServiceName;
+        
+        string Version;
+        
+        override string ToString()
+        {
+            return "Driver Unload, FriendlyName: " + (FriendlyName as string) + ", UniqueName: " + (UniqueName as string) + ", ServiceName: " + (ServiceName as string);
+        }
+    }
+    
+    accepts message EventLayerLoad
+    {
+        uint MiniportIfIndex;
+        
+        uint LowerIfIndex;
+        
+        uint MediaType;
+        
+        uint ReferenceContext;
+        
+        override string ToString()
+        {
+            return  "Layer Load, Attached to miniport interface " +
+                (MiniportIfIndex as string) +
+                " above layer interface " + (LowerIfIndex as string) +
+                " with media type " + (MediaType as string) +
+                ", context: " + (ReferenceContext as string);
+        }
+    }
+    
+    accepts message EventLayerUnload
+    {
+        uint MiniportIfIndex;
+        
+        uint LowerIfIndex;
+        
+        uint MediaType;
+        
+        uint ReferenceContext;
+        
+        override string ToString()
+        {
+            return  "Layer Unload, Detached from miniport interface " +
+                (MiniportIfIndex as string) +
+                " above layer interface " + (LowerIfIndex as string) +
+                " with media type " + (MediaType as string) +
+                ", context: " + (ReferenceContext as string);
+        }
+    }
+    
+    accepts message EventCaptureRule
+    {
+        RuleIdMap RuleId;
+        
+        DirectiveMap Directive;
+        
+        ushort Length;
+        
+        binary Value with Standard.BinaryEncoding {Length = Length};
+        
+        override string ToString()
+        {
+            return "Capture Rule, Id: " + EnumToString(this.RuleId, "NdisEtwProvider.RuleIdMap") +
+                ", Directive: " + EnumToString(this.Directive, "NdisEtwProvider.DirectiveMap") +
+                ", Length: " + (Length as string) +
+                ", Value: " + (Value as string);
+        }
+    }
+    
+    accepts message EventDriverLoadError
+    {
+        uint ErrorCode with DisplayInfo {ToText = ToHex};
+        
+        uint Location;
+        
+        uint Context;
+        
+        override string ToString()
+        {
+            return  "Driver Load Error, Driver load failed with status " +
+                (ErrorCode as string) + " at location " +
+                (Location as string);
+        }
+    }
+    
+    accepts message EventLayerLoadError
+    {
+        uint ErrorCode with DisplayInfo {ToText = ToHex};
+        
+        uint Location;
+        
+        uint Context;
+        
+        override string ToString()
+        {
+            return  "Layer Load Error, FilterAttach failed with status " +
+                (ErrorCode as string) + " at location " +
+                (Location as string) + ", context: " +
+                (Context as string);
+        }
+    }
+    
+    accepts message EventRuleLoadError
+    {
+        RuleIdMap RuleId;
+        
+        DirectiveMap Directive;
+        
+        ushort Length;
+        
+        binary Value with Standard.BinaryEncoding {Length = Length};
+        
+        override string ToString()
+        {
+            return "Rule Load Error, Id: " + EnumToString(this.RuleId, "NdisEtwProvider.RuleIdMap") +
+                ", Directive: " + EnumToString(this.Directive, "NdisEtwProvider.DirectiveMap") +
+                ", Length: " + (Length as string) +
+                ", Value: " + (Value as string);
+        }
+    }
+    
+    accepts message EventStartLayerLoad
+    {
+        Ut_OpcodeMap PreviousState;
+        
+        Ut_OpcodeMap NextState;
+        
+        uint Location;
+        
+        uint Context;
+        
+        override string ToString()
+        {
+            return  "Start Layer Load, Entering state \'" + EnumToString(this.NextState, "NdisEtwProvider.Ut_OpcodeMap") +
+                "\' from state \'" + EnumToString(this.PreviousState, "NdisEtwProvider.Ut_OpcodeMap") +
+                "\', location: " + (Location as string) +
+                ", context: " + (Context as string);
+        }
+    }
+    
+    accepts message EventEndLayerLoad
+    {
+        Ut_OpcodeMap PreviousState;
+        
+        Ut_OpcodeMap NextState;
+        
+        uint Location;
+        
+        uint Context;
+        
+        override string ToString()
+        {
+            return  "End Layer Load, Entering state \'" + EnumToString(this.NextState, "NdisEtwProvider.Ut_OpcodeMap") +
+                "\' from state \'" + EnumToString(this.PreviousState, "NdisEtwProvider.Ut_OpcodeMap") +
+                "\', location: " + (Location as string) +
+                ", context: " + (Context as string);
+        }
+    }
+    
+    accepts message EventRxPacketStart
+    {
+        override string ToString()
+        {
+            return "Rx Packet Processing Start";
+        }
+    }
+    
+    accepts message EventRxPacketComplete
+    {
+        override string ToString()
+        {
+            return "Rx Packet Processing Complete";
+        }
+    }
+    
+    accepts message EventTxPacketStart
+    {
+        override string ToString()
+        {
+            return "Tx Packet Processing Start";
+        }
+    }
+    
+    accepts message EventTxPacketComplete
+    {
+        override string ToString()
+        {
+            return "Tx Packet Processing Complete";
+        }
+    }
+    
+    accepts message EventStateRundown
+    {
+        MapCaptureSource SourceId;
+        
+        uint RundownId;
+        
+        ulong Param1 with DisplayInfo{ToText = ToHex};
+        
+        ulong Param2 with DisplayInfo{ToText = ToHex};
+        
+        string ParamStr;
+        
+        string Description;
+        
+        override string ToString()
+        {
+            return
+                "Rundown: " +
+                EnumToString(this.SourceId,
+                             "NdisEtwProvider.MapCaptureSource") +
+                ": " + (this.RundownId as string) + " - " +
+                ToHex(this.Param1) + ", " + ToHex(this.Param2) + ", " +
+                (this.ParamStr as string) + ". " +
+                (this.Description as string) + ".";
+        }
+    }
+    
+    accepts message EventPktSourceInfo
+    {
+        MapCaptureSource SourceId;
+        
+        string SourceName;
+        
+        uint IfIndex;
+        
+        ushort LayerCount;
+        
+        array<LayerInfo> LayerInfo
+            with Standard.BinaryEncoding{Length = LayerCount};
+        
+        override string ToString()
+        {
+            return
+                "Event source: " +
+                EnumToString(this.SourceId,
+                             "NdisEtwProvider.MapCaptureSource") +
+                ": " + (this.SourceName as string) + ", IfIndex: " +
+                (this.IfIndex as string) + ", LayerCount: " +
+                (this.LayerCount as string) + ".";
+        }
+    }
+}
+
+message NdisEtwVirtualDataMessage
+{
+    binary Payload;
+
+    override string ToString()
+    {
+        return  "Payload: " + Payload.ToString();
+    }
+}
+
+int get PayloadLength(this NdisEtwProvider.NdisEtwVirtualDataMessage msg)
+{
+    return msg.Payload.Count;
+}
+
+int get PayloadLength(this NdisEtwProvider.NdisEtwContract.EventPacketMetadata msg)
+{
+    return msg.Metadata.Count;
+}
+
+int get PayloadLength(this NdisEtwProvider.NdisEtwContract.EventPacketFragment msg)
+{
+    return msg.Fragment.Count;
+}
+
+int get PayloadLength(this NdisEtwProvider.NdisEtwContract.EventVMSwitchPacketFragment msg)
+{
+    return msg.Fragment.Count;
+}
+
+pattern RuleIdMap = enum byte
+                    {
+                        FrameControl = 2,
+                        MultiLayer = 3,
+                        InterfaceIndex = 4,
+                        EtherType = 6,
+                        Source_MAC_Address = 7,
+                        Destination_MAC_Address = 8,
+                        Any_MAC_Address = 9,
+                        Source_IPv4_Address = 10,
+                        Destination_IPv4_Address = 11,
+                        Any_IPv4_Address = 12,
+                        Source_IPv6_Address = 13,
+                        Destination_IPv6_Address = 14,
+                        Any_IPv6_Address = 15,
+                        IP_Protocol = 16,
+                        Packet_Truncate_Bytes = 17,
+                        Custom_MAC_Offset = 18,
+                        Custom_IP_Offset = 19,
+                        ...
+                    };
+
+pattern DirectiveMap = enum byte
+                       {
+                           OFF = 0,
+                           LTE = 1,
+                           GTE = 2,
+                           EQU = 3,
+                           MASK = 4,
+                           LIST = 5,
+                           RANGE = 6,
+                           NEQ = 131,
+                           NMASK = 132,
+                           NLIST = 133,
+                           NRANGE = 134,
+                           ...
+                       };
+                       
+pattern Ut_OpcodeMap = enum byte
+                       {
+                           Start_State = 1,
+                           End_State = 2,
+                           Loading_State = 21,
+                           Unloading_State = 22,
+                           ...
+                       };
+
+pattern MapCaptureSource = enum byte
+                           {
+                               Undefined = 0,
+                               NDIS      = 1,
+                               VM_Switch = 2,
+                               Test      = 3,
+                               ...
+                           };
+
+type LayerInfo
+{
+    uint LayerId;
+    
+    string LayerName;
+}
+
+type Destination
+{
+    uint DestinationPortId;
+    
+    string DestinationPortName;
+    
+    string DestinationNicName;
+    
+    string DestinationNicType;
+}
+
+string GetFragMark(ulong keywords)
+{
+    if ((keywords & 0x80000000) == 0)
+    {
+        if ((keywords & 0x40000000) != 0)
+        {
+            return "First Fragment";
+        }
+        else
+        {
+            return "Middle Fragment";
+        }
+    }
+    else
+    {
+        if ((keywords & 0x40000000) != 0)
+        {
+            return "";
+        }
+        else
+        {
+            return "Last Fragment";
+        }
+    }
+}
+
+const guid EtwProviderIdNdis = {2ed6006e-4729-4609-b423-3ee7bcd678ef};
+
+annotation bool NdisEtwVirtualDataMessage#IsNdisEtwMetaData;

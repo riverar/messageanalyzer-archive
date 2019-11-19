@@ -1,0 +1,769 @@
+protocol RDPECLIP with
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: Clipboard Virtual Channel Extension",
+    DocumentName = "MS-RDPECLIP",
+    ShortName = "RDPECLIP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RDPECLIP", Version = "12.0", Date = "3/16/2018", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "383234", Date = "12/23/2015"}
+        ]
+},
+BinaryEncodingDefaults{Endian = Endian.Little};
+
+using Standard;
+using Utility;
+using RDPBCGR;
+using RDPEDYC;
+using InfrastructureResources;
+using RemoteDesktopResources;
+
+endpoint Server 
+    over RDPBCGR.Server | over RDPEDYC.Server
+    issues CLIPRDR_CAPS
+    issues CLIPRDR_MONITOR_READY
+    accepts CLIPRDR_CAPS
+    accepts CLIPRDR_TEMP_DIRECTORY
+    accepts CLIPRDR_FORMAT_LIST issues CLIPRDR_FORMAT_LIST
+    accepts FORMAT_LIST_RESPONSE issues FORMAT_LIST_RESPONSE
+    accepts CLIPRDR_LOCK_CLIPDATA issues CLIPRDR_LOCK_CLIPDATA
+    accepts CLIPRDR_FORMAT_DATA_REQUEST issues CLIPRDR_FORMAT_DATA_REQUEST
+    accepts CLIPRDR_FORMAT_DATA_RESPONSE issues CLIPRDR_FORMAT_DATA_RESPONSE
+    accepts CLIPRDR_FILECONTENTS_REQUEST issues CLIPRDR_FILECONTENTS_REQUEST 
+    accepts CLIPRDR_FILECONTENTS_RESPONSE issues CLIPRDR_FILECONTENTS_RESPONSE
+    accepts CLIPRDR_UNLOCK_CLIPDATA issues CLIPRDR_UNLOCK_CLIPDATA;
+
+client endpoint Client connected to Server;
+
+type RDPECLIPContext
+{
+    RDPECLIP.Server ept = null;
+    bool isLongFormatName = false;
+    uint dwFlags = 0;
+    set<uint> formatIdOfFileList = {};
+    uint requestedFormatId;
+
+    void AcceptDispatcher(any message msg)
+    {
+        dispatch ept accepts msg;
+    }
+    void IssueDispatcher(any message msg)
+    {
+        dispatch ept issues msg;
+    }
+}
+
+autostart actor RDPECLIPOverRDPBCGR(RDPBCGR.Server server)
+{
+    RDPECLIPContext ctx = new RDPECLIPContext();
+
+    process server issues vcp:RDPBCGR.VirtualChannelPdu 
+        where (vcp#ChannelName != nothing && vcp#ChannelName == "cliprdr")
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPECLIP.Server over server;
+        }
+        DecodeAndDispatchRequest(ref ctx, vcp.virtualChannelData);
+    }
+
+    process server accepts vcp:RDPBCGR.VirtualChannelPdu 
+        where (vcp#ChannelName != nothing && vcp#ChannelName == "cliprdr")
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPECLIP.Server over server;
+        }
+        DecodeAndDispatchResponse(ref ctx, vcp.virtualChannelData);
+    }
+    
+    ~endpoint(RDPBCGR.Server server)
+    {
+        ctx = null;
+    }
+}
+
+autostart actor RDPECLIPOverRDPEDYC(RDPEDYC.Server server)
+{
+    RDPECLIPContext ctx = new RDPECLIPContext();
+
+    process server issues vcp:RDPEDYC.DVCDataPDU
+        where vcp#EDYCChannelName != nothing && vcp#EDYCChannelName == "cliprdr" && vcp.Data.Count != 0
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPECLIP.Server over server;
+        }
+        DecodeAndDispatchRequest(ref ctx, vcp.Data);
+    }
+
+    process server accepts vcp:RDPEDYC.DVCDataPDU
+        where vcp#EDYCChannelName != nothing && vcp#EDYCChannelName == "cliprdr" && vcp.Data.Count != 0
+    {
+        if (ctx.ept == null)
+        {
+            ctx.ept = endpoint RDPECLIP.Server over server;
+        }
+        DecodeAndDispatchResponse(ref ctx, vcp.Data);
+    }
+    
+    ~endpoint(RDPEDYC.Server server)
+    {
+        ctx = null;
+    }
+}
+
+void DecodeAndDispatchRequest(ref RDPECLIPContext cxt, binary bin)
+{
+    if (bin.Count < 2)
+    {
+        ThrowDecodingException("RDPECLIP", RDPECLIP_DATA_NOT_ENOUGH, []);
+    }
+
+    ushort msgType = PeekUShort(bin, 0, Endian.Little);
+    switch (msgType)
+    {
+        case CLIPRDR_HEADER_msgType.CB_CLIP_CAPS => 
+            DecodeMessage<CLIPRDR_CAPS>(cxt.IssueDispatcher, bin, "CLIPRDR_CAPS");
+        case CLIPRDR_HEADER_msgType.CB_MONITOR_READY => 
+            DecodeMessage<CLIPRDR_MONITOR_READY>(cxt.IssueDispatcher, bin, "CLIPRDR_MONITOR_READY");
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_LIST => 
+            if (BinaryDecoder<CLIPRDR_FORMAT_LIST[cxt.isLongFormatName]>(bin) is msg:CLIPRDR_FORMAT_LIST)
+            {
+                cxt.formatIdOfFileList = {};
+                if (!cxt.isLongFormatName && msg.formatListData is shortNames:CLIPRDR_SHORT_FORMAT_NAMES)
+                {
+                    foreach (var ele in shortNames.shortFormatNames)
+                    {
+                        if (ele.formatName == "FileGroupDescriptorW" && !(ele.formatId in cxt.formatIdOfFileList))
+                        {
+                            cxt.formatIdOfFileList += ele.formatId;
+                        }
+                    }
+                }
+                else if (cxt.isLongFormatName && msg.formatListData is longNames:CLIPRDR_LONG_FORMAT_NAMES)
+                {
+                    foreach (var ele in longNames.longFormatNames)
+                    {
+                        if (ele.wszFormatName == "FileGroupDescriptorW" && !(ele.formatId in cxt.formatIdOfFileList))
+                        {
+                            cxt.formatIdOfFileList += ele.formatId;
+                        }
+                    }
+                }
+                cxt.IssueDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FORMAT_LIST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_LIST_RESPONSE => 
+            DecodeMessage<FORMAT_LIST_RESPONSE>(cxt.IssueDispatcher, bin, "FORMAT_LIST_RESPONSE");
+        case CLIPRDR_HEADER_msgType.CB_LOCK_CLIPDATA => 
+            DecodeMessage<CLIPRDR_LOCK_CLIPDATA>(cxt.IssueDispatcher, bin, "CLIPRDR_LOCK_CLIPDATA");
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_REQUEST => 
+            if (BinaryDecoder<CLIPRDR_FORMAT_DATA_REQUEST>(bin) is msg:CLIPRDR_FORMAT_DATA_REQUEST)
+            {
+                cxt.requestedFormatId = msg.requestedFormatId;
+                cxt.IssueDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FORMAT_DATA_REQUEST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_RESPONSE => 
+            if (cxt.requestedFormatId == FormatID_Metafile)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Metafile]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId == FormatID_Palette)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Palette]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId in cxt.formatIdOfFileList)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.FileList]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Generic]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_RESPONSE => 
+            if (cxt.requestedFormatId == FormatID_Metafile)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Metafile]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId == FormatID_Palette)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Palette]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId in cxt.formatIdOfFileList)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.FileList]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Generic]>(cxt.IssueDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FILECONTENTS_REQUEST => 
+            if (BinaryDecoder<CLIPRDR_FILECONTENTS_REQUEST>(bin) is msg:CLIPRDR_FILECONTENTS_REQUEST)
+            {
+                cxt.dwFlags = msg.dwFlags;
+                cxt.IssueDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FILECONTENTS_REQUEST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_UNLOCK_CLIPDATA => 
+            DecodeMessage<CLIPRDR_UNLOCK_CLIPDATA>(cxt.IssueDispatcher, bin, "CLIPRDR_UNLOCK_CLIPDATA");
+        case CLIPRDR_HEADER_msgType.CB_FILECONTENTS_RESPONSE => 
+            DecodeMessage<CLIPRDR_FILECONTENTS_RESPONSE[cxt.dwFlags]>(cxt.IssueDispatcher, bin, "CLIPRDR_FILECONTENTS_RESPONSE");
+        default =>
+            ThrowDecodingException("RDPECLIP", UTILITY_INVALID_DATA_WITH_VALUE, ["msgType", msgType.ToString()]);
+    }
+}
+
+void DecodeAndDispatchResponse(ref RDPECLIPContext cxt, binary bin)
+{
+    if (bin.Count < 4)
+    {
+        ThrowDecodingException("RDPECLIP", RDPECLIP_DATA_NOT_ENOUGH, []);
+    }
+        
+    ushort msgType = PeekUShort(bin, 0, Endian.Little);
+    switch (msgType)
+    {
+        case CLIPRDR_HEADER_msgType.CB_CLIP_CAPS =>
+            if (BinaryDecoder<CLIPRDR_CAPS>(bin) is msg:CLIPRDR_CAPS)
+            {
+                foreach (var ele in msg.capabilitySets)
+                {
+                    if (ele is generalCapability:CLIPRDR_GENERAL_CAPABILITY)
+                    {
+                        cxt.isLongFormatName = (generalCapability.generalFlags & CLIPRDR_GENERAL_CAPABILITY_generalFlags.CB_USE_LONG_FORMAT_NAMES) > 0;
+                        break;
+                    }
+                }
+                cxt.AcceptDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_CAPS");
+            }
+        case CLIPRDR_HEADER_msgType.CB_TEMP_DIRECTORY => 
+            DecodeMessage<CLIPRDR_TEMP_DIRECTORY>(cxt.AcceptDispatcher, bin, "CLIPRDR_TEMP_DIRECTORY");
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_LIST => 
+            if (BinaryDecoder<CLIPRDR_FORMAT_LIST[cxt.isLongFormatName]>(bin) is msg:CLIPRDR_FORMAT_LIST)
+            {
+                cxt.formatIdOfFileList = {};
+                if (!cxt.isLongFormatName && msg.formatListData is shortNames:CLIPRDR_SHORT_FORMAT_NAMES)
+                {
+                    foreach (var ele in shortNames.shortFormatNames)
+                    {
+                        if (ele.formatName == "FileGroupDescriptorW" && !(ele.formatId in cxt.formatIdOfFileList))
+                        {
+                            cxt.formatIdOfFileList += ele.formatId;
+                        }
+                    }
+                }
+                else if (cxt.isLongFormatName && msg.formatListData is longNames:CLIPRDR_LONG_FORMAT_NAMES)
+                {
+                    foreach (var ele in longNames.longFormatNames)
+                    {
+                        if (ele.wszFormatName == "FileGroupDescriptorW" && !(ele.formatId in cxt.formatIdOfFileList))
+                        {
+                            cxt.formatIdOfFileList += ele.formatId;
+                        }
+                    }
+                }
+                cxt.AcceptDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FORMAT_LIST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_LIST_RESPONSE => 
+            DecodeMessage<FORMAT_LIST_RESPONSE>(cxt.AcceptDispatcher, bin, "FORMAT_LIST_RESPONSE");
+        case CLIPRDR_HEADER_msgType.CB_LOCK_CLIPDATA => 
+            DecodeMessage<CLIPRDR_LOCK_CLIPDATA>(cxt.AcceptDispatcher, bin, "CLIPRDR_LOCK_CLIPDATA");
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_REQUEST => 
+            if (BinaryDecoder<CLIPRDR_FORMAT_DATA_REQUEST>(bin) is msg:CLIPRDR_FORMAT_DATA_REQUEST)
+            {
+                cxt.requestedFormatId = msg.requestedFormatId;
+                cxt.AcceptDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FORMAT_DATA_REQUEST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FILECONTENTS_REQUEST => 
+            if (BinaryDecoder<CLIPRDR_FILECONTENTS_REQUEST>(bin) is msg:CLIPRDR_FILECONTENTS_REQUEST)
+            {
+                cxt.dwFlags = msg.dwFlags;
+                cxt.AcceptDispatcher(msg);
+            }
+            else
+            {
+                ThrowDecodingException("RDPECLIP", "CLIPRDR_FILECONTENTS_REQUEST");
+            }
+        case CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_RESPONSE => 
+            if (cxt.requestedFormatId == FormatID_Metafile)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Metafile]>(cxt.AcceptDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId == FormatID_Palette)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Palette]>(cxt.AcceptDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else if (cxt.requestedFormatId in cxt.formatIdOfFileList)
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.FileList]>(cxt.AcceptDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+            else
+            {
+                DecodeMessage<CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType.Generic]>(cxt.AcceptDispatcher, bin, "CLIPRDR_FORMAT_DATA_RESPONSE");
+            }
+        case CLIPRDR_HEADER_msgType.CB_UNLOCK_CLIPDATA => 
+            DecodeMessage<CLIPRDR_UNLOCK_CLIPDATA>(cxt.AcceptDispatcher, bin, "CLIPRDR_UNLOCK_CLIPDATA");
+        case CLIPRDR_HEADER_msgType.CB_FILECONTENTS_RESPONSE => 
+            DecodeMessage<CLIPRDR_FILECONTENTS_RESPONSE[cxt.dwFlags]>(cxt.AcceptDispatcher, bin, "CLIPRDR_FILECONTENTS_RESPONSE");
+        default =>
+            ThrowDecodingException("RDPECLIP", UTILITY_INVALID_DATA_WITH_VALUE, ["msgType", msgType.ToString()]);
+    }
+}
+
+void DecodeMessage<T>(void(T) dispatcher, binary bin, string messageName)
+{
+    if (BinaryDecoder<T>(bin) is msg:T)
+    {
+        dispatcher(msg);
+    }
+    else
+    {
+        ThrowDecodingException("RDPECLIP", messageName);
+    }
+}
+
+// 2.2.1 Clipboard PDU Header (CLIPRDR_HEADER)
+type CLIPRDR_HEADER
+{
+    CLIPRDR_HEADER_msgType msgType;
+    CLIPRDR_HEADER_msgFlags msgFlags;
+    uint dataLen;
+}
+
+pattern CLIPRDR_HEADER_msgType = enum ushort
+{
+    CB_MONITOR_READY = 0x0001,
+    CB_FORMAT_LIST = 0x0002,
+    CB_FORMAT_LIST_RESPONSE = 0x0003,
+    CB_FORMAT_DATA_REQUEST = 0x0004,
+    CB_FORMAT_DATA_RESPONSE = 0x0005,
+    CB_TEMP_DIRECTORY = 0x0006,
+    CB_CLIP_CAPS = 0x0007,
+    CB_FILECONTENTS_REQUEST = 0x0008,
+    CB_FILECONTENTS_RESPONSE = 0x0009,
+    CB_LOCK_CLIPDATA = 0x000A,
+    CB_UNLOCK_CLIPDATA = 0x000B,
+    ...
+};
+pattern CLIPRDR_HEADER_msgFlags = enum ushort
+{
+    CB_RESPONSE_OK = 0x0001,
+    CB_RESPONSE_FAIL = 0x0002,
+    CB_ASCII_NAMES = 0x0004,
+    ...
+};
+
+// 2.2.2.1 Clipboard Capabilities PDU (CLIPRDR_CAPS)
+message CLIPRDR_CAPS
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_CLIP_CAPS && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_CAPS", value.msgFlags);
+    ushort cCapabilitiesSets;
+    ushort pad1;
+    array<CLIPRDR_CAPS_SET> capabilitySets with BinaryEncoding{Length = cCapabilitiesSets};
+    override string ToString()
+    {
+        string summary = "CLIPRDR_CAPS";
+        if (capabilitySets.Count > 0)
+        {
+            summary += ", capabilitySets: [";
+            foreach (CLIPRDR_CAPS_SET ele in capabilitySets)
+            {
+                summary += ele.ToString() + ", ";
+            }
+            summary = summary.Segment(0, summary.Count - 2) + "]";
+        }
+        return summary;
+    }
+}
+
+// 2.2.2.1.1 Capability Set (CLIPRDR_CAPS_SET)
+pattern CLIPRDR_CAPS_SET = CLIPRDR_GENERAL_CAPABILITY;
+
+pattern CLIPRDR_CAPS_SET_capabilitySetType = enum ushort
+{
+    CB_CAPSTYPE_GENERAL = 0x0001,
+    ...
+};
+
+// 2.2.2.1.1.1 General Capability Set (CLIPRDR_GENERAL_CAPABILITY)
+type CLIPRDR_GENERAL_CAPABILITY
+{
+     CLIPRDR_CAPS_SET_capabilitySetType capabilitySetType where ValidationCheckValue(value == CLIPRDR_CAPS_SET_capabilitySetType.CB_CAPSTYPE_GENERAL, 
+        null, true, ReferenceType.Type, "RDPECLIP", "capabilitySetType", "CLIPRDR_GENERAL_CAPABILITY", "CB_CAPSTYPE_GENERAL (0x0001)", value);
+     ushort lengthCapability;
+     CLIPRDR_GENERAL_CAPABILITY_version version;
+     CLIPRDR_GENERAL_CAPABILITY_generalFlags generalFlags;
+     override string ToString()
+     {
+        return "version: " + EnumToStringInSummary<CLIPRDR_GENERAL_CAPABILITY_version>(version) + 
+            ", generalFlags: " + EnumToStringInSummary<CLIPRDR_GENERAL_CAPABILITY_generalFlags>(generalFlags);
+     }
+}
+
+pattern CLIPRDR_GENERAL_CAPABILITY_version = enum uint
+{
+    CB_CAPS_VERSION_1 = 0x00000001,
+    CB_CAPS_VERSION_2 = 0x00000002,
+    ...
+};
+
+pattern CLIPRDR_GENERAL_CAPABILITY_generalFlags = flags uint
+{
+    CB_USE_LONG_FORMAT_NAMES = 0x00000002
+        with Documentation
+            {Description = "The Long Format Name variant of the Format List PDU is supported for exchanging updated format names."},
+    CB_STREAM_FILECLIP_ENABLED = 0x00000004
+        with Documentation
+            {Description = "File copy and paste using stream-based operations are supported using the File Contents Request PDU and File Contents Response PDU."},
+    CB_FILECLIP_NO_FILE_PATHS = 0x00000008
+        with Documentation
+            {Description = "Any description of files to copy and paste MUST NOT include the source path of the files."},
+    CB_CAN_LOCK_CLIPDATA = 0x00000010
+        with Documentation
+            {Description = "Locking and unlocking of File Stream data on the clipboard is supported using the Lock Clipboard Data PDU and Unlock Clipboard Data PDU."},
+    CB_HUGE_FILE_SUPPORT_ENABLED = 0x00000020
+        with Documentation
+            {Description = "Indicates support for transferring files that are larger than 4,294,967,296 bytes in size. If this flag is not set, then only files of size less than or equal to 4,294,967,296 bytes can be exchanged using the File Contents Request PDU and File Contents Response PDU."},
+    ...
+};
+
+// 2.2.2.2 Server Monitor Ready PDU (CLIPRDR_MONITOR_READY)
+message CLIPRDR_MONITOR_READY
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_MONITOR_READY && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_MONITOR_READY", value.msgFlags);
+    override string ToString()
+    {
+        return "CLIPRDR_MONITOR_READY";
+    }
+}
+
+// 2.2.2.3 Client Temporary Directory PDU (CLIPRDR_TEMP_DIRECTORY)
+message CLIPRDR_TEMP_DIRECTORY
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_TEMP_DIRECTORY && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_TEMP_DIRECTORY", value.msgFlags);
+    string wszTempDir with BinaryEncoding{WidthForComposedType = 520 * 8};
+    override string ToString()
+    {
+        return "CLIPRDR_TEMP_DIRECTORY, wszTempDir: " + wszTempDir;
+    }
+}
+
+// 2.2.3.1 Format List PDU (CLIPRDR_FORMAT_LIST)
+message CLIPRDR_FORMAT_LIST[bool IsLongFormatName]
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FORMAT_LIST && 
+        ValidationCheckValue(value.msgFlags == 0 || value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_ASCII_NAMES, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_FORMAT_LIST", "zero or CB_ASCII_NAMES (0x0004)", value.msgFlags);
+    ([|!IsLongFormatName|] CLIPRDR_SHORT_FORMAT_NAMES[clipHeader.msgFlags] | 
+    [|IsLongFormatName|] CLIPRDR_LONG_FORMAT_NAMES) formatListData;
+    override string ToString()
+    {
+        return "CLIPRDR_FORMAT_LIST, formatListData: " + formatListData.ToString();
+    }
+}
+
+// 2.2.3.1.1 Short Format Names (CLIPRDR_SHORT_FORMAT_NAMES)
+type CLIPRDR_SHORT_FORMAT_NAMES[ushort MsgFlags]
+{
+    array<CLIPRDR_SHORT_FORMAT_NAME[MsgFlags]> shortFormatNames;
+    override string ToString()
+    {
+        string summary = "";
+        foreach (var ele in shortFormatNames)
+        {
+            summary += ele.ToString() + ", ";
+        }
+        if (summary.Count > 2)
+        {
+            summary = summary.Segment(0 , summary.Count - 2);
+        }
+        return summary;
+    }
+}
+
+// 2.2.3.1.1.1 Short Format Name (CLIPRDR_SHORT_FORMAT_NAME)
+type CLIPRDR_SHORT_FORMAT_NAME[ushort MsgFlags]
+{
+    uint formatId;
+    string formatName 
+        with BinaryEncoding{TextEncoding = (MsgFlags == CLIPRDR_HEADER_msgFlags.CB_ASCII_NAMES ? TextEncoding.ASCII : TextEncoding.Unicode), WidthForComposedType = 32 * 8};
+    override string ToString()
+    {
+        return "formatId: " + formatId.ToString() + ", formatName: " + formatName.ToString();
+    }
+}
+
+// 2.2.3.1.2 Long Format Names (CLIPRDR_LONG_FORMAT_NAMES)
+type CLIPRDR_LONG_FORMAT_NAMES
+{
+    array<CLIPRDR_LONG_FORMAT_NAME> longFormatNames;
+    override string ToString()
+    {
+        string summary = "";
+        foreach (var ele in longFormatNames)
+        {
+            summary += ele.ToString() + ", ";
+        }
+        if (summary.Count > 2)
+        {
+            summary = summary.Segment(0 , summary.Count - 2);
+        }
+        return summary;
+    }
+}
+
+// 2.2.3.1.2.1 Long Format Name (CLIPRDR_LONG_FORMAT_NAME)
+type CLIPRDR_LONG_FORMAT_NAME
+{
+    uint formatId;
+    string wszFormatName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    override string ToString()
+    {
+        return "formatId: " + formatId.ToString() + (wszFormatName.Count > 0 ? ", wszFormatName: " + wszFormatName.ToString() : "");
+    }
+}
+
+// 2.2.3.2 Format List Response PDU (FORMAT_LIST_RESPONSE)
+message FORMAT_LIST_RESPONSE
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FORMAT_LIST_RESPONSE && 
+        ValidationCheckValue(value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_OK || value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_FAIL, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "FORMAT_LIST_RESPONSE", "CB_RESPONSE_OK (0x0001) or CB_RESPONSE_FAIL (0x0002)", value.msgFlags);
+    override string ToString()
+    {
+        return "FORMAT_LIST_RESPONSE, msgFlags: " + EnumToStringInSummary<CLIPRDR_HEADER_msgFlags>(clipHeader.msgFlags);
+    }
+}
+
+// 2.2.4.1 Lock Clipboard Data PDU (CLIPRDR_LOCK_CLIPDATA)
+message CLIPRDR_LOCK_CLIPDATA
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_LOCK_CLIPDATA && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_LOCK_CLIPDATA", value.msgFlags);
+    uint clipDataId;
+    override string ToString()
+    {
+        return "CLIPRDR_LOCK_CLIPDATA, clipDataId: " + clipDataId.ToString();
+    }
+}
+
+// 2.2.4.2 Unlock Clipboard Data PDU (CLIPRDR_UNLOCK_CLIPDATA)
+message CLIPRDR_UNLOCK_CLIPDATA
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_UNLOCK_CLIPDATA && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_UNLOCK_CLIPDATA", value.msgFlags);
+    uint clipDataId;
+    override string ToString()
+    {
+        return "CLIPRDR_UNLOCK_CLIPDATA, clipDataId: " + clipDataId.ToString();
+    }
+}
+
+// 2.2.5.1 Format Data Request PDU (CLIPRDR_FORMAT_DATA_REQUEST)
+message CLIPRDR_FORMAT_DATA_REQUEST
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_REQUEST && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_FORMAT_DATA_REQUEST", value.msgFlags);
+    uint requestedFormatId;
+    override string ToString()
+    {
+        return "CLIPRDR_FORMAT_DATA_REQUEST, requestedFormatId: " + requestedFormatId.ToString();
+    }
+}
+
+// 2.2.5.2 Format Data Response PDU (CLIPRDR_FORMAT_DATA_RESPONSE)
+message CLIPRDR_FORMAT_DATA_RESPONSE[FormatDataType Type]
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FORMAT_DATA_RESPONSE && 
+        ValidationCheckValue(value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_OK || value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_FAIL, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_FORMAT_DATA_RESPONSE", "CB_RESPONSE_OK (0x0001) or CB_RESPONSE_FAIL (0x0002)", value.msgFlags);
+    ([|Type == FormatDataType.Metafile|] CLIPRDR_MFPICT | 
+    [|Type == FormatDataType.Palette|] CLIPRDR_PALETTE | 
+    [|Type == FormatDataType.FileList|] CLIPRDR_FILELIST |
+    binary) requestedFormatData;
+    override string ToString()
+    {
+        return "CLIPRDR_FORMAT_DATA_RESPONSE, msgFlags: " + EnumToStringInSummary<CLIPRDR_HEADER_msgFlags>(clipHeader.msgFlags);
+    }
+}
+
+// 2.2.5.2.1 Packed Metafile Payload (CLIPRDR_MFPICT)
+type CLIPRDR_MFPICT
+{
+    CLIPRDR_MFPICT_mappingMode mappingMode;
+    uint xExt;
+    uint yExt;
+    binary metaFileData;
+}
+
+pattern CLIPRDR_MFPICT_mappingMode = enum uint
+{
+    MM_TEXT = 0x00000001,
+    MM_LOMETRIC = 0x00000002,
+    MM_HIMETRIC  = 0x00000003,
+    MM_LOENGLISH = 0x00000004,
+    MM_HIENGLISH = 0x00000005,
+    MM_TWIPS = 0x00000006,
+    MM_ISOTROPIC = 0x00000007,
+    MM_ANISOTROPIC = 0x00000008,
+    ...
+};
+
+// 2.2.5.2.2 Packed Palette Payload (CLIPRDR_PALETTE)
+type CLIPRDR_PALETTE
+{
+    array<PALETTEENTRY> paletteEntriesData;
+}
+
+// 2.2.5.2.2.1 Palette Entry (PALETTEENTRY)
+type PALETTEENTRY
+{
+    byte red;
+    byte green;
+    byte blue;
+    byte extra;
+}
+
+// 2.2.5.2.3 Packed File List (CLIPRDR_FILELIST)
+type CLIPRDR_FILELIST
+{
+    uint cItems;
+    array<CLIPRDR_FILEDESCRIPTOR> fileDescriptorArray with BinaryEncoding{Length = cItems};
+}
+
+// 2.2.5.2.3.1 File Descriptor (CLIPRDR_FILEDESCRIPTOR)
+type CLIPRDR_FILEDESCRIPTOR
+{
+    CLIPRDR_FILEDESCRIPTOR_flags $"flags";
+    binary reserved1 with BinaryEncoding{Length = 32};
+    CLIPRDR_FILEDESCRIPTOR_fileAttributes fileAttributes;
+    binary reserved2 with BinaryEncoding{Length = 16};
+    TimeStampForLastWriteTime lastWriteTime; // the number of 100-nanoseconds intervals that have elapsed since 1 January 1601
+    uint fileSizeHigh;
+    uint fileSizeLow;
+    string fileName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, WidthForComposedType = 520 * 8};
+}
+
+pattern CLIPRDR_FILEDESCRIPTOR_flags = enum uint
+{
+    FD_ATTRIBUTES = 0x00000004,
+    FD_FILESIZE = 0x00000040,
+    FD_WRITESTIME = 0x00000020,
+    FD_SHOWPROGRESSUI = 0x00004000,
+    ...
+};
+
+pattern CLIPRDR_FILEDESCRIPTOR_fileAttributes = enum uint
+{
+    FILE_ATTRIBUTE_READONLY = 0x00000001,
+    FILE_ATTRIBUTE_HIDDEN = 0x00000002,
+    FILE_ATTRIBUTE_SYSTEM = 0x00000004,
+    FILE_ATTRIBUTE_DIRECTORY = 0x00000010,
+    FILE_ATTRIBUTE_ARCHIVE = 0x00000020,
+    FILE_ATTRIBUTE_NORMAL = 0x00000080,
+    ...
+};
+
+// 2.2.5.3 File Contents Request PDU (CLIPRDR_FILECONTENTS_REQUEST)
+message CLIPRDR_FILECONTENTS_REQUEST
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FILECONTENTS_REQUEST && ValidationCheckZero(value.msgFlags == 0, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_FILECONTENTS_REQUEST", value.msgFlags);
+    uint streamId;
+    uint lindex;
+    CLIPRDR_FILECONTENTS_REQUEST_dwFlags dwFlags;
+    uint nPositionLow;
+    uint nPositionHigh;
+    uint cbRequested;
+    optional uint clipDataId;
+    override string ToString()
+    {
+        return "CLIPRDR_FILECONTENTS_REQUEST, streamId: " + streamId.ToString() + 
+            ", lindex: " + lindex.ToString() + 
+            ", dwFlags: " + EnumToStringInSummary<CLIPRDR_FILECONTENTS_REQUEST_dwFlags>(dwFlags);
+    }
+}
+
+pattern CLIPRDR_FILECONTENTS_REQUEST_dwFlags = flags uint
+{
+    FILECONTENTS_SIZE = 0x00000001
+        with Documentation
+            {Description = "A request for the size of the file identified by the lindex field."},
+    FILECONTENTS_RANGE = 0x00000002
+        with Documentation
+            {Description = "A request for the data present in the file identified by the lindex field."},
+    ...
+};
+
+// 2.2.5.4 File Contents Response PDU (CLIPRDR_FILECONTENTS_RESPONSE)
+message CLIPRDR_FILECONTENTS_RESPONSE[uint DwFlags]
+{
+    CLIPRDR_HEADER clipHeader where value.msgType == CLIPRDR_HEADER_msgType.CB_FILECONTENTS_RESPONSE && 
+        ValidationCheckValue(value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_OK || value.msgFlags == CLIPRDR_HEADER_msgFlags.CB_RESPONSE_FAIL, this, true, 
+        ReferenceType.Message, "RDPECLIP", "clipHeader.msgFlags", "CLIPRDR_FILECONTENTS_RESPONSE", "CB_RESPONSE_OK (0x0001) or CB_RESPONSE_FAIL (0x0002)", value.msgFlags);
+    uint streamId;
+    ([|(DwFlags & CLIPRDR_FILECONTENTS_REQUEST_dwFlags.FILECONTENTS_SIZE) > 0|] ulong | 
+        binary) requestedFileContentsData;
+
+    override string ToString()
+    {
+        return "CLIPRDR_FILECONTENTS_RESPONSE, msgFlags: " + EnumToStringInSummary<CLIPRDR_HEADER_msgFlags>(clipHeader.msgFlags) + 
+            ", streamId: " + streamId.ToString();
+    }
+}
+
+const uint FormatID_Palette = 9;
+const uint FormatID_Metafile = 3;
+
+pattern FormatDataType = enum byte
+{
+    Generic = 0,
+    Palette = 1,
+    Metafile = 2,
+    FileList= 3,
+};
+
+type TimeStampForLastWriteTime
+{
+    ulong Nanoseconds_100; // 100-Nanoseconds
+
+    override string ToString()
+    {
+        return CreateDateTime(1601, 1, 1).AddMilliseconds((Nanoseconds_100 / 10000) as double).ToString() + " UTC";
+    }
+}

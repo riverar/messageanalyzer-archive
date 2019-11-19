@@ -1,0 +1,1504 @@
+<?xml version="1.0" encoding="utf-8"?>
+<AssetCollection xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Metadata>
+    <UniqueId>fa4590f6-9204-4a23-9a45-dff2cd79fa89</UniqueId>
+    <GroupId>fa4590f6-9204-4a23-9a45-dff2cd79fa89</GroupId>
+    <Name>Message Analyzer Sequence Expressions</Name>
+    <AssetType>SequenceExpressionAsset</AssetType>
+    <VersionNumber>1</VersionNumber>
+    <Author>Message Analyzer</Author>
+    <Corporation>Microsoft</Corporation>
+    <PublishedDate>2013-09-01T00:00:00</PublishedDate>
+    <ModifiedDate>2016-10-12T00:00:00</ModifiedDate>
+    <Revision>13</Revision>
+    <Description>The official release of sequence expressions from the Message Analyzer Team. Download and sync this set to get periodic updates.</Description>
+    <Rating>0</Rating>
+  </Metadata>
+  <Assets>
+    <Asset>
+      <Metadata>
+        <UniqueId>15a18d55-7c7c-41e1-b93a-bd1eb2ab4c40</UniqueId>
+        <Name>TCP Retransmit Pairs</Name>
+        <Description>Looks for pairs of messages with same sequence, ack number and same payload length. They need to be top-level TCP messages.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+using Utility;
+
+//Identifies a pair of TCP messages with same sequence and ack numbers and same payload size. Payload must not be zero and they shouldn't be keep-alive messages
+virtual operation TCPRetrans
+{
+  uint SeqNum = seqNum != 0 ? seqNum : seqNum6;
+  uint OrgMessageNumber = mn != 0 ? mn as uint : mn6 as  uint;
+  uint DestMessageNumber = mnretrans != 0 ? mnretrans as uint : mnretrans6 as uint;
+  (IPv4Address | IPv6Address) SourceAddress = sa != null ? sa : sa6;
+  (IPv4Address | IPv6Address) DestinationAddress = da != null ? da : da6;
+  
+  override string ToString()
+  {
+    return "Frame: " + DestMessageNumber.ToString() + " Sequence Number " + SeqNum.ToString() + " is a duplicate of frame " + OrgMessageNumber.ToString();
+  }
+}
+//scenario RetransmitPairs 
+= backtrack(Segment{Payload.Count &gt;= 1})
+(
+  Segment{SequenceNumber is var seqNum, AcknowledgementNumber is var ack, !KeepAlive(value), Payload is var pyl, GetMessageNumber(value) is var mn}
+  \\IPv4.Datagram { SourceAddress is var sa, DestinationAddress is var da}
+  -&gt;
+  Segment{SequenceNumber == seqNum, AcknowledgementNumber == ack, Payload.Count == pyl.Count, GetMessageNumber(value) is var mnretrans}
+  \\IPv4.Datagram { SourceAddress.Octets == sa.Octets, DestinationAddress.Octets == da.Octets }
+)
+|
+(
+  Segment{SequenceNumber is var seqNum6, AcknowledgementNumber is var ack6, !KeepAlive(value), Payload is var pyl6, GetMessageNumber(value) is var mn6}
+  \\IPv6.Datagram { SourceAddress is var sa6, DestinationAddress is var da6}
+  -&gt;
+  Segment{SequenceNumber == seqNum6, AcknowledgementNumber == ack6, Payload.Count == pyl6.Count, GetMessageNumber(value) is var mnretrans6}
+  \\IPv6.Datagram { SourceAddress.Octets == sa6.Octets, DestinationAddress.Octets == da6.Octets }
+);
+
+//Projects the KeepAlive annotation into a boolean, we are just interested in the positive case.
+bool KeepAlive(Segment s)
+{
+  return (s#IsKeepAlive != nothing)? (s#IsKeepAlive as bool) : false;
+}
+
+uint GetMessageNumber(any message x)
+{
+  var origins = x.Origins;
+  if (origins.Count == 0)
+    return x#MessageNumber as uint;
+  else
+    return GetMessageNumber(origins[0]);           
+}</Expression>
+        <InfoLink>http://en.wikipedia.org/wiki/Transmission_Control_Protocol#Reliable_transmission</InfoLink>
+        <Comment>//TCP Retransmit Pairs</Comment>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>d50ff802-b5b9-4b94-b9ca-450c8bfff65e</UniqueId>
+        <Name>Sack Detection</Name>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+
+%%viewpoint TCP/TopInModule|BottomModuleOccurrence
+
+virtual operation SACK 
+{
+    array&lt;array&lt;SackBlock&gt;&gt; blocks = sackBlocks;
+
+    override string ToString()
+    {
+        string blockrange = "";
+
+        for(int j = 0; j &lt; blocks[0].Count - 1; j++)
+        {
+            blockrange += blocks[0][j].LeftEdge.ToString() + " ~ " + blocks[0][j].RightEdge.ToString() + ", ";
+        }
+        blockrange += blocks[0][blocks[0].Count - 1].LeftEdge.ToString() + " ~ " + blocks[0][blocks[0].Count - 1].RightEdge.ToString();
+
+        return "Sack option and associated Acks for range " + blockrange;
+    }
+}
+//scenario SACK 
+= backtrack(TCP.Segment)
+(
+ \TCP.Segment{Flags is Flags{ACK == true}, GetSackBlocks(Options) is var sackBlocks, sackBlocks != null, SourcePort is var sp, DestinationPort is var dp}\\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da}
+ -&gt;
+ (
+  (
+   \TCP.Segment{IsSackRetransmit(SequenceNumber, sackBlocks), SourcePort == dp, DestinationPort == sp}\\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets} interleave [1,]
+   until
+   (\TCP.Segment{Flags is Flags{ACK == true}, SourcePort == sp, DestinationPort == dp}\\IPv4.Datagram{SourceAddress.Octets == sa.Octets, DestinationAddress.Octets == da.Octets})
+    )
+    | 
+    (
+   \TCP.Segment{IsSackRetransmit(SequenceNumber, sackBlocks), SourcePort == dp, DestinationPort == sp}\\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets} interleave [1,]
+    )
+ )
+)
+|
+(
+ \TCP.Segment{Flags is Flags{ACK == true}, GetSackBlocks(Options) is var sackBlocks6, sackBlocks6 != null, SourcePort is var sp6, DestinationPort is var dp6}\\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6}
+ -&gt;
+ (
+  (
+   \TCP.Segment{IsSackRetransmit(SequenceNumber, sackBlocks6), SourcePort == dp6, DestinationPort == sp6}\\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets} interleave [1,]
+   until
+   (\TCP.Segment{Flags is Flags{ACK == true}, SourcePort == sp6, DestinationPort == dp6}\\IPv6.Datagram{SourceAddress.Octets == sa6.Octets, DestinationAddress.Octets == da6.Octets})
+    )
+    | 
+    (
+   \TCP.Segment{IsSackRetransmit(SequenceNumber, sackBlocks6), SourcePort == dp6, DestinationPort == sp6}\\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets} interleave [1,]
+    )
+ )
+);
+
+
+array&lt;array&lt;SackBlock&gt;&gt; GetSackBlocks(optional array&lt;TcpOption&gt; options)
+{
+ if(options == nothing)
+  return null;
+  
+ array&lt;TcpOption&gt; theOptions = options as array&lt;TcpOption&gt;;
+ if(theOptions == null)
+  return null;
+
+ array&lt;array&lt;SackBlock&gt;&gt; result = null;
+ for(int i = 0; i &lt; theOptions.Count; i++)
+ {
+  if (theOptions[i] is Sack)
+  {
+   array&lt;SackBlock&gt; blocks = (theOptions[i] as Sack).Blocks;
+   if (blocks.Count &gt; 0)
+   {
+    if(result == null)
+     result = [blocks];
+    else
+     result += [blocks];
+   }
+  }
+ }
+
+ return result;
+}
+
+
+bool IsSackRetransmit(uint seqNum, array&lt;array&lt;SackBlock&gt;&gt; sackBlocks)
+{  
+ foreach(var blocks in sackBlocks)
+ {
+  if (seqNum &lt; blocks[0].LeftEdge)
+   return true;
+
+  for(int j = 0; j &lt; blocks.Count - 2; j++)
+  {
+   if (seqNum &gt;= blocks[j].RightEdge &amp;&amp; seqNum &lt; blocks[j+1].LeftEdge)
+    return true;
+  }
+ }
+ return false;
+}
+</Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>3fcc85fa-d7be-4b54-9f9c-deb601638579</UniqueId>
+        <Name>TCP Three-Way Handshake</Name>
+        <Description>TCP Three-Way handshake.  Displays approximate RTT based on the difference betweeh the Syn and SynAck</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using TCP;
+          using IPv4;
+          using IPv6;
+          using WFPCapture;
+          using Utility;
+
+          // Looks for a TCP 3-way handshake with IPv4 or IPv6 transport.  Returns the approximate
+          // response time by the time delta of the Syn -&gt; SynAck.
+
+          // Virtual Operation creates a special messages where we can expose properties that show
+          // as columns and a friendly description.
+
+          virtual operation TCP3Way
+          {
+          TimeSpan AproxRTT = GetNonNull(approxrtt, approxrtt6, approxrtt2V4, approxrtt2V6) as TimeSpan;
+          (IPv4Address | IPv6Address) Source = GetNonNull(sa, sa6, sa2V4, sa2V6) as (IPv4Address | IPv6Address);
+          (IPv4Address | IPv6Address) Destination = GetNonNull(da, da6, da2V4, da2V6) as (IPv4Address | IPv6Address);
+          ushort SourcePort = GetNonZero(sp, sp6, sp2V4, sp2V6) as ushort;
+          ushort DestinationPort = GetNonZero(dp, dp6, dp2V4, dp2V6) as ushort;
+          int ServerMaxSegmentSize = GetNonZero(SrvMaxSegSize, SrvMaxSegSize6, SrvMaxSegSize2V4, SrvMaxSegSize2V6) ;
+          int ServerScaleFactor = GetNonZero(SrvScale, SrvScale6, SrvScale2V4, SrvScale2V6) ;
+          int ServerSackPermitted = GetNonZero(SrvSackPerm, SrvSackPerm6, SrvSackPerm2V4, SrvSackPerm2V6) ;
+          int ClientMaxSegmentSize = GetNonZero(CliMaxSegSize, CliMaxSegSize6, CliMaxSegSize2V4, CliMaxSegSize2V6) ;
+          int ClientScaleFactor = GetNonZero(CliScale, CliScale6, CliScale2V4, CliScale2V6) ;
+          int ClientSacksPermitted = GetNonZero(CliSackPerm, CliSackPerm6, CliSackPerm2V4, CliSackPerm2V6) ;
+
+          override string ToString()
+          {
+          return Source.ToString() + ":" + SourcePort.ToString() + "-" + Destination.ToString() + ":" + DestinationPort.ToString();
+          };
+          }
+          // This line below has been removed since we are now using virtual operations.
+          // scenario ThreeWayHandshake
+
+          // backtrack makes sure we don't continue from where we left off.  Otherwise we won't find
+          // things that are interleaved.
+          = backtrack(Segment{Flags is TCP.Flags{SYN == true}})
+          // IPv4 transport
+          (
+          // Look for TCP over IPv4, that are not adjacent in the stack.  This will enable us to
+          // find tunnel TCP sessions.  We Save/Remember the Address/Port values and timestamp which
+          // we use to compare in rest of the expression.
+          \TCP.Segment{Flags is TCP.Flags{SYN == true},
+          SequenceNumber is var IPv4SeqNumRequest,
+          SourcePort is var sp, DestinationPort is var dp,
+          GetTimestamp(value) is var starttime,
+          value.TransportKey is var transportV4,
+          GetMaxSegSize(value) is var SrvMaxSegSize,
+          GetSackPermitted(value) is var SrvSackPerm,
+          GetScaleFactor(value) is var SrvScale}
+          \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da, value.NetworkKey is var networkV4}
+          // -&gt; Means that messages can be interleaved.  Withou the operator means they are adjacent messages.
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{SYN == true, ACK==true},
+          SequenceNumber is var IPv4SeqNumResponse,
+          AcknowledgementNumber == IPv4SeqNumRequest + 1, SourcePort == dp, DestinationPort == sp,
+          GetTimestamp(value) - starttime is var approxrtt,
+          value.TransportKey == transportV4,
+          GetMaxSegSize(value) is var CliMaxSegSize,
+          GetSackPermitted(value) is var CliSackPerm,
+          GetScaleFactor(value) is var CliScale}
+          \\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets, value.NetworkKey == networkV4}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{ACK==true},
+          SequenceNumber == IPv4SeqNumRequest + 1,
+          AcknowledgementNumber == IPv4SeqNumResponse + 1,
+          SourcePort == sp,
+          DestinationPort == dp,
+          value.TransportKey == transportV4}
+          \\IPv4.Datagram{SourceAddress.Octets == sa.Octets, DestinationAddress.Octets == da.Octets, value.NetworkKey == networkV4}
+          )
+          |
+          //IPv6 transport version
+          (
+          \TCP.Segment{Flags is TCP.Flags{SYN == true},
+          SequenceNumber is var SeqNumRequest,
+          SourcePort is var sp6,
+          DestinationPort is var dp6,
+          GetTimestamp(value) is var starttime6,
+          value.TransportKey is var transportV6,
+          GetMaxSegSize(value) is var SrvMaxSegSize6,
+          GetSackPermitted(value) is var SrvSackPerm6,
+          GetScaleFactor(value) is var SrvScale6}
+          \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6, value.NetworkHashCode is var networkV6}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{SYN == true, ACK==true},
+          SequenceNumber is var SeqNumResponse,
+          AcknowledgementNumber == SeqNumRequest + 1,
+          SourcePort == dp6, DestinationPort == sp6,
+          GetTimestamp(value) - starttime6 is var approxrtt6,
+          value.TransportKey == transportV6,
+          GetMaxSegSize(value) is var CliMaxSegSize6,
+          GetSackPermitted(value) is var CliSackPerm6,
+          GetScaleFactor(value) is var CliScale6}
+          \\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets, value.NetworkHashCode == networkV6}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{ACK==true},
+          SequenceNumber == SeqNumRequest + 1,
+          AcknowledgementNumber == SeqNumResponse + 1,
+          SourcePort == sp6,
+          DestinationPort == dp6,
+          value.TransportKey == transportV6}
+          \\IPv6.Datagram{SourceAddress.Octets == sa6.Octets, DestinationAddress.Octets == da6.Octets, value.NetworkHashCode == networkV6}
+          )
+          |
+          //WFPCapture Message2V4
+          (
+          \TCP.Segment{Flags is TCP.Flags{SYN == true},
+          SequenceNumber is var Message2V4SeqNumRequest,
+          SourcePort is var sp2V4, DestinationPort is var dp2V4,
+          GetTimestamp(value) is var starttime2V4,
+          value.TransportKey is var transport2V4,
+          GetMaxSegSize(value) is var SrvMaxSegSize2V4,
+          GetSackPermitted(value) is var SrvSackPerm2V4,
+          GetScaleFactor(value) is var SrvScale2V4}
+          \\WFPCapture.Message2V4{SourceAddress is var sa2V4, DestinationAddress is var da2V4/*, value.NetworkKey is var network2V4*/}
+          // -&gt; Means that messages can be interleaved.  Withou the operator means they are adjacent messages.
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{SYN == true, ACK==true},
+          SequenceNumber is var Message2V4SeqNumResponse,
+          AcknowledgementNumber == Message2V4SeqNumRequest + 1, SourcePort == dp2V4, DestinationPort == sp2V4,
+          GetTimestamp(value) - starttime2V4 is var approxrtt2V4,
+          value.TransportKey == transport2V4,
+          GetMaxSegSize(value) is var CliMaxSegSize2V4,
+          GetSackPermitted(value) is var CliSackPerm2V4,
+          GetScaleFactor(value) is var CliScale2V4}
+          \\WFPCapture.Message2V4{SourceAddress.Octets == da2V4.Octets, DestinationAddress.Octets == sa2V4.Octets/*, value.NetworkKey == network2V4*/}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{ACK==true},
+          SequenceNumber == Message2V4SeqNumRequest + 1,
+          AcknowledgementNumber == Message2V4SeqNumResponse + 1,
+          SourcePort == sp2V4,
+          DestinationPort == dp2V4,
+          value.TransportKey == transport2V4}
+          \\WFPCapture.Message2V4{SourceAddress.Octets == sa2V4.Octets, DestinationAddress.Octets == da2V4.Octets/*, value.NetworkKey == network2V4*/}
+          )
+          |
+          //WFPCapture Message2V6
+          (
+          \TCP.Segment{Flags is TCP.Flags{SYN == true},
+          SequenceNumber is var Message2V6SeqNumRequest,
+          SourcePort is var sp2V6, DestinationPort is var dp2V6,
+          GetTimestamp(value) is var starttime2V6,
+          value.TransportKey is var transport2V6,
+          GetMaxSegSize(value) is var SrvMaxSegSize2V6,
+          GetSackPermitted(value) is var SrvSackPerm2V6,
+          GetScaleFactor(value) is var SrvScale2V6}
+          \\WFPCapture.Message2V6{SourceAddress is var sa2V6, DestinationAddress is var da2V6/*, value.NetworkHashCode is var network2V6*/}
+          // -&gt; Means that messages can be interleaved.  Withou the operator means they are adjacent messages.
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{SYN == true, ACK==true},
+          SequenceNumber is var Message2V6SeqNumResponse,
+          AcknowledgementNumber == Message2V6SeqNumRequest + 1, SourcePort == dp2V6, DestinationPort == sp2V6,
+          GetTimestamp(value) - starttime2V6 is var approxrtt2V6,
+          value.TransportKey == transport2V6,
+          GetMaxSegSize(value) is var CliMaxSegSize2V6,
+          GetSackPermitted(value) is var CliSackPerm2V6,
+          GetScaleFactor(value) is var CliScale2V6}
+          \\WFPCapture.Message2V6{SourceAddress.Octets == da2V6.Octets, DestinationAddress.Octets == sa2V6.Octets/*, value.NetworkHashCode == network2V6*/}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{ACK==true},
+          SequenceNumber == Message2V6SeqNumRequest + 1,
+          AcknowledgementNumber == Message2V6SeqNumResponse + 1,
+          SourcePort == sp2V6,
+          DestinationPort == dp2V6,
+          value.TransportKey == transport2V6}
+          \\WFPCapture.Message2V6{SourceAddress.Octets == sa2V6.Octets, DestinationAddress.Octets == da2V6.Octets/*, value.NetworkHashCode == network2V6*/}
+          );
+
+          // Property used to retrieve the timestamp which is only at the
+          // choke point message which is the bottom one.
+          DateTime GetTimestamp(any message x)
+          {
+          var origins = x.Origins;
+          if (origins.Count == 0)
+          return x#Timestamp as DateTime;
+          else
+          return GetTimestamp(origins[0]);
+          }
+
+          int GetMaxSegSize(TCP.Segment x)
+          {
+          if(x.Options != nothing &amp;&amp; x.Options is array&lt;TcpOption&gt;){
+          array&lt;TcpOption&gt; opts = x.Options as array&lt;TcpOption&gt;;
+          foreach(TcpOption o in opts)
+          {
+          if(o is MaxSegmentSize)
+          {
+          MaxSegmentSize mss = o as MaxSegmentSize;
+          return mss.MaxSegmentSize;
+          }
+          }
+          }
+
+          return 0;
+          }
+
+          int GetScaleFactor(TCP.Segment x)
+          {
+          if(x.Options != nothing &amp;&amp; x.Options is array&lt;TcpOption&gt;){
+          array&lt;TcpOption&gt; opts = x.Options as array&lt;TcpOption&gt;;
+          foreach(TcpOption o in opts)
+          {
+          if(o is TCP.WindowsScaleFactor)
+          {
+          WindowsScaleFactor s = o as WindowsScaleFactor;
+          return s.ShiftCount;
+          }
+          }
+          }
+
+          return 0;
+          }
+
+          int GetSackPermitted(TCP.Segment x)
+          {
+          if(x.Options != nothing &amp;&amp; x.Options is array&lt;TcpOption&gt;){
+          array&lt;TcpOption&gt; opts = x.Options as array&lt;TcpOption&gt;;
+          foreach(TcpOption o in opts)
+          {
+          if(o is TCP.SackPermitted)
+          {
+          SackPermitted s = o as SackPermitted;
+          return s.Length;
+          }
+          }
+          }
+
+          return 0;
+          }
+
+          // Helpers to find the first non-zero or non-null value which determines the version
+          // that was used, IPv4, IPv6, WFPv4 or WFPv6.
+          ushort GetNonZero(ushort a, ushort b, ushort c, ushort d)
+          {
+          return a != 0 ? a : (b != 0 ? b : (c != 0 ? c : d)) ;
+          }
+
+          int GetNonZero(int a, int b, int c, int d)
+          {
+          return a != 0 ? a : (b != 0 ? b : (c != 0 ? c : d)) ;
+          }
+
+          any GetNonNull(any a, any b, any c, any d)
+          {
+          return a != null ? a : (b != null ? b : (c != null ? c : d)) ;
+          }
+
+          TimeSpan GetNonNull(TimeSpan a, TimeSpan b, TimeSpan c, TimeSpan d)
+          {
+          return a != null ? a : (b != null ? b : (c != null ? c : d)) ;
+          }
+        </Expression>
+        <InfoLink>http://support.microsoft.com/kb/172983</InfoLink>
+        <Comment>//ThreeWayHandshake</Comment>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>813937aa-8b77-4abb-a43b-aac8edf19606</UniqueId>
+        <Name>TCP Inactive Session Scan</Name>
+        <Description>TCP session that are attempted but no response, which means the port is inactive.  Could be a sign of a security attack.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+using Utility;
+
+// Finds TCP sessions that are started, but no response which means the port is inactive.
+
+virtual operation TCPInactiveSession
+{
+  (IPv4Address | IPv6Address) Source = sa != null ? sa : sa6;
+  (IPv4Address | IPv6Address) Destination = da != null ? da : da6;
+  ushort SourcePort = sp != 0 ? sp : sp6;
+  ushort DestinationPort = dp != 0 ? dp : dp6;
+
+  override string ToString()
+  { 
+    return "Inactive TCP Session Scan"; 
+  }
+}
+= backtrack(\TCP.Segment{Flags.SYN == true, Flags.ACK == false})
+( 
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp, DestinationPort is var dp} 
+  \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da}
+
+  (
+    drop !(\TCP.Segment{(Flags.SYN == true &amp;&amp; Flags.ACK == true) || Flags.RST == true, 
+                     SourcePort == sp || SourcePort == dp, DestinationPort == sp || DestinationPort == dp} 
+           \\IPv4.Datagram{SourceAddress.Octets == da.Octets || DestinationAddress.Octets == da.Octets, 
+                        SourceAddress.Octets == sa.Octets || DestinationAddress.Octets == sa.Octets})*
+  
+    [|eos()|]
+  )
+)
+|
+(
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp6, DestinationPort is var dp6} 
+  \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6}
+
+  (
+    drop !(\TCP.Segment{(Flags.SYN == true &amp;&amp; Flags.ACK == true) || Flags.RST == true, 
+                     SourcePort == sp6 || SourcePort == dp6, DestinationPort == sp6 || DestinationPort == dp6} 
+           \\IPv6.Datagram{SourceAddress.Octets == da6.Octets || DestinationAddress.Octets == da6.Octets, 
+                        SourceAddress.Octets == sa6.Octets || DestinationAddress.Octets == sa6.Octets})*
+  
+    [|eos()|]
+  )
+);</Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>78966e70-5976-49de-acc1-6ef0b5f46816</UniqueId>
+        <Name>TCP Syn Half Open Connections</Name>
+        <Description>Finds TCP Syn Half Open connections.  TCP Session with a response meaning an possible attack on an active port, but it's simply opened and Reset.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+using Utility;
+
+// This scenario will find TCP Syn Half Open connections.  These can be used to locate
+// DOS attacks.
+
+virtual operation TCPSynHalfOpen
+{
+  (IPv4Address | IPv6Address) Source = sa != null ? sa : sa6;
+  (IPv4Address | IPv6Address) Destination = da != null ? da : da6;
+  ushort SourcePort = sp != 0 ? sp : sp6;
+  ushort DestinationPort = dp != 0 ? dp : dp6;
+
+  override string ToString()
+  { 
+    return "TCP Syn Half Open - Active Session"; 
+  }
+}
+= backtrack(\TCP.Segment{Flags.SYN == true, Flags.ACK == false})
+( 
+  // Start by looking for a 3 way TCP Connection
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp, DestinationPort is var dp}
+  \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da}
+  -&gt;
+  \TCP.Segment{Flags.SYN == true, Flags.ACK == true, SourcePort == dp, DestinationPort == sp}
+  \\IPv4.Datagram{DestinationAddress.Octets == sa.Octets, SourceAddress.Octets == da.Octets}
+
+  // Now take everything after where the TCP Transport and IPv4 Network values DO NOT match. 
+  drop (!(\\TCP.Segment{Flags.ACK == true, SourcePort == sp || SourcePort == dp, DestinationPort == sp || DestinationPort == dp}
+   \\IPv4.Datagram{ SourceAddress.Octets == da.Octets || DestinationAddress.Octets == da.Octets, 
+                    SourceAddress.Octets == sa.Octets || DestinationAddress.Octets == sa.Octets }))+
+
+  // And now look for the optional Reset
+  (\TCP.Segment{Flags.RST == true, SourcePort == dp, DestinationPort == sp}
+   \\IPv4.Datagram{DestinationAddress.Octets == da.Octets, SourceAddress.Octets == sa.Octets} )?
+)
+|
+( 
+  // Start by looking for a 3 way TCP Connection
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp6, DestinationPort is var dp6}
+  \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6}
+  -&gt;
+  \TCP.Segment{Flags.SYN == true, Flags.ACK == true, SourcePort == dp6, DestinationPort == sp6}
+  \\IPv4.Datagram{DestinationAddress.Octets == sa6.Octets, SourceAddress.Octets == da6.Octets}
+
+  // Now take everything after where the TCP Transport and IPv4 Network values DO NOT match. 
+  drop (!(\\TCP.Segment{Flags.ACK == true, SourcePort == sp6 || SourcePort == dp6, DestinationPort == sp6 || DestinationPort == dp6}
+   \\IPv4.Datagram{ SourceAddress.Octets == da6.Octets || DestinationAddress.Octets == da6.Octets, 
+                    SourceAddress.Octets == sa6.Octets || DestinationAddress.Octets == sa6.Octets }))+
+
+  // And now look for the optional Reset
+  (\TCP.Segment{Flags.RST == true, SourcePort == dp6, DestinationPort == sp6}
+   \\IPv4.Datagram{DestinationAddress.Octets == da6.Octets, SourceAddress.Octets == sa6.Octets} )?
+)
+;</Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>afe32b8a-10cd-42a7-a0d7-acd7dd7e3289</UniqueId>
+        <Name>TCP FIN Stealth Scan</Name>
+        <Description>Looks for TCP 3 way handshake with not response  This indicates port is not listening or blocked.  If you see many of these, this could indicate a scan is occurring on your network.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+using Utility;
+
+// Looks for a TCP Session that only connects, but sends no data.
+
+virtual operation TCPFINStealthScan
+{
+  (IPv4Address | IPv6Address) Source = sa != null ? sa : sa6;
+  (IPv4Address | IPv6Address) Destination = da != null ? da : da6;
+  ushort SourcePort = sp != 0 ? sp : sp6;
+  ushort DestinationPort = dp != 0 ? dp : dp6;
+  
+  override string ToString() { return "TCP Session with no response"; }
+}
+ = backtrack(TCP.Segment{Flags.SYN == true, Flags.ACK == false})
+( 
+  \TCP.Segment{Flags.SYN == true, Flags.ACK == false, SourcePort is var sp, DestinationPort is var dp}
+  \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da}
+  -&gt;
+  (\TCP.Segment{Flags.SYN == true, Flags.ACK == true, SourcePort == dp, DestinationPort == sp} 
+   \\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets})
+  (
+    (\TCP.Segment{Flags.SYN == true &amp;&amp; Flags.ACK == true || Flags.RST == true, SourcePort == dp, DestinationPort == sp} 
+     \\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets}) 
+    |
+    // We can see stuff on other conversations, but let's not collect them.
+    drop (!(\\TCP.Segment{SourcePort == sp || SourcePort == dp, DestinationPort == sp || DestinationPort == dp} 
+            \\IPv4.Datagram{SourceAddress.Octets == da.Octets || DestinationAddress.Octets == da.Octets, 
+                            SourceAddress.Octets == sa.Octets || DestinationAddress.Octets == sa.Octets}))
+  )*
+  [|eos()|]
+)
+|
+( 
+  \TCP.Segment{Flags.SYN == true, Flags.ACK == false, SourcePort is var sp6, DestinationPort is var dp6} 
+  \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6}
+  -&gt;
+  (\TCP.Segment{Flags.SYN == true, Flags.ACK == true, SourcePort == dp6, DestinationPort == sp6} 
+   \\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets})
+  (
+    (\TCP.Segment{Flags.SYN == true &amp;&amp; Flags.ACK == true || Flags.RST == true, SourcePort == dp6, DestinationPort == sp6} 
+     \\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets})
+    |
+    // We can see stuff on other conversations, but let's not collect them.
+    drop (!(\\TCP.Segment{SourcePort == sp6 || DestinationPort == dp6, SourcePort == dp6 || DestinationPort == sp6}
+            \\IPv6.Datagram{SourceAddress.Octets == da6.Octets || DestinationAddress.Octets == da6.Octets, 
+                            SourceAddress.Octets == sa6.Octets || DestinationAddress.Octets == sa6.Octets}))
+  )*
+  [|eos()|]
+);</Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>5e3e4b53-3b95-414e-b047-e44328f06ea3</UniqueId>
+        <Name>TCP Connect Scan</Name>
+        <Description>Returns TCP sessions that are actively reset by the destination.  Useful for finding malware scans on your network.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using TCP;
+using IPv4;
+using IPv6;
+using Utility;
+
+// This scenario will find Syn followed by a reset from the other side.
+
+virtual operation TCPConnectScan
+{
+  (IPv4Address | IPv6Address) Source = sa != null ? sa : sa6;
+  (IPv4Address | IPv6Address) Destination = da != null ? da : da6;
+  ushort SourcePort = sp != 0 ? sp : sp6;
+  ushort DestinationPort = dp != 0 ? dp : dp6;
+  
+  override string ToString()
+  { 
+    return "TCP Connect Scan - Active Reset"; 
+  }
+}
+= backtrack(\TCP.Segment{Flags.SYN == true, Flags.ACK == false})
+( 
+  // Start by looking for a 3 way TCP Connection
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp, DestinationPort is var dp}
+  \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da}
+
+  // Now take everything after where the TCP Transport and IPv4 Network values DO NOT match. 
+  drop (!(\\TCP.Segment{Flags.ACK == true, SourcePort == sp || SourcePort == dp, DestinationPort == sp || DestinationPort == dp}
+    \\IPv4.Datagram{ SourceAddress.Octets == da.Octets || DestinationAddress.Octets == da.Octets, 
+                     SourceAddress.Octets == sa.Octets || DestinationAddress.Octets == sa.Octets }))*
+
+  // And now look for the Reset
+  (\TCP.Segment{Flags.RST == true, SourcePort == dp, DestinationPort == sp}
+   \\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets} )
+)
+|
+( 
+  // Start by looking for a 3 way TCP Connection
+  \TCP.Segment{Flags.SYN == true, SourcePort is var sp6, DestinationPort is var dp6}
+  \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6}
+  
+  // Now take everything after where the TCP Transport and IPv6 Network values DO NOT match. 
+  drop (!(\\TCP.Segment{Flags.ACK == true, SourcePort == sp6 || SourcePort == dp6, DestinationPort == sp6 || DestinationPort == dp6}
+    \\IPv6.Datagram{ SourceAddress.Octets == da6.Octets || DestinationAddress.Octets == da6.Octets, 
+                     SourceAddress.Octets == sa6.Octets || DestinationAddress.Octets == sa6.Octets }))*
+
+  // And now look for the Reset
+  (\TCP.Segment{Flags.RST == true, SourcePort == dp6, DestinationPort == sp6}
+   \\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets} )
+)
+;</Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>20198094-4cac-4e27-81cf-71afb33ca44c</UniqueId>
+        <Name>RPC Endpoint Mapper Failure</Name>
+        <Description>Finds occurrences of RPC negotiating a port, and then getting blocked by a firewall.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EPM;
+          using TCP;
+          using IPv4;
+          using Utility;
+
+          // Finds ports negotiated through the RPC endpoint mapper, that are then
+          // actively blocked by the firewall or ignored.
+
+          // Virtual Operation creates a special messages where we can expose properties and a friendly description.
+          virtual operation RPCEndpointMapperBlocked
+          {
+          ushort DestPort = destPort as ushort;
+          override string ToString()
+          {
+          return "RPC Endpoint tried to map " + DestPort.ToString() + ", and was not established.";
+          };
+          }
+          =
+          (
+          // If it's a Enpoint Response, remember the Destination Port
+
+          \\EPM._eptMessages._ept_mapResponse{ towers[0].tower_octet_string.Floors[3].RelatedOrAddressData.Data is var destPort}
+          \\ IPv4.Datagram { value.NetworkKey is var nk }
+          -&gt;  // Followed later by
+          TCP.Segment{DestinationPort == destPort, value.TransportKey is var tk} \ IPv4.Datagram { value.NetworkKey == nk }
+          -&gt;
+          // Finally see if a reset follows from the server or multple SYNS without a response.
+          (
+          (
+          (TCP.Segment{SourcePort == destPort, Flags.RST == true, value.TransportKey == tk} \ IPv4.Datagram { value.NetworkKey == nk })
+          or
+          ((TCP.Segment{DestinationPort == destPort, Flags.SYN== true, value.TransportKey == tk} \ IPv4.Datagram { value.NetworkKey == nk })
+          -&gt;
+          (TCP.Segment{DestinationPort == destPort, Flags.SYN== true, value.TransportKey == tk} \ IPv4.Datagram { value.NetworkKey == nk }))
+          )
+          )
+          );
+        </Expression>
+        <InfoLink>http://support.microsoft.com/kb/908472</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>a2527142-8640-4490-8be9-bac9e6514ec4</UniqueId>
+        <Name>RPC Endpoint Mapper Success</Name>
+        <Description>Finds occurrences of RPC negotiating a port, and then successfully negotiating a TCP session.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EPM;
+          using TCP;
+          using IPv4;
+          using Utility;
+
+          // Finds ports negotiated through the RPC endpoint mapper, that are then
+          // successfully negotiated.
+
+          // Virtual Operation creates a special messages where we can expose properties and a friendly description.
+          virtual operation RPCEndpointMapperSuccess
+          {
+          ushort DestPort = destPort as ushort;
+          override string ToString()
+          {
+          return "RPC Endpoint mapped port  " + DestPort.ToString() + ", and the TCP session was successflly established.";
+          };
+          }
+          =
+          (
+          // If it's a Endpoint Response, remember the Destination Port
+
+          \\EPM._eptMessages._ept_mapResponse{ towers[0].tower_octet_string.Floors[3].RelatedOrAddressData.Data is var destPort}
+          \\ IPv4.Datagram { value.NetworkKey is var nk }
+          -&gt;  // Followed later by
+          TCP.Segment{DestinationPort == destPort, SourcePort is var sp, Flags.SYN == true, value.TransportKey is var tk} \ IPv4.Datagram { value.NetworkKey == nk }
+          -&gt;
+          TCP.Segment{SourcePort == destPort, DestinationPort==sp, Flags.SYN == true, Flags.ACK == true, value.TransportKey == tk} \ IPv4.Datagram { value.NetworkKey == nk }
+          -&gt;
+          TCP.Segment{SourcePort == sp, DestinationPort == destPort, Flags.ACK == true, value.TransportKey == tk} \ IPv4.Datagram { value.NetworkKey == nk }
+
+          );
+        </Expression>
+        <InfoLink>http://support.microsoft.com/kb/908472</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>76d2ba9c-f81e-443d-8106-6070de1382c8</UniqueId>
+        <Name>FTP Port Negotiate Success</Name>
+        <Description>Find FTP Port that are negotiate then succesfully setup via TCP.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>// Finds FTP negotiated ports that are setup as TCP sessions.
+
+using FTP;
+using IPv4;
+using TCP;
+using Utility;
+
+//" Entering Passive Mode (10,171,70,72,239,159)."
+
+syntax FTPPortVal = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} "," porthi:regex{[0-9]+} "," portlo:regex{[0-9]+} =&gt; (((porthi as ushort)*(256 as ushort) + (portlo as ushort)) as ushort);
+syntax FTPIPv4Address = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} "," porthi:regex{[0-9]+} "," portlo:regex{[0-9]+} =&gt; 
+   new IPv4Address { Octets = ([ip1 as byte, ip2 as byte, ip3 as byte, ip4 as byte] as binary) };//syntax FTPIPv4Address = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} =&gt; new IPv4Address { Octets = ((ip1 as binary) * 24) };
+
+virtual operation FTPPortNeg
+{
+  int Port = NegotiatedPort as ushort;
+  
+  override string ToString()
+  {
+    return "FTP negotiated port=" + Port.ToString() + " and succesfully setup a TCP connection.";
+  }
+}
+= 
+(
+
+ // If it's an FTP code 227, store the NegotiatedPort and reply string for later to check the IP address.
+ \\FTP.CommandToClient{ ReplyCode == "227", FTPPort(ReplyMessage) is NegotiatedPort:ushort, FTPIPv4Address(ReplyMessage) is NegotiatedIPAddress:IPv4Address }  -&gt;
+
+ // Use the port and addres sinformaiton to check the next message at the TCP and IPv4 level.
+ TCP.Segment{ DestinationPort == NegotiatedPort, Flags.SYN == true, SourcePort is var sp } \ IPv4.Datagram { IPsMatch(NegotiatedIPAddress, DestinationAddress) }
+ -&gt;
+ TCP.Segment{SourcePort == NegotiatedPort, DestinationPort==sp, Flags.SYN == true, Flags.ACK == true}
+ -&gt;
+ TCP.Segment{SourcePort == sp, DestinationPort == NegotiatedPort, Flags.ACK == true} // Finally see if a reset or syn retransmit type traffic follows.
+);
+
+// Take the reply string and returns the port
+ushort FTPPort(string f)
+{
+ // Use our syntax to parse the reply string and return the port
+ var portval = FTPPortVal(f);
+ 
+ // If the string is empty or doesn't parse, the return will be nothing
+ if(portval != nothing)
+ {
+  return portval as ushort;
+ }
+ else
+ {
+  return 0;
+ }
+}
+
+// Takes the simple ip address and compares to the IP address.
+bool IPsMatch(IPv4Address i1, IPv4Address i2)
+{
+ if(i1.Octets == i2.Octets)
+ {
+  return true;
+ }
+ 
+ return false;
+}
+
+
+</Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/expression/dd421710</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>3a250cfc-5cb1-40c6-955f-371bc64b5f66</UniqueId>
+        <Name>FTP Port Negotiate Failure</Name>
+        <Description>Find FTP Port that are negotiate then blocked with either a reset or no response to the TCP SYN.</Description>
+        <Category>Network</Category>
+        <Properties />
+      </Metadata>
+      <Content xsi:type="SequenceExpressionAsset">
+        <Expression>using FTP;
+using IPv4;
+using TCP;
+using Utility;
+
+//" Entering Passive Mode (10,171,70,72,239,159)."
+
+syntax FTPPortVal = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} "," porthi:regex{[0-9]+} "," portlo:regex{[0-9]+} =&gt; (((porthi as ushort)*(256 as ushort) + (portlo as ushort)) as ushort);
+syntax FTPIPv4Address = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} "," porthi:regex{[0-9]+} "," portlo:regex{[0-9]+} =&gt; 
+   new IPv4Address { Octets = ([ip1 as byte, ip2 as byte, ip3 as byte, ip4 as byte] as binary) };//syntax FTPIPv4Address = regex{.*\(} ip1:regex{[0-9]+} "," ip2:regex{[0-9]+} "," ip3:regex{[0-9]+} "," ip4:regex{[0-9]+} =&gt; new IPv4Address { Octets = ((ip1 as binary) * 24) };
+
+virtual operation FTPPortNeg
+{
+  int Port = NegotiatedPort as ushort;
+  
+  override string ToString()
+  {
+    return "FTP negotiated port=" + Port.ToString() + " but did not succesfully setup a TCP connection.";
+  }
+}
+= 
+(
+
+ // If it's an FTP code 227, store the NegotiatedPort and reply string for later to check the IP address.
+ \\FTP.CommandToClient{ ReplyCode == "227", FTPPort(ReplyMessage) is NegotiatedPort:ushort, FTPIPv4Address(ReplyMessage) is NegotiatedIPAddress:IPv4Address }  -&gt;
+
+ // Use the port and addres sinformaiton to check the next message at the TCP and IPv4 level.
+ TCP.Segment{ DestinationPort == NegotiatedPort } \ IPv4.Datagram { IPsMatch(NegotiatedIPAddress, DestinationAddress) }
+ -&gt;
+ // Finally see if a reset or syn retransmit type traffic follows.
+ (
+  (
+   (TCP.Segment{SourcePort == NegotiatedPort, Flags.RST == true}) \ IPv4.Datagram { IPsMatch(NegotiatedIPAddress, SourceAddress) }
+    or 
+   (TCP.Segment{DestinationPort == NegotiatedPort, Flags.SYN== true}) \ IPv4.Datagram { IPsMatch(NegotiatedIPAddress, DestinationAddress) }
+     -&gt;
+   (TCP.Segment{DestinationPort == NegotiatedPort, Flags.SYN== true}) \ IPv4.Datagram { IPsMatch(NegotiatedIPAddress, DestinationAddress) }
+  )
+ )
+);
+
+// Take the reply string and returns the port
+ushort FTPPort(string f)
+{
+ // Use our syntax to parse the reply string and return the port
+ var portval = FTPPortVal(f);
+ 
+ // If the string is empty or doesn't parse, the return will be nothing
+ if(portval != nothing)
+ {
+  return portval as ushort;
+ }
+ else
+ {
+  return 0;
+ }
+}
+
+// Takes the simple ip address and compares to the IP address.
+bool IPsMatch(IPv4Address i1, IPv4Address i2)
+{
+ if(i1.Octets == i2.Octets)
+ {
+  return true;
+ }
+ 
+ return false;
+}
+
+
+</Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/expression/dd421710</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>c3551a8d-fa92-43dd-bbc7-0900e560fc27</UniqueId>
+        <Name>TLS Renegotiate</Name>
+        <Description>Detects TLS sessions in which connection requests were initiated by a TLS client and the Session ID &gt; 0, in
+other words, a cached Session ID was used.  When a connection request for a TLS session is initiated by a
+TLS client and it reuses an existing Session ID, the client request is renegotiated to the TLS server with the
+use of a cached Session ID. However, during renegotiation, not all the TLS session information is represented
+on the wire. When this occurs, Message Analyzer’s Decryption tool is unable to decrypt these renegotiated sessions.
+
+When a TLS Session is first negotiated, a Session ID is created.  The session ID can be cached and used to setup the
+session again as a short cut.  However, all the TLS session info is not presented on the wire during this renegotiation.
+When this happens, Message Analyzer’s decryption expert is unable to decrypt these renegotiated sessions.
+        </Description>
+        <Category>TLS</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using TLS;
+          using TCP;
+
+          virtual operation TLS_SSL_Negotiation
+          {
+          string CipherSuite = cipherSuite;
+          string Version = vers;
+
+          override string ToString()
+          {
+          return "Renegotiated TLS session, version=" + Version + " Cipher=" + CipherSuite;
+          }
+          }
+          =
+          backtrack(TLS.RecordLayers)
+          (
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.handshake), TLSIsMsgType(records, TLS.HandshakeType.client_hello), ClientSessionIDReNeg(records), TLSGetVers(records) is var vers } \\ TCP.Segment{ value.TransportKey is var tkey}
+          -&gt;
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.handshake), TLSIsMsgType(records, TLS.HandshakeType.server_hello), GetCipherSuite(records) is var cipherSuite } \\ TCP.Segment{ value.TransportKey == tkey}
+          -&gt;
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.change_cipher_spec) } \\ TCP.Segment{ value.TransportKey == tkey}
+          )
+          ;
+
+          bool TLSIsType(array&lt;TLS.RecordLayer&gt; Layers, TLS.ContentType ct)
+          {
+          if(Layers[0].$"type" == ct)
+          {
+          return true;
+          }
+          return false;
+          }
+
+          bool TLSIsMsgType(array&lt;TLS.RecordLayer&gt; Layers, TLS.HandshakeType ht)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          if(rl.$"type" == TLS.ContentType.handshake &amp;&amp; rl.fragment is hsArray:array&lt;Handshake&gt;)
+          {
+          foreach(TLS.Handshake hs in hsArray)
+          {
+          if(hs.msg_type == ht)
+          {
+          return true;
+          }
+          }
+          }
+          }
+          return false;
+          }
+
+          string
+          GetCipherSuite(array&lt;TLS.RecordLayer&gt; Layers)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          if(rl.$"type" == TLS.ContentType.handshake &amp;&amp; rl.fragment is hsArray:array&lt;Handshake&gt;)
+          {
+          foreach(TLS.Handshake hs in hsArray)
+          {
+          if (hs.msg_type is HandshakeType.server_hello &amp;&amp; hs.body is sh:ServerHello)
+          {
+          return EnumToString(sh.cipher_suite, "IANA.CipherSuite");
+          }
+          }
+          }
+          }
+          return "Cipher Not Found";
+          }
+
+          bool
+          ClientSessionIDReNeg(array&lt;TLS.RecordLayer&gt; Layers)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          if(rl.$"type" == TLS.ContentType.handshake &amp;&amp; rl.fragment is hsArray:array&lt;Handshake&gt;)
+          {
+          foreach(TLS.Handshake hs in hsArray)
+          {
+          if (hs.msg_type is HandshakeType.client_hello &amp;&amp; hs.body is ch:ClientHello)
+          {
+          return (ch.session_id.length_in_bytes &gt; 0);
+          }
+          }
+          }
+          }
+          return false;
+          }
+
+          string
+          TLSGetVers(array&lt;TLS.RecordLayer&gt; Layers)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          return rl.version.ToString();
+          }
+          return "Version Not Found";
+          }
+        </Expression>
+        <InfoLink>https://en.wikipedia.org/wiki/Transport_Layer_Security</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>d02447f6-9871-49bd-9274-2f506c797841</UniqueId>
+        <Name>TLS Negotiation</Name>
+        <Description>Detects TLS sessions in which connection requests were initiated by a TLS client and the Session ID = 0, 
+in other words, a cached Session ID was not used.  The server then issues a Session ID to the client, which the client 
+may or may not cache for use in subsequent connection requests. By caching the Session ID, the client can reuse the existing ID as a shortcut to facilitate subsequent connection requests, as required.
+        </Description>
+        <Category>TLS</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using TLS;
+          using TCP;
+
+          virtual operation TLS_SSL_Negotiation
+          {
+          string CipherSuite = cipherSuite;
+          string Version = vers;
+
+          override string ToString()
+          {
+          return "Negotiated TLS session, version=" + Version + " Cipher=" + CipherSuite;
+          }
+          }
+          =
+          backtrack(TLS.RecordLayers)
+          (
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.handshake), TLSIsMsgType(records, TLS.HandshakeType.client_hello), TLSGetVers(records) is var vers } \\ TCP.Segment{ value.TransportKey is var tkey}
+          -&gt;
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.handshake), TLSIsMsgType(records, TLS.HandshakeType.server_hello), GetCipherSuite(records) is var cipherSuite } \\ TCP.Segment{ value.TransportKey == tkey}
+          -&gt;
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.handshake), TLSIsMsgType(records, TLS.HandshakeType.client_key_exchange) } \\ TCP.Segment{ value.TransportKey == tkey}
+          -&gt;
+          TLS.RecordLayers{ TLSIsType(records, TLS.ContentType.change_cipher_spec) } \\ TCP.Segment{ value.TransportKey == tkey}
+          )
+          ;
+
+          bool TLSIsType(array&lt;TLS.RecordLayer&gt; Layers, TLS.ContentType ct)
+          {
+          if(Layers[0].$"type" == ct)
+          {
+          return true;
+          }
+          return false;
+          }
+
+          bool TLSIsMsgType(array&lt;TLS.RecordLayer&gt; Layers, TLS.HandshakeType ht)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          if(rl.$"type" == TLS.ContentType.handshake &amp;&amp; rl.fragment is hsArray:array&lt;Handshake&gt;)
+          {
+          foreach(TLS.Handshake hs in hsArray)
+          {
+          if(hs.msg_type == ht)
+          {
+          return true;
+          }
+          }
+          }
+          }
+          return false;
+          }
+
+          string
+          GetCipherSuite(array&lt;TLS.RecordLayer&gt; Layers)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          if(rl.$"type" == TLS.ContentType.handshake &amp;&amp; rl.fragment is hsArray:array&lt;Handshake&gt;)
+          {
+          foreach(TLS.Handshake hs in hsArray)
+          {
+          if (hs.msg_type is HandshakeType.server_hello &amp;&amp; hs.body is sh:ServerHello)
+          {
+          return EnumToString(sh.cipher_suite, "IANA.CipherSuite");
+          }
+          }
+          }
+          }
+          return "Cipher Not Found";
+          }
+
+          string
+          TLSGetVers(array&lt;TLS.RecordLayer&gt; Layers)
+          {
+          foreach(TLS.RecordLayer rl in Layers)
+          {
+          return rl.version.ToString();
+          }
+          return "Version Not Found";
+          }
+        </Expression>
+        <InfoLink>https://en.wikipedia.org/wiki/Transport_Layer_Security</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>e3e857f2-5bbe-4f9a-90b0-258a53ab2c61</UniqueId>
+        <Name>Lync Voip</Name>
+        <Description>Locates Lync Voip calls</Description>
+        <Category>Lync</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using SIP;
+          using SDP;
+          using TCP;
+          using UDP;
+          using IPv4;
+          using IPv6;
+          using Utility;
+
+          // Looks for a TCP 3-way handshake with IPv4 or IPv6 transport.  Returns the approximate
+          // response time by the time delta of the Syn -&gt; SynAck.
+
+          // Virtual Operation creates a special messages where we can expose properties that show
+          // as columns and a friendly description.
+
+          virtual operation LyncCall
+          {
+          int RTP_port = p;
+          (IPv4Address | IPv6Address) InitialSpeaker = sa != null ? sa : sa6;
+          string From = f as string;
+          string To = t as string;
+          (IPv4Address | IPv6Address) Destination = da != null ? da : da6;
+          ushort SourcePort = sp != 0 ? sp : sp6;
+          ushort DestinationPort = dp != 0 ? dp : dp6;
+          int RTCP = cp;
+
+          override string ToString()
+          {
+          return "Lycn Call";
+          };
+          }
+          // This line below has been removed since we are now using virtual operations.
+          // scenario ThreeWayHandshake
+
+          // backtrack makes sure we don't continue from where we left off.  Otherwise we won't find
+          // things that are interleaved.
+          = backtrack(Segment{Flags is TCP.Flags{SYN == true}})
+          // IPv4 transport
+          (
+          // Look for TCP over IPv4, that are not adjacent in the stack.  This will enable us to
+          // find tunnel TCP sessions.  We Save/Remember the Address/Port values and timestamp which
+          // we use to compare in rest of the expression.
+          \TCP.Segment{Flags is TCP.Flags{SYN == true}, SequenceNumber is var IPv4SeqNumRequest,
+          SourcePort is var sp, DestinationPort is var dp,
+          value.TransportKey is var transportV4
+          }
+          \\IPv4.Datagram{SourceAddress is var sa, DestinationAddress is var da, value.NetworkKey is var networkV4}
+          // -&gt; Means that messages can be interleaved.  Withou the operator means they are adjacent messages.
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{SYN == true, ACK==true}, SequenceNumber is var IPv4SeqNumResponse,
+          AcknowledgementNumber == IPv4SeqNumRequest + 1, SourcePort == dp, DestinationPort == sp,
+          value.TransportKey == transportV4
+          }
+          \\IPv4.Datagram{SourceAddress.Octets == da.Octets, DestinationAddress.Octets == sa.Octets, value.NetworkKey == networkV4}
+          -&gt;
+          \TCP.Segment{Flags is TCP.Flags{ACK==true}, SequenceNumber == IPv4SeqNumRequest + 1, AcknowledgementNumber == IPv4SeqNumResponse + 1, SourcePort == sp, DestinationPort == dp, value.TransportKey == transportV4}
+          \\IPv4.Datagram{SourceAddress.Octets == sa.Octets, DestinationAddress.Octets == da.Octets, value.NetworkKey == networkV4}
+
+          -&gt;
+          \\SDP.SessionDescription{GetLyncPort(MediaDescriptions as array&lt;MediaDescriptionType&gt;) is p:int,GetLyncControlPort(MediaDescriptions as array&lt;MediaDescriptionType&gt;) is cp:int}
+          \SIP.Request{Headers["From"] is var f, Headers["To"] is var t}
+          \TCP.Segment{value.TransportKey == transportV4}
+          \\IPv4.Datagram{value.NetworkKey == networkV4}
+
+          -&gt;
+
+          (
+          \\UDP.Datagram{SourcePort == p || DestinationPort == p || SourcePort == cp || DestinationPort == cp}
+          |
+          \\SIP.Request
+          \TCP.Segment{value.TransportKey == transportV4}
+          \\IPv4.Datagram{value.NetworkKey == networkV4}
+          |
+          \\SIP.Response
+          \TCP.Segment{value.TransportKey == transportV4}
+          \\IPv4.Datagram{value.NetworkKey == networkV4}
+          ) interleave[1,]
+          )
+          |
+          //IPv6 transport version
+          (
+          \TCP.Segment{Flags is TCP.Flags{SYN == true}, SequenceNumber is var SeqNumRequest, SourcePort is var sp6, DestinationPort is var dp6, value.TransportKey is var transportV6}
+          \\IPv6.Datagram{SourceAddress is var sa6, DestinationAddress is var da6, value.NetworkHashCode is var networkV6}
+          -&gt;
+          Segment{Flags is TCP.Flags{SYN == true, ACK==true}, SequenceNumber is var SeqNumResponse, AcknowledgementNumber == SeqNumRequest + 1, SourcePort == dp6, DestinationPort == sp6, value.TransportKey == transportV6}
+          \\IPv6.Datagram{SourceAddress.Octets == da6.Octets, DestinationAddress.Octets == sa6.Octets, value.NetworkHashCode == networkV6}
+          -&gt;
+          Segment{Flags is TCP.Flags{ACK==true}, SequenceNumber == SeqNumRequest + 1, AcknowledgementNumber == SeqNumResponse + 1, SourcePort == sp6, DestinationPort == dp6, value.TransportKey == transportV6}
+          \\IPv6.Datagram{SourceAddress.Octets == sa6.Octets, DestinationAddress.Octets == da6.Octets, value.NetworkHashCode == networkV6}
+          );
+
+          int GetLyncPort(array&lt;SDP.MediaDescriptionType&gt; md)
+          {
+          string m = md[0].MediaField;
+
+          int n = m.IndexOf(" ");
+          if(n &gt;= 0)
+          {
+
+          string mediaType = m.Segment(0, n);
+          string m_rest = m.Segment(n+1);
+
+          int port_ptr = m_rest.IndexOf(" ");
+
+          optional int oport = m_rest.Segment(0, port_ptr) as int;
+          if(oport != nothing)
+          {
+          return oport as int;
+          }
+          }
+          return 0;
+          }
+
+          int GetLyncControlPort(array&lt;SDP.MediaDescriptionType&gt; md)
+          {
+
+          //optional array&lt;AttributeFieldType&gt; a = md[0].AttributeFields;
+
+          if(md[0].AttributeFields != nothing){
+          array&lt;AttributeFieldType&gt; a = md[0].AttributeFields as array&lt;AttributeFieldType&gt;;
+
+          foreach(AttributeFieldType aft in a){
+          int i = aft.Attribute.IndexOf("rtcp");
+
+          if(i &gt;=0){
+          int j = aft.Attribute.IndexOf(":");
+
+          string s = aft.Attribute.Segment(j+1);
+
+          optional int oport = s as int;
+          if(oport != nothing)
+          {
+          return oport as int;
+          }
+          }
+          }
+          }
+          return 0;
+          }
+        </Expression>
+        <Comment>//Lync Void Calls</Comment>
+        <InfoLink>http://bing.com</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>76b1b5a3-2437-4d50-9430-a6847732a058</UniqueId>
+        <Name>RTP Missing Sequence</Name>
+        <Category>Lync</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using RTP;
+          using UDP;
+
+          scenario SequentialPattern =
+          backtrack(RTP.Datagram)
+          (
+          RTP.Datagram{SequenceNumber is var A_SequenceNumber} \\ UDP.Datagram{SourcePort is var p}
+          -&gt;
+          drop(!(\ UDP.Datagram{SourcePort != p}))*
+
+          RTP.Datagram{SequenceNumber-A_SequenceNumber != 1} \\ UDP.Datagram{SourcePort == p}
+          )
+          ;
+        </Expression>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>4ce23cbb-1711-4938-b5a9-c5f6d20c7854</UniqueId>
+        <Name>SCEP: Certificate enroll failed.</Name>
+        <Category>MDM Device Management</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EventLog;
+
+          scenario SCEP__Certificate_enroll_failed_ =
+          backtrack(EventLog.EventLogEntryEx2)
+          (
+          EventLog.EventLogEntryEx2{"SCEP: Certificate enroll failed." in Message}
+          )
+          ;
+        </Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/library/windows/hardware/dn897303(v=vs.85).aspx</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>63902567-ee54-44e6-a5c8-1a88ae4efa3d</UniqueId>
+        <Name>Wifi CSP - wlan profile failure </Name>
+        <Category>MDM Device Management</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EventLog;
+
+          scenario Wifi_CSP___wlan_profile_failure =
+          backtrack(EventLog.EventLogEntryEx2)
+          (
+          EventLog.EventLogEntryEx2{"WiFiConfigurationServiceProvider: Node set value failed to set the wlan profile" in Message}
+          )
+          ;
+        </Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/library/windows/hardware/dn904981(v=vs.85).aspx</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>514fd774-c2f2-4d6c-b46d-164ac74eae17</UniqueId>
+        <Name>Policy CSP - Security Add Policy Error</Name>
+        <Category>MDM Device Management</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EventLog;
+
+          scenario Policy_CSP___Security_Add_Policy_Error =
+          backtrack(EventLog.EventLogEntryEx2)
+          (
+          EventLog.EventLogEntryEx2{"MDM ConfigurationManager: Command failure" in Message,"Command Type: (CmdType_Add)" in Message,"CSP URI: (./Vendor/MSFT/Policy/Config/Security)" in Message}
+          )
+          ;
+        </Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/library/windows/hardware/dn904962(v=vs.85).aspx</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>f265822e-96c2-461d-81f5-8224768f7562</UniqueId>
+        <Name>Reporting CSP EDP - Reterive by Time Parameter Incorrect</Name>
+        <Category>MDM Device Management</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EventLog;
+
+          scenario WIP_CSP___Reterive_by_Time_Parameter_Incorrect =
+          backtrack(EventLog.EventLogEntryEx2)
+          (
+          EventLog.EventLogEntryEx2{"MDM ConfigurationManager: Command failure status." in Message,"CSP URI: (./Vendor/MSFT/Reporting/EnterpriseDataProtection/RetrieveByTimeRange/StartTime)" in Message}
+          )
+          ;
+        </Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/library/windows/hardware/mt697634(v=vs.85).aspx</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+    <Asset>
+      <Metadata>
+        <UniqueId>caaf2f31-1227-46fa-9292-884de6821c65</UniqueId>
+        <Name>Reporting CSP EDP - Reterive by Count Parameter Incorrect</Name>
+        <Category>MDM Device Management</Category>
+        <Properties />
+      </Metadata>
+      <Content
+        xsi:type="SequenceExpressionAsset">
+        <Expression>
+          using EventLog;
+
+          scenario WIP_CSP___Reterive_by_Time_Parameter_Incorrect =
+          backtrack(EventLog.EventLogEntryEx2)
+          (
+          EventLog.EventLogEntryEx2{"MDM ConfigurationManager: Command failure status." in Message,"CSP URI: (./Vendor/MSFT/Reporting/EnterpriseDataProtection/RetrieveByCount/StartTime)" in Message}
+          )
+          ;
+        </Expression>
+        <InfoLink>https://msdn.microsoft.com/en-us/library/windows/hardware/mt697634(v=vs.85).aspx</InfoLink>
+      </Content>
+      <Properties />
+    </Asset>
+   </Assets>
+  <Properties />
+</AssetCollection>

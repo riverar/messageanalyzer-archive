@@ -1,0 +1,222 @@
+module TLSOverTSGUActor with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Utility;
+using TSGU;
+using Standard;
+using TLS;
+
+autostart actor TLSOverTSGU(TSGU.ExtendedServer server)
+{
+    TLSStreamDecodingCache requestCache = null;
+    TLSStreamDecodingCache responseCache = null;
+    TLS.Server ept = null;
+    TSGU.Server tsguServerEPT = null;
+    binary tsguData;
+    TransportTypePatt transportType = TransportTypePatt.Unknown;
+
+    process server accepts tsgu:any message where CheckIfTSGUMsgAndGetData(ref transportType, tsgu, ref tsguData, true)
+    {
+        if (tsguServerEPT == null)
+        {
+            tsguServerEPT = endpoint TSGU.Server over server;
+            tsguServerEPT.tunnelPort = server.tunnelPort;
+            tsguServerEPT.remotePort = server.remotePort;
+        }
+        if ((requestCache == null || requestCache.BufferCount() == 0) && !IsTlsHeader(tsguData))
+        {
+            dispatch tsguServerEPT accepts tsgu; // if there is nothing is cache and the beginning of message is not TLS header, dispatch to Server directly
+        }
+        else
+        {
+            if (requestCache == null)
+            {
+                ept = endpoint TLS.Server over server;
+                InitializeTLSStreamDecodingCachePair(ref requestCache, ref responseCache, ept, GetTSGUBufferLength);
+                InitializeTLSServerFromTSGU(server, DispathDecrytedMessageBack, ept);
+            }
+            AddTSGUBuffer(requestCache, tsgu, tsguData);
+            requestCache.TryDecodeAndDispatchMessage();
+        }
+    }
+
+    process server issues tsgu:any message where CheckIfTSGUMsgAndGetData(ref transportType, tsgu, ref tsguData, false)
+    {
+        if (tsguServerEPT == null)
+        {
+            tsguServerEPT = endpoint TSGU.Server over server;
+            tsguServerEPT.tunnelPort = server.tunnelPort;
+            tsguServerEPT.remotePort = server.remotePort;
+        }
+        if ((responseCache == null || responseCache.BufferCount() == 0) && !IsTlsHeader(tsguData))
+        {
+            dispatch tsguServerEPT issues tsgu; // if there is nothing is cache and the beginning of message is not TLS header, dispatch to Server directly
+        }
+        else
+        {
+            if (responseCache == null)
+            {
+                ept = endpoint TLS.Server over server;
+                InitializeTLSStreamDecodingCachePair(ref requestCache, ref responseCache, ept, GetTSGUBufferLength);
+                InitializeTLSServerFromTSGU(server, DispathDecrytedMessageBack, ept);
+            }
+            AddTSGUBuffer(responseCache, tsgu, tsguData);
+            responseCache.TryDecodeAndDispatchMessage();
+        }
+    }
+
+    void DispathDecrytedMessageBack(binary bin, TLS.RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        if (rls.Origins[0] is (HTTP_DATA_PACKET | TSGU.TsProxySendToServerRequest | TSGU.TsProxySetupReceivePipeResponse))
+        {
+            DispathBackToTSGU(bin, server, direction, rls.Origins[0]);
+        }
+    }
+    
+    void DispathBackToTSGU(binary bin, TLS.Server e, MessageDirection direction, any message tsgu)
+    {
+        if (direction == MessageDirection.Accepts)
+        {
+            if (tsgu is tsgu1:HTTP_DATA_PACKET)
+            {
+                TSGU.HTTP_DATA_PACKET msg = 
+                    new TSGU.HTTP_DATA_PACKET
+                    {
+                        hdr = 
+                            new TSGU.HTTP_PACKET_HEADER
+                            {
+                                packetType = tsgu1.hdr.packetType,
+                                headerReserved = tsgu1.hdr.headerReserved,
+                                packetLength = (bin.Count + 10) as uint,
+                            },
+                        cbDataLen = bin.Count as ushort,
+                        data = bin as array<byte>,
+                    };
+                msg.SourceData = bin;
+                if (bin != null && bin.Count != 0)
+                {
+                    AssociateFieldPosition(msg, "data", bin, 0, bin.Count * 8);
+                }
+                dispatch tsguServerEPT accepts msg;
+            }
+            else if (tsgu is tsgu2:TSGU.TsProxySendToServerRequest)
+            {
+                TSGU.TsProxySendToServerRequest msg = 
+                    new TSGU.TsProxySendToServerRequest
+                    {
+                        IDL_handle = tsgu2.IDL_handle,
+                        pRpcMessage = new GenericSendDataMessagePacket
+                        {
+                            PCHANNEL_CONTEXT_HANDLE_NOSERIALIZE_NR = 
+                                tsgu2.pRpcMessage.PCHANNEL_CONTEXT_HANDLE_NOSERIALIZE_NR,
+                            totalDataBytes = bin.Count as uint,
+                            numBuffers = 1,
+                            buffer1Length = bin.Count as uint,
+                            buffer1 = bin as array<byte>,
+                        },
+                    };
+                msg.pRpcMessage.SourceData = bin;
+                if (bin != null && bin.Count != 0)
+                {
+                    AssociateFieldPosition(msg.pRpcMessage, "buffer1", bin, 0, bin.Count * 8);
+                }
+                dispatch tsguServerEPT accepts msg;
+            }
+        }
+        else
+        {
+            if (tsgu is tsgu1:HTTP_DATA_PACKET)
+            {
+                TSGU.HTTP_DATA_PACKET msg = 
+                    new TSGU.HTTP_DATA_PACKET
+                    {
+                        hdr = 
+                            new TSGU.HTTP_PACKET_HEADER
+                            {
+                                packetType = tsgu1.hdr.packetType,
+                                headerReserved = tsgu1.hdr.headerReserved,
+                                packetLength = (bin.Count + 10) as uint,
+                            },
+                        cbDataLen = bin.Count as ushort,
+                        data = bin as array<byte>,
+                    };
+                msg.SourceData = bin;
+                if (bin != null && bin.Count != 0)
+                {
+                    AssociateFieldPosition(msg, "data", bin, 0, bin.Count * 8);
+                }
+                dispatch tsguServerEPT issues msg;
+            }
+            else if (tsgu is tsgu2:TSGU.TsProxySetupReceivePipeResponse)
+            {
+                TSGU.TsProxySetupReceivePipeResponse msg = 
+                    new TSGU.TsProxySetupReceivePipeResponse
+                    {
+                        data = bin, // TsProxySetupReceivePipeResponse in this actor must have this field
+                    };
+                msg.SourceData = bin;
+                if (bin != null && bin.Count != 0)
+                {
+                    AssociateFieldPosition(msg, "data", bin, 0, bin.Count * 8);
+                }
+                dispatch tsguServerEPT issues msg;
+            }
+        }
+    }
+   
+    int GetTSGUBufferLength(any message msg)
+    {
+        if (msg is tsgu1:HTTP_DATA_PACKET)
+        {
+            return tsgu1.cbDataLen;
+        }
+        else if (msg is tsgu2:TSGU.TsProxySendToServerRequest)
+        {
+            return tsgu2.pRpcMessage.totalDataBytes as int;
+        }
+        else if (msg is tsgu3:TSGU.TsProxySetupReceivePipeResponse)
+        {
+            return (tsgu3.data as binary).Count;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+
+    void AddTSGUBuffer(TLSStreamDecodingCache requestCache, any message tsgu, binary bin)
+    {
+        requestCache.Buffer += bin;
+        requestCache.Origins += [tsgu];
+    }
+
+    ~endpoint(TSGU.ExtendedServer server)
+    {
+        if (requestCache != null)
+        {
+            requestCache.ClearInDestructor();
+        }
+        if (responseCache != null)
+        {
+            responseCache.ClearInDestructor();
+        }
+    }
+}
+
+void InitializeTLSServerFromTSGU(TSGU.ExtendedServer tsguExtended, 
+    void(binary, RecordLayers, TLS.Server, MessageDirection) dispatchBack, 
+    TLS.Server tlsServer)
+{
+    tlsServer.InitializeContext(tsguExtended.localAddress, tsguExtended.remoteAddress, 
+        tsguExtended.localPort, tsguExtended.remotePort, dispatchBack);
+}

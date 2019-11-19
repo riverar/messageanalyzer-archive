@@ -1,0 +1,867 @@
+protocol NNTP with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII}, // WORKAROUND: BUG23734: Stream Encoding does not support UTF8 as Text Encoding.
+Documentation
+{
+    ProtocolName = "Network News Transfer Protocol", 
+    ShortName = "NNTP", 
+    Description = "Network News Transfer Protocol (NNTP) is used for the distribution, inquiry, retrieval and posting of Netnews articles using a reliable stream-based mechanism." 
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3977"},
+            new Reference{Name = "RFC 2980"},
+            new Reference{Name = "RFC 4644"},
+            new Reference{Name = "RFC 4643"},
+            new Reference{Name = "RFC 6048"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using IANA;
+
+//-------------------------------------------
+// endpoint
+
+endpoint Server
+    over IntermidiateServer
+    accepts CommandAndResponseOperation;
+client endpoint Client connected to Server;
+
+// Intermidiate layer
+endpoint IntermidiateServer 
+    over TCP.Server
+    provides MessageContract consumes MessageContract;
+client endpoint IntermidiateClient connected to IntermidiateServer;
+
+//-------------------------------------------
+// Actors
+
+// Actor to dispatch the operation that constructed from the command message and the reponse message
+autostart actor OperationActor(IntermidiateServer node)
+{    
+    MessageContract.Command request = null;
+    
+    // Command
+    process node accepts req:MessageContract.Command 
+    {
+        if (request == null)
+        {
+            request = req;
+        }
+        else
+        {
+            ValidationCheck(false, request, "Incomplete operation due to missing response message.");
+            request = req;
+        }
+    }
+    
+    // Response
+    process node issues res:MessageContract.Response
+    {
+        if (request == null)
+        {
+            // Validate the message sequence, except for the response message that sent by server for initial connection set-up.
+            ValidationCheck(res.Response.ResponseCode == "200" || res.Response.ResponseCode == "201", res, "Incomplete operation due to command message is missing.");
+            reject;
+        }
+        else
+        {
+            var op = new CommandAndResponseOperation
+                        {
+                            Command = request.Command,
+                            Response = res.Response
+                        };
+            op.Origins = [request as any message, res as any message];
+            dispatch (endpoint Server over node) accepts op;
+            
+            // Clear the temperay buffer
+            request = null;
+        }
+    }
+}
+
+autostart actor NNTPOverTCP(TCP.Server server)
+{
+    NNTPOverTCPDecodingHelper decodingHelper = null;
+
+    process server accepts s:TCP.Segment{DestinationPort is Port.NNTP}
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new NNTPOverTCPDecodingHelper();
+            decodingHelper.InitializeNNTPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment{SourcePort is Port.NNTP}
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new NNTPOverTCPDecodingHelper();
+            decodingHelper.InitializeNNTPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+//-------------------------------------------
+// Helper functions
+type NNTPOverTCPDecodingHelper : TCP.TCPDecodingHelper
+{
+    void InitializeNNTPOverTCPDecodingHelper(TCP.Server server)
+    {
+        SessionContext context = new SessionContext{};
+
+        NNTPRequestOverTCPDecodingCache acceptsCache = new NNTPRequestOverTCPDecodingCache();
+        acceptsCache.InitializeNNTPOverTCPDecodingCache(server, ref context);
+        AcceptsCache = acceptsCache;
+
+        NNTPResponseOverTCPDecodingCache issuesCache = new NNTPResponseOverTCPDecodingCache();
+        issuesCache.InitializeNNTPOverTCPDecodingCache(server, ref context);
+        IssuesCache = issuesCache;
+    }
+}
+
+type SessionContext
+{
+    array<string> CachedCommands = [];
+    int arrayIndex = 0;
+    bool IsCommandCountinue = false;
+
+    bool IsCachedCommandsEmpty()
+    {
+        return CachedCommands.Count <= arrayIndex;
+    }
+
+    void AddCommand(string command)
+    {
+        CachedCommands += [command];
+    }
+
+    string GetCurrentCommand()
+    {
+        return CachedCommands[arrayIndex];
+    }
+
+    string ConsumeCurrentCommand()
+    {
+        string command = CachedCommands[arrayIndex];
+
+        arrayIndex++;
+        if (arrayIndex == CachedCommands.Count)
+        {
+            CachedCommands = [];
+            arrayIndex = 0;
+        }
+        return command;
+    }
+
+    void ResetCommands()
+    {
+        CachedCommands = [];
+        arrayIndex = 0;
+    }
+}
+
+const set<string> CommandNameSet = {"ARTICLE", "BODY", "CAPABILITIES", "DATE", "GROUP", "HDR", "HEAD", "HELP", "IHAVE", "LAST", "LIST", "LISTGROUP",
+                                    "MODE", "NEWGROUPS", "NEWNEWS", "NEXT", "OVER", "POST", "QUIT", "STAT", "CHECK", "TAKETHIS", "XREPLIC", "XGTITLE",
+                                    "XHDR", "XINDEX", "XOVER", "XPAT", "XPATH", "XROVER", "XTHREAD", "AUTHINFO"};
+const binary CRLFBinary = $[0D0A];
+const binary CRLFCRLFBinary = $[0D0A2E0D0A]; // CRLF.CRLF
+
+type NNTPRequestOverTCPDecodingCache: TCPTextDecodingCache
+{
+    SessionContext Context;
+
+    void InitializeNNTPOverTCPDecodingCache(TCP.Server server, ref SessionContext context)
+    {
+        Context = context;
+        base.InitializeTextDecodingCache(
+            "NNTP",
+            endpoint NNTP.IntermidiateServer over server,
+            MessageDirection.Accepts,
+            IsNNTPRequest,
+            GetNNTPRequestEndMarkBinary,
+            DecodeNNTPRequest,
+            (binary b) => nothing);
+    }
+
+    bool? IsNNTPRequest(binary buffer)
+    {
+        if (((CommandName(buffer) is str:string) && (str.ToUpper() in CommandNameSet)) || Context.IsCommandCountinue)
+        {
+            return true;
+        }
+        else // missing IHAVE355 or POST340 command, and CommandCountinue frame is coming
+        {
+            return false;
+        }
+    }
+
+    binary GetNNTPRequestEndMarkBinary()
+    {
+        if (Context.IsCommandCountinue)
+        {
+            return CRLFCRLFBinary;
+        }
+        else
+        {
+            return CRLFBinary;
+        }
+    }
+
+    optional any message DecodeNNTPRequest(stream s)
+    {
+        // decode request
+        optional MessageContract.Command command = CommandMessageDecoder(s, Context.IsCommandCountinue);
+        // update context
+        if (command is cmd:MessageContract.Command && cmd.Command.Command is str:string)
+        {
+            Context.AddCommand(str.ToUpper());
+        }
+        else // if CommandCountinue is coming, reset Context.PreviousCommand
+        {
+            Context.ResetCommands();
+        }
+        return command;
+    }
+
+    override void ClearExceptionally()
+    {
+        Context.ResetCommands();
+        Context.IsCommandCountinue = false;
+        base.ClearExceptionally();
+    }
+
+    override void ClearInDestructor()
+    {
+        Context.ResetCommands();
+        Context.IsCommandCountinue = false;
+        base.ClearInDestructor();
+    }
+}
+
+type NNTPResponseOverTCPDecodingCache: TCPTextDecodingCache
+{
+    SessionContext Context;
+    optional string ResponseCode;
+
+    void InitializeNNTPOverTCPDecodingCache(TCP.Server server, ref SessionContext context)
+    {
+        Context = context;
+        base.InitializeTextDecodingCache(
+            "NNTP",
+            endpoint NNTP.IntermidiateServer over server,
+            MessageDirection.Issues,
+            IsNNTPReponse,
+            GetNNTPReponseEndMarkBinary,
+            DecodeNNTPResponse,
+            (binary b) => nothing);
+    }
+
+    bool? IsNNTPReponse(binary buffer)
+    {
+        this.ResponseCode = ResponseCode(buffer);
+        return this.ResponseCode != nothing;
+    }
+
+    binary GetNNTPReponseEndMarkBinary()
+    {
+        if (Context.IsCachedCommandsEmpty())
+        {
+            return CRLFBinary;
+        }
+        else
+        {
+            string command = Context.GetCurrentCommand();
+            // response contains Multi-line Data Blocks
+            if ((command == "IHAVE" && this.ResponseCode == "335") ||
+                (command == "POST" && this.ResponseCode == "340") ||
+                (command == "CAPABILITIES" && this.ResponseCode == "101") ||
+                (command == "LISTGROUP" && this.ResponseCode == "211") ||
+                (command == "ARTICLE" && this.ResponseCode == "220") ||
+                (command == "HEAD" && this.ResponseCode == "221") ||
+                (command == "BODY" && this.ResponseCode == "222") ||
+                (command == "HELP" && this.ResponseCode == "100") ||
+                (command == "NEWGROUPS" && this.ResponseCode == "231") ||
+                (command == "NEWNEWS" && this.ResponseCode == "230") ||
+                (command == "LIST" && this.ResponseCode == "215") ||
+                (command == "OVER" && this.ResponseCode == "224") ||
+                (command == "HDR" && this.ResponseCode == "225"))
+            {
+                // should end with CRLF.CRLF
+                return CRLFCRLFBinary;
+            }
+            else
+            {
+                // should end with CRLF
+                return CRLFBinary;
+            }
+        }
+    }
+
+    optional any message DecodeNNTPResponse(stream s)
+    {
+        optional MessageContract.Response response;
+        // decode response
+        if (Context.IsCachedCommandsEmpty()) // Context.CachedCommands is empty
+        {
+            response = ResponseMessageDecoder(s, false);
+        }
+        else
+        {
+            string command = Context.ConsumeCurrentCommand();
+            response = ResponseMessageDecoder(s, (command == "AUTHINFO GENERIC"));
+            // update context
+            if ((command == "IHAVE" && this.ResponseCode == "335") || 
+                (command == "POST" && this.ResponseCode == "340"))
+            {
+                Context.IsCommandCountinue = true;
+            }
+            else
+            {
+                Context.IsCommandCountinue = false;
+            }
+        }
+        return response;
+    }
+
+    override void ClearExceptionally()
+    {
+        Context.ResetCommands();
+        Context.IsCommandCountinue = false;
+        ResponseCode = nothing;
+        base.ClearExceptionally();
+    }
+
+    override void ClearInDestructor()
+    {
+        Context.ResetCommands();
+        Context.IsCommandCountinue = false;
+        ResponseCode = nothing;
+        base.ClearInDestructor();
+    }
+}
+
+// Decode the data as the Command message
+optional MessageContract.Command CommandMessageDecoder(stream s, bool isCommandCountinue)
+{
+    MessageContract.Command msg = new MessageContract.Command{};
+    msg.Command = new CommandStruct{};
+    msg.Command.CommandDatastream = nothing;
+    if (!isCommandCountinue)
+    {
+        msg.Command.CommandCountinue = nothing;
+        if (CommandLine(s) is commandType:CommandType)
+        {
+            msg.Command.Command = commandType.Command as string;
+            if (commandType.Parameter != nothing)
+            {
+                msg.Command.Parameter = commandType.Parameter;
+            }
+            else
+            {
+                msg.Command.Parameter = nothing;
+            }
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+    else
+    {
+        msg.Command.Command = nothing;
+        msg.Command.Parameter = nothing;
+        msg.Command.CommandCountinue = CommandContinuation(s);
+        if (msg.Command.CommandCountinue == nothing)
+        {
+            return nothing;
+        }
+    }
+    return msg;
+}
+
+const set<string> AuthinfoGenericCommandResponseCode = {"281", "480", "500", "501", "502", "503"};
+// Decode the data as the Response message
+optional MessageContract.Response ResponseMessageDecoder(stream s, bool isAuthSpecific)
+{
+    string responseCode = ResponseCode(s) as string;
+    MessageContract.Response msg = new MessageContract.Response{};
+    msg.Response = new ResponseStruct{};
+    msg.Response.ResponseCode = responseCode;
+    //281 Authentication succeeded
+    //480 Authentication required
+    //500 Command not understood
+    //501 Command not supported
+    //502 No permission
+    //503 Program error, function not performed
+    //nnn  authenticator-specific protocol
+    if (isAuthSpecific && !(responseCode in AuthinfoGenericCommandResponseCode))
+    {
+        msg.Response.ResponseBody = s.PeekBytes(s.BitPosition, s.ByteLength - s.BytePosition);
+        // consume all remaining bytes now
+        BinaryDecoder<Blob[(s.ByteLength - s.BytePosition) as uint]>(s);
+    }
+    else
+    {
+        optional array<string> responseBody = ResponseBody(s);
+        if (responseBody != nothing)
+        {
+            msg.Response.ResponseBody = responseBody;
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+    return msg;
+}
+
+//-------------------------------------------
+// Operation and Messages
+operation CommandAndResponseOperation
+{
+    in CommandStruct Command;
+    out ResponseStruct Response;
+    
+    override string ToString()
+    {
+        return "Operation, Command: " + (Command.Command as string) + ", Response Code: " + ResponseCodeTable(Response.ResponseCode);
+    }
+}
+  
+contract MessageContract
+{
+    message Command
+    {
+        CommandStruct Command;
+        
+        override string ToString()
+        {
+            return "Command: " + (Command.Command as string);
+        }
+    }
+    
+    message Response
+    {
+        ResponseStruct Response;
+        
+        override string ToString()
+        {
+            return "Response Code: " + ResponseCodeTable(Response.ResponseCode);
+        }
+    }
+}
+
+string ResponseCodeTable(string ResponseCode)
+{
+    switch (ResponseCode)
+    {
+        case "100" => return ResponseCode + " - Help text";
+        case "190" => return ResponseCode + " - Debug output";
+        case "199" => return ResponseCode + " - Debug output";
+        case "200" => return ResponseCode + " - Server ready (posting allowed)";
+        case "201" => return ResponseCode + " - Server ready (no posting allowed)";
+        case "202" => return ResponseCode + " - Slave status noted";
+        case "203" => return ResponseCode + " - Streaming is OK";
+        case "205" => return ResponseCode + " - Closing connection (goodbye)";
+        case "211" => return ResponseCode + " - Group selected";
+        case "215" => return ResponseCode + " - List of newsgroups follows";
+        case "220" => return ResponseCode + " - Article retrieved (head and body follow)";
+        case "221" => return ResponseCode + " - Article retrieved (head follows)";
+        case "222" => return ResponseCode + " - Article retrieved (body follows)";
+        case "223" => return ResponseCode + " - Article retrieved (request text separately)";
+        case "224" => return ResponseCode + " - Data follows";
+        case "230" => return ResponseCode + " - List of new articles by message-id follows";
+        case "231" => return ResponseCode + " - List of new newsgroups follows";
+        case "235" => return ResponseCode + " - Article transferred ok";
+        case "238" => return ResponseCode + " - No such article found, please send it to me";
+        case "239" => return ResponseCode + " - Article transferred ok";
+        case "240" => return ResponseCode + " - Article posted ok";
+        case "281" => return ResponseCode + " - Ok";
+        case "288" => return ResponseCode + " - Binary data to follow";
+        case "282" => return ResponseCode + " - List of groups and descriptions follows";
+        case "335" => return ResponseCode + " - Send article to be transferred";
+        case "340" => return ResponseCode + " - Send article to be posted";
+        case "381" => return ResponseCode + " - Password Required";
+        case "400" => return ResponseCode + " - Service discontinued";
+        case "411" => return ResponseCode + " - No such news group";
+        case "412" => return ResponseCode + " - No newsgroup has been selected";
+        case "420" => return ResponseCode + " - No current article has been selected";
+        case "421" => return ResponseCode + " - No next article in this group";
+        case "422" => return ResponseCode + " - No previous article in this group";
+        case "423" => return ResponseCode + " - No such article number in this group";
+        case "430" => return ResponseCode + " - No such article found";
+        case "431" => return ResponseCode + " - Try sending it again later";
+        case "435" => return ResponseCode + " - Article not wanted (do not send it)";
+        case "436" => return ResponseCode + " - Transfer failed (try again later)";
+        case "437" => return ResponseCode + " - Article rejected (do not try again)";
+        case "438" => return ResponseCode + " - Already have it, please don't send it to me";
+        case "439" => return ResponseCode + " - Article transfer failed";
+        case "440" => return ResponseCode + " - Posting not allowed";
+        case "441" => return ResponseCode + " - Posting failed";
+        case "480" => return ResponseCode + " - Transfer permission denied";
+        case "481" => return ResponseCode + " - Groups and descriptions unavailable";
+        case "500" => return ResponseCode + " - Command not recognized";
+        case "501" => return ResponseCode + " - Command syntax error";
+        case "502" => return ResponseCode + " - Access restriction or permission denied";
+        case "503" => return ResponseCode + " - Program fault (command not performed)";
+        default    => return ResponseCode + " - Unknown";
+    }
+}
+//-------------------------------------------
+// Data types
+
+// 9.2 Commands
+syntax CommandName = s:regex{[\x41-\x5A\x61-\x7A]+} => s;
+syntax CommandLine = s:Command (EOL)*=> s;
+syntax Command = s:(
+                    ArticleCommand          |
+                    BodyCommand             |
+                    CapabilitiesCommand     |
+                    DateCommand             |
+                    GroupCommand            |
+                    HdrCommand              |
+                    HeadCommand             |
+                    HelpCommand             |
+                    IhaveCommand            |
+                    LastCommand             |
+                    ListCommand             |
+                    ListgroupCommand        |
+                    ModeReaderCommand       |
+                    NewgroupsCommand        |
+                    NewnewsCommand          |
+                    NextCommand             |
+                    OverCommand             |
+                    PostCommand             |
+                    QuitCommand             |
+                    StatCommand             |
+                    CheckCommand            |
+                    ModeStreamCommand       |
+                    TakethisCommand         |
+                    XreplicCommand          |
+                    XgtitleCommand          |
+                    XHdrCommand             |
+                    XIndexCommand           |
+                    XOverCommand            |
+                    XPatCommand             |
+                    XPathCommand            |
+                    XRoverCommand           |
+                    XThreadCommand          |
+                    AuthinfoSASLCommand     |
+                    AuthinfoUserCommand     |
+                    AuthinfoPassCommand     |
+                    AuthinfoSimpleCommand   |
+                    AuthinfoGenericCommand  
+                    ) => s;
+
+syntax ArticleCommand = c:regex {(?i)ARTICLE} s:(WS ArticleRef)? 
+                        => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax BodyCommand = c:regex {(?i)BODY} s:(WS ArticleRef)? 
+                     => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax CapabilitiesCommand = c:regex {(?i)CAPABILITIES} s:(WS Keyword)? 
+                             => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax DateCommand = c:regex {(?i)DATE} => new CommandType{Command = c, Parameter = nothing};
+
+syntax GroupCommand = c:regex {(?i)GROUP} s:(WS a:NewsgroupName => a)? 
+                      => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax HdrCommand = c:regex {(?i)HDR} WS a:HeaderMetaName s:(WS b:RangeRef => b)? 
+                    => new CommandType{Command = c, Parameter = a + (s.Count == 0 ? "" : " " + s[0])};
+
+syntax HeadCommand = c:regex {(?i)HEAD} s:(WS a:ArticleRef => a)? 
+                     => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax HelpCommand = c:regex {(?i)HELP} => new CommandType{Command = c, Parameter = nothing};
+
+syntax IhaveCommand = c:regex {(?i)IHAVE} WS s:MessageId 
+                      => new CommandType{Command = c, Parameter = s};
+
+syntax LastCommand = c:regex {(?i)LAST} => new CommandType{Command = c, Parameter = nothing};
+
+syntax ListCommand = c:regex {(?i)LIST} s:(WS ListArguments)? 
+                     => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax ListgroupCommand = c:regex {(?i)LISTGROUP} s:(WS a:NewsgroupName b:(WS Range)? => (a + (b.Count == 0 ? "" : b[0])))? 
+                          =>  new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax ModeReaderCommand = c:regex {(?i)MODE} WS s:regex {(?i)READER}=> new CommandType{Command = c + " " + s, Parameter = nothing};
+
+syntax NewgroupsCommand = c:regex {(?i)NEWGROUPS} WS s:DateTime 
+                          => new CommandType{Command = c, Parameter = s};
+
+syntax NewnewsCommand = c:regex {(?i)NEWNEWS} WS s1:Wildmat WS s2:DateTime => new CommandType{Command = c, Parameter = s1 + " " + s2};
+
+syntax NextCommand = c:regex {(?i)NEXT} => new CommandType{Command = c, Parameter = nothing};
+
+syntax OverCommand = c:regex {(?i)OVER} s:(WS RangeRef)? => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax PostCommand = c:regex {(?i)POST} => new CommandType{Command = c, Parameter = nothing};
+
+syntax QuitCommand = c:regex {(?i)QUIT} => new CommandType{Command = c, Parameter = nothing};
+
+syntax StatCommand = c:regex {(?i)STAT} s:(WS ArticleRef)? => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax CheckCommand = c:regex {(?i)CHECK} s:MessageId => new CommandType{Command = c, Parameter = s};
+
+syntax ModeStreamCommand = c:regex {(?i)MODE STREAM} => new CommandType{Command = c, Parameter = nothing};
+
+syntax TakethisCommand = c:regex {(?i)TAKETHIS} s:MessageId => new CommandType{Command = c, Parameter = s};
+
+syntax XreplicCommand = c:regex {(?i)XREPLIC} 
+                        s:(a:NewsgroupName ":" b:DIGIT3 d:("," e:NewsgroupName ":" f:DIGIT3 =>("," + e + ":" + f))*
+                        => (a + ":" + b + ConvertStringArrayToString(d)))
+                        => new CommandType{Command = c, Parameter = s};
+
+syntax XgtitleCommand = c:regex {(?i)XGTITLE} s:(Wildmat)? => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax XHdrCommand = c:regex {(?i)XHDR} s1:Header s2:(Range | MessageId)? => new CommandType{Command = c, Parameter = s1 + (s2.Count == 0 ? "" : s2[0])};
+
+syntax XIndexCommand = c:regex {(?i)XINDEX} s:NewsgroupName  => new CommandType{Command = c, Parameter = s};
+
+syntax XOverCommand = c:regex {(?i)XOVER} s:Range => new CommandType{Command = c, Parameter = s};
+
+syntax XPatCommand = c:regex {(?i)XPAT} s1:Header s2:(Range | MessageId)? => new CommandType{Command = c, Parameter = s1 + (s2.Count == 0 ? "" : s2[0])};
+
+syntax XPathCommand = c:regex {(?i)XPATH} s:MessageId => new CommandType{Command = c, Parameter = s};
+
+syntax XRoverCommand = c:regex {(?i)XROVER} s:(Range)? => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax XThreadCommand = c:(a:regex {(?i)XTHREAD} b:(regex {(?i)DBINIT} | regex {(?i)THREAD})? => (a + (b.Count == 0 ? "" : b[0]))) 
+                        => new CommandType{Command = c, Parameter = nothing};
+
+syntax AuthinfoSASLCommand = c:(regex {(?i)AUTHINFO SASL}) WS s1:Mechanism s2:(WS InitialResponse)?
+                            => new CommandType{Command = c, Parameter = s1 + (s2.Count == 0 ? "": (" " + s2[0]))};
+                            
+syntax AuthinfoUserCommand = c:(regex {(?i)AUTHINFO USER}) WS s:UserName 
+                            => new CommandType{Command = c, Parameter = s};
+
+syntax AuthinfoPassCommand = c:(regex {(?i)AUTHINFO PASS}) WS s:Password 
+                            => new CommandType{Command = c, Parameter = s};
+
+syntax AuthinfoSimpleCommand = c:regex {(?i)AUTHINFO SIMPLE} WS s1:UserName WS s2:Password 
+                                => new CommandType{Command = c, Parameter = s1 + s2};
+
+syntax AuthinfoGenericCommand = c:regex {(?i)AUTHINFO GENERIC} (WS)* s:(regex{[^\n\r]+})?
+                                => new CommandType{Command = c, Parameter = (s.Count == 0 ? nothing : s[0])};
+
+syntax Mechanism = s:(regex {[A-Z0-9\x2D\x5F]{1,20}}) => s;
+
+// Future Reference: update when base64 is supported.
+syntax InitialResponse = s:String => s;
+
+syntax UserName = s:BCHAR+ => ConvertStringArrayToString(s);
+syntax Password = s:BCHAR+ => ConvertStringArrayToString(s);
+syntax ArticleRef = s:(ArticleNumber | MessageId) => s;
+syntax Date = s:(Date4y | Date2y) => s;
+syntax Date4y = regex {[0-9]{8}};
+syntax Date2y = regex {[0-9]{6}};
+syntax DateTime = a:Date WS b:Time c:(WS "GMT")? => (a + " " + b + (c.Count == 0 ? "" : " " + c[0]));
+syntax HeaderMetaName = s:(HeaderName | MetadataName) => s;
+syntax MetadataName = a:":" b:(ANOTCOLON)* => ConvertStringArrayToString([a] + b);
+syntax Range = s:(a:ArticleNumber d:("-" c:(ArticleNumber)? => ("-" + (c.Count == 0 ? "" : c[0])))? => (a + (d.Count == 0 ? "" : d[0]))) => s;
+syntax RangeRef = s:(Range | MessageId) => s;
+syntax Time = s:regex {[0-9]{6}} => s;
+
+syntax ListArguments =  (a1:regex {(?i)ACTIVE} b1:(WS Wildmat)? => (a1 + (b1.Count == 0 ? "" : " " + b1[0])))                                          |
+                        (a2:regex {(?i)ACTIVE.TIMES} b2:(WS Wildmat)? => (a2 + (b2.Count == 0 ? "" : " " + b2[0])))                                    |
+                        (a3:regex {(?i)DISTRIB.PATS} => a3)                                                                                         |
+                        (a4:regex {(?i)HEADERS} b4:(WS c4:("MSGID"|"RANGE"|"msgid"|"range") => (" " + c4))? => (a4 + (b4.Count == 0 ? "" : b4[0])))    |
+                        (a5:regex {(?i)NEWSGROUPS} b5:(WS Wildmat)? => (a5 + (b5.Count == 0 ? "" : " " + b5[0])))                                      |
+                        (a6:regex {(?i)OVERVIEW.FMT} => a6)                                                                                         |
+                        (a7:regex {(?i)DISTRIBUTIONS} => a7)                                                                                        |
+                        (a8:regex {(?i)SUBSCRIPTIONS} => a8);
+
+// 9.3 Command Continuation
+syntax CommandContinuation = s:(Ihave335Continuation |Post340Continuation) => s;
+syntax Ihave335Continuation = s:EncodedArticle => s;
+syntax Post340Continuation = s:EncodedArticle => s;
+syntax EncodedArticle = s:MultiLineDataBlock => s;
+
+// 9.4 Response
+//syntax Response = a:InitialResponseLine b:(MultiLineDataBlock)? 
+                    //=> new ResponseType{ResponseCode = a.ResponseCode, ResponseBody = (b == nothing? a.ResponseBody: a.ResponseBody + b)};
+//syntax InitialResponseLine = a:DIGIT3 b:(c:SP d:ResponseArgument => (c + d))* e:(f:SP g:TrailingComment => (f + g))* h:CRLF 
+                             //=> new ResponseType{ResponseCode = a, ResponseBody = [ConvertStringArrayToString(b + e + [h])]};
+syntax ResponseCode = s:DIGIT3 => s;
+syntax ResponseBody = a:(b:(c:SP d:ResponseArgument => (c + d))* 
+                         e:(f:SP g:TrailingComment => (f + g))* 
+                         CRLF 
+                            => [ConvertStringArrayToString(b + e)]
+                        ) 
+                      i:(MultiLineDataBlock)? 
+                        => (i.Count == 0 ? a : (a + i[0]));
+                        
+syntax ResponseArgument = s:(ACHAR)+ => ConvertStringArrayToString(s);
+syntax TrailingComment = s:(UCHAR)* => ConvertStringArrayToString(s);
+
+syntax Header = a:HeaderName b:":" (CRLF)? SP c:HeaderContent CRLF => (a + b + c);
+syntax HeaderContent = s:(SCHAR | (CRLF)? WS)* => ConvertStringArrayToString(s);
+
+// Future Reference: update when syntax is supported
+//syntax InitialResponseContent = Response-111-content  |
+                                //Response-211-content  |
+                                //Response-220-content  |
+                                //Response-221-content  |
+                                //Response-222-content  |
+                                //Response-223-content  |
+                                //Response-401-content;
+//
+//syntax Response-111-content = "111" SP Date4y Time;
+//syntax Response-211-content = "211" (SP Article-Number){3} SP newsgroup-name;
+//syntax Response-220-content = "220" SP Article-Number SP Message-Id;
+//syntax Response-221-content = "221" SP Article-Number SP Message-Id;
+//syntax Response-222-content = "222" SP Article-Number SP Message-Id;
+//syntax Response-223-content = "223" SP Article-Number SP Message-Id;
+//syntax Response-401-content = "401" SP Capability-Label;
+//
+//syntax MultiLineResponse-content = Article-220-ml-content       |
+                                    //Body-222-ml-content         |
+                                    //Capabilities-101-ml-content |
+                                    //Hdr-225-ml-content          |
+                                    //Head-221-ml-content         |
+                                    //Help-100-ml-content         |
+                                    //List-215-ml-content         |
+                                    //Listgroup-211-ml-content    |
+                                    //Newgroups-231-ml-content    |
+                                    //Newnews-230-ml-content      |
+                                    //Over-224-ml-content;
+//
+//syntax Article-220-ml-content = Article;
+//syntax Body-222-ml-content = Body;
+//syntax Capabilities-101-ml-content = Version-Line CRLF *(Capability-Line CRLF);
+//syntax Hdr-225-ml-content = *(Article-Number SP Hdr-Content CRLF);
+//syntax Head-221-ml-content = (Header)+;
+//syntax Help-100-ml-content = ((U-CHAR)* CRLF)*;
+//syntax List-215-ml-content = List-Content;
+//syntax Listgroup-211-ml-content = (Article-Number CRLF)*;
+//syntax Newgroups-231-ml-content = Active-Groups-List;
+//syntax Newnews-230-ml-content = (Message-Id CRLF)*;
+//syntax Over-224-ml-content = (Article-Number Over-Content CRLF)*;
+//
+//syntax Active-Groups-List = (Newsgroup-Name SPA Article-Number SPA Article-Number SPA Newsgroup-Status CRLF)*;
+//syntax hdr-content = (S-NONTAB)*;
+//syntax hdr-n-content = [((Header-Name ":") | Metadata-Name) SP Hdr-Content];
+//syntax List-Content = Body;
+//syntax Newsgroup-Status = %x79 | %x6E | %x6D | Private-Status;
+//syntax Over-Content = 1*6(TAB hdr-content) | 7(TAB hdr-content) *(TAB hdr-n-content);
+//syntax private-status = token; // except the values in newsgroup-status
+//
+//syntax Capability-Line = Capability-Entry;
+//syntax Capability-Entry = X-Capability-Entry;
+//syntax X-Capability-Entry = Capability-Label (WS capability-argument)*;
+//syntax Capability-Label = Keyword;
+//syntax Capability-Argument = token;
+
+// 9.8 General Non-terminals
+syntax MultiLineDataBlock = a:ContentLines b:Termination => (a + [b]);
+syntax ContentLines = s:((a:CRLF => a) | (b:ContentText c:CRLF => (b + c)))* => s;
+syntax ContentText = a:(".." | BNONDOT) b:(BCHAR)* => (a + ConvertStringArrayToString(b));
+syntax Termination = s:"." CRLF => s;
+
+syntax ArticleNumber = s:regex {[0-9]{1,16}} => s;
+syntax HeaderName = s:regex {[\x21-\x39\x3B-\x7E]+} => s;
+syntax Keyword = s:(a:ALPHA b:regex {[A-Za-z0-9\x2D\x2E]{2,}} => (a + b)) => s;
+syntax MessageId = a:"<" s:ANOTGT248 b:">" => (a + s + b);
+syntax NewsgroupName = s:(WildmatExact)+ => ConvertStringArrayToString(s);
+syntax Token = s:(PCHAR)+ => ConvertStringArrayToString(s);
+
+syntax Wildmat = a:WildmatPattern s:(b:"," c:("!")? d:WildmatPattern => (b + (c == nothing ? "" : "!") + d))* 
+                    => (a + ConvertStringArrayToString(s));
+syntax WildmatPattern = s:(WildmatItem)* => ConvertStringArrayToString(s);
+syntax WildmatItem = s:(WildmatExact | WildmatWild) => s;
+syntax WildmatExact = s:(regex {[\x22-\x29]}   |
+                         regex {[\x2B]}        |
+                         regex {[\x2D-\x3E]}   |
+                         regex {[\x40-\x5A]}   |
+                         regex {[\x5E-\x7E]}   |
+                         UTF8nonascii) => s;
+syntax WildmatWild = s:("*" | "?") => s;
+
+syntax ACHAR = s:regex {[\x21-\x7E]} => s;
+syntax ANOTCOLON = s:regex {[\x21-\x39\x3B-\x7E]} => s;
+syntax ANOTGT = s:regex {[\x21-\x3D\x3F-\x7E]} => s;
+syntax PCHAR = s:(ACHAR | UTF8nonascii)=>s;
+syntax UCHAR = s:(CTRL | TAB | SP | ACHAR | UTF8nonascii) => s;
+syntax ANOTGT248 =s:regex {[\x21-\x3D\x3F-\x7E]{1,248}} => s;
+syntax BCHAR = s:(CTRL | TAB | SP | regex {[\x21-\xFF]}) => s;
+syntax BNONDOT = s:(CTRL | TAB | SP | regex {[\x21-\x2D]} | regex {[\x2F-\xFF]}) => s;
+
+syntax ALPHA = s:regex {[A-Za-z]} => s;
+syntax CR = s:"\r" => s;
+syntax CRLF = s:"\r\n" => s;
+syntax CTRL = s:(regex {[\x01-\x08]} | regex {[\x0B-\x0C]} | regex {[\x0E-\x1F]}) => s;
+syntax DIGIT = s:regex {[\x30-\x39]} => s;
+syntax EOL = (SP | TAB)* CRLF;
+syntax LF = s:"\n" => s;
+syntax WS = s:(a:(SP | TAB) => a)+ => ConvertStringArrayToString(s);
+syntax SP = s:regex {[\x20]} => s;
+syntax TAB = s:regex {[\x09]} => s;
+syntax UTF8nonascii = s:(UTF82 | UTF83 | UTF84) => s;
+syntax UTF82 = a:(regex {[\xC2-\xDF]}) b:UTF8tail => (a + b);
+syntax UTF83 =(a1:regex {[\xE0]} b1:regex {[\xA0-\xBF]} c1:UTF8tail => (a1 + b1 + c1))  |
+              (a2:regex {[\xE1-\xEC]} b2:UTF8tail2 => (a2 + b2))                      |
+              (a3:regex {[\xED]} b3:regex {[\x80-\x9F]} c3:UTF8tail=> (a3 + b3 + c3))   |
+              (a4:regex {[\xEE-\xEF]} b4:UTF8tail2=> (a4 + b4));
+syntax UTF84 =(a1:regex {[\xF0]} b1:regex {[\x90-\xBF]} c1:UTF8tail2 => (a1 + b1 + c1)) |
+              (a2:regex {[\xF1-\xF3]} b2:UTF8tail3 => (a2 + b2))                      |
+              (a3:regex {[\xF4]} b3:regex {[\x80-\x8F]} c3:UTF8tail2 => (a3 + b3 + c3));
+syntax UTF8tail = s:regex {[\x80-\xBF]} => s;
+syntax UTF8tail2 = s:(a:UTF8tail b:UTF8tail => (a + b))=> s;
+syntax UTF8tail3 = s:(a:UTF8tail b:UTF8tail c:UTF8tail => (a + b + c)) => s;
+syntax DIGIT3 = s:regex {[0-9]{3}} => s;
+syntax SCHAR = s:regex{[\x21-\xFF]} => s;
+syntax DIGIT3AndWS = s:DIGIT3 WS => s;
+syntax String = s:(regex {[\x00-\xFF]*}) => s;
+
+type CommandStruct
+{
+    optional string Command;
+    optional any CommandCountinue;
+    optional any Parameter;
+    // Future Reference: Implement the CommandDatastream parsing according to RFC 4644
+    optional any CommandDatastream;
+}
+
+type ResponseStruct
+{
+    string ResponseCode;
+    optional any ResponseBody;
+}
+
+type CommandType
+{
+    string Command;
+    optional string Parameter;
+}
+
+type ResponseType
+{
+    string ResponseCode;
+    optional array<string> ResponseBody;
+}

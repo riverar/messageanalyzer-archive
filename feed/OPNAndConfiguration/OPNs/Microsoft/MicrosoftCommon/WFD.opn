@@ -1,0 +1,2574 @@
+protocol WFD with
+BinaryEncodingDefaults{Endian = Endian.Little},
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "WFDTS1.1", Link = "https://www.wi-fi.org/wi-fi-display-technical-specification-v11"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "381817", Date = "09/23/2015"}
+        ]
+};
+
+using WiFi;
+using WiFiDirect;
+using RTSP;
+using HTTP;
+using TCP;
+using Utility;
+using Standard;
+using MicrosoftCommonResources;
+
+endpoint Server
+    over RTSP.Server | over TCP.Server
+    provides mutable RTSPControlMessage
+    provides RemoteI2C;
+
+// Dummy endpoint contains global variable to avoid cross capture impact
+endpoint WfdDummyEndpoint accepts any message issues any message
+{
+    set<ushort> RemoteI2CPorts = {};
+    set<ushort> UIBCPorts = {};
+};
+
+const ushort WFDPort = 7236;
+const string WfdAudioCodecsConstString = "wfd_audio_codecs";
+const string WfdVideoFormatsConstString = "wfd_video_formats";
+const string Wfd3DVideoFormatsConstString = "wfd_3d_video_formats";
+const string WfdContentProtectionConstString = "wfd_content_protection";
+const string WfdDisplayEdidConstString = "wfd_display_edid";
+const string WfdCoupledSinkConstString = "wfd_coupled_sink";
+const string WfdTriggerMethodConstString = "wfd_trigger_method";
+const string WfdPresentationUrlConstString = "wfd_presentation_URL";
+const string WfdClientRtpPortsConstString = "wfd_client_rtp_ports";
+const string WfdRouteConstString = "wfd_route";
+const string WfdI2CConstString = "wfd_I2C";
+const string WfdAVFormatChangeTimingConstString = "wfd_av_format_change_timing";
+const string WfdPreferredDisplayModeConstString = "wfd_preferred_display_mode";
+const string WfdUibcCapabilityConstString = "wfd_uibc_capability";
+const string WfdUibcSettingConstString = "wfd_uibc_setting";
+const string WfdStandbyConstString = "wfd_standby";
+const string WfdConnectorTypeConstString = "wfd_connector_type";
+const string WfdIdrRequestConstString = "wfd_idr_request";
+const string ModuleName = "WFD";
+const binary WfdOUI = $[506f9a];
+
+// --------------------------------------- RTSP Control Messages ---------------------------------
+autostart actor RtspOverTcp(TCP.Server server)
+{
+    RtspOverTCPDecodingHelper decodingHelper = null;
+
+    process server issues seg:TCP.Segment where seg.SourcePort == WFDPort
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server accepts seg:TCP.Segment where seg.DestinationPort == WFDPort
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    process server accepts seg:TCP.Segment where seg.SourcePort == WFDPort
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server issues seg:TCP.Segment where seg.DestinationPort == WFDPort
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new RtspOverTCPDecodingHelper();
+            decodingHelper.InitializeRtspOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+autostart actor WfdOverRtsp(RTSP.Server server)
+{
+    map<uint, string> sourceControlMessageTypeMap = {};
+    map<uint, string> sinkControlMessageTypeMap = {};
+    WFD.Server ept = null;
+
+    WFD.Server GetOrCreateEndpoint()
+    {
+        if (ept == null)
+        {
+            ept = endpoint Server over server;
+        }
+
+        return ept;
+    }
+
+    process server accepts rtspRequest:RTSP.Request where IsWfdControlMessage(rtspRequest)
+    {
+        switch (rtspRequest.RequestLine.Method)
+        {
+            case "OPTIONS" =>
+                string tag = "";
+                if (rtspRequest.Headers.Keys["Require"])
+                {
+                    tag = rtspRequest.Headers["Require"] as string;
+                }
+                dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM1Request{Tag = tag});
+            case "GET_PARAMETER" =>
+                if (rtspRequest.MessageBody is body:binary)
+                {
+                    if (BinaryDecoder<RTSPControlMessage.RtspM3Request>(body) is rtspM3Request:RTSPControlMessage.RtspM3Request)
+                    {
+                        dispatch GetOrCreateEndpoint() accepts rtspM3Request;
+                    }
+                    else
+                    {
+                        ThrowDecodingException("WFD", "RTSP M3 Request");
+                    }
+                }
+                else
+                {
+                    dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM16Request());
+                }
+            case "SET_PARAMETER" =>
+                if (rtspRequest.MessageBody is body:binary && ParameterValues(body) is parameterValues:map<string, any>)
+                {
+                    any message requestMessage = null;
+                    if (parameterValues.Keys[WfdTriggerMethodConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sourceControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdTriggerMethodConstString};
+                        }
+                        
+                        requestMessage = new RTSPControlMessage.RtspM5Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdStandbyConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sourceControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdStandbyConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM12Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdUibcCapabilityConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sourceControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcCapabilityConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM14Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                        RetrieveUIBCInfo(requestMessage);
+                    }
+                    else if (parameterValues.Keys[WfdUibcSettingConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sourceControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcSettingConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM15Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdUibcCapabilityConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sourceControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcCapabilityConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM15Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else
+                    {
+                        requestMessage = new RTSPControlMessage.RtspM4Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+
+                        // Retrieve UIBC information from M4 Request
+                        RetrieveUIBCInfo(requestMessage);
+                    }
+
+                    requestMessage.SourceData = body;
+                    requestMessage.AssignFieldEncodingInfo("ParameterValues", 0, body.Count * 8);
+                    dispatch GetOrCreateEndpoint() accepts requestMessage;
+                }
+                else
+                {
+                    ThrowDecodingException("WFD");
+                }
+            
+            default =>
+                ThrowDecodingException("WFD", WFDNotSupportedMethod, []);
+        }
+    }
+
+    process server issues rtspResponse:RTSP.Response where IsWfdControlMessage(rtspResponse)
+    {
+        string rtspMethod = "";
+        if (rtspResponse#RTSPMethod is str:string)
+        {
+            rtspMethod = str;
+        }
+        else
+        {
+            ThrowDecodingException("WFD", WFDMissRTSPRequest, []);
+        }
+
+        switch (rtspMethod)
+        {
+            case "OPTIONS" =>
+                array<string> supportedMethods = [];
+                if (rtspResponse.Headers.Keys["Public"])
+                {
+                    supportedMethods = rtspResponse.Headers["Public"] as array<string>;
+                }
+                dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM1Response{SupportedMethods = supportedMethods});
+            case "GET_PARAMETER" =>
+                if (rtspResponse.MessageBody is body:binary)
+                {
+                    if (BinaryDecoder<RTSPControlMessage.RtspM3Response>(body) is rtspM3Response:RTSPControlMessage.RtspM3Response)
+                    {
+                        RetrieveRemoteI2CInfo(rtspM3Response);
+                        dispatch GetOrCreateEndpoint() issues rtspM3Response;
+                    }
+                    else
+                    {
+                        ThrowDecodingException("WFD", "RTSP M3 Response");
+                    }
+                }
+                else
+                {
+                    dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM16Response());
+                }
+            case "SET_PARAMETER" =>
+                if (rtspResponse.Headers.Keys["CSeq"] && sourceControlMessageTypeMap.Keys[rtspResponse.Headers["CSeq"] as uint])
+                {
+                    switch (sourceControlMessageTypeMap[rtspResponse.Headers["CSeq"] as uint])
+                    {
+                        case WfdTriggerMethodConstString =>
+                            dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM5Response());
+                        case WfdStandbyConstString =>
+                            dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM12Response());
+                        case WfdUibcCapabilityConstString =>
+                            dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM14Response());
+                        case WfdUibcSettingConstString =>
+                            dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM15Response());
+                        default =>
+                            ThrowDecodingException("WFD"); // this code should not be reached
+                    }
+
+                    sourceControlMessageTypeMap = sourceControlMessageTypeMap.Remove(rtspResponse.Headers["CSeq"] as uint);
+                }
+                else
+                {
+                    dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM4Response());
+                }
+            default =>
+                ThrowDecodingException("WFD", WFDNotSupportedMethod, []);
+        }
+    }
+
+    process server issues rtspRequest:RTSP.Request where IsWfdControlMessage(rtspRequest)
+    {
+        switch (rtspRequest.RequestLine.Method)
+        {
+            case "OPTIONS" =>
+                string tag = "";
+                if (rtspRequest.Headers.Keys["Require"])
+                {
+                    tag = rtspRequest.Headers["Require"] as string;
+                }
+                dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM2Request{Tag = tag});
+            case "SETUP" =>
+                RTSPControlMessage.RtspM6Request rtspM6Request = new RTSPControlMessage.RtspM6Request();
+                if (rtspRequest.Headers.Keys["Transport"])
+                {
+                    string transportString = rtspRequest.Headers["Transport"] as string;
+                    rtspM6Request.Transport = Transport(transportString);
+                    if (rtspM6Request.Transport == nothing)
+                    {
+                        rtspM6Request.Transport = transportString;
+                    }
+                }
+                dispatch GetOrCreateEndpoint() issues rtspM6Request;
+            case "PLAY" =>
+                dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM7Request());
+            case "TEARDOWN" =>
+                if (rtspRequest.MessageBody is body:binary)
+                {
+                    if (BinaryDecoder<RTSPControlMessage.RtspM8Request>(body) is rtspM8Request:RTSPControlMessage.RtspM8Request)
+                    {
+                        dispatch GetOrCreateEndpoint() issues rtspM8Request;
+                    }
+                    else
+                    {
+                        ThrowDecodingException("WFD", "RTSP M8 Request");
+                    }
+                }
+                else
+                {
+                    dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM8Request{ParameterValues = {}});
+                }
+            case "PAUSE" =>
+                dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM9Request());
+            case "SET_PARAMETER" =>
+                if (rtspRequest.MessageBody is body:binary && ParameterValues(body) is parameterValues:map<string, any>)
+                {
+                    any message requestMessage = null;
+                    if (parameterValues.Keys[WfdRouteConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdRouteConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM10Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdConnectorTypeConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdConnectorTypeConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM11Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdStandbyConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdStandbyConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM12Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdIdrRequestConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdIdrRequestConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM13Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdUibcCapabilityConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcCapabilityConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM14Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                        RetrieveUIBCInfo(requestMessage);
+                    }
+                    else if (parameterValues.Keys[WfdUibcSettingConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcSettingConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM15Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else if (parameterValues.Keys[WfdUibcCapabilityConstString])
+                    {
+                        if (rtspRequest.Headers.Keys["CSeq"])
+                        {
+                            sinkControlMessageTypeMap += {rtspRequest.Headers["CSeq"] as uint -> WfdUibcCapabilityConstString};
+                        }
+
+                        requestMessage = new RTSPControlMessage.RtspM15Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+                    else
+                    {
+                        requestMessage = new RTSPControlMessage.RtspM4Request
+                        {
+                            ParameterValues = parameterValues,
+                        };
+                    }
+
+                    requestMessage.SourceData = body;
+                    requestMessage.AssignFieldEncodingInfo("ParameterValues", 0, body.Count * 8);
+                    dispatch GetOrCreateEndpoint() issues requestMessage;
+                }
+                else
+                {
+                    ThrowDecodingException("WFD");
+                }
+            default =>
+                ThrowDecodingException("WFD", WFDNotSupportedMethod, []);
+        }
+    }
+
+    process server accepts rtspResponse:RTSP.Response where IsWfdControlMessage(rtspResponse)
+    {
+        string rtspMethod = "";
+        if (rtspResponse#RTSPMethod is str:string)
+        {
+            rtspMethod = str;
+        }
+
+        switch (rtspMethod)
+        {
+            case "OPTIONS" =>
+                array<string> supportedMethods = [];
+                if (rtspResponse.Headers.Keys["Public"])
+                {
+                    supportedMethods = rtspResponse.Headers["Public"] as array<string>;
+                }
+                dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM2Response{SupportedMethods = supportedMethods});
+            case "SETUP" =>
+                RTSPControlMessage.RtspM6Response rtspM6Response = new RTSPControlMessage.RtspM6Response();
+                if (rtspResponse.Headers.Keys["Transport"])
+                {
+                    string transportString = rtspResponse.Headers["Transport"] as string;
+                    rtspM6Response.Transport = Transport(transportString);
+                    if (rtspM6Response.Transport == nothing)
+                    {
+                        rtspM6Response.Transport = transportString;
+                    }
+                }
+                dispatch GetOrCreateEndpoint() accepts rtspM6Response;
+            case "PLAY" =>
+                dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM7Response());
+            case "TEARDOWN" =>
+                dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM8Response());
+            case "PAUSE" =>
+                dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM9Response());
+                        case "SET_PARAMETER" =>
+                if (rtspResponse.Headers.Keys["CSeq"] && sinkControlMessageTypeMap.Keys[rtspResponse.Headers["CSeq"] as uint])
+                {
+                    switch (sinkControlMessageTypeMap[rtspResponse.Headers["CSeq"] as uint])
+                    {
+                        case WfdRouteConstString =>
+                            dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM10Response());
+                        case WfdConnectorTypeConstString =>
+                            dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM11Response());
+                        case WfdStandbyConstString =>
+                            dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM12Response());
+                        case WfdIdrRequestConstString =>
+                            dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM13Response());
+                        case WfdUibcCapabilityConstString =>
+                            dispatch GetOrCreateEndpoint() issues (new RTSPControlMessage.RtspM14Response());
+                        case WfdUibcSettingConstString =>
+                            dispatch GetOrCreateEndpoint() accepts (new RTSPControlMessage.RtspM15Response());
+                        default =>
+                            ThrowDecodingException("WFD"); // this code should not be reached
+                    }
+
+                    sinkControlMessageTypeMap = sinkControlMessageTypeMap.Remove(rtspResponse.Headers["CSeq"] as uint);
+                }
+                else
+                {
+                    ThrowDecodingException("WFD");
+                }
+            default =>
+                ThrowDecodingException("WFD", WFDNotSupportedMethod, []);
+        }
+    }
+
+    bool IsWfdControlMessage(RTSP.Request request)
+    {
+        var origins = request.Origins;
+        return origins.Count > 0 && origins[0] is seg:TCP.Segment &&
+            (seg.SourcePort == WFDPort || seg.DestinationPort == WFDPort);
+    }
+    
+    bool IsWfdControlMessage(RTSP.Response response)
+    {
+        var origins = response.Origins;
+        return origins.Count > 0 && origins[0] is seg:TCP.Segment &&
+            (seg.SourcePort == WFDPort || seg.DestinationPort == WFDPort) &&
+            response.StatusLine.Status == 200;
+    }
+}
+
+contract RTSPControlMessage
+{
+    accepts RtspM1Request
+    {
+        string Tag;
+
+        override string ToString()
+        {
+            return "RTSP M1 Request, OPTIONS: " + Tag;
+        }
+    }
+    issues RtspM1Response
+    {
+        array<string> SupportedMethods;
+
+        override string ToString()
+        {
+            if (SupportedMethods.Count == 0)
+            {
+                return "RTSP M1 Response, No Supported Methods.";
+            }
+            else
+            {
+                string summaryLine = "RTSP M1 Response, Supported Methods: [" + SupportedMethods[0];
+                for (int i = 1; i < SupportedMethods.Count; i++)
+                {
+                    summaryLine += ", " + SupportedMethods[i];
+                    if (i == 3)
+                    {
+                        // too many items and replace with ...
+                        summaryLine += "...";
+                        break;
+                    }
+                }
+                return summaryLine + "]";
+            }
+        }
+    }
+
+    issues RtspM2Request
+    {
+        string Tag;
+
+        override string ToString()
+        {
+            return "RTSP M2 Request, OPTIONS: " + Tag;
+        }
+    }
+
+    accepts RtspM2Response
+    {
+        array<string> SupportedMethods;
+
+        override string ToString()
+        {
+            if (SupportedMethods.Count == 0)
+            {
+                return "RTSP M2 Response, No Supported Methods.";
+            }
+            else
+            {
+                string summaryLine = "RTSP M2 Response, Supported Methods: " + SupportedMethods[0];
+                for (int i = 1; i < SupportedMethods.Count; i++)
+                {
+                    summaryLine += ", " + SupportedMethods[i];
+                }
+                return summaryLine;
+            }
+        }
+    }
+
+    accepts RtspM3Request
+    {
+        array<string> Parameters with Encoding{Decoder = ParametersDecoder};
+
+        override string ToString()
+        {
+            return "RTSP M3 Request, GET_PARAMETER";
+        }
+    }
+    
+    issues RtspM3Response
+    {
+        map<string, any> ParameterValues with Encoding{Decoder = ParameterValuesDecoder};
+
+        override string ToString()
+        {
+            return "RTSP M3 Response, GET_PARAMETER";
+        }
+    }
+
+    accepts RtspM4Request
+    {
+        map<string, any> ParameterValues with Encoding{Decoder = ParameterValuesDecoder};
+
+        override string ToString()
+        {
+            return "RTSP M4 Request, SET_PARAMETER";
+        }
+    }
+    
+    issues RtspM4Response
+    {
+        override string ToString()
+        {
+            return "RTSP M4 Response, SET_PARAMETER";
+        }
+    }
+
+    accepts RtspM5Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M5 Request, " + WfdTriggerMethodConstString + ": " + ParameterValues[WfdTriggerMethodConstString].ToString();
+        }
+    }
+    
+    issues RtspM5Response
+    {
+        override string ToString()
+        {
+            return "RTSP M5 Response";
+        }
+    }
+
+    issues RtspM6Request
+    {
+        optional (TransportType | string) Transport;
+
+        override string ToString()
+        {
+            return "RTSP M6 Request, SETUP";
+        }
+    }
+
+    accepts RtspM6Response
+    {
+        optional (TransportType | string) Transport;
+
+        override string ToString()
+        {
+            return "RTSP M6 Response, SETUP";
+        }
+    }
+
+    issues RtspM7Request
+    {
+        override string ToString()
+        {
+            return "RTSP M7 Request, PLAY";
+        }
+    }
+
+    accepts RtspM7Response
+    {
+        override string ToString()
+        {
+            return "RTSP M7 Response, PLAY";
+        }
+    }
+
+    issues RtspM8Request
+    {
+        map<string, any> ParameterValues with Encoding{Decoder = ParameterValuesDecoder}; // extended in WFDPE
+
+        override string ToString()
+        {
+            return "RTSP M8 Request, TEARDOWN";
+        }
+    }
+
+    accepts RtspM8Response
+    {
+        override string ToString()
+        {
+            return "RTSP M8 Response, TEARDOWN";
+        }
+    }
+
+    issues RtspM9Request
+    {
+        override string ToString()
+        {
+            return "RTSP M9 Request, PAUSE";
+        }
+    }
+
+    accepts RtspM9Response
+    {
+        override string ToString()
+        {
+            return "RTSP M9 Response, PAUSE";
+        }
+    }
+
+    issues RtspM10Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M10 Request, " + WfdRouteConstString + ": " + ParameterValues[WfdRouteConstString].ToString();
+        }
+    }
+
+    accepts RtspM10Response
+    {
+        override string ToString()
+        {
+            return "RTSP M10 Response";
+        }
+    }
+
+    issues RtspM11Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M11 Request, " + WfdConnectorTypeConstString + ": " + ParameterValues[WfdConnectorTypeConstString].ToString();
+        }
+    }
+
+    accepts RtspM11Response
+    {
+        override string ToString()
+        {
+            return "RTSP M11 Response";
+        }
+    }
+
+    message RtspM12Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M12 Request, " + WfdStandbyConstString;
+        }
+    }
+
+    message RtspM12Response
+    {
+        override string ToString()
+        {
+            return "RTSP M12 Response";
+        }
+    }
+
+    issues RtspM13Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M13 Request, " + WfdIdrRequestConstString;
+        }
+    }
+
+    accepts RtspM13Response
+    {
+        override string ToString()
+        {
+            return "RTSP M13 Response";
+        }
+    }
+
+    message RtspM14Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M14 Request, " + WfdUibcCapabilityConstString + ": " + ParameterValues[WfdUibcCapabilityConstString].ToString();
+        }
+    }
+
+    message RtspM14Response
+    {
+        override string ToString()
+        {
+            return "RTSP M14 Response";
+        }
+    }
+
+    message RtspM15Request
+    {
+        map<string, any> ParameterValues;
+
+        override string ToString()
+        {
+            return "RTSP M15 Request, " + WfdUibcSettingConstString + ": " + ParameterValues[WfdUibcSettingConstString].ToString();
+        }
+    }
+
+    message RtspM15Response
+    {
+        override string ToString()
+        {
+            return "RTSP M15 Response";
+        }
+    }
+
+    accepts RtspM16Request
+    {
+        override string ToString()
+        {
+            return "RTSP M16 Request, Confirm Active RTSP Session";
+        }
+    }
+
+    issues RtspM16Response
+    {
+        override string ToString()
+        {
+            return "RTSP M16 Response, Confirm Active RTSP Session";
+        }
+    }
+};
+
+// section 5.1.4.1 Coupled Sink Status Bitmap
+pattern CoupledSinkStatusEnum = enum byte
+{
+    NotCoupled = 0x00,
+    Coupled = 0x01,
+    TeardownCoupling = 0x02,
+    Reserved = 0x03,
+    ...
+};
+
+// section 5.1.5.1 CEA Resolutions/Refresh Rates Bitmap
+pattern CEABitmapFlag = flags uint
+{
+    $"640x480 p60" = 0x00000001,
+    $"720x480 p60" = 0x00000002,
+    $"720x480 i60" = 0x00000004,
+    $"720x576 p50" = 0x00000008,
+    $"720x576 i50" = 0x00000010,
+    $"1280x720 p30" = 0x00000020,
+    $"1280x720 p60" = 0x00000040,
+    $"1920x1080 p30" = 0x00000080,
+    $"1920x1080 p60" = 0x00000100,
+    $"1920x1080 i60" = 0x00000200,
+    $"1280x720 p25" = 0x00000400,
+    $"1280x720 p50" = 0x00000800,
+    $"1920x1080 p25" = 0x00001000,
+    $"1920x1080 p50" = 0x00002000,
+    $"1920x1080 i50" = 0x00004000,
+    $"1280x720 p24" = 0x00008000,
+    $"1920x1080 p24" = 0x00010000,
+    ...
+};
+
+// 5.1.5.2 VESA Resolutions/Refresh Rates Bitmap
+pattern VESABitmapFlag = flags uint
+{
+    $"800x600 p30" = 0x00000001,
+    $"800x600 p60" = 0x00000002,
+    $"1024x768 p30" = 0x00000004,
+    $"1024x768 p60" = 0x00000008,
+    $"1152x864 p30" = 0x00000010,
+    $"1152x864 p60" = 0x00000020,
+    $"1280x768 p30" = 0x00000040,
+    $"1280x768 p60" = 0x00000080,
+    $"1280x800 p30" = 0x00000100,
+    $"1280x800 p60" = 0x00000200,
+    $"1360x768 p30" = 0x00000400,
+    $"1360x768 p60" = 0x00000800,
+    $"1366x768 p30" = 0x00001000,
+    $"1366x768 p60" = 0x00002000,
+    $"1280x1024 p30" = 0x00004000,
+    $"1280x1024 p60" = 0x00008000,
+    $"1400x1050 p30" = 0x00010000,
+    $"1400x1050 p60" = 0x00020000,
+    $"1440x900 p30" = 0x00040000,
+    $"1440x900 p60" = 0x00080000,
+    $"1600x900 p30" = 0x00100000,
+    $"1600x900 p60" = 0x00200000,
+    $"1600x1200 p30" = 0x00400000,
+    $"1600x1200 p60" = 0x00800000,
+    $"1680x1024 p30" = 0x01000000,
+    $"1680x1024 p60" = 0x02000000,
+    $"1680x1050 p30" = 0x04000000,
+    $"1680x1050 p60" = 0x08000000,
+    $"1920x1200 p30" = 0x10000000,
+    $"1920x1200 p60" = 0x20000000,
+    ...
+};
+
+// section 5.1.5.3 HH Resolutions/Refresh Rates Bitmap
+pattern HHBitmapFlag = flags uint
+{
+    $"800x480 p30" = 0x00000001,
+    $"800x480 p60" = 0x00000002,
+    $"854x480 p30" = 0x00000004,
+    $"854x480 p60" = 0x00000008,
+    $"864x480 p30" = 0x00000010,
+    $"864x480 p60" = 0x00000020,
+    $"640x360 p30" = 0x00000040,
+    $"640x360 p60" = 0x00000080,
+    $"960x540 p30" = 0x00000100,
+    $"960x540 p60" = 0x00000200,
+    $"848x480 p30" = 0x00000400,
+    $"848x480 p36" = 0x00000800,
+    ...
+};
+
+// section 5.1.5.4 Native Resolutions/Refresh Rates Bitmap
+type NativeResolutionsRefreshRatesBitmapType
+{
+    TableSelectionEnum TableSelection with BinaryEncoding{Width = 3};
+    byte Index with BinaryEncoding{Width = 5};
+}
+
+pattern TableSelectionEnum = enum byte
+{
+    IndexToCEAResolutionRefresh = 0x00,
+    IndexToVESAResolutionRefresh = 0x01,
+    IndexToHHResolutionRefresh = 0x03,
+    ...
+};
+
+// section 5.1.5.5 Profiles Bitmap
+pattern ProfileBitmapFlags = flags byte
+{
+    CBP = 0x01,
+    CHP = 0x02,
+    ...
+};
+
+// section 5.1.5.6 Levels Bitmap
+pattern LevelBitmapFlags = flags byte
+{
+    $"H.264 Level 3.1 bit" = 0x01,
+    $"H.264 Level 3.2 bit" = 0x02,
+    $"H.264 Level 4 bit" = 0x04,
+    $"H.264 Level 4.1 bit" = 0x08,
+    $"H.264 Level 4.2 bit" = 0x10,
+    ...
+};
+
+// section 5.1.5.7 Slice Encoding Parameters Bitmap
+type SliceEncodingParametersBitmapType
+{
+    byte Reserved with BinaryEncoding{Width = 3};
+    byte MaxSliceSizeRatio with BinaryEncoding{Width = 3};
+    ushort MaxSliceNum with BinaryEncoding{Width = 10};
+} with BinaryEncodingDefaults{Endian = Endian.Big}, BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+// section 5.1.5.8 Video Frame Rate Control Support Bitmap
+type VideoFrameRateControlSupportBitmapType
+{
+    bool VideoFrameSkippingSupport with BinaryEncoding{Width = 1};
+    byte MaxSkipInterval with DisplayInfo{ToText = MaxSkipIntervalToString}, BinaryEncoding{Width = 3};
+    bool VideoFrameRateChange with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 3};
+
+    string MaxSkipIntervalToString(any input)
+    {
+        if (!VideoFrameSkippingSupport)
+        {
+            return "Reserved";
+        }
+        else
+        {
+            if ((input as byte) == 0)
+            {
+                return "No limitation";
+            }
+            else
+            {
+                return input.ToString();
+            }
+        }
+    }
+};
+
+VideoFrameRateControlSupportBitmapType ParseVideoFrameRateControlSupportBitmapType(byte data)
+{
+    return new VideoFrameRateControlSupportBitmapType
+    {
+        VideoFrameSkippingSupport = (data & 0x01) as bool,
+        MaxSkipInterval = (data & 0x0e) as byte,
+        VideoFrameRateChange = (data & 0x10) as bool,
+        Reserved = (data & 0xe0) as byte,
+    };
+}
+
+// section 5.1.7.1 LPCM Modes Bitmap
+pattern LPCMModesFlags = flags uint
+{
+    $"44.1 kHz, 16 Bits Width, 2 Channels" = 1,
+    $"48 kHz, 16 Bits Width, 2 Channels" = 2,
+    ...
+};
+
+// section 5.1.7.2 AAC Modes Bitmap
+pattern AACModesFlags = flags uint
+{
+    $"48 kHz, 16 Bits Width, 2 Channels, AAC-LC" = 1,
+    $"48 kHz, 16 Bits Width, 4 Channels, AAC-LC" = 2,
+    $"48 kHz, 16 Bits Width, 6 Channels, AAC-LC" = 4,
+    $"48 kHz, 16 Bits Width, 8 Channels, AAC-LC" = 8,
+    ...
+};
+
+// section 5.1.7.3 AC3 Modes Bitmap
+pattern AC3ModesFlags = flags uint
+{
+    $"48 kHz, 16 Bits Width, 2 Channels, AC-3" = 1,
+    $"48 kHz, 16 Bits Width, 4 Channels, AC-3" = 2,
+    $"48 kHz, 16 Bits Width, 6 Channels, AC-3" = 4,
+    ...
+};
+
+// section 5.1.6.1 3D Video Capability Bitmap
+pattern ThreeDVideoCapabilityBitmapFlags = flags ulong
+{
+    $"1920x(540+540) p24, Top & Bottom[Half]" = 0x00000001,
+    $"1280x(360+360) p60, Top & Bottom[Half]" = 0x00000002,
+    $"1280x(360+360) p50, Top & Bottom[Half]" = 0x00000004,
+    $"1920x1080 (p24L+p24R), Frame Sequential" = 0x00000008,
+    $"1280x720 (p60L+p60R), Frame Sequential" = 0x00000010,
+    $"1280x720 (p30L+p30R), Frame Sequential" = 0x00000020,
+    $"1280x720 (p50L+p50R), Frame Sequential" = 0x00000040,
+    $"1280x720 (p25L+p25R), Frame Sequential" = 0x00000080,
+    $"1920x(1080+45+1080) p24, Frame Packing" = 0x00000100,
+    $"1280x(720+30+720) p60, Frame Packing" = 0x00000200,
+    $"1280x(720+30+720) p30, Frame Packing" = 0x00000400,
+    $"1280x(720+30+720) p50, Frame Packing" = 0x00000800,
+    $"1280x(720+30+720) p25, Frame Packing" = 0x00001000,
+    $"(960+960)x1080 i60, Side by Side[Half]" = 0x00002000,
+    $"(960+960)x1080 i50, Side by Side[Half]" = 0x00004000,
+    $"640x(240 + 240) p60, Top & Bottom [Half]" = 0x00008000,
+    $"(320+320)x480 p60, Side by Side [Half]" = 0x00010000,
+    $"720x(240+240) p60, Top & Bottom [Half]" = 0x00020000,
+    $"(360+360)x480 p60, Side by Side [Half]" = 0x00040000,
+    $"720x(288+288) p50, Top & Bottom [Half]" = 0x00080000,
+    $"(360+360)x576 p50, Side by Side [Half]" = 0x00100000,
+    $"1280x(360+360) p24, Top & Bottom [Half]" = 0x00200000,
+    $"(640+640)x720 p24, Side by Side [Half]" = 0x00400000,
+    $"1280x(360+360) p25, Top & Bottom [Half]" = 0x00800000,
+    $"(640+640)x720 p25, Side by Side [Half]" = 0x01000000,
+    $"1280x(360+360) p30, Top & Bottom [Half]" = 0x02000000,
+    $"(640+640)x720 p30, Side by Side [Half]" = 0x04000000,
+    $"1920x(540+540) p30, Top & Bottom [Half]" = 0x08000000,
+    $"1920x(540+540) p50, Top & Bottom [Half]" = 0x10000000,
+    $"1920x(540+540) p60, Top & Bottom [Half]" = 0x20000000,
+    $"(640+640)x720 p50, Side by Side [Half]" = 0x40000000,
+    $"(640+640)x720 p60, Side by Side [Half]" = 0x80000000,
+    $"(960+960)x1080 p24, Side by Side [Half]" = 0x100000000,
+    $"(960+960)x1080 p50, Side by Side [Half]" = 0x200000000,
+    $"(960+960)x1080 p60, Side by Side [Half]" = 0x400000000,
+    $"1920x(1080+45+1080) p30, Frame Packing" = 0x800000000,
+    $"1920x(1080+45+1080) i50, Frame Packing" = 0x1000000000,
+    $"1920x(1080+45+1080) i60, Frame Packing" = 0x2000000000,
+    ...
+};
+
+// section 5.1.8.1 Content Protection Bitmap
+pattern ContentProtectionBitmapFlags = flags byte
+{
+    $"HDCP 2.0 Support" = 0x01,
+    $"HDCP 2.1 Support" = 0x02,
+    ...
+};
+
+// section 5.1.9.1 WFD Extended Capabilities Bitmap
+pattern WfdExtendedCapabilitiesBitmapFlags = flags ushort
+{
+    UIBCSupport = 0x01,
+    I2CReadWriteSupport = 0x02,
+    PreferredDisplayModeSupport = 0x04,
+    StandbyResumeControlSupport = 0x08,
+    TDLSPersistentSupport = 0x10,
+    TDLSPersistentBSSIDSupport = 0x20,
+    ...
+};
+// ----------------------------------------------------- syntax --------------------------------------------
+syntax WSP = regex{\x09|\0x20};
+syntax WSPS = regex{[\x09|\0x20]*};
+syntax Parameter = regex{[\x21-\x39\x3B-\x7E]*};
+syntax ParameterValue = p:Parameter WSPS vn:(": " v:regex{[^\r\n]*} => v)? =>
+    new KeyValuePair
+    {
+        Key = p,
+        Value = vn.Count > 0 ? vn[0] : ""
+    };
+syntax ParameterValues = sn:(s:ParameterValue CRLF => s)* => ParseRtspParameterValues(sn);
+syntax Parameters = sn:(s:Parameter CRLF => s)* => sn;
+
+syntax HexDig2 = s:regex{[0-9A-Fa-f]{2}} => s.ToByte(true);
+syntax HexDig4 = s:regex{[0-9A-Fa-f]{4}} => s.ToUShort(true);
+syntax HexDig8 = s:regex{[0-9A-Fa-f]{8}} => s.ToUInt(true);
+
+// WFD section 6.2.4
+syntax Transport = Profile clientPort:ClientPort serverPort:(";" p:ServerPort => p)? =>
+    new TransportType
+    {
+        ClientPort = clientPort,
+        ServerPort = serverPort.Count > 0 ? serverPort[0] : nothing,
+    };
+syntax Profile = "RTP/AVP/UDP;unicast;";
+type TransportType
+{
+    PortRangeType ClientPort;
+    optional PortRangeType ServerPort;
+
+    override string ToString()
+    {
+        string summaryLine = "Client Port: " + ClientPort.ToString();
+        if (ServerPort != nothing)
+        {
+            summaryLine += ", Server Port: " + ServerPort.ToString();
+        }
+
+        return summaryLine;
+    }
+}
+syntax ClientPort = "client_port=" p1:IPPORT p2:("-" p:IPPORT => p)? =>
+    new PortRangeType
+    {
+        Port1 = p1,
+        Port2 = p2.Count > 0 ? p2[0] : nothing,
+    };
+syntax ServerPort = "server_port=" p1:IPPORT p2:("-" p:IPPORT => p)? =>
+    new PortRangeType
+    {
+        Port1 = p1,
+        Port2 = p2.Count > 0 ? p2[0] : nothing,
+    };
+type PortRangeType
+{
+    ushort Port1;
+    optional ushort Port2;
+
+    override string ToString()
+    {
+        if (Port2 == nothing)
+        {
+            return Port1.ToString();
+        }
+        else
+        {
+            return Port1.ToString() + "-" + Port2.ToString();
+        }
+    }
+}
+syntax IPPORT = s:regex{[0-9]{1,5}} => (s as ushort);
+
+// section 6.1.2 wfd-audio-codecs
+syntax WfdAudioCodecs = "none" | SinkAudioList;
+syntax SinkAudioList = s:SinkAudio sn:(", " s1:SinkAudio => s1)* => ([s] + sn);
+syntax SinkAudio = format:AudioFormat HTTP.SP modes:HexDig8 HTTP.SP latency:HexDig2 =>
+    new SinkAudioType
+    {
+        AudioFormat = format,
+        Modes = modes,
+        Latency = latency,
+    };
+
+syntax AudioFormat = regex{LPCM|AAC|AC3};
+type SinkAudioType
+{
+    string AudioFormat;
+    uint Modes with DisplayInfo{ToText = ModesToText};
+    byte Latency;
+
+    string ModesToText(any input)
+    {
+        switch (AudioFormat)
+        {
+            case "LPCM" =>
+                return EnumToStringInSummary<LPCMModesFlags>(input as uint);
+            case "AAC" =>
+                return EnumToStringInSummary<AACModesFlags>(input as uint);
+            case "AC3" =>
+                return EnumToStringInSummary<AC3ModesFlags>(input as uint);
+            default =>
+                return input.ToString();
+        }
+    }
+}
+
+pattern WfdAudioCodecsType = string | array<SinkAudioType>;
+
+// section 6.1.3 wfd-video-formats
+syntax WfdVideoFormats = "none" | (native:HexDig2 HTTP.SP preferredDisplayModeSupported:HexDig2 HTTP.SP h264CodecArray:H264CodecArray =>
+    new WfdVideoFormatsType
+    {
+        Native = native,
+        PreferredDisplayModeSupported = preferredDisplayModeSupported,
+        H264Codec = h264CodecArray,
+    });
+type WfdVideoFormatsType
+{
+    byte Native;
+    PreferredDisplayModeSupportedPattern PreferredDisplayModeSupported;
+    array<H264CodecType> H264Codec;
+}
+pattern PreferredDisplayModeSupportedPattern = enum byte
+{
+    NotSupported = 0,
+    Supported = 1,
+    ...
+};
+syntax H264CodecArray = h:H264Codec hm:(", " h2:H264Codec => h2)* => ([h] + hm);
+syntax H264Codec = profile:HexDig2 HTTP.SP level:HexDig2 HTTP.SP miscParams:MiscParams HTTP.SP
+    maxHres:("none" | HexDig4) HTTP.SP maxVres:("none" | HexDig4) =>
+    new H264CodecType
+    {
+        Profile = profile,
+        Level = level,
+        MiscParams = miscParams,
+        MaxHres = maxHres,
+        MaxVres = maxVres,
+    };
+type H264CodecType
+{
+    ProfileBitmapFlags Profile;
+    LevelBitmapFlags Level;
+    MiscParamsType MiscParams;
+    (string | ushort) MaxHres;
+    (string | ushort) MaxVres;
+}
+syntax MiscParams = ceaSupport:HexDig8 HTTP.SP vesaSupport:HexDig8 HTTP.SP hhSupport:HexDig8 HTTP.SP latency:HexDig2
+    HTTP.SP minSliceSize:HexDig4 HTTP.SP sliceEncParams:HexDig4 HTTP.SP frameRateControlSupport:HexDig2 =>
+    new MiscParamsType
+    {
+        CEASupport = ceaSupport,
+        VESASupport = vesaSupport,
+        HHSupport = hhSupport,
+        Latency = latency,
+        MinSliceSize = minSliceSize,
+        SliceEncParams = sliceEncParams,
+        FrameRateControSupport = ParseVideoFrameRateControlSupportBitmapType(frameRateControlSupport),
+    };
+type MiscParamsType
+{
+    CEABitmapFlag CEASupport;
+    VESABitmapFlag VESASupport;
+    HHBitmapFlag HHSupport;
+    byte Latency;
+    ushort MinSliceSize;
+    ushort SliceEncParams;
+    VideoFrameRateControlSupportBitmapType FrameRateControSupport;
+}
+
+// section 6.1.4 wfd-3d-formats
+syntax Wfd3DFormat = "none" | ThreeDCapList;
+syntax ThreeDCapList = native:HexDig2 HTTP.SP preferredDisplayModeSupported:HexDig2 HTTP.SP h264CodecArray:H264CodecArray =>
+    new ThreeDCapListType
+    {
+        Native = native,
+        PreferredDisplayModeSupported = preferredDisplayModeSupported,
+        H264Codec = h264CodecArray,
+    };
+type ThreeDCapListType
+{
+    byte Native;
+    PreferredDisplayModeSupportedPattern PreferredDisplayModeSupported;
+    array<H264CodecType> H264Codec;
+}
+
+// section 6.1.5 wfd-content-protection
+syntax WfdContentProtection = "none" | (hdcp:regex{HDCP2.0|HDCP2.1} " port=" port:IPPORT =>
+    new WfdContentProtectionType
+    {
+        HDCPVersion = hdcp,
+        Port = port,
+    });
+type WfdContentProtectionType
+{
+    string HDCPVersion;
+    ushort Port;
+}
+
+// section 6.1.6 wfd-display-edid
+syntax DisplayEdid = "none" | (count:HexDig4 payload:EdidPayload[count] =>
+    new EdidBlockType
+    {
+        EdidBlockCount = count,
+        Payload = payload,
+    });
+type EdidBlockType
+{
+    ushort EdidBlockCount;
+    EdidMemoryBlocks Payload;
+}
+syntax EdidPayload[uint Count] = s:(EdidMemoryBlocks[Count] from BinaryDecoder) => s;
+type EdidMemoryBlocks[uint Count]
+{
+    array<EdidMemoryBlock> Blocks with BinaryEncoding{Length = Count};
+}
+type EdidMemoryBlock
+{
+    binary Data with BinaryEncoding{Length = 128};
+
+    override string ToString()
+    {
+        return "EDID memory space";
+    }
+}
+
+// section 6.1.7 wfd-coupled-sink
+syntax CoupledSinkCap = "none" | (status:HexDig2 HTTP.SP sinkAddress:SinkAddress =>
+    new CoupledSinkCapType
+    {
+        Status = status,
+        SinkAddress = sinkAddress
+    });
+type CoupledSinkCapType
+{
+    CoupledSinkStatusEnum Status;
+    (string | MacAddress) SinkAddress;
+}
+syntax SinkAddress = "none" | (Utility.MacAddress from BinaryDecoder);
+
+// section 6.1.9 wfd-presentation-url
+syntax WfdPresentationUrl = wfdUrl0:regex{[^\x20]*} HTTP.SP wfdUrl1:regex{[^\x20]*} =>
+    new WfdPresentationUrlType
+    {
+        WfdUrl0 = wfdUrl0,
+        WfdUrl1 = wfdUrl1,
+    };
+type WfdPresentationUrlType
+{
+    string WfdUrl0;
+    string WfdUrl1;
+}
+
+// section 6.1.10 wfd-client-rtp-ports
+syntax WfdClientRtpPorts = profile:"RTP/AVP/UDP;unicast" HTTP.SP rtpPort0:IPPORT HTTP.SP rtpPort1:IPPORT HTTP.SP mode:"mode=play" =>
+    new WfdClientRtpPortsType
+    {
+        Profile = profile,
+        RtpPort0 = rtpPort0,
+        RtpPort1 = rtpPort1,
+        Mode = mode,
+    };
+type WfdClientRtpPortsType
+{
+    string Profile;
+    ushort RtpPort0;
+    ushort RtpPort1;
+    string Mode;
+}
+
+// section 6.1.12 wfd-I2C
+syntax WfdI2C = "none" | IPPORT;
+
+// section 6.1.13 wfd-av-format-change-timing
+syntax WfdAVFormatChangeTiming = pts:regex{[0-9A-Za-z]{10}} HTTP.SP dts:regex{[0-9A-Za-z]{10}} =>
+    new WfdAVFormatChangeTimingType
+    {
+         PTS = pts.ToULong(true) as ulong,
+         DTS = dts.ToULong(true) as ulong,
+    };
+type WfdAVFormatChangeTimingType
+{
+    ulong PTS;
+    ulong DTS;
+}
+
+// section 6.1.14 wfd-preferred-display-mode
+syntax WfdPreferredDisplayMode = pclock:regex{[0-9A-Za-z]{6}} HTTP.SP h:HexDig4 HTTP.SP hb:HexDig4 HTTP.SP hspolHsoff:HexDig4 HTTP.SP hsw:HexDig4 HTTP.SP
+    v:HexDig4 HTTP.SP vb:HexDig4 HTTP.SP vspolVsoff:HexDig4 HTTP.SP vsw:HexDig4 HTTP.SP vbs3d:HexDig2 HTTP.SP twoDS3DModes:HexDig2 HTTP.SP pdepth:HexDig2 HTTP.SP
+    h264Codec:H264CodecArray =>
+    new WfdPreferredDisplayModeType
+    {
+        PClock = pclock.ToUInt(true) as uint,
+        H = h,
+        HB = hb,
+        HSPOL_HSOFF = hspolHsoff,
+        HSW = hsw,
+        V = v,
+        VB = vb,
+        VSPOL_VSOFF = vspolVsoff,
+        VSW = vsw,
+        VBS3D = vbs3d,
+        TwoD_S3D_Modes = twoDS3DModes,
+        PDepth = pdepth,
+        H264Codec = h264Codec,
+    };
+type WfdPreferredDisplayModeType
+{
+    uint PClock;
+    ushort H;
+    ushort HB;
+    ushort HSPOL_HSOFF;
+    ushort HSW;
+    ushort V;
+    ushort VB;
+    ushort VSPOL_VSOFF;
+    ushort VSW;
+    byte VBS3D;
+    TwoDThreeDModesFlags TwoD_S3D_Modes;
+    PDepthFlags PDepth;
+    array<H264CodecType> H264Codec;
+}
+pattern TwoDThreeDModesFlags = flags byte
+{
+    $"Progressive 2D mode" = 0x01,
+    $"Top & Bottom Half (Stereoscopic 3D)" = 0x02,
+    $"Frame Sequential(Stereoscopic 3D)" = 0x04,
+    $"Frame Packing(Stereoscopic 3D)" = 0x08,
+    $"Side by side Half(Stereoscopic 3D)" = 0x10,
+    ...
+};
+pattern PDepthFlags = flags byte
+{
+    $"24 bits per pixel" = 0x01,
+    $"30 bits per pixel" = 0x02,
+    $"36 bits per pixel" = 0x04,
+    $"48 bits per pixel" = 0x08,
+    ...
+};
+
+// section 6.1.15 wfd-uibc-capability
+syntax WfdUibcCapability = "none" | (inputCategoryVal:InputCategoryVal ";" genericCapVal:GenericCapVal ";" hidcCapVal:HidcCapVal ";" tcpPort:TcpPort =>
+    new WfdUibcCapabilityType
+    {
+        InputCategoryVal = inputCategoryVal,
+        GenericCapVal = genericCapVal,
+        HidcCapVal = hidcCapVal,
+        TcpPort = tcpPort,
+    });
+type WfdUibcCapabilityType
+{
+    (string | array<string>) InputCategoryVal;
+    (string | array<string>) GenericCapVal;
+    (string | array<DetailedCapType>) HidcCapVal;
+    (string | ushort) TcpPort;
+}
+syntax InputCategoryVal = "input_category_list=" v:("none" | InputCategoryList) => v;
+syntax InputCategoryList = inputCat:regex{GENERIC|HIDC} inputCatArr:(", " s:regex{GENERIC|HIDC} => s)* => ([inputCat] + inputCatArr);
+syntax GenericCapVal = "generic_cap_list=" v:("none" | GenericCapValList) => v;
+syntax GenericCapValList = inpType:InpType inpTypeArray:(", " s:InpType => s)* => ([inpType] + inpTypeArray);
+syntax InpType = regex{Keyboard|Mouse|SingleTouch|MultiTouch|Joystick|Camera|Gesture|RemoteControl};
+syntax HidcCapVal = "hidc_cap_list=" v:("none" | HidcCapList) => v;
+syntax HidcCapList = detailedCap:DetailedCap detailedCapArray:(", " s:DetailedCap => s)* => ([detailedCap] + detailedCapArray);
+syntax DetailedCap = inpType:InpType "/" inpPath:InpPath =>
+    new DetailedCapType
+    {
+        InpType = inpType,
+        InpPath = inpPath,
+    };
+type DetailedCapType
+{
+    string InpType;
+    string InpPath;
+
+    override string ToString()
+    {
+        return InpType + ": " + InpPath;
+    }
+}
+syntax InpPath = regex{Infrared|USB|BT|Zigbee|WiFi|No-SP};
+syntax TcpPort = "port=" s:("none" | IPPORT) => s;
+
+// section 6.1.19 wfd-connector-type
+syntax WfdConnectorType = "none" | (h:HexDig2 => new WfdConnectorTypeType{ConnectorType = h});
+type WfdConnectorTypeType
+{
+    ConnectorTypeEnum ConnectorType;
+
+    override string ToString()
+    {
+        return EnumToStringInSummary<ConnectorTypeEnum>(ConnectorType);
+    }
+};
+pattern ConnectorTypeEnum = enum byte
+{
+    $"Video Graphics Array (VGA) Connector" = 0,
+    $"S-Video connector" = 1,
+    $"Composite video connector" = 2,
+    $"Component video connector" = 3,
+    $"Digital Video Interface (DVI) connector" = 4,
+    $"HDMI connector" = 5,
+    $"Wi-Fi Display" = 7,
+    $"Japanese D connector" = 8,
+    $"Serial Digital Image (SDI) connector" = 9,
+    $"A Display Port connector (DP)" = 10,
+    $"A Unified Display Interface (UDI)" = 12,
+    ...
+};
+
+autostart actor WfdOverTcp(TCP.Server server)
+{
+    WfdDummyEndpoint wfdDummyEndpoint = null;
+    RemoveI2CDecodingHelper removeI2CDecodingHelper = null;
+    UIBCDecodingHelper uibcDecodingHelper = null;
+
+    process server accepts seg:TCP.Segment where IsRemoteI2C(seg.DestinationPort)
+    {
+        if (removeI2CDecodingHelper == null)
+        {
+            removeI2CDecodingHelper = new RemoveI2CDecodingHelper();
+            removeI2CDecodingHelper.InitializeRemoteI2CDecodingHelper(server);
+        }
+
+        removeI2CDecodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server issues seg:TCP.Segment where IsRemoteI2C(seg.SourcePort)
+    {
+        if (removeI2CDecodingHelper == null)
+        {
+            removeI2CDecodingHelper = new RemoveI2CDecodingHelper();
+            removeI2CDecodingHelper.InitializeRemoteI2CDecodingHelper(server);
+        }
+
+        removeI2CDecodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    process server issues seg:TCP.Segment where IsRemoteI2C(seg.DestinationPort)
+    {
+        if (removeI2CDecodingHelper == null)
+        {
+            removeI2CDecodingHelper = new RemoveI2CDecodingHelper();
+            removeI2CDecodingHelper.InitializeRemoteI2CDecodingHelper(server);
+        }
+
+        removeI2CDecodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server accepts seg:TCP.Segment where IsRemoteI2C(seg.SourcePort)
+    {
+        if (removeI2CDecodingHelper == null)
+        {
+            removeI2CDecodingHelper = new RemoveI2CDecodingHelper();
+            removeI2CDecodingHelper.InitializeRemoteI2CDecodingHelper(server);
+        }
+
+        removeI2CDecodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    process server accepts seg:TCP.Segment where IsUIBC(seg.DestinationPort)
+    {
+        if (uibcDecodingHelper == null)
+        {
+            uibcDecodingHelper = new UIBCDecodingHelper();
+            uibcDecodingHelper.InitializeUIBCDecodingHelper(server);
+        }
+
+        uibcDecodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server issues seg:TCP.Segment where IsUIBC(seg.SourcePort)
+    {
+        if (uibcDecodingHelper == null)
+        {
+            uibcDecodingHelper = new UIBCDecodingHelper();
+            uibcDecodingHelper.InitializeUIBCDecodingHelper(server);
+        }
+
+        uibcDecodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    process server issues seg:TCP.Segment where IsUIBC(seg.DestinationPort)
+    {
+        if (uibcDecodingHelper == null)
+        {
+            uibcDecodingHelper = new UIBCDecodingHelper();
+            uibcDecodingHelper.InitializeUIBCDecodingHelper(server);
+        }
+
+        uibcDecodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server accepts seg:TCP.Segment where IsUIBC(seg.SourcePort)
+    {
+        if (uibcDecodingHelper == null)
+        {
+            uibcDecodingHelper = new UIBCDecodingHelper();
+            uibcDecodingHelper.InitializeUIBCDecodingHelper(server);
+        }
+
+        uibcDecodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+
+    bool IsRemoteI2C(ushort port)
+    {
+        if (wfdDummyEndpoint == null)
+        {
+            wfdDummyEndpoint = endpoint WfdDummyEndpoint;
+        }
+
+        return wfdDummyEndpoint.RemoteI2CPorts[port];
+    }
+
+    bool IsUIBC(ushort port)
+    {
+        if (wfdDummyEndpoint == null)
+        {
+            wfdDummyEndpoint = endpoint WfdDummyEndpoint;
+        }
+
+        return wfdDummyEndpoint.UIBCPorts[port];
+    }
+}
+
+// ----------------------------------------------------- Remote I2C --------------------------------------------
+type RemoveI2CDecodingHelper : TCP.TCPDecodingHelper
+{
+    void InitializeRemoteI2CDecodingHelper(TCP.Server server)
+    {
+        RemoteI2CDecodingCache acceptsCache = new RemoteI2CDecodingCache();
+        acceptsCache.InitializeRemoteI2CDecodingCache(MessageDirection.Accepts, server);
+        AcceptsCache = acceptsCache;
+
+        RemoteI2CDecodingCache issuesCache = new RemoteI2CDecodingCache();
+        issuesCache.InitializeRemoteI2CDecodingCache(MessageDirection.Issues, server);
+        IssuesCache = issuesCache;
+    }
+}
+
+type RemoteI2CDecodingCache : TCP.TCPDecodingCache
+{
+    void InitializeRemoteI2CDecodingCache(MessageDirection messageDirection, TCP.Server server)
+    {
+        base.Initialize(
+            "WFD Remote I2C",
+            endpoint WFD.Server over server,
+            messageDirection,
+            IsRemoteI2C,
+            IsSufficientForRemoteI2C,
+            DecodeRemoteI2CMessage,
+            DecodeRemoteI2CIncompleteMessage);
+    }
+
+    bool? IsRemoteI2C(binary buffer)
+    {
+        // assume that buffer count must be not zero when calling this message
+        if (Direction == MessageDirection.Accepts)
+        {
+            return buffer[0] == 0 || buffer[0] == 1;
+        }
+        else // issues
+        {
+            return (buffer[0] & 0x7E) == 0;
+        }
+    }
+
+    uint? IsSufficientForRemoteI2C(binary buffer)
+    {
+        if (Direction == MessageDirection.Accepts)
+        {
+            switch (buffer[0])
+            {
+                case 0 => // read request
+                    if (buffer.Count == 1)
+                    {
+                        return null;
+                    }
+                    else
+                    {
+                        byte writeCount = buffer[1];
+                        int length = 2;
+                        for (int i = 0; i < writeCount; i++)
+                        {
+                            if (buffer.Count < (length + 2))
+                            {
+                                return null; // not enough
+                            }
+
+                            length += buffer[length + 1] + 4;
+                        }
+
+                        return buffer.Count >= (length + 2) ? 0 : (length + 2) as uint;
+                    }
+                case 1 =>
+                    if (buffer.Count > 2)
+                    {
+                        return buffer[1] >= buffer.Count ? 0 : (buffer[1] as uint);
+                    }
+                    else
+                    {
+                        return null;
+                    }
+                default =>
+                    return null;
+            }
+        }
+        else // issues
+        {
+            if (buffer[0] == 0)
+            {
+                if (buffer.Count > 2)
+                {
+                    return buffer[1] >= buffer.Count ? 0 : (buffer[1] as uint);
+                }
+                else
+                {
+                    return null;
+                }
+            }
+            else
+            {
+                return 0; // sufficient when length >= 1
+            }
+        }
+    }
+
+    optional any message DecodeRemoteI2CMessage(stream s)
+    {
+        byte currentByte = s.CurrentByte;
+        // assume that buffer count must be not zero when calling this message
+        if (Direction == MessageDirection.Accepts)
+        {
+            switch (currentByte)
+            {
+                case 0x00 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Read_Request>(s) as optional any message;
+                case 0x01 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Write_Request>(s) as optional any message;
+                default =>
+                    return nothing;
+            }
+        }
+        else // issues
+        {
+            switch (currentByte)
+            {
+                case 0x00 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Read_Reply_Ack>(s) as optional any message;
+                case 0x80 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Read_Reply_Nak>(s) as optional any message;
+                case 0x01 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Write_Reply_Ack>(s) as optional any message;
+                case 0x81 =>
+                    return BinaryDecoder<RemoteI2C.Remote_I2C_Write_Reply_Nak>(s) as optional any message;
+                default =>
+                    return nothing;
+            }
+        }
+    }
+
+    optional any message DecodeRemoteI2CIncompleteMessage(binary buffer)
+    {
+        byte currentByte = buffer[0];
+        // assume that buffer count must be not zero when calling this message
+        if (Direction == MessageDirection.Accepts)
+        {
+            switch (currentByte)
+            {
+                case 0x00 =>
+                    return BinaryDecoder<RemoteI2C.IncompleteRemote_I2C_Read_Request>(buffer) as optional any message;
+                case 0x01 =>
+                    return BinaryDecoder<RemoteI2C.IncompleteRemote_I2C_Write_Request>(buffer) as optional any message;
+                default =>
+                    return nothing;
+            }
+        }
+        else // issues
+        {
+            switch (currentByte)
+            {
+                case 0x00 =>
+                    return BinaryDecoder<RemoteI2C.IncompleteRemote_I2C_Read_Reply_Ack>(buffer) as optional any message;
+                default =>
+                    return nothing;
+            }
+        }
+    }
+}
+
+contract RemoteI2C
+{
+    accepts Remote_I2C_Read_Request
+    {
+        byte RequestIdentifier;
+        byte Number_Of_I2C_Write_Transactions;
+        array<WriteTransaction> WriteTransactions with BinaryEncoding{Length = Number_Of_I2C_Write_Transactions};
+        byte Read_I2C_Device_Identifier;
+        byte Number_Of_Bytes_To_Read;
+
+        override string ToString()
+        {
+            return "Remote_I2C_Read_Request, Number_Of_I2C_Write_Transactions: " + Number_Of_I2C_Write_Transactions.ToString() +
+                ", Read_I2C_Device_Identifier: " + Read_I2C_Device_Identifier.ToString() +
+                ", Number_Of_Bytes_To_Read: " + Number_Of_Bytes_To_Read.ToString();
+        }
+    }
+
+    accepts IncompleteRemote_I2C_Read_Request
+    {
+        byte RequestIdentifier;
+        byte Number_Of_I2C_Write_Transactions;
+        array<WriteTransaction> WriteTransactions with BinaryEncoding{MaxLength = Number_Of_I2C_Write_Transactions};
+
+        override string ToString()
+        {
+            return "Incomplete Remote_I2C_Read_Request, Number_Of_I2C_Write_Transactions: " + Number_Of_I2C_Write_Transactions.ToString();
+        }
+    }
+
+    accepts Remote_I2C_Write_Request
+    {
+        byte RequestIdentifier;
+        byte Number_of_Bytes_To_Write;
+        binary Data with BinaryEncoding{Length = Number_of_Bytes_To_Write};
+
+        override string ToString()
+        {
+            return "Remote_I2C_Write_Request, Number_of_Bytes_To_Write: " + Number_of_Bytes_To_Write.ToString();
+        }
+    }
+
+    accepts IncompleteRemote_I2C_Write_Request
+    {
+        byte RequestIdentifier;
+        byte Number_of_Bytes_To_Write;
+        binary Data with BinaryEncoding{MaxLength = Number_of_Bytes_To_Write};
+
+        override string ToString()
+        {
+            return "Incompelte Remote_I2C_Write_Request, Number_of_Bytes_To_Write: " + Number_of_Bytes_To_Write.ToString();
+        }
+    }
+
+    issues Remote_I2C_Read_Reply_Ack
+    {
+        byte ReplyIdentifier;
+        byte Number_of_Bytes_To_Read;
+        binary Data with BinaryEncoding{Length = Number_of_Bytes_To_Read};
+
+        override string ToString()
+        {
+            return "Remote_I2C_Read_Reply_Ack, Number_of_Bytes_To_Read: " + Number_of_Bytes_To_Read.ToString();
+        }
+    }
+
+    issues IncompleteRemote_I2C_Read_Reply_Ack
+    {
+        byte ReplyIdentifier;
+        byte Number_of_Bytes_To_Read;
+        binary Data with BinaryEncoding{MaxLength = Number_of_Bytes_To_Read};
+
+        override string ToString()
+        {
+            return "Incomplete Remote_I2C_Read_Reply_Ack, Number_of_Bytes_To_Read: " + Number_of_Bytes_To_Read.ToString();
+        }
+    }
+
+    issues Remote_I2C_Read_Reply_Nak
+    {
+        byte ReplyIdentifier;
+
+        override string ToString()
+        {
+            return "Remote_I2C_Read_Reply_Nak";
+        }
+    }
+
+    issues Remote_I2C_Write_Reply_Ack
+    {
+        byte ReplyIdentifier;
+
+        override string ToString()
+        {
+            return "Remote_I2C_Write_Reply_Ack";
+        }
+    }
+
+    issues Remote_I2C_Write_Reply_Nak
+    {
+        byte ReplyIdentifier;
+
+        override string ToString()
+        {
+            return "Remote_I2C_Write_Reply_Nak";
+        }
+    }
+}
+
+type WriteTransaction
+{
+    byte Write_I2C_Device_Identifier;
+    byte Number_of_Bytes_To_Write;
+    binary Data with BinaryEncoding{Length = Number_of_Bytes_To_Write};
+    byte NoStopBit;
+    byte I2C_Transaction_Delay;
+}
+
+// ----------------------------------------------------- UIBC --------------------------------------------
+type UIBCDecodingHelper : TCP.TCPDecodingHelper
+{
+    void InitializeUIBCDecodingHelper(TCP.Server server)
+    {
+        UIBCOverTcpDecodingCache acceptsCache = new UIBCOverTcpDecodingCache();
+        acceptsCache.InitializeUIBCOverTCPDecodingCache(MessageDirection.Accepts, server);
+        AcceptsCache = acceptsCache;
+
+        UIBCOverTcpDecodingCache issuesCache = new UIBCOverTcpDecodingCache();
+        issuesCache.InitializeUIBCOverTCPDecodingCache(MessageDirection.Issues, server);
+        IssuesCache = issuesCache;
+    }
+}
+
+type UIBCOverTcpDecodingCache: TCP.TCPDecodingCache
+{
+    void InitializeUIBCOverTCPDecodingCache(MessageDirection messageDirection, TCP.Server server)
+    {
+        base.Initialize(
+            "WFD",
+            endpoint WFD.Server over server,
+            messageDirection,
+            IsUibc,
+            IsSufficientForUIBC,
+            DecodeUIBCMessage,
+            DecodeIncompleteUIBCMessage);
+    }
+
+    bool? IsUibc(binary data)
+    {
+        if (data.Count < 2)
+        {
+            return null;
+        }
+        else
+        {
+            return (data[0] & 0xC0) == 0 /* version */ &&
+                (data[0] & 0x0F) == 0 && (data[1] & 0xF0) == 0 /* reserved */ &&
+                ((data[1] & 0xF0) == 0 || (data[1] & 0xF0) == 1); // input category
+        }
+    }
+
+    uint? IsSufficientForUIBC(binary buffer)
+    {
+        if (buffer.Count < 4)
+        {
+            return null;
+        }
+        else
+        {
+            int length = ((buffer[2] << 8) + buffer[3]);
+            length += ((buffer[0] & 0x10) > 0 ? 6 /* including Timestamp */ : 4);
+            return length <= buffer.Count ? 0 : (length as uint);
+        }
+    }
+
+    optional any message DecodeUIBCMessage(stream s)
+    {
+        return BinaryDecoder<UIBCMessage>(s) as optional any message;
+    }
+
+    optional any message DecodeIncompleteUIBCMessage(binary data)
+    {
+        return BinaryDecoder<IncompleteUIBCMessage>(data) as optional any message;
+    }
+}
+
+message UIBCMessage
+{
+    UIBCMessageHeader UIBCMessageHeader;
+    ushort Length;
+    optional [|UIBCMessageHeader.T|] ushort Timestamp;
+    ([|UIBCMessageHeader.InputCategory == InputCategoryEnum.Generic|] array<GenericInputBody> |
+        [|UIBCMessageHeader.InputCategory == InputCategoryEnum.HIDC|] array<HIDCInputBody> |
+        binary) UIBCInputBody with BinaryEncoding{WidthForComposedType = Length * 8};
+
+    override string ToString()
+    {
+        return "UIBC Message: Version: " + UIBCMessageHeader.Version.ToString() +
+            ", InputCategory: " + EnumToStringInSummary<InputCategoryEnum>(UIBCMessageHeader.InputCategory) +
+            ", Length: " + Length.ToString();
+    }
+}
+
+message IncompleteUIBCMessage
+{
+    UIBCMessageHeader UIBCMessageHeader;
+    byte Length;
+    optional [|UIBCMessageHeader.T|] ushort Timestamp;
+    binary UIBCInputBody with BinaryEncoding{MaxLength = Length};
+
+    override string ToString()
+    {
+        return "Incomplete UIBC Message: Version: " + UIBCMessageHeader.Version.ToString() +
+            ", InputCategory: " + EnumToStringInSummary<InputCategoryEnum>(UIBCMessageHeader.InputCategory) +
+            ", Length: " + Length.ToString();
+    }
+}
+
+type UIBCMessageHeader
+{
+    InputCategoryEnum InputCategory with BinaryEncoding{Width = 4};
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type,
+        "WFD", "Reserved", "UIBCMessageHeader", value);
+    bool T with BinaryEncoding{Width = 1};
+    byte Version where ValidationCheckZero(value == 0, null, true, ReferenceType.Type,
+            "WFD", "Version", "UIBCMessageHeader", value)
+        with BinaryEncoding{Width = 3};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+pattern InputCategoryEnum = enum byte
+{
+    Generic = 0,
+    HIDC = 1,
+    ...
+};
+
+// section 4.11.3.1 Generic Input Body Format
+type GenericInputBody
+{
+    GenericInputIDEnum GenericInputID;
+    ushort Length;
+    ([|GenericInputID == GenericInputIDEnum.$"Left Mouse Down/Touch Down"|] MouseInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Left Mouse Up/Touch Up"|] MouseInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Mouse Move/Touch Move"|] MouseInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Key Down"|] MouseInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Key Up"|] MouseInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Zoom"|] ZoomInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Vertical Scroll"|] ScrollInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Horizontal Scroll"|] ScrollInputType |
+    [|GenericInputID == GenericInputIDEnum.$"Rotate"|] RotateInputType |
+    binary) Describe with BinaryEncoding{WidthForComposedType = Length * 8};
+}
+
+pattern GenericInputIDEnum = enum byte
+{
+    $"Left Mouse Down/Touch Down" = 0,
+    $"Left Mouse Up/Touch Up" = 1,
+    $"Mouse Move/Touch Move" = 2,
+    $"Key Down" = 3,
+    $"Key Up" = 4,
+    $"Zoom" = 5,
+    $"Vertical Scroll" = 6,
+    $"Horizontal Scroll" = 7,
+    $"Rotate" = 8,
+    ...
+};
+
+type MouseInputType
+{
+    byte NumberOfPointers;
+    array<Pointer> Pointers with BinaryEncoding{Length = NumberOfPointers};
+}
+
+type Pointer
+{
+    byte PointerId;
+    ushort XCoordinate;
+    ushort YCoordinate;
+}
+
+type KeyInputType
+{
+    byte Reserved;
+    ushort KeyCode1;
+    ushort KeyCode2;
+}
+
+type ZoomInputType
+{
+    ushort X;
+    ushort Y;
+    byte IntegerTimesToZoom;
+    byte FractionTimesToZoom;
+}
+
+type ScrollInputType
+{
+    ushort Number with BinaryEncoding{Width = 13, Endian = Endian.Big};
+    byte ScrollDirectionIndication with BinaryEncoding{Width = 1};
+    byte ScrollUnitIndication with BinaryEncoding{Width = 2};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+type RotateInputType
+{
+    byte IntegerPortionOfRotationAmount;
+    byte FractionPortionOfRotationAmount;
+}
+
+// section 4.11.3.2 HIDC Input Body Format
+type HIDCInputBody
+{
+    HIDInputPathEnum HIDInputPath;
+    HIDTypeEnum HIDType;
+    UsageEnum Usage;
+    ushort Length;
+    binary HIDC with BinaryEncoding{Length = Length};
+}
+
+pattern HIDInputPathEnum = enum byte
+{
+    Infrared = 0,
+    USB = 1,
+    Bluetooth = 2,
+    Zigbee = 3,
+    WiFi = 4,
+    VendorSpecificHIDInterface = 5,
+    ...
+};
+
+pattern HIDTypeEnum = enum byte
+{
+    Keyboard = 0,
+    Mouse = 1,
+    SingleTouch = 2,
+    MultiTouch = 3,
+    Joystick = 4,
+    Camera = 5,
+    Gesture = 6,
+    RemoteController = 7,
+    VendorSpecificHIDType = 8,
+    ...
+};
+
+pattern UsageEnum = enum byte
+{
+    HIDInputReport = 0,
+    HIDReportDescriptor = 1,
+    ...
+};
+
+// ----------------------------------------------------- WiFi Extension --------------------------------------------
+autostart actor WFDObserveWiFi(WiFi.Node node)
+{
+    observe node accepts m:WiFiMessage
+    {
+        if (m.Body is beaconFrame:WiFi.BeaconFrame)
+        {
+            ExtendWFDInformationElement(ref beaconFrame.InformationElements);
+        }
+        else if (m.Body is probeRequestFrame:WiFi.ProbeRequestFrame)
+        {
+            ExtendWFDInformationElement(ref probeRequestFrame.InformationElements);
+        }
+        else if (m.Body is probeResponseFrame:WiFi.ProbeResponseFrame)
+        {
+            ExtendWFDInformationElement(ref probeResponseFrame.InformationElements);
+        }
+        else if (m.Body is associationRequestFrame:WiFi.AssociationRequestFrame)
+        {
+            ExtendWFDInformationElement(ref associationRequestFrame.InformationElements);
+        }
+        else if (m.Body is associationResponseFrame:WiFi.AssociationResponseFrame)
+        {
+            ExtendWFDInformationElement(ref associationResponseFrame.InformationElements);
+        }
+        else if (m.Body is reassociationRequestFrame:WiFi.ReassociationRequestFrame)
+        {
+            ExtendWFDInformationElement(ref reassociationRequestFrame.InformationElements);
+        }
+        else if (m.Body is reassociationResponseFrame:WiFi.ReassociationResponseFrame)
+        {
+            ExtendWFDInformationElement(ref reassociationResponseFrame.InformationElements);
+        }
+    }
+}
+
+autostart actor WFDObserveWiFiDirect(WiFiDirect.Node node)
+{
+    observe node accepts m:GONegotiationRequest
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:GONegotiationResponse
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:GONegotiationConfirmation
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:P2PInvitationRequest
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:P2PInvitationResponse
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:ProvisionDiscoveryRequest
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+
+    observe node accepts m:ProvisionDiscoveryResponse
+    {
+        ExtendWFDInformationElement(ref m.Elements);
+    }
+}
+
+void ExtendWFDInformationElement(ref array<InformationField> informationElements)
+{
+    array<InformationField> newInformationElements = [];
+    binary wfdInformationElementBinary = $[];
+    foreach (var informationElement in informationElements)
+    {
+        if (informationElement is vendorSpecificInformation:VendorSpecificInformation &&
+            vendorSpecificInformation.OUI == WfdOUI && vendorSpecificInformation.VendorSpecificContent is data:binary &&
+            data.Count > 0 && data[0] == 0x0A)
+        {
+            // replace with WFD information element
+            wfdInformationElementBinary += data.Segment(1); // ignore the type field
+        }
+        else
+        {
+            newInformationElements += [informationElement];
+        }
+    }
+
+    if (wfdInformationElementBinary.Count > 0)
+    {
+        // add Element information before the binary
+        wfdInformationElementBinary = $[DD] + (wfdInformationElementBinary.Count as ushort).ToBinary(true) +
+            WfdOUI + $[0A] + wfdInformationElementBinary;
+
+        switch (wfdInformationElementBinary)
+        {
+            case wfdInformationElement:WfdInformationElement from BinaryDecoder<WfdInformationElement> =>
+
+                newInformationElements += [wfdInformationElement];
+            default =>
+                ThrowDecodingException("WFD", "WfdInformationElement");
+        }
+
+        // update information element array
+        informationElements = newInformationElements;
+    }
+}
+
+// section 5.1.1 WFD IE Format
+type WfdInformationElement : VendorSpecificInformation
+{
+    new ushort Length;
+    new optional binary VendorSpecificContent with Encoding{Ignore = true};
+    byte OUIType;
+    array<WfdSubElement> SubElementsBody;
+} with BinaryEncodingDefaults{Endian = Endian.Big}; // section 5, it is Big Endian
+
+pattern WfdSubElement = [|stream.RemainingByteLength > 1|]
+(
+    [|stream.CurrentByte == 0|] WfdDeviceInformationSubElement |
+    [|stream.CurrentByte == 1|] AssociatedBSSIDSubElement |
+    [|stream.CurrentByte == 2|] WfdAudioFormatsSubElement |
+    [|stream.CurrentByte == 3|] WfdVideoFormatsSubElement |
+    [|stream.CurrentByte == 4|] WfdVideo3DFormatsSubelement |
+    [|stream.CurrentByte == 5|] ContentProtectionSubElement |
+    [|stream.CurrentByte == 6|] CoupledSinkInformationSubelement |
+    [|stream.CurrentByte == 7|] WfdExtendedCapabilitySubElement |
+    [|stream.CurrentByte == 8|] LocalIPAddressSubElement |
+    [|stream.CurrentByte == 9|] WfdSessionInformationSubElement |
+    [|stream.CurrentByte == 10|] AlternativeMacAddressSubElement
+);
+
+// section 5.1.2 WFD Device Information Subelement
+type WfdDeviceInformationSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    WfdDeviceInformationSubType WfdDeviceInformation;
+    ushort SessionManagementControlPort;
+    ushort WFDDeviceMaximumThroughput;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+type WfdDeviceInformationSubType
+{
+    byte Reserved with BinaryEncoding{Width = 5};
+    bool AudioUnSupported with BinaryEncoding{Width = 1};
+    bool TimeSynchronizationSupport with BinaryEncoding{Width = 1};
+    bool CPSupport with BinaryEncoding{Width = 1};
+    PCEnum PC with BinaryEncoding{Width = 1};
+    bool WsdSupport with BinaryEncoding{Width = 1};
+    WfdSessionAvailabilityEnum WfdSessionAvailability with BinaryEncoding{Width = 2};
+    bool CoupledSinkOperationSupportAtSink with BinaryEncoding{Width = 1};
+    bool CoupledSinkOperationSupportAtSource with BinaryEncoding{Width = 1};
+    WfdDeviceTypeEnum WfdDeviceType with BinaryEncoding{Width = 2};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+pattern WfdDeviceTypeEnum = enum byte
+{
+    WfdSource = 0x00,
+    PrimarySink = 0x01,
+    SecondarySink = 0x02,
+    DualRole = 0x03,
+    ...
+};
+
+pattern WfdSessionAvailabilityEnum = enum byte
+{
+    NotAvailable = 0x00,
+    Available = 0x01,
+    ...
+};
+
+pattern PCEnum = enum byte
+{
+    PreferredP2P = 0x00,
+    PrefferedTDLS = 0x01,
+    ...
+};
+
+// section 5.1.3 Associated BSSID Subelement
+type AssociatedBSSIDSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    MacAddress AssociatedBSSID;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.4 Coupled Sink Information Subelement
+type CoupledSinkInformationSubelement
+{
+    byte SubElementID;
+    ushort Length;
+    CoupledSinkStatusEnum CoupledSinkStatusBitmap;
+    MacAddress CoupledSinkMACAddress;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.5 WFD Video Formats Subelement
+type WfdVideoFormatsSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    CEABitmapFlag CEAResolutionsRefreshRatesBitmap;
+    VESABitmapFlag VESAResolutionsRefreshRatesBitmap;
+    HHBitmapFlag HHResolutionsRefreshRatesBitmap;
+    NativeResolutionsRefreshRatesBitmapType NativeResolutionsRefreshRatesBitmap;
+    ProfileBitmapFlags ProfilesBitmap;
+    LevelBitmapFlags LevelsBitmap;
+    byte Latency;
+    byte MinimumSliceSize;
+    SliceEncodingParametersBitmapType SliceEncodingParametersBitmap;
+    VideoFrameRateControlSupportBitmapType VideoFrameRateControlSupportBitmap;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.6 WFD 3D Video Formats Subelement
+type WfdVideo3DFormatsSubelement
+{
+    byte SubElementID;
+    ushort Length;
+    ThreeDVideoCapabilityBitmapFlags ThreeDVideoCapabilityBitmap;
+    NativeResolutionsRefreshRatesBitmapType NativeResolutionsRefreshRatesBitmap;
+    ProfileBitmapFlags ProfilesBitmap;
+    LevelBitmapFlags LevelsBitmap;
+    byte Latency;
+    byte MinimumSliceSize;
+    SliceEncodingParametersBitmapType SliceEncodingParametersBitmap;
+    VideoFrameRateControlSupportBitmapType VideoFrameRateControlSupportBitmap;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.7 WFD Audio Formats Subelement
+type WfdAudioFormatsSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    LPCMModesFlags LPCMModesBitmap;
+    byte LPCMDecoderLatency;
+    AACModesFlags AACModesBitmap;
+    byte AACDecoderLatency;
+    AC3ModesFlags AC3ModesBitmap;
+    byte AC3DecoderLatency;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.8 Content Protection Subelement
+type ContentProtectionSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    ContentProtectionBitmapFlags ContentProtectionBitmap;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.9 WFD Extended Capability Subelement
+type WfdExtendedCapabilitySubElement
+{
+    byte SubElementID;
+    ushort Length;
+    WfdExtendedCapabilitiesBitmapFlags WfdExtendedCapabilitiesBitmap;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.10 Local IP Address Subelement
+type LocalIPAddressSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    byte Version;
+    IPv4Address IPv4Address;
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.11 WFD Session Information Subelement
+type WfdSessionInformationSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    array<WFDDeviceInfoDescriptor> WFDDeviceInfoDescriptors with BinaryEncoding{WidthForComposedType = Length * 8};
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+type WFDDeviceInfoDescriptor
+{
+    byte Length;
+    MacAddress DeviceAddress;
+    MacAddress AssociatedBSSID;
+    WfdDeviceInformationSubType WfdDeviceInfomation;
+    ushort WfdDeviceMaximumThroughput;
+    binary CoupledSinkInformation with BinaryEncoding{Length = 7};
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// section 5.1.12 Alternative MAC Address Subelement
+type AlternativeMacAddressSubElement
+{
+    byte SubElementID;
+    ushort Length;
+    MacAddress AlternativeMacAddress;
+} with BinaryEncoding{Endian = Endian.Big};
+
+// ----------------------------------------------------- Utilities --------------------------------------------
+optional array<string> ParametersDecoder(stream s)
+{
+    return Parameters(s);
+}
+
+optional map<string, any> ParameterValuesDecoder(stream s)
+{
+    return ParameterValues(s);
+}
+
+void RetrieveRemoteI2CInfo(RTSPControlMessage.RtspM3Response rtspM3Response)
+{
+    if (rtspM3Response.ParameterValues.Keys[WfdI2CConstString] &&
+        rtspM3Response.ParameterValues[WfdI2CConstString] is i2cPort:ushort)
+    {
+        // cache the remote I2C port
+        WfdDummyEndpoint wfdDummyEndpoint = endpoint WfdDummyEndpoint;
+        wfdDummyEndpoint.RemoteI2CPorts[i2cPort] = true;
+    }
+}
+
+void RetrieveUIBCInfo(any message rtspMessage)
+{
+    if (rtspMessage is rtspM4Request:RTSPControlMessage.RtspM4Request &&
+        rtspM4Request.ParameterValues.Keys[WfdUibcCapabilityConstString] &&
+        rtspM4Request.ParameterValues[WfdUibcCapabilityConstString] is wfdUibcCapabilityType1:WfdUibcCapabilityType &&
+        wfdUibcCapabilityType1.TcpPort is port1:ushort)
+    {
+        // cache the remote I2C port
+        WfdDummyEndpoint wfdDummyEndpoint = endpoint WfdDummyEndpoint;
+        wfdDummyEndpoint.UIBCPorts[port1] = true;
+    }
+    else if (rtspMessage is rtspM14Request:RTSPControlMessage.RtspM14Request &&
+        rtspM14Request.ParameterValues.Keys[WfdUibcCapabilityConstString] &&
+        rtspM14Request.ParameterValues[WfdUibcCapabilityConstString] is wfdUibcCapabilityType2:WfdUibcCapabilityType &&
+        wfdUibcCapabilityType2.TcpPort is port2:ushort)
+    {
+        // cache the remote I2C port
+        WfdDummyEndpoint wfdDummyEndpoint = endpoint WfdDummyEndpoint;
+        wfdDummyEndpoint.UIBCPorts[port2] = true;
+    }
+}
+
+// Convert key value pair array to map and parse the value to WFD defined structure
+map<string, any> ParseRtspParameterValues(array<KeyValuePair> headers)
+{
+    map<string, any> mergedMap = MergeHeaders(headers);
+    set<string> keys = mergedMap.Keys;  // value copy
+    if (keys[WfdAudioCodecsConstString])
+    {
+        HTTP.ParseHeaderValue<WfdAudioCodecsType>(ModuleName, WfdAudioCodecsConstString, ref mergedMap, WfdAudioCodecs, null);
+    }
+    if (keys[WfdVideoFormatsConstString])
+    {
+        HTTP.ParseHeaderValue<string | WfdVideoFormatsType>(ModuleName, WfdVideoFormatsConstString, ref mergedMap, WfdVideoFormats, null);
+    }
+    if (keys[Wfd3DVideoFormatsConstString])
+    {
+        HTTP.ParseHeaderValue<string | ThreeDCapListType>(ModuleName, Wfd3DVideoFormatsConstString, ref mergedMap, Wfd3DFormat, null);
+    }
+    if (keys[WfdContentProtectionConstString])
+    {
+        HTTP.ParseHeaderValue<string | WfdContentProtectionType>(ModuleName, WfdContentProtectionConstString, ref mergedMap, WfdContentProtection, null);
+    }
+    if (keys[WfdDisplayEdidConstString])
+    {
+        HTTP.ParseHeaderValue<string | EdidBlockType>(ModuleName, WfdDisplayEdidConstString, ref mergedMap, DisplayEdid, null);
+    }
+    if (keys[WfdCoupledSinkConstString])
+    {
+        HTTP.ParseHeaderValue<string | CoupledSinkCapType>(ModuleName, WfdCoupledSinkConstString, ref mergedMap, CoupledSinkCap, null);
+    }
+    if (keys[WfdPresentationUrlConstString])
+    {
+        HTTP.ParseHeaderValue<WfdPresentationUrlType>(ModuleName, WfdPresentationUrlConstString, ref mergedMap, WfdPresentationUrl, null);
+    }
+    if (keys[WfdClientRtpPortsConstString])
+    {
+        HTTP.ParseHeaderValue<WfdClientRtpPortsType>(ModuleName, WfdClientRtpPortsConstString, ref mergedMap, WfdClientRtpPorts, null);
+    }
+    if (keys[WfdI2CConstString])
+    {
+        HTTP.ParseHeaderValue<string | ushort>(ModuleName, WfdI2CConstString, ref mergedMap, WfdI2C, null);
+    }
+    if (keys[WfdAVFormatChangeTimingConstString])
+    {
+        HTTP.ParseHeaderValue<WfdAVFormatChangeTimingType>(ModuleName, WfdAVFormatChangeTimingConstString, ref mergedMap, WfdAVFormatChangeTiming, null);
+    }
+    if (keys[WfdPreferredDisplayModeConstString])
+    {
+        HTTP.ParseHeaderValue<WfdPreferredDisplayModeType>(ModuleName, WfdPreferredDisplayModeConstString, ref mergedMap, WfdPreferredDisplayMode, null);
+    }
+    if (keys[WfdUibcCapabilityConstString] && mergedMap[WfdUibcCapabilityConstString] is wfdUibcCapabilityStr:string
+        && wfdUibcCapabilityStr != "none")
+    {
+        HTTP.ParseHeaderValue<string | WfdUibcCapabilityType>(ModuleName, WfdUibcCapabilityConstString, ref mergedMap, WfdUibcCapability, null);
+    }
+    if (keys[WfdConnectorTypeConstString])
+    {
+        HTTP.ParseHeaderValue<string | WfdConnectorTypeType>(ModuleName, WfdConnectorTypeConstString, ref mergedMap, WfdConnectorType, null);
+    }
+
+    return mergedMap;
+}

@@ -1,0 +1,154 @@
+protocol WebProxy with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376443", Date = "04/03/2015"}
+        ]
+};
+
+using Etw;
+using EtwEvent;
+using HTTP;
+using Utility;
+
+const guid EtwProviderIdWebProxy = {6EF4653A-71F9-4AD3-B093-61C38C9C299F};
+
+endpoint Server[uint KeySessionId]
+    accepts Message issues Message
+{
+    // Shared variables for whole connection.
+    ConnectionContext context = new ConnectionContext();
+
+    HttpDecodingCache<HttpContract.Request> inboundCache = 
+        new HttpDecodingCache<HttpContract.Request>().
+            InitializeHttpCache(context, MessageDirection.Accepts, endpoint HTTP.Server over this, false, TryDecodeRequestHeader, TryDecodeRequestBodyAndDispatch, SetAnnotationForRequest);
+    HttpDecodingCache<HttpContract.Response> outboundCache = 
+        new HttpDecodingCache<HttpContract.Response>().
+            InitializeHttpCache(context, MessageDirection.Issues, endpoint HTTP.Server over this, false, TryDecodeResponseHeader, TryDecodeResponseBodyAndDispatch, SetAnnotationForResponse);
+    
+    process this accepts m:Message
+    {
+        stream s = m.Payload;
+        inboundCache.Buffer = m.Payload; // 'Buffer' will be used to assign SourceData of decoded message.
+        if (TryDecodeRequestHeader(inboundCache, s) && TryDecodeRequestBodyAndDispatch(inboundCache, s))
+        {
+            inboundCache.ResetAfterSucceed(s, false);
+        }
+        else
+        {
+            ThrowDecodingException("WebProxy", "HTTP Request");
+        }
+    }
+
+    process this issues m:Message
+    {
+        stream s = m.Payload;
+        outboundCache.Buffer = m.Payload; // 'Buffer' will be used to assign SourceData of decoded message.
+        if (TryDecodeResponseHeader(outboundCache, s) && TryDecodeResponseBodyAndDispatch(outboundCache, s))
+        {
+            outboundCache.ResetAfterSucceed(s, false);
+        }
+        else
+        {
+            ThrowDecodingException("WebProxy", "HTTP Response");
+        }
+    }
+
+    // destructor
+    ~endpoint(Server server)
+    {
+        inboundCache.ClearInDestructor();
+        outboundCache.ClearInDestructor();
+    }
+
+    void SetAnnotationForRequest(HttpContract.Request req)
+    {   
+        req#SourceAddress = "Local";
+    }
+
+    void SetAnnotationForResponse(HttpContract.Response res)
+    {   
+        res#DestinationAddress = "Local";
+    }
+}
+
+client endpoint Client connected to Server;
+
+autostart actor WebProxyOverEtwEvent(EtwEvent.Node etw)
+{
+    map<uint, string> host = {};
+    
+    process etw accepts m:EtwProviderMsg
+        where m.EventRecord.Header.ProviderId == EtwProviderIdWebProxy
+    {
+        switch (m.Payload)
+        {
+            case fm:WebProxy.Message from BinaryDecoder<WebProxy.Message> =>
+                stream s = fm.Payload;
+                if (fm.IsRequest == 1)
+                {
+                    if (RequestHeader(s) is requestHeader:HttpContract.Request)
+                    {
+                        if ("Host" in requestHeader.Headers)
+                        {
+                            host[fm.SessionId] = requestHeader.Headers["Host"] as string;
+                            fm.DestinationAddress = host[fm.SessionId];
+                            fm.SourceAddress = "Local";
+                        }
+                    }
+                    dispatch (endpoint Server[fm.SessionId]) accepts fm;
+                }
+                else
+                {
+                    if (fm.SessionId in host)
+                    {
+                        fm.SourceAddress = host[fm.SessionId];
+                        fm.DestinationAddress = "Local";
+                        host = host.Remove(fm.SessionId);
+                    }
+                    dispatch (endpoint Server[fm.SessionId]) issues fm;
+                }
+            default =>
+                ThrowDecodingException("WebProxy");
+        }
+    }
+}
+
+message Message
+{
+    uint SessionId;
+    ulong TimeStamp;
+    uint IsRequest;
+    string SourceAddress with Encoding{Ignore = true} with Visualization{AliasName = "Address"};
+    string DestinationAddress with Encoding{Ignore = true} with Visualization{AliasName = "Address"};
+    uint PayloadLength;
+    binary Payload with MimeDescription{Format = "text/plain"};
+
+    override string ToString()
+    {
+        return "SessionId: " + SessionId.ToString() + 
+            ", PayloadLength: " + PayloadLength.ToString();
+    }
+}
+
+string get Source(this WebProxy.Message msg)
+{
+    return msg.SourceAddress;
+}
+
+string get Destination(this WebProxy.Message msg)
+{
+    return msg.DestinationAddress;
+}
+
+string get Network(this WebProxy.Message msg)
+{
+    return (msg.SourceAddress == "Local"
+        ? msg.SourceAddress + " - " + msg.DestinationAddress
+        : msg.DestinationAddress + " - " + msg.SourceAddress);
+}

@@ -1,0 +1,135 @@
+protocol SMB2ScenarioValidation;
+
+using Diagnostics;
+using ERREF;
+using SMB;
+using SMB2;
+using ScenarioValidationUtility;
+
+// ---------------------------------------------Main Actor--------------------------------------------- //
+// Hold all the ADM variable, for sequence validation
+autostart actor SMB2ScenarioValidationActor(SMB2.Server server)
+{
+    TransportConnection transportConnection = null;
+    SMBScenarioValidationConfiguration config = GetConfigurableValue<SMBScenarioValidationConfiguration>();
+
+    observe server accepts smbMessage:SMB.Messages.ComNegotiateRequest where config.EnableSMB2ScenarioValidation &&
+        ((transportConnection == null && smbMessage.Mid == 0) || // for the first message to active the sequence validation
+        (transportConnection != null && transportConnection.ValidationEnabled)) // for the following messages
+    {
+        if (transportConnection == null && smbMessage.Mid == 0)
+        {
+            transportConnection = InitialConnection(server);
+            if (transportConnection == null)
+                return;
+        }
+
+        assert transportConnection != null;
+        transportConnection.PendingRequestList[smbMessage.Mid] = smbMessage;
+    }
+
+    // 3.3.5.2   Receiving Any Message
+    observe server accepts req:SMB2.SMB2Request where config.EnableSMB2ScenarioValidation &&
+        ((transportConnection == null && req.Header.MessageId == 0) || // for the first message to active the sequence validation
+        (transportConnection != null && transportConnection.ValidationEnabled) || // for the following messages
+        (transportConnection == null && req.Header.MessageId != 0)) // when the first message is missing
+    {
+        if (transportConnection == null && req.Header.MessageId == 0)
+        {
+            transportConnection = InitialConnection(server);
+            if (transportConnection == null)
+                return;
+        }
+        else if (transportConnection == null && req.Header.MessageId != 0)
+        {
+            transportConnection = new TransportConnection();
+            SequenceValidationCheckFail(req, DiagnosisLevel.Information, SMB2_FirstRequestIsMissing, DiableValidationForTransportConnection, transportConnection);
+        }
+
+        assert transportConnection != null;
+        if (!(req is SMB2.Messages.CancelRequest))
+        {
+            transportConnection.PendingRequestList[req.Header.MessageId] = req;
+        }
+        else
+        {
+            // TODO: Check for CancelRequest
+        }
+    }
+
+    observe server issues res:SMB2.SMB2Response where config.EnableSMB2ScenarioValidation &&
+        ((transportConnection != null && transportConnection.ValidationEnabled))
+    {
+        if (res is negRes:SMB2.Messages.NegotiateResponse)
+        {
+            InitialGlobal(ref transportConnection, negRes);
+        }
+
+        if (res is leaseNotify:SMB2.Messages.LeaseBreakNotification)
+        {
+            // TODO: Check for LeaseBreakNotification
+        }
+        else if (res is oplockNotify:SMB2.Messages.OplockBreakNotification)
+        {
+            // TODO: Check for OplockBreakNotification
+        }
+        else if (transportConnection.ExistRequest(res))
+        {
+            any message request = transportConnection.GetRequest(res);
+            array<any message> args = [request, res as any message];
+            // LogADM(globalMap);
+            if (request is SMB.Messages.ComNegotiateRequest)
+            {
+                validationForSMBNegotiate.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is SMB2.Messages.NegotiateRequest)
+            {
+                validationForSMB2Negotiate.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is SMB2.Messages.SessionSetupRequest)
+            {
+                validationForSMB2SessionSetup.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is SMB2.Messages.LogoffRequest)
+            {
+                validationForSMB2Logoff.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is SMB2.Messages.TreeConnectRequest)
+            {
+                validationForSMB2TreeConnect.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is SMB2.Messages.TreeDisconnectRequest)
+            {
+                validationForSMB2TreeDisconnect.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else if (request is echoRequest:SMB2.Messages.EchoRequest)
+            {
+                // TODO: Check for EchoRequest
+                validationForReceivingAnyMessage.CheckAndUpdate([transportConnection], [config], args);
+            }
+            else
+            {
+                validationForOtherMessages.CheckAndUpdate([transportConnection], [config], args);
+            }
+            // LogADM(globalMap);
+            if (!IsAnInterimResponse(res))
+            {
+                transportConnection.RemoveRequest(res);
+            }
+        }
+        else if (!transportConnection.ExistRequest(res))
+        {
+            SequenceValidationCheckFail(res, DiagnosisLevel.Information, SMB2_RequestIsMissing, DiableValidationForTransportConnection, transportConnection);
+        }
+        else
+        {
+        }
+        FlushLog();
+    }
+
+    ~endpoint(SMB2.Server server)
+    {
+        DecodeOnTcpConnClose([transportConnection]);
+        transportConnection = null;
+    }
+}

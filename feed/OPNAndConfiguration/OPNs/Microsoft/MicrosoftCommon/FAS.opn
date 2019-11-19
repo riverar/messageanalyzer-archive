@@ -1,0 +1,195 @@
+protocol FAS with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "File Access Service",
+    ShortName = "FAS",
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-FASOD", Version = "2.1", Date = "05/15/2014"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "", Date = ""}
+        ]
+};
+
+using Standard;
+using Utility;
+
+// This is the central endpoint that exposes SMB/SMB2 message to upper layer file protocol(e.g. GPREG, GPCAP, etc).
+endpoint Server accepts any message issues any message
+{
+    // delegate to get message offset from SMB/SMB2 message.
+    (ulong)(any message, FAS.Server) MessageOffsetGetter; 
+    // delegate to get message data from SMB/SMB2 message.
+    (binary)(any message) MessageDataGetter;
+    CommandType Command;
+    string FileName;
+    // record message offset from Read request.
+    // since Read response message doesn't have offset in itself, while its offset is in corresponding Read request message. 
+    ulong? ReadResponseOffset;
+
+    // Indicates it's time to reassemble, set to true only if CloseRequest is accepted.
+    bool HasCloseRequestAccepted = false;
+}
+
+FAS.Server InitializeFASServer(any endpoint underlayerEp, CommandType cmd, 
+    (ulong)(any message, FAS.Server) messageOffsetGetter, (binary)(any message) messageDataGetter, string fileName)
+{
+    FAS.Server fasServer = endpoint FAS.Server over underlayerEp;
+    fasServer.Command = cmd;
+    fasServer.MessageOffsetGetter = messageOffsetGetter;
+    fasServer.MessageDataGetter = messageDataGetter;
+    fasServer.FileName = fileName;
+    return fasServer;
+}
+
+ulong CalculateRealSmbOffset(uint lowOffset, optional uint highOffset)
+{
+    ulong offset = lowOffset;
+    if (highOffset is high:uint)
+    {
+        offset += ((high as ulong) << 32);
+    }
+    return offset;
+};
+
+type FASReassemblyHelper
+{
+    array<any message> Origins = [];
+    binary FileBuffer = $[];
+    
+    // delegates
+    (ulong)(any message, FAS.Server) MessageOffsetGetter;
+    (binary)(any message) MessageDataGetter;
+    
+    FASReassemblyHelper Initialize((ulong)(any message, FAS.Server) offsetGetter, (binary)(any message) dataGetter)
+    {
+        MessageOffsetGetter = offsetGetter;
+        MessageDataGetter = dataGetter;
+        return this;
+    }
+
+    void AddDataMessage(any message m, FAS.Server server)
+    {
+        ulong offset = MessageOffsetGetter(m, server);
+        binary data = MessageDataGetter(m);
+        Origins += [m];
+        if (FileBuffer.Count == offset)
+        {
+            FileBuffer += data;
+            return;
+        }
+        else
+        {
+            ReleaseCache();
+        }
+    }
+
+    void ReleaseCache()
+    {
+        foreach (var m in Origins)
+        {
+            DisplayTopLevelMessage(m);
+        }
+        Origins = [];
+        FileBuffer = $[];
+    }
+
+    void ResetAfterSucceed()
+    {
+        Origins = [];
+        FileBuffer = $[];
+    }
+}
+
+pattern CommandType = enum byte
+{ 
+    None,
+    Read,
+    Write,
+};
+
+bool NeedFASReassemble(string fileName)
+{
+    return IsGPCAP(fileName) || IsGPREG(fileName) || IsFCIADA(fileName);
+}
+
+// GPCAP
+const string CAP_INF = @"\Machine\Microsoft\Windows NT\Cap\cap.inf";
+bool IsGPCAP(string fileName)
+{
+    int startPos = fileName.Count - CAP_INF.Count;
+    if (startPos > 0)
+    {
+        return fileName.Segment(startPos, CAP_INF.Count) == CAP_INF;
+    }
+    return false;
+}
+
+// GPREG
+bool IsGPREG(string fileName)
+{
+    var lastSlashPos = fileName.LastIndexOf(@"\");
+    var dotPos = fileName.LastIndexOf(".");
+    if (lastSlashPos < 0)
+    {
+        return false;
+    }
+    string name = fileName.Segment(lastSlashPos + 1).ToLower();
+    string ext = fileName.Segment(dotPos + 1).ToLower();
+    if (name == "registry.pol"  || // GRREG
+        ext == "adm"            || // GRREG
+        ext == "admx"           || // GRREG
+        ext == "adml"           || // GRREG
+        ext == "cmtx"           || // GRREG
+        ext == "cmtl")             // GRREG
+    {
+        return true;
+    }
+    return false;
+}
+
+// FCIADS
+const string FciadsFileName = ":FSRM{ef88c031-5950-4164-ab92-eec5f16005a5}";
+bool IsFCIADA(string fileName)
+{
+    return fileName == FciadsFileName;
+}
+
+optional string GetStringFromBinary(binary bin)
+{
+    // Unicode: FFFE
+    // Unicode big endian: FEFF
+    // UTF-8: EFBBBF
+    if (bin.Count > 2 && bin[0] == 0xFF && bin[1] == 0xFE && BinaryStringDecoder(bin.Segment(2), TextEncoding.Unicode) is unicode:string)
+    {
+        return unicode;
+    }
+    else if (bin.Count > 2 && bin[0] == 0xFE && bin[1] == 0xFF && BinaryDecoder<UnicodeBigEndianString>(bin.Segment(2)) is unicodeBE:UnicodeBigEndianString)
+    {
+        return unicodeBE.TextContent;
+    }
+    else if (bin.Count > 3 && bin[0] == 0xEF && bin[1] == 0xBB && bin[2] == 0xBF && BinaryStringDecoder(bin.Segment(3), TextEncoding.UTF8) is utf8:string)
+    {
+        return utf8;
+    }
+    else if (BinaryStringDecoder(bin, TextEncoding.UTF8) is utf8NoBom:string)
+    {
+        return utf8NoBom;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+type UnicodeBigEndianString
+{
+    string TextContent with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Endian = Endian.Big};
+}

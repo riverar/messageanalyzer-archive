@@ -1,0 +1,1982 @@
+protocol RAP with 
+BinaryEncodingDefaults{Endian = Endian.Little, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Remote Administration Protocol",
+    ShortName = "RAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RAP", Version = "28.0", Date = "6/30/2015", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382596", Date = "12/03/2015"}
+        ]
+};
+
+using Standard;
+using SMB;
+using Utility;
+using ERREF;
+
+///////////////////////
+// Implementation Notes
+// RAP protocol is a RPC-like protocol that enables clients to perform administrative functions on servers.
+// From parser's aspect, the impact is string encoding in the wire is much more like RPC encoding and it has difference from normal block protocol.
+// The detail of string encoding is like:
+//      other-field-1
+//      other-field-2
+//      string-field-offset-low(ushort)
+//      string-field-offset-high(ushort)
+//      other field-n
+//      ...
+//      value-of-string, at position specified by 'offset' field refer to the start of whole message.
+// 
+// To make parser more usable, we'll define the 'string-field' in type of string, and decode the value using Mix-Encoding.
+// The side efffect will be some user may get confused when compare the parser definition with protocol TD.
+///////////////////////
+
+// Endpoint
+endpoint Server 
+    over SMB.Server 
+    accepts RequestMessage issues ResponseMessage;
+
+// Actor
+autostart actor RapOverSmbServer(SMB.Server server)
+{
+    // key: SMB Mid of request which could parse as RAP
+    // value: required info from RAP request message to decode corresponding response message.
+    map<ushort, SessionInfo> rapRequestMid = {};
+    process server accepts s:SMB.Messages.ComTransactionRequest where s.Request.TransParameters is block:Utility.Blob && block.Data is bin:binary && 
+        bin.Count > 2 && ((bin[0] + (bin[1] << 8)) as ushort) is opCode:ushort && InRange<Opcodes>(opCode)
+    {
+        // Append TransData if any
+        if (s.Request.TransData is bin2:binary && bin2.Count > 0)
+        {
+            bin += bin2;
+        }
+        ushort infoLevel;
+        DecodeAndDispatchRequest(bin, opCode, server, ref infoLevel);
+        rapRequestMid[s.Mid] = new SessionInfo{OpCode = opCode, InfoLevel = infoLevel};
+    }
+
+    process server issues s:SMB.Messages.ComTransactionResponse where s.Mid in rapRequestMid.Keys && (s.Response.TransParameters is block2:Utility.Blob && block2.Data is bin:binary)
+    {
+        // Append TransData if any
+        if (s.Response.TransData is bin2:binary && bin2.Count > 0)
+        {
+            bin += bin2;
+        }
+
+        SessionInfo sessionInfo = rapRequestMid[s.Mid];
+        DecodeAndDispatchResponse(bin, sessionInfo.OpCode, sessionInfo.InfoLevel, server);
+
+        rapRequestMid = rapRequestMid.Remove(s.Mid);
+    }
+    ~endpoint(SMB.Server server)
+    {
+        rapRequestMid = null;
+    }
+}
+
+type SessionInfo
+{
+    RAP.Opcodes OpCode;
+    ushort InfoLevel;
+}
+
+void DecodeAndDispatchRequest(binary bin, ushort opCode, SMB.Server server, ref ushort infoLevel)
+{
+    RequestMessage req;
+    switch (opCode)
+    {
+        // Server 
+        case Opcodes.NetServerGetInfo =>
+            req = DecodeMessageOrThrowException<NetServerGetInfoRequest>(bin, "NetServerGetInfoRequest");
+            infoLevel = (req as NetServerGetInfoRequest).RAPParams.InfoLevel;
+        case Opcodes.NetServerEnum2 =>
+            req = DecodeMessageOrThrowException<NetServerEnum2Request>(bin, "NetServerEnum2Request");
+            infoLevel = (req as NetServerEnum2Request).RAPParams.InfoLevel;
+        case Opcodes.NetServerEnum3 =>
+            req = DecodeMessageOrThrowException<NetServerEnum3Request>(bin, "NetServerEnum3Request");
+            infoLevel = (req as NetServerEnum3Request).RAPParams.InfoLevel;
+        // Share 
+        case Opcodes.NetShareEnum =>
+            req = DecodeMessageOrThrowException<NetShareEnumRequest>(bin, "NetShareEnumRequest");
+            infoLevel = (req as NetShareEnumRequest).RAPParams.InfoLevel;
+        case Opcodes.NetShareGetInfo =>
+            req = DecodeMessageOrThrowException<NetShareGetInfoRequest>(bin, "NetShareGetInfoRequest");
+            infoLevel = (req as NetShareGetInfoRequest).RAPParams.InfoLevel;
+        // Print 
+        case Opcodes.NetPrintQEnum =>
+            req = DecodeMessageOrThrowException<NetPrintQEnumRequest>(bin, "NetPrintQEnumRequest");
+            infoLevel = (req as NetPrintQEnumRequest).RAPParams.InfoLevel;
+        case Opcodes.NetPrintQGetInfo =>
+            req = DecodeMessageOrThrowException<NetPrintQGetInfoRequest>(bin, "NetPrintQGetInfoRequest");
+            infoLevel = (req as NetPrintQGetInfoRequest).RAPParams.InfoLevel;
+        case Opcodes.NetPrintJobSetInfo =>
+            req = DecodeMessageOrThrowException<NetPrintJobSetInfoRequest>(bin, "NetPrintJobSetInfoRequest");
+        case Opcodes.NetPrintJobGetInfo =>
+            req = DecodeMessageOrThrowException<NetPrintJobGetInfoRequest>(bin, "NetPrintJobGetInfoRequest");
+            infoLevel = (req as NetPrintJobGetInfoRequest).RAPParams.InfoLevel;
+        case Opcodes.NetPrintJobPause =>
+            req = DecodeMessageOrThrowException<NetPrintJobPauseRequest>(bin, "NetPrintJobPauseRequest");
+        case Opcodes.NetPrintJobContinue =>
+            req = DecodeMessageOrThrowException<NetPrintJobContinueRequest>(bin, "NetPrintJobContinueRequest");
+        case Opcodes.NetPrintJobDelete =>
+            req = DecodeMessageOrThrowException<NetPrintJobDeleteRequest>(bin, "NetPrintJobDeleteRequest");
+        // User 
+        case Opcodes.NetUserPasswordSet2 =>
+            req = DecodeMessageOrThrowException<NetUserPasswordSet2Request>(bin, "NetUserPasswordSet2Request");
+        case Opcodes.NetUserGetInfo =>
+            req = DecodeMessageOrThrowException<NetUserGetInfoRequest>(bin, "NetUserGetInfoRequest");
+            infoLevel = (req as NetUserGetInfoRequest).RAPParams.InfoLevel;
+        // Time 
+        case Opcodes.NetRemoteTOD =>
+            req = DecodeMessageOrThrowException<NetRemoteTODRequest>(bin, "NetRemoteTODRequest");
+        // Workstation 
+        case Opcodes.NetWkstaGetInfo =>
+            req = DecodeMessageOrThrowException<NetWkstaGetInfoRequest>(bin, "NetWkstaGetInfoRequest");
+            infoLevel = (req as NetWkstaGetInfoRequest).RAPParams.InfoLevel;
+        case Opcodes.NetWkstaUserLogon =>
+            req = DecodeMessageOrThrowException<NetWkstaUserLogonRequest>(bin, "NetWkstaUserLogonRequest");
+            infoLevel = (req as NetWkstaUserLogonRequest).RAPParams.InfoLevel;
+        case Opcodes.NetWkstaUserLogoff =>
+            req = DecodeMessageOrThrowException<NetWkstaUserLogoffRequest>(bin, "NetWkstaUserLogoffRequest");
+            infoLevel = (req as NetWkstaUserLogoffRequest).RAPParams.InfoLevel;
+        default =>
+            ThrowDecodingException("RAP");
+    }
+    if (req != null)
+    {
+        dispatch endpoint RAP.Server over server accepts req;
+    }
+}
+
+void DecodeAndDispatchResponse(binary bin, Opcodes opCode, ushort infoLevel, SMB.Server server)
+{
+    ResponseMessage res;
+    switch (opCode)
+    {
+        // Server 
+        case Opcodes.NetServerGetInfo =>
+            switch (bin)
+            {
+                case res1:NetServerGetInfoResponse from BinaryDecoder<NetServerGetInfoResponse[infoLevel]> =>
+                    res = res1;
+                default =>
+                    ThrowDecodingException("RAP", "NetServerGetInfoResponse");
+            }
+        case Opcodes.NetServerEnum2 =>
+            switch (bin)
+            {
+                case res2:NetServerEnum2Response from BinaryDecoder<NetServerEnum2Response[infoLevel]> =>
+                    res = res2;
+                default =>
+                    ThrowDecodingException("RAP", "NetServerEnum2Response");
+            }
+        case Opcodes.NetServerEnum3 =>
+            switch (bin)
+            {
+                case res3:NetServerEnum3Response from BinaryDecoder<NetServerEnum3Response[infoLevel]> =>
+                    res = res3;
+                default =>
+                    ThrowDecodingException("RAP", "NetServerEnum3Response");
+            }
+        // Share 
+        case Opcodes.NetShareEnum =>
+            switch (bin)
+            {
+                case res4:NetShareEnumResponse from BinaryDecoder<NetShareEnumResponse[infoLevel]> =>
+                    res = res4;
+                default =>
+                    ThrowDecodingException("RAP", "NetShareEnumResponse");
+            }
+        case Opcodes.NetShareGetInfo =>
+            switch (bin)
+            {
+                case res5:NetShareGetInfoResponse from BinaryDecoder<NetShareGetInfoResponse[infoLevel]> =>
+                    res = res5;
+                default =>
+                    ThrowDecodingException("RAP", "NetShareGetInfoResponse");
+            }
+        // Print 
+        case Opcodes.NetPrintQEnum =>
+            switch (bin)
+            {
+                case res6:NetPrintQEnumResponse from BinaryDecoder<NetPrintQEnumResponse[infoLevel]> =>
+                    res = res6;
+                default =>
+                    ThrowDecodingException("RAP", "NetPrintQEnumResponse");
+            }
+        case Opcodes.NetPrintQGetInfo =>
+            switch (bin)
+            {
+                case res7:NetPrintQGetInfoResponse from BinaryDecoder<NetPrintQGetInfoResponse[infoLevel]> =>
+                    res = res7;
+                default =>
+                    ThrowDecodingException("RAP", "NetPrintQGetInfoResponse");
+            }
+        case Opcodes.NetPrintJobSetInfo =>
+            res = DecodeMessageOrThrowException<NetPrintJobSetInfoResponse>(bin, "NetPrintJobSetInfoResponse");
+        case Opcodes.NetPrintJobGetInfo =>
+            switch (bin)
+            {
+                case res8:NetPrintJobGetInfoResponse from BinaryDecoder<NetPrintJobGetInfoResponse[infoLevel]> =>
+                    res = res8;
+                default =>
+                    ThrowDecodingException("RAP", "NetPrintJobGetInfoResponse");
+            }
+        case Opcodes.NetPrintJobPause =>
+            res = DecodeMessageOrThrowException<NetPrintJobPauseResponse>(bin, "NetPrintJobPauseResponse");
+        case Opcodes.NetPrintJobContinue =>
+            res = DecodeMessageOrThrowException<NetPrintJobContinueResponse>(bin, "NetPrintJobContinueResponse");
+        case Opcodes.NetPrintJobDelete =>
+            res = DecodeMessageOrThrowException<NetPrintJobDeleteResponse>(bin, "NetPrintJobDeleteResponse");
+        // User 
+        case Opcodes.NetUserPasswordSet2 =>
+            res = DecodeMessageOrThrowException<NetUserPasswordSet2Response>(bin, "NetUserPasswordSet2Response");
+        case Opcodes.NetUserGetInfo =>
+            switch (bin)
+            {
+                case res9:NetUserGetInfoResponse from BinaryDecoder<NetUserGetInfoResponse[infoLevel]> =>
+                    res = res9;
+                default =>
+                    ThrowDecodingException("RAP", "NetUserGetInfoResponse");
+            }
+        // Time 
+        case Opcodes.NetRemoteTOD =>
+            res = DecodeMessageOrThrowException<NetRemoteTODResponse>(bin, "NetRemoteTODResponse");
+        // Workstation 
+        case Opcodes.NetWkstaGetInfo =>
+            switch (bin)
+            {
+                case res10:NetWkstaGetInfoResponse from BinaryDecoder<NetWkstaGetInfoResponse[infoLevel]> =>
+                    res = res10;
+                default =>
+                    ThrowDecodingException("RAP", "NetWkstaGetInfoResponse");
+            }
+        case Opcodes.NetWkstaUserLogon =>
+            switch (bin)
+            {
+                case res11:NetWkstaUserLogonResponse from BinaryDecoder<NetWkstaUserLogonResponse[infoLevel]> =>
+                    res = res11;
+                default =>
+                    ThrowDecodingException("RAP", "NetWkstaUserLogonResponse");
+            }
+        case Opcodes.NetWkstaUserLogoff =>
+            switch (bin)
+            {
+                case res12:NetWkstaUserLogoffResponse from BinaryDecoder<NetWkstaUserLogoffResponse[infoLevel]> =>
+                    res = res12;
+                default =>
+                    ThrowDecodingException("RAP", "NetWkstaUserLogoffResponse");
+            }
+        default =>
+            ThrowDecodingException("RAP");
+    }
+    if (res != null)
+    {
+        dispatch endpoint RAP.Server over server issues res;
+    }
+}
+
+T DecodeMessageOrThrowException<T>(binary bin, string msgName)
+{
+    switch (bin)
+    {
+        case m:T from BinaryDecoder<T> =>
+            return m;
+        default =>
+            ThrowDecodingException("RAP", msgName);
+            T t;
+            return t;
+    }
+}
+
+// Messages
+
+// 2.5.1
+message RequestMessage
+{
+    Opcodes RAPOpcode;
+}
+
+// 2.5.2
+message ResponseMessage
+{
+    Win32ErrorCodeEnum Win32ErrorCode with DisplayInfo{ToText = (any obj) => Win32ErrorCodesToText(obj as ushort)};
+    short Converter;
+}
+
+pattern Win32ErrorCodeEnum = enum ushort 
+{
+    ERROR_SUCCESS               = 0x0000,
+    ERROR_MORE_DATA             = 0x00EA,
+    NERR_BufTooSmall            = 0x084B,
+    ERROR_INVALID_LEVEL         = 0x007C,
+    ERROR_INVALID_PARAMETER     = 0x0057,
+    ...
+};
+
+string Win32ErrorCodesToText(ushort errorCode)
+{
+    if (InRange<Win32ErrorCodeEnum>(errorCode))
+    {
+        return EnumToStringInSummary<Win32ErrorCodeEnum>(errorCode);
+    }
+    else
+    {
+        return ERREF.Win32ErrorCodesToText(errorCode as uint);
+    }
+}
+
+// 2.5.4
+pattern Opcodes = enum ushort
+{
+    // Server 
+    NetServerGetInfo        = 0x000D,
+    NetServerEnum2          = 0x0068,
+    NetServerEnum3          = 0x00D7,
+    // Share 
+    NetShareEnum            = 0x0000,
+    NetShareGetInfo         = 0x0001,
+    // Print 
+    NetPrintQEnum           = 0x0045,
+    NetPrintQGetInfo        = 0x0046,
+    NetPrintJobSetInfo      = 0x0093,
+    NetPrintJobGetInfo      = 0x004D,
+    NetPrintJobPause        = 0x0052,
+    NetPrintJobContinue     = 0x0053,
+    NetPrintJobDelete       = 0x0051,
+    // User 
+    NetUserPasswordSet2     = 0x0073,
+    NetUserGetInfo          = 0x0038,
+    // Time 
+    NetRemoteTOD            = 0x005B,
+    // Workstation 
+    NetWkstaGetInfo         = 0x003F,
+    NetWkstaUserLogon       = 0x0084,
+    NetWkstaUserLogoff      = 0x0085,
+    ...
+};
+
+// 2.5.5.1.1
+message NetServerGetInfoRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "WrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetServerGetInfoRequest", "WrLh", value);
+    string DataDesc
+        where ValidationCheckValue(value == "B16BBDz", this, true, ReferenceType.Message, "RAP", "DataDesc", "NetServerGetInfoRequest", "B16BBDz", value);
+    NetServerGetInfoRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetServerGetInfo;
+
+    override string ToString()
+    {
+        return "NetServerGetInfoRequest, " + RAPParams.ToString();
+    }
+};
+
+type NetServerGetInfoRequest_RAPParams
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString();
+    }
+}
+
+// 2.5.5.1.2
+message NetServerGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetServerGetInfoResponse_RAPOutParams RAPOutParams;
+    optional ([|InfoLevel == 0 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  NetServerInfo0 |
+         [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  NetServerInfo1[6 - Converter]) RAPOutData;
+
+    override string ToString()
+    {
+        return "NetServerGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetServerGetInfoResponse_RAPOutParams
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.5.2.1
+message NetServerEnum2Request : RequestMessage
+{
+    string ParamDesc where ValidationCheckValue(value == "WrLehDO" || value == "WrLehDz", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetServerEnum2Request", "WrLehDO or WrLehDz", value);
+    string DataDesc where ValidationCheckValue(value == "B16" || value == "B16BBDz", this, true, ReferenceType.Message, "RAP", "DataDesc", "NetServerEnum2Request", "B16 or B16BBDz", value);
+    NetServerEnum2Request_RAPParams[ParamDesc] RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetServerEnum2;
+
+    override string ToString()
+    {
+        return "NetServerEnum2Request, " + RAPParams.ToString();
+    }
+}
+type NetServerEnum2Request_RAPParams[string ParamDesc]
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+    ServerType  ServerType;
+    optional [|ParamDesc == "WrLehDz"|] string Domain;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString() + ", ServerType: " + EnumToStringInSummary<ServerType>(ServerType) +
+            (Domain != nothing ? (", Domain: " + Domain.ToString()) : "");
+    }
+}
+pattern ServerType = flags uint
+{
+    SV_TYPE_WORKSTATION                         =   0x00000001,
+    SV_TYPE_SERVER                              =   0x00000002,
+    SV_TYPE_SQLSERVER                           =   0x00000004,
+    SV_TYPE_DOMAIN_CTRL                         =   0x00000008,
+    SV_TYPE_DOMAIN_BAKCTRL                      =   0x00000010,
+    SV_TYPE_TIME_SOURCE                         =   0x00000020,
+    SV_TYPE_AFP                                 =   0x00000040,
+    SV_TYPE_NOVELL                              =   0x00000080,
+    SV_TYPE_DOMAIN_MEMBER                       =   0x00000100,
+    SV_TYPE_PRINTQ_SERVER                       =   0x00000200,
+    SV_TYPE_DIALIN_SERVER                       =   0x00000400,
+    $"SV_TYPE_SERVER_UNIX/SV_TYPE_XENIX_SERVER" =   0x00000800,
+    SV_TYPE_NT                                  =   0x00001000,
+    SV_TYPE_WFW                                 =   0x00002000,
+    SV_TYPE_SERVER_MFPN                         =   0x00004000,
+    SV_TYPE_SERVER_NT                           =   0x00008000,
+    SV_TYPE_POTENTIAL_BROWSER                   =   0x00010000,
+    SV_TYPE_BACKUP_BROWSER                      =   0x00020000,
+    SV_TYPE_MASTER_BROWSER                      =   0x00040000,
+    SV_TYPE_DOMAIN_MASTER                       =   0x00080000,
+    SV_TYPE_WINDOWS                             =   0x00400000,
+    SV_TYPE_DFS                                 =   0x00800000,
+    SV_TYPE_CLUSTER_NT                          =   0x01000000,
+    SV_TYPE_TERMINALSERVER                      =   0x02000000,
+    SV_TYPE_CLUSTER_VS_NT                       =   0x04000000,
+    SV_TYPE_DCE                                 =   0x10000000,
+    SV_TYPE_ALTERNATE_XPORT                     =   0x20000000,
+    SV_TYPE_LOCAL_LIST_ONLY                     =   0x40000000,
+    SV_TYPE_DOMAIN_ENUM                         =   0x80000000,
+    ...
+};
+
+// 2.5.5.2.2
+message NetServerEnum2Response[ushort InfoLevel] : ResponseMessage
+{ 
+    NetServerEnum2Response_RAPOutParams RAPOutParams;
+    optional [|RAPOutParams.EntriesReturned > 0|]
+        ([|InfoLevel == 0|]  array<NetServerInfo0> |
+         [|InfoLevel == 1|]  array<NetServerInfo1[8 - Converter]>) RAPOutData
+            with BinaryEncoding{Length = RAPOutParams.EntriesReturned};
+    
+    override string ToString()
+    {
+        return "NetServerEnum2Response, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetServerEnum2Response_RAPOutParams 
+{
+    ushort EntriesReturned;
+    ushort EntriesAvailable;
+}
+
+// 2.5.5.3.1
+message NetServerEnum3Request : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "WrLehDzz", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetServerEnum3Request", "WrLehDzz", value);
+    string DataDesc where ValidationCheckValue(value == "B16" || value == "B16BBDz", this, true, ReferenceType.Message, "RAP", "DataDesc", "NetServerEnum3Request", "B16 or B16BBDz", value);
+    NetServerEnum3Request_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetServerEnum3;
+
+    override string ToString()
+    {
+        return "NetServerEnum3Request, " + RAPParams.ToString();
+    }
+};
+
+type NetServerEnum3Request_RAPParams
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+    ServerType ServerType;
+    string Domain;
+    string FirstNameToReturn with BinaryEncoding{MaxLength = 15};
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString() + ", ServerType: " + EnumToStringInSummary<ServerType>(ServerType) +
+            ", FirstNameToReturn: " + FirstNameToReturn;
+    }
+};
+
+message NetServerEnum3Response[ushort InfoLevel] : ResponseMessage
+{
+    NetServerEnum3Response_RAPOutParams RAPOutParams;
+    optional [|RAPOutParams.EntriesReturned > 0|]
+        ([|InfoLevel == 0|]  array<NetServerInfo0> |
+         [|InfoLevel == 1|]  array<NetServerInfo1[8 - Converter]>) RAPOutData
+            with BinaryEncoding{Length = RAPOutParams.EntriesReturned};
+
+    override string ToString()
+    {
+        return "NetServerEnum3Response, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+type NetServerEnum3Response_RAPOutParams
+{
+    ushort EntriesReturned;
+    ushort EntriesAvailable;
+}
+
+// 2.5.5.4.1
+type NetServerInfo0
+{
+    string ServerName with BinaryEncoding{WidthForComposedType = 16 * 8};
+
+    override string ToString()
+    {
+        return "ServerName: " + ServerName;
+    }
+}
+
+type NetServerInfo1[int StartPosition]
+{
+    string ServerName with BinaryEncoding{WidthForComposedType = 16 * 8};
+    byte MajorVersion;
+    byte MinorVersion;
+    ServerType ServerType;
+    string ServerComment with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "ServerName: " + ServerName + ", ServerType: " + EnumToStringInSummary<ServerType>(ServerType);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.6.1.1
+message NetShareEnumRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "WrLeh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetShareEnumRequest", "WrLeh", value);
+    string DataDesc 
+        where ValidationCheckValue(value == "B13" || value == "B13BWz" || value == "B13BWzWWWzB9B", this, true, ReferenceType.Message, 
+        "RAP", "DataDesc", "NetShareEnumRequest", "B13, B13BWz or B13BWzWWWzB9B", value);
+    NetShareEnumRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetShareEnum;
+
+    override string ToString()
+    {
+        return "NetShareEnumRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetShareEnumRequest_RAPParams
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+    
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString();
+    }
+};
+
+// 2.5.6.1.2
+message NetShareEnumResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetShareEnumResponse_RAPOutParams RAPOutParams;
+    optional [|RAPOutParams.EntriesReturned > 0|]
+        ([|InfoLevel == 0|]  array<NetShareInfo0> |
+         [|InfoLevel == 1|]  array<NetShareInfo1[8 - Converter]> |
+         [|InfoLevel == 2|] array<NetShareInfo2[8 - Converter]>) RAPOutData
+            with BinaryEncoding{Length = RAPOutParams.EntriesReturned};
+
+    override string ToString()
+    {
+        return "NetShareEnumResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+type NetShareEnumResponse_RAPOutParams
+{
+    ushort EntriesReturned;
+    ushort EntriesAvailable;
+}
+
+// 2.5.6.2.1
+message NetShareGetInfoRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "zWrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetShareGetInfoRequest", "zWrLh", value);
+    string DataDesc where ValidationCheckValue(value == "B13" || value == "B13BWz" || value == "B13BWzWWWzB9B", this, true, 
+        ReferenceType.Message, "RAP", "DataDesc", "NetShareGetInfoRequest", "B13, B13BWz or B13BWzWWWzB9B", value);
+    NetShareGetInfoRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetShareGetInfo;
+
+    override string ToString()
+    {
+        return "NetShareGetInfoRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetShareGetInfoRequest_RAPParams
+{
+    string NetName;
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "NetName: " + NetName + ", InfoLevel: " + InfoLevel.ToString();
+    }
+};
+
+// 2.5.6.2.2
+message NetShareGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetShareGetInfoResponse_RAPOutParams RAPOutParams;
+    optional ([|InfoLevel == 0 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  NetShareInfo0 |
+         [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  NetShareInfo1[6 - Converter] |
+         [|InfoLevel == 2 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetShareInfo2[6 - Converter]) RAPOutData;
+
+    override string ToString()
+    {
+        return "NetShareGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetShareGetInfoResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+type NetShareInfo0
+{
+    string NetworkName with BinaryEncoding{WidthForComposedType = 13 * 8};
+
+    override string ToString()
+    {
+        return "NetworkName: " + NetworkName;
+    }
+}
+
+type NetShareInfo1[int StartPosition]
+{
+    string NetworkName with BinaryEncoding{WidthForComposedType = 13 * 8};
+    byte Pad;
+    NetShareInfo1_Type Type 
+        where ValidationCheckEnumValue(InRange<NetShareInfo1_Type>(Type), null, true, ReferenceType.Type, "RAP", "Type", "NetShareInfo1", "0x0000, 0x0001, 0x0002, 0x0003", value);
+    string Remark with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "NetworkName: " + NetworkName + ", Type: " + EnumToStringInSummary<NetShareInfo1_Type>(Type);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+pattern NetShareInfo1_Type = enum ushort
+{
+    DiskDirectoryTree       = 0x0000,
+    PrinterQueue            = 0x0001,
+    CommunicationsDevice    = 0x0002,
+    IPC                     = 0x0003,
+    ...
+};
+
+type NetShareInfo2[int StartPosition]
+{
+    string NetworkName with BinaryEncoding{WidthForComposedType = 13 * 8};
+    byte Pad;
+    NetShareInfo1_Type Type where ValidationCheckEnumValue(InRange<NetShareInfo1_Type>(Type), null, true, ReferenceType.Type, "RAP", "Type", "NetShareInfo2", "0x0000, 0x0001, 0x0002, 0x0003", value);
+    string Remark with Encoding{Decoder = RefStringDecoder};
+    ushort Permissions;
+    ushort MaxUses;
+    ushort CurrentUses;
+    string Path with Encoding{Decoder = RefStringDecoder};
+    string Password with BinaryEncoding{Length = 9};
+    byte Pad2;
+
+    override string ToString()
+    {
+        return "NetworkName: " + NetworkName + ", Type: " + EnumToStringInSummary<NetShareInfo1_Type>(Type) + ", CurrentUses: " + CurrentUses.ToString();
+    }
+    
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.7.1.1
+message NetPrintQEnumRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "WrLeh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetShareGetInfoRequest", "zWrLh", value);
+    string DataDesc 
+        where ValidationCheckValue(value == "B13" || value == "B13BWWWzzzzzWW" || value == "B13BWWWzzzzzWN" || value == "zWWWWzzzzWWzzl" || value == "zWWWWzzzzWNzzl" || value == "z", 
+        this, true, ReferenceType.Message, "RAP", "DataDesc", "NetPrintQEnumRequest", "B13BWz, B13BWWWzzzzzWW, B13BWWWzzzzzWN, zWWWWzzzzWWzzl, zWWWWzzzzWNzzl or z", value);
+    NetPrintQEnumRequest_RAPParams RAPParams;
+    string AuxDesc 
+        where ValidationCheckValue(value == "WB21BB16B10zWWzDDz", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintQEnumRequest", "WB21BB16B10zWWzDDz", value);
+
+    invariant RAPOpcode == Opcodes.NetPrintQEnum;
+
+    override string ToString()
+    {
+        return "NetPrintQEnumRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetPrintQEnumRequest_RAPParams
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString();
+    }
+};
+
+// 2.5.7.1.2
+message NetPrintQEnumResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetPrintQEnumResponse_RAPOutParams RAPOutParams;
+    optional [|RAPOutParams.EntriesReturned > 0|]
+        ([|InfoLevel == 0|] array<PrintQueue0> |
+         [|InfoLevel == 1|] array<PrintQueue1[8 - Converter]> |
+         [|InfoLevel == 2|] array<NetPrintQEnumResponse_RAPOutData2[8 - Converter]> | 
+         [|InfoLevel == 3|] array<PrintQueue3[8 - Converter]> |
+         [|InfoLevel == 4|] array<NetPrintQEnumResponse_RAPOutData4[8 - Converter]> |
+         [|InfoLevel == 5|] array<PrintQueue5[8 - Converter]>) RAPOutData
+            with BinaryEncoding{Length = RAPOutParams.EntriesReturned};
+    
+    override string ToString()
+    {
+        return "NetPrintQEnumResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetPrintQEnumResponse_RAPOutParams 
+{
+    ushort EntriesReturned;
+    ushort EntriesAvailable;
+}
+
+type NetPrintQEnumResponse_RAPOutData2[int StartPosition]
+{
+    PrintQueue1[StartPosition] PrintQueue;
+    array<PrintJobInfo1[StartPosition]> PrintJobs with BinaryEncoding{Length = PrintQueue.PrintJobCount};
+
+    override string ToString()
+    {
+        return PrintQueue.ToString();
+    }
+}
+
+type NetPrintQEnumResponse_RAPOutData4[int StartPosition]
+{
+    PrintQueue3[StartPosition] PrintQueue;
+    array<PrintJobInfo2[StartPosition]> PrintJobs with BinaryEncoding{Length = PrintQueue.PrintJobCount};
+
+    override string ToString()
+    {
+        return PrintQueue.ToString();
+    }
+}
+
+// 2.5.7.2.1
+message NetPrintQGetInfoRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "zWrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintQGetInfoRequest", "zWrLh", value);
+    string DataDesc 
+        where ValidationCheckValue(value == "B13" || value == "B13BWWWzzzzzWW" || value == "B13BWWWzzzzzWN" || value == "zWWWWzzzzWWzzl" || value == "zWWWWzzzzWNzzl" || value == "z", 
+        this, true, ReferenceType.Message, "RAP", "DataDesc", "NetPrintQGetInfoRequest", "B13, B13BWWWzzzzzWW, B13BWWWzzzzzWN, zWWWWzzzzWWzzl, zWWWWzzzzWNzzl or z", value);
+    NetPrintQGetInfoRequest_RAPParams RAPParams;
+    optional [|RAPParams.InfoLevel == 2|] string AuxDesc
+        where ValidationCheckValue(value == nothing || value == "WB21BB16B10zWWzDDz", this, true, ReferenceType.Message, "RAP", "AuxDesc", "NetPrintQGetInfoRequest", "WB21BB16B10zWWzDDz", value);
+
+    invariant RAPOpcode == Opcodes.NetPrintQGetInfo;
+    
+    override string ToString()
+    {
+        return "NetPrintQGetInfoRequest, " + RAPParams.ToString();
+    }
+}
+type NetPrintQGetInfoRequest_RAPParams
+{
+    string PrintQueueName;
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "PrintQueueName: " + PrintQueueName + ", InfoLevel: " + InfoLevel.ToString();
+    }
+}
+
+// 2.5.7.2.2
+message NetPrintQGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetPrintQGetInfoResponse_RAPOutParams RAPOutParams;
+    optional ([|InfoLevel == 0 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] PrintQueue0 |
+         [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  PrintQueue1[6 - Converter] |
+         [|InfoLevel == 2 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  NetPrintQGetInfoResponse_RAPOutData2[6 - Converter]|
+         [|InfoLevel == 3 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] PrintQueue3[6 - Converter] |
+         [|InfoLevel == 4 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetPrintQGetInfoResponse_RAPOutData4[6 - Converter] |
+         [|InfoLevel == 5 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] PrintQueue5[6 - Converter]) RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetPrintQGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) + 
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetPrintQGetInfoResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+type NetPrintQGetInfoResponse_RAPOutData2[int StartPosition]
+{
+    PrintQueue1[StartPosition] PrintQueue;
+    array<PrintJobInfo1[StartPosition]> PrintJobInfo with BinaryEncoding{Length = PrintQueue.PrintJobCount};
+
+    override string ToString()
+    {
+        return PrintQueue.ToString();
+    }
+}
+
+type NetPrintQGetInfoResponse_RAPOutData4[int StartPosition]
+{
+    PrintQueue3[StartPosition] PrintQueue;
+    array<PrintJobInfo2[StartPosition]> PrintJobInfo with BinaryEncoding{Length = PrintQueue.PrintJobCount};
+
+    override string ToString()
+    {
+        return PrintQueue.ToString();
+    }
+}
+
+// 2.5.7.3.1
+message NetPrintJobSetInfoRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "WWsTP", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintJobSetInfoRequest", "WWsTP", value);
+    string DataDesc
+        where ValidationCheckValue(value == "WB21BB16B10zWWzDDz", this, true, ReferenceType.Message, "RAP", "DataDesc", "NetPrintJobSetInfoRequest", "WB21BB16B10zWWzDDz", value);
+    NetPrintJobSetInfo_RAPParams RAPParams;
+    ([|RAPParams.ParamNum in {0x0001, 0x0006, 0x0007}|] short |
+    [|RAPParams.ParamNum in {0x0009, 0x000A}|] int |
+    [|RAPParams.ParamNum in {0x0002, 0x0003, 0x0004, 0x0005, 0x0008, 0x000B}|] string) RAPInData;
+
+    invariant RAPOpcode == Opcodes.NetPrintJobSetInfo;
+
+    override string ToString()
+    {
+        return "NetPrintJobSetInfoRequest, " + RAPParams.ToString() + ", RAPInData: " + RAPInData.ToString();
+    }
+}
+
+type NetPrintJobSetInfo_RAPParams 
+{
+    ushort JobID;
+    ushort InfoLevel;
+    ushort BufferSize;
+    NetPrintJobSetInfo_RAPParams_ParamNum ParamNum
+        where ValidationCheckEnumValueTooManyItems(InRange<NetPrintJobSetInfo_RAPParams_ParamNum>(value), null, true, ReferenceType.Type, "RAP", "ParamNum", "NetPrintJobSetInfo_RAPParams", "NetPrintJobSetInfo", "[MS-RAP]");
+    
+    override string ToString()
+    {
+        return "JobID, " + JobID.ToString() + ", InfoLevel: " + InfoLevel.ToString() + ", ParamNum: " + EnumToStringInSummary<NetPrintJobSetInfo_RAPParams_ParamNum>(ParamNum);
+    }
+}
+
+pattern NetPrintJobSetInfo_RAPParams_ParamNum = enum ushort
+{
+    JobNum          = 0x0001,
+    UserName        = 0x0002,
+    NotifyName      = 0x0003,
+    DataType        = 0x0004,
+    ParametersString= 0x0005,
+    JobPosition     = 0x0006,
+    JobStatus       = 0x0007,
+    JobStatusStr    = 0x0008,
+    TimeSubmitted   = 0x0009,
+    JobSize         = 0x000A,
+    JobComment      = 0x000B,
+    ... 
+};
+
+// 2.5.7.3.2
+message NetPrintJobSetInfoResponse : ResponseMessage
+{
+    override string ToString()
+    {
+        return "NetPrintJobSetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+};
+
+// 2.5.7.4.1
+message NetPrintJobGetInfoRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "WWrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintJobGetInfoRequest", "WWrLh", value);
+    string DataDesc where ValidationCheckValue(value == "WWzWWDDzzzzzzzzzzlz", this, true, ReferenceType.Message, "RAP", "DataDesc", "NetPrintJobGetInfoRequest", "WWzWWDDzzzzzzzzzzlz", value);
+    NetPrintJobGetInfoRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetPrintJobGetInfo;
+    
+    override string ToString()
+    {
+        return "NetPrintJobGetInfoRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetPrintJobGetInfoRequest_RAPParams
+{
+    ushort JobID;
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString() + ", InfoLevel: " + InfoLevel.ToString();
+    }
+}
+
+// 2.5.7.4.2
+message NetPrintJobGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetPrintJobGetInfoResponse_RAPOutParams RAPOutParams;
+    optional ([|InfoLevel == 0 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] PrintJobInfo0 |
+         [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  PrintJobInfo1[6 - Converter] |
+         [|InfoLevel == 2 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|]  PrintJobInfo2[6 - Converter] |
+         [|InfoLevel == 3 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] PrintJobInfo3[6 - Converter]) RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetPrintJobGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) +
+            (RAPOutData != nothing ? (", " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetPrintJobGetInfoResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.7.5.1
+message NetPrintJobPauseRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "W", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintJobPauseRequest", "W", value);
+    string DataDesc;
+    NetPrintJobPauseRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetPrintJobPause;
+    
+    override string ToString()
+    {
+        return "NetPrintJobPauseRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetPrintJobPauseRequest_RAPParams
+{
+    ushort JobID;
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString();
+    }
+};
+
+// 2.5.7.5.2
+message NetPrintJobPauseResponse : ResponseMessage
+{
+    override string ToString()
+    {
+        return "NetPrintJobPauseResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+};
+
+// 2.5.7.6.1
+message NetPrintJobContinueRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "W", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintJobContinueRequest", "W", value);
+    string DataDesc;
+    NetPrintJobContinueRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetPrintJobContinue;
+    
+    override string ToString()
+    {
+        return "NetPrintJobPauseRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetPrintJobContinueRequest_RAPParams
+{
+    ushort JobID;
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString();
+    }
+};
+
+// 2.5.7.6.2
+message NetPrintJobContinueResponse : ResponseMessage
+{
+    override string ToString()
+    {
+        return "NetPrintJobContinueResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+};
+
+// 2.5.7.7.1
+message NetPrintJobDeleteRequest : RequestMessage
+{
+    string ParamDesc
+        where ValidationCheckValue(value == "W", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetPrintJobDeleteRequest", "W", value);
+    string DataDesc;
+    NetPrintJobDeleteRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetPrintJobDelete;
+    
+    override string ToString()
+    {
+        return "NetPrintJobDeleteRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetPrintJobDeleteRequest_RAPParams
+{
+    ushort JobID;
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString();
+    }
+};
+
+// 2.5.7.7.2
+message NetPrintJobDeleteResponse : ResponseMessage
+{
+    override string ToString()
+    {
+        return "NetPrintJobDeleteResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+};
+
+// 2.5.7.8.1
+type PrintQueue0
+{
+    string PrintQName  with BinaryEncoding{WidthForComposedType = 13 * 8};
+
+    override string ToString()
+    {
+        return "PrintQName: " + PrintQName;
+    }
+}
+
+// 2.5.7.8.2
+type PrintQueue1[int StartPosition]
+{
+    string PrintQName  with BinaryEncoding{WidthForComposedType = 13 * 8};
+    byte Pad1;
+    ushort Priority;
+    ushort StartTime where ValidationCheckLessThan(value < 1440, null, true, ReferenceType.Type, "RAP", "StartTime", "PrintQueue1", "1440", value);
+    ushort UntilTime where ValidationCheckLessThan(value < 1440, null, true, ReferenceType.Type, "RAP", "UntilTime", "PrintQueue1", "1440", value);
+    string SeparatorPageFilename with Encoding{Decoder = RefStringDecoder};
+    string PrintProcessorDllName with Encoding{Decoder = RefStringDecoder};
+    string PrintDestinationsName with Encoding{Decoder = RefStringDecoder};
+    string PrintParameterString with Encoding{Decoder = RefStringDecoder};
+    string CommentString with Encoding{Decoder = RefStringDecoder};
+    PrintQStatus PrintQStatus 
+        where ValidationCheckEnumValue(InRange<PrintQStatus>(PrintQStatus), null, true, ReferenceType.Type, "RAP", "PrintQStatus", "PrintQueue1", "0x0000, 0x0001, 0x0002, 0x0003", value);
+    ushort PrintJobCount;
+
+    override string ToString()
+    {
+        return "PrintQName: " + PrintQName + ", Priority: " + Priority.ToString() + ", PrintQStatus: " + EnumToStringInSummary<PrintQStatus>(PrintQStatus) + 
+            ", PrintJobCount: " + PrintJobCount.ToString();
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+pattern PrintQStatus = enum ushort
+{
+    PRQ_ACTIVE      = 0x0000,
+    PRQ_PAUSE       = 0x0001,
+    PRQ_ERROR       = 0x0002,
+    PRQ_PENDING     = 0x0003,
+    ...
+};
+
+// 2.5.7.8.3
+type PrintQueue3[int StartPosition]
+{
+    string PrintQueueName with Encoding{Decoder = RefStringDecoder};
+    ushort Priority;
+    ushort StartTime where ValidationCheckLessThan(value < 1440, null, true, ReferenceType.Type, "RAP", "StartTime", "PrintQueue3", "1440", value);
+    ushort UntilTime where ValidationCheckLessThan(value < 1440, null, true, ReferenceType.Type, "RAP", "UntilTime", "PrintQueue3", "1440", value);
+    ushort Pad;
+    string SeparatorPageFilename with Encoding{Decoder = RefStringDecoder};
+    string PrintProcessorDllName with Encoding{Decoder = RefStringDecoder};
+    string PrintParameterString with Encoding{Decoder = RefStringDecoder};
+    string CommentString with Encoding{Decoder = RefStringDecoder};
+    PrintQStatus PrintQStatus 
+        where ValidationCheckEnumValue(InRange<PrintQStatus>(PrintQStatus), null, true, ReferenceType.Type, "RAP", "PrintQStatus", "PrintQueue3", "0x0000, 0x0001, 0x0002, 0x0003", value);
+    ushort PrintJobCount;
+    string Printers with Encoding{Decoder = RefStringDecoder};
+    string DriverName with Encoding{Decoder = RefStringDecoder};
+    string PrintDriverData with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "Priority: " + Priority.ToString() + "PrintQStatus: " + EnumToStringInSummary<PrintQStatus>(PrintQStatus) + 
+            ", PrintJobCount: " + PrintJobCount.ToString();
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.7.8.4
+type PrintQueue5[int StartPosition]
+{
+    string PrintQueueName with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "PrintQName: " + PrintQueueName;
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.7.8.5
+type PrintJobInfo0
+{
+    ushort JobID;
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString();
+    }
+}
+
+// 2.5.7.8.6
+type PrintJobInfo1[int StartPosition]
+{
+    ushort JobID;
+    string UserName with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad;
+    string NotifyName with BinaryEncoding{WidthForComposedType = 16 * 8};
+    string DataType with BinaryEncoding{WidthForComposedType = 10 * 8};
+    string PrintParameterString with Encoding{Decoder = RefStringDecoder};
+    ushort JobPosition;
+    JobStatus JobStatus;
+    string JobStatusString with Encoding{Decoder = RefStringDecoder};
+    uint TimeSubmitted;
+    uint JobSize;
+    string JobCommentString with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString() + ", UserName: " + UserName + ", JobStatus: " + EnumToStringInSummary<JobStatus>(JobStatus);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+pattern JobStatus = enum ushort 
+{
+    PRJ_QS_QUEUED       = 0x0000,
+    PRJ_QS_PAUSED       = 0x0001,
+    PRJ_QS_SPOOLING     = 0x0002,
+    PRJ_QS_PRINTING     = 0x0003,
+    PRJ_QS_ERROR        = 0x0010,
+    ...
+};
+
+// 2.5.7.8.7
+type PrintJobInfo2[int StartPosition]
+{
+    ushort JobID;
+    ushort Priority;
+    string UserName with Encoding{Decoder = RefStringDecoder};
+    ushort JobPosition;
+    JobStatus JobStatus;
+    uint TimeSubmitted with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint JobSize;
+    string CommentString with Encoding{Decoder = RefStringDecoder};
+    string DocumentName with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString() + ", JobStatus: " + EnumToStringInSummary<JobStatus>(JobStatus);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.7.8.8
+type PrintJobInfo3[int StartPosition]
+{
+    ushort JobID;
+    ushort Priority;
+    string UserName with Encoding{Decoder = RefStringDecoder};
+    ushort JobPosition;
+    JobStatus JobStatus;
+    uint TimeSubmitted with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint JobSize;
+    string CommentString with Encoding{Decoder = RefStringDecoder};
+    string DocumentName with Encoding{Decoder = RefStringDecoder};
+    string NotifyName with Encoding{Decoder = RefStringDecoder};
+    string DataType with Encoding{Decoder = RefStringDecoder};
+    string PrintParameterString with Encoding{Decoder = RefStringDecoder};
+    string StatusString with Encoding{Decoder = RefStringDecoder};
+    string QueueName with Encoding{Decoder = RefStringDecoder};
+    string PrintProcessorName with Encoding{Decoder = RefStringDecoder};
+    string PrintProcessorParams with Encoding{Decoder = RefStringDecoder};
+    string DriverName with Encoding{Decoder = RefStringDecoder};
+    string DriverDataOffset with Encoding{Decoder = RefStringDecoder};
+    string PrinterNameOffset with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "JobID: " + JobID.ToString() + ", JobStatus: " + EnumToStringInSummary<JobStatus>(JobStatus);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.8.1.1 
+message NetUserPasswordSet2Request : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "zb16b16WW", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetUserPasswordSet2Request", "zb16b16WW", value);
+    string DataDesc;
+    NetUserPasswordSet2Request_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetUserPasswordSet2;
+    
+    override string ToString()
+    {
+        return "NetUserPasswordSet2Request, " + RAPParams.ToString();
+    }
+}
+
+type NetUserPasswordSet2Request_RAPParams
+{
+    string UserName;
+    string OldPassword with BinaryEncoding{WidthForComposedType = 16 * 8};
+    string NewPassword with BinaryEncoding{WidthForComposedType = 16 * 8};
+    ushort EncryptedPassword;
+    ushort RealPasswordLength;
+
+    override string ToString()
+    {
+        return "UserName, " + UserName + ", OldPassword: " + OldPassword + ", NewPassword: " + NewPassword;
+    }
+};
+
+// 2.5.8.1.2 
+message NetUserPasswordSet2Response : ResponseMessage
+{
+    override string ToString()
+    {
+        return "NetUserPasswordSet2Response, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+}
+
+// 2.5.8.2.1
+message NetUserGetInfoRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "zWrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetUserGetInfoRequest", "zWrLh", value);
+    string DataDesc;
+    NetUserGetInfoRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetUserGetInfo;
+    
+    override string ToString()
+    {
+        return "NetUserGetInfoRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetUserGetInfoRequest_RAPParams
+{
+    string UserName;
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "UserName: " + UserName + ", InfoLevel: " + InfoLevel.ToString();
+    }
+};
+
+// 2.5.8.2.2
+message NetUserGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetUserGetInfoResponse_RAPOutParams RAPOutParams;
+    optional ([|InfoLevel == 0 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetUserInfo0  |
+         [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetUserInfo1[6 - Converter] |
+         [|InfoLevel == 2 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetUserInfo2[6 - Converter] | 
+         [|InfoLevel == 10 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetUserInfo10[6 - Converter] | 
+         [|InfoLevel == 11 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetUserInfo11[6 - Converter] ) RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetUserGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) +
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetUserGetInfoResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.8.3.1
+type NetUserInfo0
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+
+    override string ToString()
+    {
+        return "Name: " + Name;
+    }
+}
+
+// 2.5.8.3.2
+type NetUserInfo1[int StartPosition]
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad;
+    string Password with BinaryEncoding{WidthForComposedType = 16 * 8};
+    uint PasswordAge;
+    Priv Priv;
+    string HomeDir with Encoding{Decoder = RefStringDecoder};
+    string Comment with Encoding{Decoder = RefStringDecoder};
+    NetUserInfo1_Flags Flags;
+    string ScriptPath with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "Name: " + Name + ", Priv: " + EnumToStringInSummary<Priv>(Priv) + ", NetUserInfo1_Flags" + EnumToString<NetUserInfo1_Flags>(Flags);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+pattern Priv = enum ushort
+{
+    USER_PRIV_GUEST = 0,
+    USER_PRIV_USER  = 1,
+    USER_PRV_ADMIN  = 2,
+    ...
+};
+pattern NetUserInfo1_Flags = flags ushort
+{
+    UF_TEMP_DUPLICATE_ACCOUNT       = 0x0100,
+    UF_NORMAL_ACCOUNT               = 0x0200,
+    UF_INTERDOMAIN_TRUST_ACCOUNT    = 0x0800,
+    UF_WORKSTATION_TRUST_ACCOUNT    = 0x1000,
+    UF_SERVER_TRUST_ACCOUNT         = 0x2000,
+    UF_MACHINE_ACCOUNT_MASK         = 0x3800,
+    UF_ACCOUNT_TYPE_MASK            = 0x380A,
+    ...
+};
+
+// 2.5.8.3.3
+type NetUserInfo2[int StartPosition]
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad;
+    string Password with BinaryEncoding{WidthForComposedType = 16 * 8};
+    uint PasswordAge;
+    Priv Priv;
+    string HomeDir with Encoding{Decoder = RefStringDecoder};
+    string Comment with Encoding{Decoder = RefStringDecoder};
+    NetUserInfo1_Flags Flags;
+    string ScriptPath with Encoding{Decoder = RefStringDecoder};
+    AuthFlags AuthFlags;
+    string FullName with Encoding{Decoder = RefStringDecoder};
+    string UsrComment with Encoding{Decoder = RefStringDecoder};
+    string pParms with Encoding{Decoder = RefStringDecoder};
+    string WorkStations with Encoding{Decoder = RefStringDecoder};
+    uint LastLogon with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint LastLogOff with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint AcctExpires with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint MaxStorage;
+    ushort UnitsPerWeek where ValidationCheckValue(value == 168, null, true, ReferenceType.Type, "RAP", "UnitsPerWeek", "NetUserInfo2", "168", value);
+    string LogonHours with Encoding{Decoder = RefStringDecoder};
+    ushort BadPwCount;
+    ushort NumLogons;
+    string LogonServer with Encoding{Decoder = RefStringDecoder};
+    ushort CountryCode;
+    ushort CodePage;
+
+    override string ToString()
+    {
+        return "Name: " + Name + ", Priv: " + EnumToStringInSummary<Priv>(Priv) + ", NetUserInfo1_Flags" + 
+            EnumToString<NetUserInfo1_Flags>(Flags) + ", AuthFlags: " + EnumToStringInSummary<AuthFlags>(AuthFlags);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+};
+pattern AuthFlags  = enum uint
+{
+    AF_OP_PRINT     = 0,
+    AF_OP_COMM      = 1,
+    AF_OP_SERVER    = 2,
+    AF_OP_ACCOUNTS  = 3,
+    ...
+};
+
+// 2.5.8.3.4
+type NetUserInfo10[int StartPosition]
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad;
+    string Comment with Encoding{Decoder = RefStringDecoder};
+    string UsrComment with Encoding{Decoder = RefStringDecoder};
+    string FullName with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "Name: " + Name;
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.8.3.5
+type NetUserInfo11[int StartPosition]
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad;
+    string Comment with Encoding{Decoder = RefStringDecoder};
+    string UserComment with Encoding{Decoder = RefStringDecoder};
+    string FullName with Encoding{Decoder = RefStringDecoder};
+    Priv Priv;
+    AuthFlags AuthFlags;
+    uint PasswordAge;
+    string HomeDir with Encoding{Decoder = RefStringDecoder};
+    string Parms with Encoding{Decoder = RefStringDecoder};
+    uint LastLogon with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint LastLogoff with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    ushort BadPWCount;
+    ushort NumLogons;
+    string LogonServer with Encoding{Decoder = RefStringDecoder};
+    ushort CountryCode;
+    string Workstations with Encoding{Decoder = RefStringDecoder};
+    uint MaxStorage;
+    ushort UnitsPerWeek where ValidationCheckValue(value == 168, null, true, ReferenceType.Type, "RAP", "UnitsPerWeek", "NetUserInfo11", "168", value);
+    string LogonHours with Encoding{Decoder = RefStringDecoder};
+    ushort CodePage;
+
+    override string ToString()
+    {
+        return "Name: " + Name + ", Priv: " + EnumToStringInSummary<Priv>(Priv) + ", AuthFlags: " + EnumToStringInSummary<AuthFlags>(AuthFlags);
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.9.1.1
+message NetRemoteTODRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "rL", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetRemoteTODRequest", "rL", value);
+    string DataDesc
+        where ValidationCheckValue(value == "DDBBBBWWBBWB", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetRemoteTODRequest", "DDBBBBWWBBWB", value);
+    NetRemoteTODRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetRemoteTOD;
+    
+    override string ToString()
+    {
+        return "NetRemoteTODRequest";
+    }
+}
+
+type NetRemoteTODRequest_RAPParams
+{
+    ushort ReceiveBufferSize;
+};
+
+// 2.5.9.1.2
+message NetRemoteTODResponse : ResponseMessage
+{
+    optional [|Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] TimeOfDayInfo RAPOutParams;
+        
+    override string ToString()
+    {
+        return "NetRemoteTODResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode);
+    }
+}
+
+type TimeOfDayInfo
+{
+    uint TimeSinceJan11970 with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint TimeSinceBoot;
+    byte Hours;
+    byte Minutes;
+    byte Seconds;
+    byte Hundreds;
+    ushort TimeZone;
+    ushort ClockFrequency;
+    byte Day;
+    byte Month;
+    ushort Year;
+    Weekday Weekday;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddSeconds(TimeSinceJan11970).ToLocalTime().ToString();
+    }
+}
+
+pattern Weekday = enum byte
+{
+    Monday = 0,
+    Tuesday = 1,
+    Wednesday = 2,
+    Thursday = 3,
+    Friday = 4,
+    Saturdaty = 5,
+    Sunday = 6,
+    ...
+};
+
+// 2.5.10.1.1
+message NetWkstaGetInfoRequest: RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "WrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaGetInfoRequest", "WrLh", value);
+    string DataDesc
+        where ValidationCheckValue(value == "zzzBBzz", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaGetInfoRequest", "zzzBBzz", value);
+    NetWkstaGetInfoRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetWkstaGetInfo;
+    
+    override string ToString()
+    {
+        return "NetWkstaGetInfoRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetWkstaGetInfoRequest_RAPParams
+{
+    ushort InfoLevel;
+    ushort ReceiveBufferSize;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString();
+    }
+};
+
+// 2.5.10.1.2
+message NetWkstaGetInfoResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetWkstaGetInfoResponse_RAPOutParams RAPOutParams;
+    optional [|InfoLevel == 10 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetWkstaInfo10[6 - Converter] RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetWkstaGetInfoResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) +
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetWkstaGetInfoResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.10.2.1
+message NetWkstaUserLogonRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "zzWb54WrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaUserLogonRequest", "zzWb54WrLh", value);
+    string DataDesc
+        where ValidationCheckValue(value == "WB21BWDWWDDDDDDDzzzD", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaUserLogonRequest", "WB21BWDWWDDDDDDDzzzD", value);
+    NetWkstaUserLogonRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetWkstaUserLogon;
+    
+    override string ToString()
+    {
+        return "NetWkstaUserLogonRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetWkstaUserLogonRequest_RAPParams
+{
+    ushort Reserved;
+    ushort InfoLevel;
+    NetWkstaUserLogonRequestData WkstaUserLogonBuffer;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString() + ", " + WkstaUserLogonBuffer.ToString();
+    }
+};
+
+// 2.5.10.2.2
+message NetWkstaUserLogonResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetWkstaUserLogonResponse_RAPOutParams RAPOutParams;
+    optional [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetWkstaUserLogonResponseData RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetWkstaUserLogonResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) +
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetWkstaUserLogonResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.10.3.1
+message NetWkstaUserLogoffRequest : RequestMessage
+{
+    string ParamDesc 
+        where ValidationCheckValue(value == "zzWb38WrLh", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaUserLogoffRequest", "zzWb38WrLh", value);
+    string DataDesc
+        where ValidationCheckValue(value == "WDW", this, true, ReferenceType.Message, "RAP", "ParamDesc", "NetWkstaUserLogoffRequest", "WDW", value);
+    NetWkstaUserLogoffRequest_RAPParams RAPParams;
+
+    invariant RAPOpcode == Opcodes.NetWkstaUserLogoff;
+    
+    override string ToString()
+    {
+        return "NetWkstaUserLogoffRequest, " + RAPParams.ToString();
+    }
+}
+
+type NetWkstaUserLogoffRequest_RAPParams
+{
+    ushort Reserved;
+    ushort InfoLevel;
+    NetWkstaUserLogoffRequestData WkstaUserLogoffBuffer;
+
+    override string ToString()
+    {
+        return "InfoLevel: " + InfoLevel.ToString() + ", " + WkstaUserLogoffBuffer.ToString();
+    }
+};
+
+// 2.5.10.3.2
+message NetWkstaUserLogoffResponse[ushort InfoLevel] : ResponseMessage
+{
+    NetWkstaUserLogoffResponse_RAPOutParams RAPOutParams;
+    optional [|InfoLevel == 1 && Win32ErrorCode == Win32ErrorCodeEnum.ERROR_SUCCESS|] NetWkstaUserLogoffResponseData RAPOutData;
+    
+    override string ToString()
+    {
+        return "NetWkstaUserLogoffResponse, Status: " + Win32ErrorCodesToText(Win32ErrorCode) +
+            (RAPOutData != nothing ? (", RAPOutData: " + RAPOutData.ToString()) : "");
+    }
+}
+
+type NetWkstaUserLogoffResponse_RAPOutParams 
+{
+    ushort TotalBytesAvailable;
+}
+
+// 2.5.10.4.1
+type NetWkstaInfo10[int StartPosition]
+{
+    string ComputerName with Encoding{Decoder = RefStringDecoder};
+    string UserName with Encoding{Decoder = RefStringDecoder};
+    string LanGroup with Encoding{Decoder = RefStringDecoder};
+    byte VerMajor;
+    byte VerMinor;
+    string LogonDomain with Encoding{Decoder = RefStringDecoder};
+    string OtherDomain with Encoding{Decoder = RefStringDecoder};
+
+    override string ToString()
+    {
+        return "ComputerName: " + ComputerName.ToString() + ", UserName:" + UserName.ToString();
+    }
+
+    optional string RefStringDecoder(stream s)
+    {
+        int offset = ((BinaryDecoder<uint>(s) as uint) as int);
+        if (offset == 0)
+        {
+            return Str_NotPresent;
+        }
+        offset += StartPosition;
+        return DecodeASCIIStringFromOffset(s, offset);
+    }
+}
+
+// 2.5.10.4.2
+type NetWkstaUserLogonRequestData
+{
+    string UserName with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad1;
+    string Password with BinaryEncoding{WidthForComposedType = 15 * 8};
+    byte Pad2;
+    string WorkstationName  with BinaryEncoding{WidthForComposedType = 16 * 8};
+
+    override string ToString()
+    {
+        return "WorkstationName: " + WorkstationName + ", UserName:" + UserName;
+    }
+}
+
+// 2.5.10.4.3
+type NetWkstaUserLogonResponseData
+{
+    NetWkstaUserLogonResponseData_Code Code;
+    string EffName with BinaryEncoding{WidthForComposedType = 21 * 5};
+    byte Pad1;
+    Priv Priv;
+    AuthFlags AuthFlags;
+    ushort NumLogons;
+    ushort BadPWCount;
+    uint LastLogon with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint LastLogoff with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint LogoffTime with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint KickoffTime with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint PasswordAge;
+    uint PWCanChange with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint PWMustChange with DisplayInfo{ToText = (any obj) => CreateDateTime(1970, 1, 1).AddSeconds(obj as uint).ToLocalTime().ToString()};
+    uint Computer;
+    uint Domain;
+    uint ScriptPath;
+    uint Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Message, "RAP", "Reserved1", "NetWkstaUserLogonResponseData", value);
+
+    override string ToString()
+    {
+        return "Code: " + EnumToStringInSummary<NetWkstaUserLogonResponseData_Code>(Code) + ", EffName:" + EffName;
+    }
+}
+
+pattern NetWkstaUserLogonResponseData_Code = enum ushort
+{
+    NERR_Success                = 0,
+    ERROR_ACCESS_DENIED         = 5,
+    NERR_LogonScriptError       = 2212,
+    NERR_StandaloneLogon        = 2214,
+    NERR_NonValidatedLogon      = 2217,
+    NERR_InvalidWorkstation     = 2240,
+    NERR_InvalidLogonHours      = 2241,
+    NERR_PasswordExpired        = 2242,
+    ...
+};
+
+// 2.5.10.4.4
+type NetWkstaUserLogoffRequestData
+{
+    string Name with BinaryEncoding{WidthForComposedType = 21 * 8};
+    byte Pad1;
+    string Workstation with BinaryEncoding{WidthForComposedType = 16 * 8};
+
+    override string ToString()
+    {
+        return "Workstation: " + Workstation + ", Name:" + Name;
+    }
+}
+
+// 2.5.10.4.5
+type NetWkstaUserLogoffResponseData
+{
+    NetWkstaUserLogoffResponseData_Code Code;
+    uint Duration;
+    ushort NumLogons;
+
+    override string ToString()
+    {
+        return "Code: " + EnumToStringInSummary<NetWkstaUserLogonResponseData_Code>(Code);
+    }
+}
+
+pattern NetWkstaUserLogoffResponseData_Code = enum ushort
+{
+    NERR_Success                = 0,
+    ERROR_ACCESS_DENIED         = 5,
+    NERR_InvalidWorkstation     = 2240,
+    ...
+};
+
+optional string DecodeASCIIStringFromOffset(stream s, int byteOffset)
+{
+    if (s.ByteLength < byteOffset)
+    {
+        return nothing;
+    }
+    if (BinaryDecoder<ASCIIString>(s.PeekBytes(byteOffset * 8)) is asciiString:ASCIIString)
+    {
+        return asciiString.String;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+type ASCIIString
+{
+    string String with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+const string Str_NotPresent = "<Not Present>";

@@ -1,0 +1,260 @@
+protocol ADFSOAL with 
+Documentation
+{
+    ProtocolName = "Active Directory Federation Services OAuth Authorization Code Lookup Protocol",
+    ShortName = "ADFSOAL",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-ADFSOAL", Version = "1.0", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "361243", Date = "03/24/2014"}
+        ]
+};
+
+using Standard;
+using HTTP;
+using Utility;
+using IdentityAndSecurityResources;
+
+const map<uint, string> StatusCodeMap = {
+    200 -> "OK", 
+    404 -> "NOT FOUND", 
+    401 -> "Unauthorized / Access Denied", 
+    501 -> "Missing VERSION PARAMETER / Unknown Version Parameter", 
+    500 -> "Internal Server Error"
+};
+
+endpoint Server
+    over HTTP.Server
+    provides AdfsoalContract;
+
+client endpoint Client connected to Server;
+
+autostart actor ADFSOALOverHTTP(HTTP.Server server)
+{
+    string urlBase64Id; // used in IsADFSOALMessage for http request.
+    process server accepts req:HTTP.HttpContract.Request where IsADFSOALMessage(req.Uri, out urlBase64Id)
+    {
+        AdfsoalContract.ArtifactRequest request = new AdfsoalContract.ArtifactRequest{};
+        var artifactId = URLBase64StringToBinary(urlBase64Id);
+        if (artifactId != nothing)
+        {
+            request.ArtifactId = artifactId as binary;
+        }
+        else
+        {
+            // If it cannot be parsed as Base64URL, use the undecoded binary and report a diagnostics message.
+            request.ArtifactId = urlBase64Id as binary;
+            ValidationCheck(false, request, IdentityAndSecurityResources.ADFSOAL_STR_PARSE_BASE64URL_FAIL);
+        }
+        if ("client-request-id" in req.Headers)
+        {
+            request.ClientRequestId = req.Headers["client-request-id"] as string;
+        }
+        if (req.Uri.Query == nothing || req.Uri.Query == null)
+        {
+            ValidationCheck(false, request, IdentityAndSecurityResources.ADFSOAL_STR_CHECK_PARAMETER_API_VERSION);
+        }
+        else
+        {
+            if (req.Uri.Query is query:map<string, string>)
+            {
+                query = ParsePercentEncodedQuery(query);
+                if ("api-version" in query)
+                {
+                    request.ApiVersion = query["api-version"];
+                }
+                else
+                {
+                    ValidationCheck(false, request, IdentityAndSecurityResources.ADFSOAL_STR_CHECK_PARAMETER_API_VERSION);
+                }
+                // 2.2.2.1   client-request-id
+                // If both are specified, the ADFSOAL server gives precedence to the ClientRequestId query parameter 
+                // and ignores the value of the client-request-id HTTP header.
+                if ("ClientRequestId" in query)
+                {
+                    request.ClientRequestId = query["ClientRequestId"];
+                }
+            }
+            else
+            {
+                ValidationCheck(false, request, IdentityAndSecurityResources.ADFSOAL_STR_CHECK_PARAMETER_API_VERSION);
+            }
+        }
+        dispatch (endpoint Server over server) accepts request;
+    }
+    
+    process server issues res:HTTP.HttpContract.Response where res#Uri != nothing && IsADFSOALMessage(res#Uri as HTTP.UriType, out urlBase64Id)
+    {
+        if (res.StatusCode == 200)
+        {
+            switch (res.Payload)
+            {
+                case m:AdfsoalContract.ArtifactResponse from JsonDecoder<AdfsoalContract.ArtifactResponse> =>
+                    dispatch (endpoint Server over server) issues m;
+                    
+                default => 
+                    ThrowDecodingException("ADFSOAL", "ArtifactResponse");
+            }
+        }
+        else
+        {
+            AdfsoalContract.ArtifactErrorResponse errorResponse = new AdfsoalContract.ArtifactErrorResponse{StatusCode = res.StatusCode};
+            if (res.Payload.Count > 0)
+            {
+                switch (res.Payload)
+                {
+                    case err:ErrorDetails from JsonDecoder<ErrorDetails> =>
+                        errorResponse.Details = err as ErrorDetails;
+                    default => 
+                        ThrowDecodingException("ADFSOAL", "ArtifactErrorResponse");
+                }
+            }
+            dispatch (endpoint Server over server) issues errorResponse;
+        }
+    }
+    
+    // Determine if a HTTP message is a ADFSOAL message by checking the URI.
+    // If it is, store the artifactid into <param>id<param>.
+    bool IsADFSOALMessage(HTTP.UriType uri, out string id)
+    {
+        if (uri != null && uri.AbsPath != nothing && uri.AbsPath != null)
+        {
+            var str = ArtifactIdFromUri(uri.AbsPath as stream);
+            if (str != nothing)
+            {
+                id = str as string;
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+contract AdfsoalContract
+{
+    accepts message ArtifactRequest
+    {
+        binary ArtifactId;
+        string ApiVersion;
+        optional string ClientRequestId;
+        override string ToString()
+        {
+            return "Artifact Request, ArtifactId: " + ArtifactId.ToString();
+        }
+    }
+    
+    // 2.2.4.2   Artifact
+    issues message ArtifactResponse
+    {
+        binary id;
+        string clientId;
+        string redirectUri;
+        string relyingPartyIdentifier;
+        DataField data with Encoding {Decoder = JsonDecoderFromStream<DataField>, SourcePattern = TypeOf<string>()};
+    
+        override string ToString()
+        {
+            return "Artifact Response";
+        }
+    }
+    
+    issues message ArtifactErrorResponse
+    {
+        uint StatusCode;
+        optional ErrorDetails Details;
+    
+        override string ToString()
+        {
+            string reasonPhrase = "Unknown";
+            if (StatusCodeMap[StatusCode] != null)
+            {
+                reasonPhrase = StatusCodeMap[StatusCode];
+            }
+            string msg = "";
+            if (Details != nothing && (Details as ErrorDetails).$"message" != nothing)
+            {
+                msg = ", message: " + ((Details as ErrorDetails).$"message" as string);
+            }
+            return "Artifact Error Response, Status: " + reasonPhrase + msg;
+        }
+    }
+    
+    issues virtual operation Operation
+    {
+        in binary ArtifactId = rid;
+        out DataField Data = dataField;
+
+        override string ToString()
+        {
+            return "Operation, ArtifactId: " + ArtifactId.ToString();
+        }
+    } =
+    accepts AdfsoalContract.ArtifactRequest{ArtifactId is rid:binary}
+    issues AdfsoalContract.ArtifactResponse{data is dataField:DataField, id is binary where value == rid};
+    
+    issues virtual operation OperationFailure
+    {
+        in binary ArtifactId = id;
+        out uint StatusCode = statusCode;
+        out optional ErrorDetails Details = details;
+
+        override string ToString()
+        {
+            string reasonPhrase = "Unknown";
+            if (StatusCodeMap[StatusCode] != null)
+            {
+                reasonPhrase = StatusCodeMap[StatusCode];
+            }
+            return "OperationFailure, Status: " + reasonPhrase + ", ArtifactId: " + ArtifactId.ToString();
+        }
+    } =
+    accepts AdfsoalContract.ArtifactRequest{ArtifactId is id:binary}
+    issues AdfsoalContract.ArtifactErrorResponse{StatusCode != 200, StatusCode is statusCode:uint, Details is details:(optional ErrorDetails)};
+}
+
+// 2.2.4.2   Artifact
+type DataField
+{
+    string access_token;
+    string token_type;
+    int expires_in;
+    optional string refresh_token;
+}
+
+// 2.2.5   ErrorDetails
+type ErrorDetails
+{
+    optional string $"message";
+    optional  string $"type";
+    optional int id;
+    optional string debugInfo;
+}
+
+syntax ArtifactIdFromUri = s1:"/adfs/artifact/" s2:regex{[\x00-\xFF]*$} => s2;
+
+// WORKAROUND for Base64URL, URL may have no padding for Base64 encoded string
+optional binary URLBase64StringToBinary(string str)
+{
+    if (str != null)
+    {
+        str = str.Replace("%2B", "+").Replace("%2F", "/").Replace("%2b", "+").Replace("%2f", "/").Replace("%3D", "=").Replace("%3d", "=");
+        int lastGroupLen = str.Count % 4;
+        if (lastGroupLen == 3)
+        {
+            str = str + "=";
+        }
+        else if (lastGroupLen == 2)
+        {
+            str = str + "==";
+        }
+    }
+    return Base64StringToBinary(str);
+}

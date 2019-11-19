@@ -1,0 +1,2618 @@
+protocol MSASCMD with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Exchange ActiveSync: Command Reference Protocol",
+    ShortName = "MS-ASCMD",
+    DocumentName = "MS-ASCMD",
+    ProtocolType = "Block",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2016 Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-ASCMD", Version = "21.0"}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class=RevisionClass.Major, Version="1.0.0", Date="14/09/2015"}
+    ]
+};
+
+using Diagnostics;
+using HTTP;
+using MSASWBXML;
+using MSASHTTP;
+using WBXML;
+using MSASEMAIL;
+using MSASAIRS;
+using MSASDOC;
+using MSASTASK;
+using MSASCAL;
+using Standard;
+using Utility;
+
+annotation string ResponseMessage#HttpFault;
+
+const string EASDiscoverReqNamespace = "http://schemas.microsoft.com/exchange/autodiscover/mobilesync/requestschema/2006";
+const string EASDiscoverResNamespace = "http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006";
+const string ExchangeDiscoverNamespace = "http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006";
+
+pattern EASMessageBodyType = MultiPartResponse | WBXML.DocumentType | xml | string | binary;
+
+syntax LiteralString = s:regex{[\x00-\x7F]+} => s;  
+syntax XmlStartingLine = regex{[ \r\n]*} ("<" | "&lt;");
+
+endpoint Server over MSASHTTP.Server | over HTTP.Server
+                accepts RequestMessage 
+                issues ResponseMessage;
+                
+client endpoint Client connected to Server;
+
+autostart actor ActorOverASHttpServer(MSASHTTP.Server node)
+{
+   bool IsASCMD = false;
+   
+   process node accepts ashttpMsg:ASHTTPContract.Request where ashttpMsg.RequestLine.Method == "POST" && ashttpMsg#CmdName != "Provision"
+   {
+        IsASCMD = true;
+        string contentTypeTemp = ("Content-Type" in ashttpMsg.Headers == false) ? "" :  ashttpMsg.Headers["Content-Type"] as string;
+
+        RequestMessage msg = new RequestMessage(
+            (ashttpMsg.Body as binary).Count > 0? ASCMDMessageDecoder(ashttpMsg.Body as binary, contentTypeTemp): ashttpMsg.Body as binary, 
+            ashttpMsg#CmdName as string,
+            contentTypeTemp);
+        dispatch (endpoint Server over node) accepts msg;
+   }
+
+   process node issues ashttpMsg:ASHTTPContract.Response where IsASCMD && ashttpMsg#CmdName != nothing
+   {
+       ResponseMessage msg;
+       string contentTypeTemp = ("Content-Type" in ashttpMsg.Headers == false) ? "" :  ashttpMsg.Headers["Content-Type"] as string;
+       
+       if (ashttpMsg.StatusLine.Status < 400)
+       {
+           msg = new ResponseMessage(
+                (ashttpMsg.Body as binary).Count > 0? ASCMDMessageDecoder(ashttpMsg.Body as binary, contentTypeTemp): ashttpMsg.Body as binary, 
+                ashttpMsg#CmdName as string, 
+                contentTypeTemp);
+       }
+       else
+       {
+           msg = new ResponseMessage(
+                ashttpMsg.Body as binary, 
+                ashttpMsg#CmdName as string, 
+                contentTypeTemp,
+                GenerateHttpFaultMessage(ashttpMsg.StatusLine.Status, ashttpMsg.StatusLine.Reason)
+                );
+       }
+
+       dispatch (endpoint Server over node) issues msg;
+       IsASCMD = false;
+   }
+}
+
+autostart actor ActorOverHttpServer(HTTP.Server node)
+{
+    xml xmlValue;
+    bool IsEASAutodiscover = false;
+    
+    process node accepts httpMsg:HttpContract.Request 
+        where httpMsg.Payload.Count > 0 
+        && httpMsg.Headers.ContentTypeContains("text/xml")
+        && IsValidEASDiscoverFormat(httpMsg.Payload, out xmlValue)
+    {
+        IsEASAutodiscover = true;
+        RequestMessage msg = new RequestMessage(httpMsg.Payload as binary, "Autodiscover", "text/xml");
+        dispatch (endpoint Server over node) accepts msg;
+    }
+
+    process node issues httpMsg:HttpContract.Response where IsEASAutodiscover
+    {
+        ResponseMessage msg;
+        xml autodiscoverResponse;
+        if (httpMsg.StatusCode < 400)
+        {
+            msg = new ResponseMessage(httpMsg.Payload as binary, "Autodiscover", "text/xml");
+            IsValidDiscoverResponseMessage(msg.Body as binary, out autodiscoverResponse);
+        }
+        else
+        {
+            msg = new ResponseMessage(
+                    httpMsg.Payload as binary, 
+                    "Autodiscover", 
+                    "text/xml",
+                    GenerateHttpFaultMessage(httpMsg.StatusCode, httpMsg.ReasonPhrase)
+                  );
+        }
+        
+        dispatch (endpoint Server over node) issues msg;
+        IsEASAutodiscover = false;
+    }
+}
+
+message RequestMessage
+{
+    EASMessageBodyType Body;
+    string Command;
+    string ContentType;
+    
+    RequestMessage(binary data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+    }
+
+    RequestMessage(EASMessageBodyType data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        isValidEASMessage(this.Body, false);
+    }
+    
+    override string ToString()
+    {     
+        string ns = GetCmdNamespace(Command);
+        
+        if (ns == "")
+            return Command + " Request";
+         
+        return ns + "." + Command + " Request";
+    }
+}
+
+message ResponseMessage
+{
+    EASMessageBodyType Body;
+    string Command;
+    string ContentType;
+    bool ContainsHttpFault;
+    
+    ResponseMessage(EASMessageBodyType data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        isValidEASMessage(this.Body, true);
+        ContainsHttpFault = false;
+    }
+
+    ResponseMessage(binary data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        ContainsHttpFault = false;
+    }
+    
+    ResponseMessage(binary data, string command, string ashttpContentType, string httpFault)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        ContainsHttpFault = true;
+        this#HttpFault = httpFault;
+    }
+    
+    override string ToString()
+    {
+        string ns = GetCmdNamespace(Command);
+        
+         if (!ContainsHttpFault)
+         {
+            return (ns == "" ? (Command) : (ns + "." + Command))  + " Response";
+         }
+         else 
+         {
+            return (ns == "" ? (Command) : (ns + "." + Command))  + " Response (" + (this#HttpFault as string) + ")";
+         }
+    }
+}
+
+EASMessageBodyType ASCMDMessageDecoder(binary bin, string ashttpContentType)
+{
+    switch (ashttpContentType)
+    {
+        case "text/html" =>
+            return LiteralString(bin) as string;
+        case "message/rfc822" => 
+            return LiteralString(bin) as string;   
+        case "text/xml" => 
+            return BuildXml(LiteralString(bin) as string);
+        case "application/vnd.ms-sync" =>
+            return DecodeASWBXml(bin);
+        case "application/vnd.ms-sync.wbxml" => 
+            return DecodeASWBXml(bin);
+        case "application/vnd.ms-sync.multipart" => 
+            return MultiPartResponse.Decode(bin);
+        default => 
+            return bin;
+    }
+}
+    
+
+void isValidEASMessage(EASMessageBodyType Body, bool isResponse)
+{
+    if (Body is WBXML.DocumentType)
+    {
+        WBXML.DocumentType body = Body as WBXML.DocumentType;
+        if (body.DecodedXml != nothing)
+        {
+            xml decodedXMLResult = body.DecodedXml as xml;
+            IsValidMessage(decodedXMLResult, isResponse);
+        }   
+    }
+}
+
+type MultiPartResponse
+{
+    int PartsCount;
+    array<PartMetaData> PartsMetaData;
+    array<EASMessageBodyType> Parts;
+    
+    override string ToString()
+    {
+        return Format("Contains {0} Parts", PartsCount);
+    }
+    
+    static MultiPartResponse Decode(stream s)
+    {
+        int currentBitPosition = s.BitPosition;
+        MultiPartResponse multiResponse = new MultiPartResponse();
+        multiResponse.PartsCount = BinaryDecoder<int>(s) as int;
+        
+        multiResponse.PartsMetaData = [];
+        for (int i = 0; i < multiResponse.PartsCount; i++)
+        {
+            multiResponse.PartsMetaData += [BinaryDecoder<PartMetaData>(s) as PartMetaData];
+        }
+        
+        multiResponse.Parts = [];
+        
+        if (multiResponse.PartsCount >= 1)
+        {
+            var wbXmlBinary = s.PeekBytes(
+                currentBitPosition + multiResponse.PartsMetaData[0].Offset * 8,
+                multiResponse.PartsMetaData[0].Length);
+            var wbXmlDocument = DecodeASWBXml(s);
+            multiResponse.Parts += [wbXmlDocument];
+        }
+        
+        for (int i = 1; i < multiResponse.PartsCount; i++)
+        {
+            var bytes = s.PeekBytes(
+                currentBitPosition + multiResponse.PartsMetaData[i].Offset * 8,
+                multiResponse.PartsMetaData[i].Length);
+            multiResponse.Parts += [bytes];
+        }
+        
+        return multiResponse;
+    }
+}
+
+type PartMetaData
+{
+    int Offset;
+    int Length;
+    
+    override string ToString()
+    {
+        return Format("Offset: {0}, Length: {1}", Offset, Length);
+    }
+}
+
+WBXML.DocumentType DecodeASWBXml(stream s)
+{
+    var wbXmlDocument = BinaryDecoder<WBXML.DocumentType>(s) as WBXML.DocumentType;
+    MSASWBXML.Converter converter = new MSASWBXML.Converter();
+    wbXmlDocument.DecodedXml = converter.ConvertToXml(wbXmlDocument);
+    
+    if (wbXmlDocument.Body != nothing && wbXmlDocument.Body.Contents != nothing)
+    {
+        array<ContentType> ContentValue = wbXmlDocument.Body.Contents as array<ContentType>;
+        wbXmlDocument.Body.Contents = FurtherDecodeEASStrucutre(ContentValue,25);//codepage 0-24 is vailable values defined in TD
+    }
+    return wbXmlDocument;
+}
+
+array<ContentType> FurtherDecodeEASStrucutre(array<ContentType> e, byte codePageType)
+{
+    if(e == nothing || e.Count == 0)
+    {
+        return e;
+    }
+    byte CurrentCodePageType = codePageType;
+    for(int i=0; i< e.Count; i++)
+    {
+        if (e[i] is ElementType)
+        {
+            ElementType elementValue = e[i] as ElementType;
+            if(elementValue.CodePage != nothing)
+            {
+                CurrentCodePageType = (elementValue.CodePage as CodePageType).Value;
+            }
+
+            if(elementValue.Contents != nothing)
+            {
+                array<ContentType> ContentValue = elementValue.Contents as array<ContentType>;
+
+                if(ContentValue.Count == 0)
+                {
+                    continue;
+                }
+                
+                if(elementValue.NameToken == 0x4A && CurrentCodePageType == 0x16)//0x0A ConversationIndex; 0x16 GAL
+                {
+                    for(int j=0; j< ContentValue.Count; j++)
+                    {
+                        
+                        ConversationIndex StructureValue = DecodeMessage(elementValue.NameToken, (ContentValue[j] as OpaqueType).Value as binary) as ConversationIndex;
+                        EAS_OpaqueType EAS_OpaqueTypeValue = new EAS_OpaqueType();
+                        EAS_OpaqueTypeValue.Value = (ContentValue[j] as OpaqueType).Value;
+                        EAS_OpaqueTypeValue.TypeToken = (ContentValue[j] as OpaqueType).TypeToken;
+                        EAS_OpaqueTypeValue.Length = (ContentValue[j] as OpaqueType).Length;
+                        EAS_OpaqueTypeValue.ConverdationIndexStructure = StructureValue;
+                        ContentValue[j] = EAS_OpaqueTypeValue;
+                    }
+                }
+                if(elementValue.NameToken == 0x58 && CurrentCodePageType == 0x04)//0x18 MeetingStatus; 0x04 Calendar
+                {
+                    for(int j=0; j< ContentValue.Count; j++)
+                    {
+                        string stringValue = (ContentValue[j] as StringType).Value;
+                        array<byte> tempByteArray = [];
+                        tempByteArray += [stringValue as byte]; 
+                        
+                        MeetingStatus StructureValue = DecodeMessage(elementValue.NameToken, tempByteArray as binary) as MeetingStatus;
+                        EAS_StringType EAS_StringTypeValue = new EAS_StringType();
+                        EAS_StringTypeValue.Value = (ContentValue[j] as StringType).Value;
+                        EAS_StringTypeValue.TypeToken = (ContentValue[j] as StringType).TypeToken;
+                        EAS_StringTypeValue.MeetingStatusStructure = StructureValue;
+                        ContentValue[j] = EAS_StringTypeValue;
+                    }   
+                }
+
+                if(elementValue.NameToken == 0x74 && CurrentCodePageType == 0x02)//0x34 GlobalObjId; 0x02 Email
+                {
+                    for(int j=0; j< ContentValue.Count; j++)
+                    {
+                        binary Binpayload = Base64StringToBinary((ContentValue[j] as StringType).Value as string) as binary;
+                        GlobalObjId StructureValue = DecodeMessage(elementValue.NameToken, Binpayload) as GlobalObjId;
+                        EAS_StringType EAS_StringTypeValue = new EAS_StringType();
+                        EAS_StringTypeValue.Value = (ContentValue[j] as StringType).Value;
+                        EAS_StringTypeValue.TypeToken = (ContentValue[j] as StringType).TypeToken;
+                        EAS_StringTypeValue.GlobalObjIdStructure = StructureValue;
+                        ContentValue[j] = EAS_StringTypeValue;
+                    }
+                }
+                
+                FurtherDecodeEASStrucutre(ContentValue,CurrentCodePageType);
+                elementValue.Contents = ContentValue;
+                e[i] = elementValue;
+            }   
+        }
+        else if (e[i] is StringType)
+        {
+            continue;
+        }
+        else if (e[i] is OpaqueType)
+        {
+            continue;
+        }   
+    }
+    return e;
+}
+
+pattern EASContentType = GlobalObjId | ConversationIndex | MeetingStatus | binary;
+EASContentType DecodeMessage(byte NameToken, binary payload)
+{
+    switch(NameToken)
+    {
+        case 0x4A =>
+            ConversationIndex ConversationIndexValue = BinaryDecoder<ConversationIndex>(payload) as ConversationIndex;  
+            return ConversationIndexValue;
+        case 0x58 =>
+            MeetingStatus MeetingStatusValue = BinaryDecoder<MeetingStatus>(payload) as MeetingStatus;  
+            return MeetingStatusValue;  
+        case 0x74 =>
+            GlobalObjId GlobalObjId = BinaryDecoder<GlobalObjId>(payload) as GlobalObjId;
+            return GlobalObjId;
+        default =>
+            return payload;
+    }   
+}
+
+// ConversationIndex defined in section 2.2.2.4 of MS-ASCON
+type ConversationIndex
+{
+    ConversationIndexHeader ConversationIndexHeader;
+    optional array<ResponseLevel> ResponseLevels;
+}
+type ConversationIndexHeader
+{
+    array<byte> CurrentFILETIMEhighpart with BinaryEncoding{Length = 3};
+    array<byte> CurrentFILETIMElowpart with BinaryEncoding{Length = 2};
+}
+type ResponseLevel
+{
+    array<byte> ResponseLevel with BinaryEncoding{Length = 5};
+}
+
+// GlobalObjId defined in section 2.2.2.37 of MS-ASEMAIL
+type GlobalObjId
+{
+    array<byte> CLASSID where ValidationCheck(value == [0x04,0x00,0x00,0x00,0x82,0x00,0xE0,0x00,0x74,0xC5,0xB7,0x10,0x1A,0x82,0xE0,0x08], null, "This field MUST be %x04.00.00.00.82.0.E0.0.74.C5.B7.10.1A.82.E0.08") with BinaryEncoding {Length = 16};
+    (INSTATE_DATE | INSTATE_ZERO) INSTDATE; 
+    NOW NOW;
+    array<byte> ZERO where ValidationCheck(value == [0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00], null, "This field MUST be %x00.00.00.00.00.00.00.00") with BinaryEncoding {Length = 8};
+    uint BYTECOUNT;
+    (VCALID[BYTECOUNT] | OUTLOOKID[BYTECOUNT]) DATA;
+}
+type INSTATE_ZERO
+{
+    array<byte> Value where ValidationCheck(value == [0x00,0x00,0x00,0x00], null, "This field MUST be %x00.00.00.00") with BinaryEncoding {Length = 4};
+}
+type INSTATE_DATE
+{
+    byte yearHigh;
+    byte yearLow;
+    byte month where (value <=0x0C && value >= 0x01);
+    byte date where (value <=0x1F && value >= 0x01);
+}
+type NOW
+{
+    array<byte> value1 with BinaryEncoding{Length = 4};
+    array<byte> value2 with BinaryEncoding{Length = 4};
+}
+type VCALID[uint byteCount]
+{
+    string VCALSTRING where (value == "vCal-Uid") with BinaryEncoding {Length = 8,TextEncoding = TextEncoding.UTF8};
+    array<byte> VERSION where ValidationCheck(value == [0x01,0x00,0x00,0x00], null, "This field MUST be %x01.00.00.00") with BinaryEncoding {Length = 4};
+    array<byte> UID with BinaryEncoding {Length = byteCount-13};
+    byte NULL where (value ==0x00);
+}
+type OUTLOOKID[uint byteCount]
+{
+    array<byte> OUTLOOKID with BinaryEncoding{Length = byteCount};
+}
+
+// MeetingStatus defined in section 2.2.2.28 of MS-ASCAL
+type MeetingStatus
+{
+    byte Meeting with BinaryEncoding{Width = 1};
+    byte Received with BinaryEncoding{Width = 1};
+    byte Cancelled with BinaryEncoding{Width = 1};
+    byte unused with BinaryEncoding{Width = 5};
+}
+
+type EAS_OpaqueType: OpaqueType
+{
+    ConversationIndex ConverdationIndexStructure;
+}
+type EAS_StringType : StringType
+{
+    optional GlobalObjId GlobalObjIdStructure;
+    optional MeetingStatus MeetingStatusStructure;
+}
+
+string GenerateHttpFaultMessage(uint statusCode, string reason)
+{
+    return Format("{0} {1}", statusCode, reason);
+}
+
+bool IsValidEASDiscoverFormat(binary bin, out xml xmlValue)
+{
+    // Valid XML starting characters: "<" or "&lt;", may have leading white characters.
+    if (XmlStartingLine(bin) != nothing)
+    {
+        xmlValue = BuildXml(LiteralString(bin) as string);
+
+        if (xmlValue != null)
+        {
+            // There may be an XML declaration node before "Autodiscover" node.
+            var bodyContent = (xmlValue.Children).Filter(e => (e as xml).Kind == XmlKind.Element);
+            if (bodyContent.Count == 1)
+            {
+                var rootName = bodyContent[0].Name as XmlName;
+                if (rootName.LocalName == "Autodiscover" && IsValidEASDiscoverNameSpace(rootName.NamespaceUri as string))
+                {
+                    xmlValue = bodyContent[0];                  
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+bool IsValidEASDiscoverNameSpace(string uri)
+{
+    if (uri == null || uri == "")
+        return false;
+        
+    if (uri == EASDiscoverReqNamespace || uri == EASDiscoverResNamespace || uri == ExchangeDiscoverNamespace)
+            return true;
+    
+    return false;
+}
+
+pattern IPMStickyNote = regex {IPM.StickyNote || IPM.StickyNote.*};
+
+void IsValidDiscoverResponseMessage(binary bin, out xml xmlValue)
+{
+    // Valid XML starting characters: "<" or "&lt;", may have leading white characters.
+    if (XmlStartingLine(bin) != nothing)
+    {
+        xmlValue = BuildXml(LiteralString(bin) as string);
+
+        if (xmlValue != null)
+        {
+            // There may be an XML declaration node before "Autodiscover" node.
+            var bodyContent = (xmlValue.Children).Filter(e => (e as xml).Kind == XmlKind.Element);
+            if (bodyContent.Count == 1)
+            {
+                var rootName = bodyContent[0].Name as XmlName;
+                if (rootName.LocalName == "Autodiscover" && IsValidEASDiscoverNameSpace(rootName.NamespaceUri as string))
+                {
+                    xmlValue = bodyContent[0];  
+                    array<xml> autodiscoverStatus = xmlValue select xpath{//Error/Status};          
+                    if (autodiscoverStatus.Count > 0)
+                    {
+                        foreach (xml x in autodiscoverStatus)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForAutodiscover>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Autodiscover Status value: {0}; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }   
+                    
+                    array<xml> autodiscoverType = xmlValue select xpath{//Server/Type};         
+                    if (autodiscoverType.Count > 0)
+                    {
+                        foreach (xml x in autodiscoverType)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<TypeForAutodiscover>(xValue), null, () => Format("Invalid Autodiscover Type value: {0}; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }           
+                }
+            }
+        }
+    }
+}
+
+void IsValidMessage(xml encodedXml, bool isResponse)
+{
+    string encodedXmlString = encodedXml.ToString();
+    string updatedEncodedXmlString = encodedXmlString.Replace("::","");
+    var updatedEncodedBody = updatedEncodedXmlString.ToXml();
+    
+    if (updatedEncodedBody != nothing)
+    { 
+        xml updatedEncodedXml = updatedEncodedBody as xml;
+        
+        var bodyContent = (updatedEncodedXml.Children).Filter(e => (e as xml).Kind == XmlKind.Element);
+        if (bodyContent.Count == 1)
+        {
+            updatedEncodedXml = bodyContent[0];
+        }
+        
+        var rootName = bodyContent[0].Name as XmlName;
+        
+        if (rootName != nothing)
+        {       
+            // For request and response, elements value need to check.      
+            if (rootName.LocalName == "SearchSearch")
+            {
+                IsValidMessageForSearchAndAirSync(updatedEncodedXml);
+            }
+            else if(rootName.LocalName == "AirSyncSync")
+            {
+                IsValidMessageForSearchAndAirSync(updatedEncodedXml);
+                
+                //MS-ASNOTE 
+                array<xml> notesMessageClass = updatedEncodedXml select xpath{//NotesMessageClass};         
+                if (notesMessageClass.Count > 0)
+                {
+                    foreach (xml x in notesMessageClass)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck(xValue is IPMStickyNote, null, () => Format("Invalid MessageClass value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                //MS-ASAIRS：                
+                array<xml> airsyncbaseNativeBodyType = updatedEncodedXml select xpath{//AirSyncApplicationData/AirSyncBaseNativeBodyType};          
+                if (airsyncbaseNativeBodyType.Count > 0)
+                {
+                    foreach (xml x in airsyncbaseNativeBodyType)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASAIRS.NativeBodyType>(xValue), null, () => Format("Invalid NativeBodyType value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                //MS-ASCAL
+                array<xml> calendarAllDayEvent = updatedEncodedXml select xpath{//CalendarAllDayEvent};         
+                if (calendarAllDayEvent.Count > 0)
+                {
+                    foreach (xml x in calendarAllDayEvent)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.AllDayEvent>(xValue), null, () => Format("Invalid AllDayEvent value: {0}; ", x.Value.ToString()));                          
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarAttendeeStatus = updatedEncodedXml select xpath{//CalendarAttendee/CalendarAttendeeStatus};
+                if (calendarAttendeeStatus.Count > 0)
+                {
+                    foreach (xml x in calendarAttendeeStatus)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck(InRange<MSASCAL.AttendeeStatus>(xValue), null, () => Format("Invalid AttendeeStatus value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarAttendeeType = updatedEncodedXml select xpath{//CalendarAttendee/CalendarAttendeeType};
+                if (calendarAttendeeType.Count > 0)
+                {
+                    foreach (xml x in calendarAttendeeType)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.AttendeeType>(xValue), null, () => Format("Invalid AttendeeType value: {0}; ", x.Value.ToString()));                            
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarBusyStatus = updatedEncodedXml select xpath{//CalendarBusyStatus};           
+                if (calendarBusyStatus.Count > 0)
+                {
+                    foreach (xml x in calendarBusyStatus)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.BusyStatus>(xValue), null, () => Format("Invalid BusyStatus value: {0}; ", x.Value.ToString()));                            
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarCalendarType = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarCalendarType};    
+                if (calendarCalendarType.Count > 0)
+                {
+                    foreach (xml x in calendarCalendarType)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.CalendarType>(xValue), null, () => Format("Invalid CalendarType value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                    
+                array<xml> calendarDayOfMonth = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarDayOfMonth};
+                if (calendarDayOfMonth.Count > 0)
+                {
+                    foreach (xml x in calendarDayOfMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) <= 31 && (xValue as uint) >= 1, null, () => Format("The DayOfMonth value: {0} MUST be between 1 and 31; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+
+                array<xml> calendarDayOfWeek = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarDayOfWeek};
+                if (calendarDayOfWeek.Count > 0)
+                {
+                    foreach (xml x in calendarDayOfWeek)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(((xValue as uint) is MSASCAL.DayOfWeek), null, () => Format("Invalid DayOfWeek value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarFirstDayOfWeek = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarFirstDayOfWeek};            
+                if (calendarFirstDayOfWeek.Count > 0)
+                {
+                    foreach (xml x in calendarFirstDayOfWeek)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.FirstDayOfWeek>(xValue), null, () => Format("Invalid FirstDayOfWeek value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+
+                array<xml> calendarInterval = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarInterval};    
+                if (calendarInterval.Count > 0)
+                {
+                    foreach (xml x in calendarInterval)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) >= 0 && (xValue as uint) <= 999, null, () => Format("The Interval value: {0} MUST with a minimum value of 0 and a maximum value of 999; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+
+                array<xml> calendarIsLeapMonth = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarIsLeapMonth};          
+                if (calendarIsLeapMonth.Count > 0)
+                {
+                    foreach (xml x in calendarIsLeapMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.IsLeapMonth>(xValue), null, () => Format("Invalid IsLeapMonth value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                                
+                array<xml> calendarMeetingStatus = updatedEncodedXml select xpath{//CalendarMeetingStatus};         
+                if (calendarMeetingStatus.Count > 0)
+                {
+                    foreach (xml x in calendarMeetingStatus)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.MeetingStatus>(xValue), null, () => Format("Invalid MeetingStatus value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+
+                array<xml> calendarMonthOfYear = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarMonthOfYear};          
+                if (calendarMonthOfYear.Count > 0)
+                {
+                    foreach (xml x in calendarMonthOfYear)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) >= 1 && (xValue as uint) <= 12, null, () => Format("The MonthOfYear value: {0} MUST be between 1 and 12; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarOccurrences = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarOccurrences};  
+                if (calendarOccurrences.Count > 0)
+                {
+                    foreach (xml x in calendarOccurrences)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck((xValue as uint) <= 999, null, () => Format("The Occurrences value: {0} should not greater than 999; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarSensitivity = updatedEncodedXml select xpath{//CalendarSensitivity};         
+                if (calendarSensitivity.Count > 0)
+                {
+                    foreach (xml x in calendarSensitivity)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.Sensitivity>(xValue), null, () => Format("Invalid Sensitivity value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calType = updatedEncodedXml select xpath{//CalendarType};            
+                if (calType.Count > 0)
+                {
+                    foreach (xml x in calType)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASCAL.Type>(xValue), null, () => Format("Invalid Type value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> calendarWeekOfMonth = updatedEncodedXml select xpath{//CalendarRecurrence/CalendarWeekOfMonth};
+                if (calendarWeekOfMonth.Count > 0)
+                {
+                    foreach (xml x in calendarWeekOfMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) >= 1 && (xValue as uint) <= 5, null, () => Format("The WeekOfMonth value: {0} MUST be between 1 and 5; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                //MS-ASTASK
+                array<xml> tasksCalendarType = updatedEncodedXml select xpath{//TasksRecurrence/TasksWeekOfMonth};
+                if (tasksCalendarType.Count > 0)
+                {
+                    foreach (xml x in tasksCalendarType)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASTASK.CalendarType>(xValue), null, () => Format("Invalid CalendarType value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksDayOfMonth = updatedEncodedXml select xpath{//TasksRecurrence/TasksDayOfMonth};
+                if (tasksDayOfMonth.Count > 0)
+                {
+                    foreach (xml x in tasksDayOfMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) >= 1 && (xValue as uint) <= 31, null, () => Format("The DayOfMonth value: {0} MUST be between 1 and 31; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksDayOfWeek = updatedEncodedXml select xpath{//TasksRecurrence/TasksDayOfWeek};
+                if (tasksDayOfWeek.Count > 0)
+                {
+                    foreach (xml x in tasksDayOfWeek)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();                                             
+                            ValidationCheck((xValue as uint) is MSASTASK.DayOfWeek, null, () => Format("Invalid DayOfWeek value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksFirstDayOfWeek = updatedEncodedXml select xpath{//TasksRecurrence/TasksFirstDayOfWeek};
+                if (tasksFirstDayOfWeek.Count > 0)
+                {
+                    foreach (xml x in tasksFirstDayOfWeek)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASTASK.FirstDayOfWeek>(xValue), null, () => Format("Invalid FirstDayOfWeek value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksInterval = updatedEncodedXml select xpath{//TasksRecurrence/TasksInterval};
+                if (tasksInterval.Count > 0)
+                {
+                    foreach (xml x in tasksInterval)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck((xValue as uint) <= 999, null, () => Format("The maximum value of Interval should be 999, but the actual value is : {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksIsLeapMonth = updatedEncodedXml select xpath{//TasksRecurrence/TasksIsLeapMonth};
+                if (tasksIsLeapMonth.Count > 0)
+                {
+                    foreach (xml x in tasksIsLeapMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck(InRange<MSASTASK.IsLeapMonth>(xValue), null, () => Format("Invalid IsLeapMonth value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksMonthOfYear = updatedEncodedXml select xpath{//TasksRecurrence/TasksMonthOfYear};
+                if (tasksMonthOfYear.Count > 0)
+                {
+                    foreach (xml x in tasksMonthOfYear)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck((xValue as uint) >= 1 && (xValue as uint) <= 12, null, () => Format("The MonthOfYear value: {0} MUST be between 1 and 12; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksReminderSet = updatedEncodedXml select xpath{//TasksReminderSet};
+                if (tasksReminderSet.Count > 0)
+                {
+                    foreach (xml x in tasksReminderSet)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASTASK.ReminderSet>(xValue), null, () => Format("Invalid ReminderSet value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksSensitivity = updatedEncodedXml select xpath{//TasksSensitivity};
+                if (tasksSensitivity.Count > 0)
+                {
+                    foreach (xml x in tasksSensitivity)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASTASK.Sensitivity>(xValue), null, () => Format("Invalid Sensitivity value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksType = updatedEncodedXml select xpath{//TasksRecurrence/TasksType};
+                if (tasksSensitivity.Count > 0)
+                {
+                    foreach (xml x in tasksSensitivity)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString(); 
+                            ValidationCheck(InRange<MSASTASK.Type>(xValue), null, () => Format("Invalid Type value: {0}; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+                array<xml> tasksWeekOfMonth = updatedEncodedXml select xpath{//TasksRecurrence/TasksWeekOfMonth};
+                if (tasksWeekOfMonth.Count > 0)
+                {
+                    foreach (xml x in tasksWeekOfMonth)
+                    {                   
+                        if (x.Value!= nothing || x.Value!= null)
+                        {
+                            string xValue = x.Value.ToString();     
+                            ValidationCheck((xValue as uint) >= 1 && (xValue as uint) <= 5, null, () => Format("The WeekOfMonth value: {0} MUST be between 1 and 5; ", x.Value.ToString()));
+                        }                   
+                    }
+                }
+                
+            }
+            
+            if (isResponse)
+            {
+                if (rootName.LocalName == "ResolveRecipientsResolveRecipients")
+                {
+                    array<xml> resolveRecipientsMergedFreeBusy = updatedEncodedXml select xpath{//ResolveRecipientsAvailability/ResolveRecipientsMergedFreeBusy};           
+                    if (resolveRecipientsMergedFreeBusy.Count > 0)
+                    {
+                        foreach (xml x in resolveRecipientsMergedFreeBusy)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();                             
+                                for(int i = 0; i< xValue.Count; i++)
+                                {
+                                    string s = xValue.Segment(i,1);
+                                    ValidationCheck(InRange<MergedFreeBusy>(s), null, () => Format("Invalid MergedFreeBusy value: {0}; ", xValue));
+                                }                                                   
+                                
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> resolveRecipientsStatus = updatedEncodedXml select xpath{/ResolveRecipientsStatus};  
+                    if (resolveRecipientsStatus.Count > 0)
+                    {
+                        foreach (xml x in resolveRecipientsStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForResolveRecipientsResponseOfResolveRecipients>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status for ResolveRecipients value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> responseStatus = updatedEncodedXml select xpath{//ResolveRecipientsResponse/ResolveRecipientsStatus};            
+                    if (responseStatus.Count > 0)
+                    {
+                        foreach (xml x in responseStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForResolveRecipientsResponseOfResponse>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status for Response value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+                    
+                    array<xml> availabilityStatus = updatedEncodedXml select xpath{//ResolveRecipientsAvailability/ResolveRecipientsStatus};            
+                    if (availabilityStatus.Count > 0)
+                    {
+                        foreach (xml x in availabilityStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForResolveRecipientsResponseOfAvailability>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status for Availability value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> certificatesStatus = updatedEncodedXml select xpath{//ResolveRecipientsCertificates/ResolveRecipientsStatus};            
+                    if (certificatesStatus.Count > 0)
+                    {
+                        foreach (xml x in certificatesStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck((InRange<StatusForResolveRecipientsResponseOfCertificates>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status for Certificate value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> pictureStatus = updatedEncodedXml select xpath{//ResolveRecipientsPicture/ResolveRecipientsStatus};          
+                    if (pictureStatus.Count > 0)
+                    {
+                        foreach (xml x in pictureStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck((InRange<StatusForResolveRecipientsResponseOfPicture>(xValue) || InRange<Status>(xValue)) , null, () => Format("Invalid Status for Picture value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "SettingsSettings")
+                {
+                    array<xml> settingsGetOofState = updatedEncodedXml select xpath{//SettingsGet/SettingsOofState};            
+                    if (settingsGetOofState.Count > 0)
+                    {
+                        foreach (xml x in settingsGetOofState)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(InRange<OofState>(xValue), null, () => Format("Invalid OofState value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> settingsStatus = updatedEncodedXml select xpath{/SettingsStatus};            
+                    if (settingsStatus.Count > 0)
+                    {
+                        foreach (xml x in settingsStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                if (xValue != "nothing")
+                                {
+                                    int xValueFormat = xValue as int;
+                                    ValidationCheck(InRange<StatusForSettingsResponseOfSettings>(xValue) || (xValueFormat >= 100 && xValueFormat <= 255), null, () => Format("Invalid Settings Status value: {0}; ", xValue));
+                                }                               
+                            }                           
+                        }
+                    }
+
+                    array<xml> rightsManagementInformationStatus = updatedEncodedXml select xpath{//SettingsRightsManagementInformation/SettingsStatus};            
+                    if (rightsManagementInformationStatus.Count > 0)
+                    {
+                        foreach (xml x in rightsManagementInformationStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForSettingsResponseOfGetRMGetSetOOFSetDIGetUI>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Settings RightsManagementInformation Status value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+
+                    array<xml> oofStatus = updatedEncodedXml select xpath{//SettingsOof/SettingsStatus};            
+                    if (oofStatus.Count > 0)
+                    {
+                        foreach (xml x in oofStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(InRange<StatusForSettingsResponseOfGetRMGetSetOOFSetDIGetUI>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid Settings Oof Status value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> devicePasswordStatus = updatedEncodedXml select xpath{//SettingsDevicePassword/SettingsStatus};          
+                    if (devicePasswordStatus.Count > 0)
+                    {
+                        foreach (xml x in devicePasswordStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<Status>(xValue)|| InRange<StatusForSettingsResponseOfDevicePassword>(xValue)), null, () => Format("Invalid Settings DevicePasswordStatus Status value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                    
+                    array<xml> userInformationStatus = updatedEncodedXml select xpath{//SettingsUserInformation/SettingsStatus};            
+                    if (userInformationStatus.Count > 0)
+                    {
+                        foreach (xml x in userInformationStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<StatusForSettingsResponseOfGetRMGetSetOOFSetDIGetUI>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid Settings UserInformation Status value: {0}; ", xValue));
+                                
+                            }
+                            
+                        }
+                    }   
+
+                    array<xml> deviceInformationStatus = updatedEncodedXml select xpath{//SettingsDeviceInformation/SettingsStatus};            
+                    if (deviceInformationStatus.Count > 0)
+                    {
+                        foreach (xml x in deviceInformationStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<StatusForSettingsResponseOfGetRMGetSetOOFSetDIGetUI>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid Settings DeviceInformation Status value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+                    
+                    //MS-ASRM           
+                    array<xml> rmTTemplateDescription = updatedEncodedXml select xpath{//RightsManagementRightsManagementTemplate/RightsManagementTemplateDescription};         
+                    if (rmTTemplateDescription.Count > 0)
+                    {
+                        foreach (xml x in rmTTemplateDescription)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(xValue.Count <= 10240, null, () => Format("The TemplateDescription value: {0} should be less than 10240; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }       
+                    
+                    array<xml> rmTTemplateName = updatedEncodedXml select xpath{//RightsManagementRightsManagementTemplate/RightsManagementTemplateName};           
+                    if (rmTTemplateName.Count > 0)
+                    {
+                        foreach (xml x in rmTTemplateName)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(xValue.Count <= 256, null, () => Format("The TemplateName value: {0} should be less than 10240; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "SearchSearch")
+                {
+                    array<xml> searchStatus = updatedEncodedXml select xpath{/SearchStatus};            
+                    if (searchStatus.Count > 0)
+                    {
+                        foreach (xml x in searchStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForSearchResponseOfSearch>(xValue)|| InRange<Status>(xValue)), null, () => Format("Invalid Status for Search value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                    
+                    array<xml> storeStatus = updatedEncodedXml select xpath{//SearchStore/SearchStatus};            
+                    if (storeStatus.Count > 0)
+                    {
+                        foreach (xml x in storeStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck((InRange<StatusForSearchResponseOfStore>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status for Store value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                    
+                    array<xml> searchPictureStatus = updatedEncodedXml select xpath{//GALPicture/GALStatus};            
+                    if (searchPictureStatus.Count > 0)
+                    {
+                        foreach (xml x in searchPictureStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck((InRange<StatusForSearchResponseOfPicture>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Search Status for Picture value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                    
+                    //MS-ASDOC
+                    array<xml> documentLibraryIsFolder = updatedEncodedXml select xpath{//SearchProperties/DocumentLibraryIsFolder};        
+                    if (documentLibraryIsFolder.Count > 0)
+                    {
+                        foreach (xml x in documentLibraryIsFolder)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<MSASDOC.IsFolder>(xValue), null, () => Format("Invalid IsFolder value: {0}; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                
+                    array<xml> documentLibraryIsHidden = updatedEncodedXml select xpath{//SearchProperties/DocumentLibraryIsHidden};            
+                    if (documentLibraryIsHidden.Count > 0)
+                    {
+                        foreach (xml x in documentLibraryIsHidden)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<MSASDOC.IsHidden>(xValue), null, () => Format("Invalid IsHidden value: {0}; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);
+                }
+                else if (rootName.LocalName == "FolderHierarchyFolders")
+                {
+                    array<xml> folderType = updatedEncodedXml select xpath{//FolderHierarchyFolder/FolderHierarchyType};            
+                    if (folderType.Count > 0)
+                    {
+                        foreach (xml x in folderType)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(InRange<TypeForGetHierarchy>(xValue), null, () => Format("Invalid type for GetHierarchy value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                }
+                else if(rootName.LocalName == "AirSyncSync")
+                {
+                    // MS-ASCMD
+                    array<xml> syncStatus_Collection = updatedEncodedXml select xpath{//AirSyncCollection/AirSyncStatus};               
+                    IsValidValueforSyncStatus(syncStatus_Collection);
+                    
+                    array<xml> syncStatus_Change = updatedEncodedXml select xpath{//AirSyncChange/AirSyncStatus};           
+                    IsValidValueforSyncStatus(syncStatus_Change);
+                    
+                    array<xml> syncStatus_Add = updatedEncodedXml select xpath{//AirSyncAdd/AirSyncStatus};         
+                    IsValidValueforSyncStatus(syncStatus_Add);
+                    
+                    array<xml> syncStatus_Delete = updatedEncodedXml select xpath{//AirSyncDelete/AirSyncStatus};           
+                    IsValidValueforSyncStatus(syncStatus_Delete);
+                    
+                    array<xml> syncStatus_Fetch = updatedEncodedXml select xpath{//AirSyncFetch/AirSyncStatus};         
+                    IsValidValueforSyncStatus(syncStatus_Fetch);
+                    
+                    array<xml> syncStatus_Sync= updatedEncodedXml select xpath{/AirSyncStatus};         
+                    IsValidValueforSyncStatus(syncStatus_Sync);
+                    
+                    
+                    //MS-ASRM
+                    array<xml> rightsManagementContentOwner = updatedEncodedXml select xpath{//RightsManagementRightsManagementLicense/RightsManagementContentOwner};           
+                    if (rightsManagementContentOwner.Count > 0)
+                    {
+                        foreach (xml x in rightsManagementContentOwner)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(xValue.Count <= 320, null, () => Format("The ContentOwner value: {0} should be less than 320; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                
+                    array<xml> rmLTemplateDescription = updatedEncodedXml select xpath{//RightsManagementRightsManagementLicense/RightsManagementTemplateDescription};                  
+                    if (rmLTemplateDescription.Count > 0)
+                    {
+                        foreach (xml x in rmLTemplateDescription)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(xValue.Count <= 10240, null, () => Format("The TemplateDescription value: {0} should be less than 10240; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                
+                    array<xml> rmLTemplateName = updatedEncodedXml select xpath{//RightsManagementRightsManagementLicense/RightsManagementTemplateName};        
+                    if (rmLTemplateName.Count > 0)
+                    {
+                        foreach (xml x in rmLTemplateName)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(xValue.Count <= 256, null, () => Format("The TemplateName value: {0} should be less than 10240; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                    
+                    //MS-ASCAL
+                    array<xml> calendarResponseType = updatedEncodedXml select xpath{//CalendarResponseType};           
+                    if (calendarResponseType.Count > 0)
+                    {
+                        foreach (xml x in calendarResponseType)
+                        {                   
+                            if (x.Value!= nothing || x.Value!= null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<MSASCAL.ResponseType>(xValue), null, () => Format("Invalid ResponseType value: {0}; ", x.Value.ToString()));
+                            }                   
+                        }
+                    }
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);
+                }
+                else if(rootName.LocalName == "ItemOperationsItemOperations")
+                {
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);  
+                    
+                    // MS-ASCMD
+                    array<xml> ItemOperationsStatus = updatedEncodedXml select xpath{/ItemOperationsStatus};
+                    IsValidValueforSyncStatusofItemOperations(ItemOperationsStatus);
+                    array<xml> ItemOperationsMoveStatus = updatedEncodedXml select xpath{//ItemOperationsMove/ItemOperationsStatus};
+                    IsValidValueforSyncStatusofItemOperations(ItemOperationsMoveStatus);
+                    array<xml> ItemOperationsEmptyFolderContentsStatus = updatedEncodedXml select xpath{//ItemOperationsEmptyFolderContents/ItemOperationsStatus};
+                    IsValidValueforSyncStatusofItemOperations(ItemOperationsEmptyFolderContentsStatus);
+                    array<xml> ItemOperationsFetchStatus = updatedEncodedXml select xpath{//ItemOperationsFetch/ItemOperationsStatus};
+                    IsValidValueforSyncStatusofItemOperations(ItemOperationsFetchStatus);               
+                }
+                else if (rootName.LocalName == "ComposeMailSmartReply")
+                {
+                    array<xml> smartReplyStatus = updatedEncodedXml select xpath{//ComposeMailSmartReply/ComposeMailStatus};
+                    IsValidValueforSyncStatusofSmartForwardOrReply(smartReplyStatus);
+                }
+                else if (rootName.LocalName == "ComposeMailSmartForward")
+                {
+                    array<xml> smartForwardStatus = updatedEncodedXml select xpath{//ComposeMailSmartForward/ComposeMailStatus};
+                    IsValidValueforSyncStatusofSmartForwardOrReply(smartForwardStatus);
+                }
+                else if (rootName.LocalName == "ComposeMailSendMail")
+                {
+                    array<xml> sendMailStatus = updatedEncodedXml select xpath{/ComposeMailStatus};     
+                    if (sendMailStatus.Count > 0)
+                    {
+                        foreach (xml x in sendMailStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<Status>(xValue), null, () => Format("Invalid status value for SendMail response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "PingPing")
+                {
+                    array<xml> pingStatus = updatedEncodedXml select xpath{/PingStatus};        
+                    if (pingStatus.Count > 0)
+                    {
+                        foreach (xml x in pingStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck((InRange<Status>(xValue)||InRange<StatusForPing>(xValue)), null, () => Format("Invalid status value for Ping response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "MoveMoveItems")
+                {
+                    array<xml> responseMoveStatus = updatedEncodedXml select xpath{//MoveResponse/MoveStatus};
+                    IsValidValueforSyncStatusofMoveItems(responseMoveStatus);
+                    array<xml> moveStatus = updatedEncodedXml select xpath{/MoveStatus};
+                    IsValidValueforSyncStatusofMoveItems(moveStatus);
+                }
+                else if (rootName.LocalName == "MeetingResponseMeetingResponse")
+                {
+                    array<xml> meetingResponseStatus = updatedEncodedXml select xpath{//MeetingResponseResult/MeetingResponseStatus};       
+                    if (meetingResponseStatus.Count > 0)
+                    {
+                        foreach (xml x in meetingResponseStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<StatusForMeetingResponse>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid status value for MeetingResponse response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "GetItemEstimateGetItemEstimate")
+                {
+                    array<xml> getItemEstimateResponseStatus = updatedEncodedXml select xpath{//GetItemEstimateResponse/GetItemEstimateStatus}; 
+                    IsValidValueforGetItemEstimate(getItemEstimateResponseStatus);
+                    array<xml> getItemEstimateStatus = updatedEncodedXml select xpath{/GetItemEstimateStatus};  
+                    IsValidValueforGetItemEstimate(getItemEstimateStatus);
+                }
+                else if (rootName.LocalName == "FolderHierarchyFolderUpdate")
+                {
+                    array<xml> folderUpdateStatus = updatedEncodedXml select xpath{/FolderHierarchyStatus};
+                    if (folderUpdateStatus.Count > 0)
+                    {
+                        foreach (xml x in folderUpdateStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<StatusForFolderUpdate>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid status value for FolderUpdate response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "FolderHierarchyFolderSync")
+                {
+                    array<xml> folderSyncStatus = updatedEncodedXml select xpath{/FolderHierarchyStatus};
+                    if (folderSyncStatus.Count > 0)
+                    {
+                        foreach (xml x in folderSyncStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<StatusForFolderSync>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid status value for FolderSync response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "FolderHierarchyFolderDelete")
+                {
+                    array<xml> folderDeleteStatus = updatedEncodedXml select xpath{/FolderHierarchyStatus};
+                    if (folderDeleteStatus.Count > 0)
+                    {
+                        foreach (xml x in folderDeleteStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<StatusForFolderDelete>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid status value for FolderDelete response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "FolderHierarchyFolderCreate")
+                {
+                    array<xml> folderCreateStatus = updatedEncodedXml select xpath{/FolderHierarchyStatus};
+                    if (folderCreateStatus.Count > 0)
+                    {
+                        foreach (xml x in folderCreateStatus)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<StatusForFolderCreate>(xValue)||InRange<Status>(xValue), null, () => Format("Invalid status value for FolderCreate response: {0} ", xValue));
+                            }
+                        }
+                    }
+                }
+                else if (rootName.LocalName == "ValidateCertValidateCert")
+                {
+                    array<xml> validateCertStatus = updatedEncodedXml select xpath{/ValidateCertStatus};
+                    IsValidValueforValidateCert(validateCertStatus);
+                    array<xml> validateCertCertificateStatus = updatedEncodedXml select xpath{//ValidateCertCertificate/ValidateCertStatus};
+                    IsValidValueforValidateCert(validateCertCertificateStatus);
+                }
+            }
+            else
+            {
+                if (rootName.LocalName == "ResolveRecipientsResolveRecipients")
+                {
+                    array<xml> certificateRetrieval = updatedEncodedXml select xpath{//ResolveRecipientsOptions/ResolveRecipientsCertificateRetrieval};         
+                    if (certificateRetrieval.Count > 0)
+                    {
+                        foreach (xml x in certificateRetrieval)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<CertificateRetrieval>(xValue), null, () => Format("Invalid CertificateRetrieval value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+                }
+                else if (rootName.LocalName == "MeetingResponseMeetingResponse")
+                {
+                    array<xml> requestUserResponse = updatedEncodedXml select xpath{//MeetingResponseRequest/MeetingResponseUserResponse};          
+                    if (requestUserResponse.Count > 0)
+                    {
+                        foreach (xml x in requestUserResponse)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<UserResponse>(xValue), null, () => Format("Invalid UserResponse value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+                }
+                else if (rootName.LocalName == "AirSyncSync")
+                {
+                    array<xml> conflict = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncConflict};         
+                    if (conflict.Count > 0)
+                    {
+                        foreach (xml x in conflict)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<Conflict>(xValue), null, () => Format("Invalid Conflict value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> airSyncFilterType = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncFilterType};          
+                    if (airSyncFilterType.Count > 0)
+                    {
+                        foreach (xml x in airSyncFilterType)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(InRange<FilterTypeForSync>(xValue), null, () => Format("Invalid FilterType for Sync value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> syncAirsyncMIMESupport = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncMIMESupport};            
+                    if (syncAirsyncMIMESupport.Count > 0)
+                    {
+                        foreach (xml x in syncAirsyncMIMESupport)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<MIMESupportForSync>(xValue), null, () => Format("Invalid MIMESupport for Sync value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+                    
+                    array<xml> airsyncMIMETruncation = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncMIMETruncation};          
+                    if (airsyncMIMETruncation.Count > 0)
+                    {
+                        foreach (xml x in airsyncMIMETruncation)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<MIMETruncation>(xValue), null, () => Format("Invalid MIMETruncation value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> airsyncTruncation = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncTruncation};          
+                    if (airsyncTruncation.Count > 0)
+                    {
+                        foreach (xml x in airsyncTruncation)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<Truncation>(xValue), null, () => Format("Invalid Truncation value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }   
+
+                    array<xml> airsyncWait = updatedEncodedXml select xpath{/AirSyncWait};          
+                    if (airsyncWait.Count > 0)
+                    {
+                        foreach (xml x in airsyncWait)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                
+                                if (xValue != "nothing")
+                                {
+                                    int xValueFormat = xValue as int;
+                                    ValidationCheck(xValueFormat <= 59 && xValueFormat >= 1, null, () => Format("Invalid Wait value: {0}; ", xValue));
+                                }
+                            }                           
+                        }
+                    }   
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);
+                }
+                else if (rootName.LocalName == "GetItemEstimateGetItemEstimate")
+                {
+                    array<xml> airSyncFilterType = updatedEncodedXml select xpath{//AirSyncOptions/AirSyncFilterType};          
+                    if (airSyncFilterType.Count > 0)
+                    {
+                        foreach (xml x in airSyncFilterType)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();
+                                ValidationCheck(InRange<AirsyncFilterTypeForGetItemEstimate>(xValue), null, () => Format("Invalid FilterType for GetItemEstimate value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+
+                    array<xml> getItemEstimateFilterType = updatedEncodedXml select xpath{//GetItemEstimateCollection/GetItemEstimateFilterType};           
+                    if (getItemEstimateFilterType.Count > 0)
+                    {
+                        foreach (xml x in getItemEstimateFilterType)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<FilterTypeForGetItemEstimate>(xValue), null, () => Format("Invalid FilterType for GetItemEstimate value: {0}; ", xValue));
+                            }
+                    
+                        }
+                    }                   
+                }
+                else if (rootName.LocalName == "ItemOperationsItemOperations")
+                {
+                    array<xml> airsyncMIMESupport = updatedEncodedXml select xpath{//ItemOperationsOptions/AirSyncMIMESupport};         
+                    if (airsyncMIMESupport.Count > 0)
+                    {
+                        foreach (xml x in airsyncMIMESupport)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<MIMESupportForItemOperations>(xValue), null, () => Format("Invalid MIMESupport for ItemOperations value: {0}; ", xValue));
+                            }
+                        }
+                    }   
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);
+                }
+                else if (rootName.LocalName == "SearchSearch")
+                {
+                    array<xml> searchAirsyncMIMESupport = updatedEncodedXml select xpath{//SearchOptions/AirSyncMIMESupport};           
+                    if (searchAirsyncMIMESupport.Count > 0)
+                    {
+                        foreach (xml x in searchAirsyncMIMESupport)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString();     
+                                ValidationCheck(InRange<MIMESupportForSearch>(xValue), null, () => Format("Invalid MIMESupport for Search value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }
+                    IsValidMessageForItemOperationsAndSearchAndAirSync(updatedEncodedXml, isResponse);
+                }
+                else if (rootName.LocalName == "SettingsSettings")
+                {
+                    array<xml> settingsOofState = updatedEncodedXml select xpath{//SettingsSet/SettingsOofState};           
+                    if (settingsOofState.Count > 0)
+                    {
+                        foreach (xml x in settingsOofState)
+                        {                   
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value.ToString(); 
+                                ValidationCheck(InRange<OofState>(xValue), null, () => Format("Invalid OofState value: {0}; ", xValue));
+                            }
+                            
+                        }
+                    }                   
+                }
+            }
+        }
+        
+    }
+}
+
+void IsValidValueforSyncStatus (array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck((InRange<StatusForSyncResponse>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid status value for Sync response: {0} ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidValueforSyncStatusofSmartForwardOrReply(array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck(InRange<Status>(xValue), null, () => Format("Invalid status value for SmartReply or SmartForward response: {0} ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidValueforSyncStatusofMoveItems(array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck((InRange<Status>(xValue)||InRange<StatusForMoveItems>(xValue)), null, () => Format("Invalid status value for MoveItems response: {0} ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidValueforSyncStatusofItemOperations(array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck((InRange<Status>(xValue)||InRange<StatusForItemOperations>(xValue)), null, () => Format("Invalid status value for ItemOperations response: {0} ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidValueforGetItemEstimate(array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck((InRange<Status>(xValue)||InRange<StatusForGetItemEstimate>(xValue)), null, () => Format("Invalid status value for GetItemEstimate response: {0} ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidValueforValidateCert(array<xml> xmlItems)
+{
+    if (xmlItems.Count > 0)
+    {
+        foreach (xml x in xmlItems)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();
+                ValidationCheck((InRange<StatusForValidateCert>(xValue)||InRange<Status>(xValue)), null, () => Format("Invalid status value for ValidateCert response: {0} ", xValue));
+            }
+        }
+    }
+}
+
+void IsValidMessageForSearchAndAirSync(xml updatedEncodedXml)
+{
+    array<xml> emailAttMethod = updatedEncodedXml select xpath{//EmailAttachment/EmailAttMethod};
+    if (emailAttMethod.Count > 0)
+    {
+        foreach (xml x in emailAttMethod)
+        {
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value as string;
+                ValidationCheck(InRange<MSASEMAIL.AttMethod>(xValue), null, () => Format("Invalid AttMethod value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> emailBusyStatus = updatedEncodedXml select xpath{//EmailMeetingRequest/EmailBusyStatus};
+    if (emailBusyStatus.Count > 0)
+    {
+        foreach (xml x in emailBusyStatus)
+        {
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value as string;
+                ValidationCheck(InRange<MSASEMAIL.BusyStatus>(xValue), null, () => Format("Invalid BusyStatus value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> calendarType = updatedEncodedXml select xpath{//EmailRecurrence/Email2CalendarType};
+    if (calendarType.Count > 0)
+    {
+        foreach (xml x in calendarType)
+        {
+             if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value as string;
+                ValidationCheck(InRange<MSASCAL.AttendeeType>(xValue), null, () => Format("Invalid CalendarType value: {0}; ", xValue));
+            }
+        }
+    }           
+    
+    array<xml> dayOfWeek = updatedEncodedXml select xpath{//EmailRecurrence/EmailDayOfWeek};            
+    if (dayOfWeek.Count > 0)
+    {
+        foreach (xml x in dayOfWeek)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck((xValue as uint) is MSASEMAIL.DayOfWeek, null, () => Format("Invalid DayOfWeek value: {0}; ", xValue));             
+            }               
+        }
+    }
+                
+    array<xml> firstDayOfWeek = updatedEncodedXml select xpath{//EmailRecurrence/Email2FirstDayOfWeek};         
+    if (firstDayOfWeek.Count > 0)
+    {
+        foreach (xml x in firstDayOfWeek)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();
+                ValidationCheck(InRange<MSASEMAIL.FirstDayOfWeek>(xValue), null, () => Format("Invalid FirstDayOfWeek value: {0}; ", xValue));
+            }   
+        }
+    }
+                
+    array<xml> importance = updatedEncodedXml select xpath{//EmailImportance};          
+    if (importance.Count > 0)
+    {
+        foreach (xml x in importance)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASEMAIL.Importance>(xValue), null, () => Format("Invalid Importance value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> instanceType = updatedEncodedXml select xpath{//EmailMeetingRequest/EmailInstanceType};          
+    if (instanceType.Count > 0)
+    {
+        foreach (xml x in instanceType)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck(InRange<MSASEMAIL.InstanceType>(xValue), null, () => Format("Invalid InstanceType value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> lastVerbExecuted = updatedEncodedXml select xpath{//Email2LastVerbExecuted};         
+    if (lastVerbExecuted.Count > 0)
+    {
+        foreach (xml x in lastVerbExecuted)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck(InRange<MSASEMAIL.LastVerbExecuted>(xValue), null, () => Format("Invalid LastVerbExecuted value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> location = updatedEncodedXml select xpath{//EmailMeetingRequest/EmailLocation};          
+    if (location.Count > 0)
+    {
+        foreach (xml x in location)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck(xValue.Count < 32768, null, () => Format("The Location value: {0} should be less than 32768; ", xValue));
+            }                   
+        }
+    }
+                
+    array<xml> meetingMessageType = updatedEncodedXml select xpath{//EmailMeetingRequest/Email2MeetingMessageType};         
+    if (meetingMessageType.Count > 0)
+    {
+        foreach (xml x in meetingMessageType)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString();         
+                ValidationCheck(InRange<MSASEMAIL.MeetingMessageType>(xValue), null, () => Format("Invalid MeetingMessageType value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> sensitivity = updatedEncodedXml select xpath{//EmailMeetingRequest/EmailSensitivity};            
+    if (sensitivity.Count > 0)
+    {
+        foreach (xml x in sensitivity)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASEMAIL.Sensitivity>(xValue), null, () => Format("Invalid Sensitivity value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> status = updatedEncodedXml select xpath{//EmailFlag/EmailStatus};            
+    if (status.Count > 0)
+    {
+        foreach (xml x in status)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASEMAIL.Status>(xValue), null, () => Format("Invalid Status value: {0}; ", xValue));
+            }
+        }
+    }
+                
+    array<xml> emailType = updatedEncodedXml select xpath{//EmailRecurrence/EmailType};         
+    if (emailType.Count > 0)
+    {
+        foreach (xml x in emailType)
+        {                   
+            if (x.Value != nothing || x.Value != null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASEMAIL.Type>(xValue), null, () => Format("Invalid Type value: {0}; ", xValue));
+            }
+        }
+    }   
+                
+    array<xml> tasksComplete = updatedEncodedXml select xpath{//TasksComplete};
+    if (tasksComplete.Count > 0)
+    {
+        foreach (xml x in tasksComplete)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASTASK.Complete>(xValue), null, () => Format("Invalid Complete value: {0}; ", x.Value.ToString()));
+            }                   
+        }
+    }
+}
+
+void IsValidMessageForItemOperationsAndSearchAndAirSync(xml updatedEncodedXml, bool isResponse)
+{
+    array<xml> airsyncbaseAttachmentMethod = updatedEncodedXml select xpath{//AirSyncBaseAttachment/AirSyncBaseMethod};         
+    if (airsyncbaseAttachmentMethod.Count > 0)
+    {
+        foreach (xml x in airsyncbaseAttachmentMethod)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();     
+                ValidationCheck(InRange<MSASAIRS.MethodAttachment>(xValue), null, () => Format("Invalid Method value: {0}; ", x.Value.ToString()));
+            }                   
+        }
+    }
+                
+    array<xml> airsyncbaseAddMethod = updatedEncodedXml select xpath{//AirSyncBaseAdd/AirSyncBaseMethod};           
+    if (airsyncbaseAddMethod.Count > 0)
+    {
+        foreach (xml x in airsyncbaseAddMethod)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString(); 
+                ValidationCheck(InRange<MSASAIRS.MethodAdd>(xValue), null, () => Format("Invalid Method value: {0}; ", x.Value.ToString()));
+            }                   
+        }
+    }
+                                
+    array<xml> airsyncbaseType = updatedEncodedXml select xpath{//AirSyncBaseType};         
+    if (airsyncbaseType.Count > 0)
+    {
+        foreach (xml x in airsyncbaseType)
+        {                   
+            if (x.Value!= nothing || x.Value!= null)
+            {
+                string xValue = x.Value.ToString();
+                ValidationCheck(InRange<MSASAIRS.Type>(xValue), null, () => Format("Invalid Type value: {0}; ", x.Value.ToString()));
+            }                   
+        }
+    }
+                
+    if(isResponse)
+    {
+        array<xml> airsyncbaseStatus = updatedEncodedXml select xpath{//AirSyncBaseBodyPart/AirSyncBaseStatus};         
+        if (airsyncbaseStatus.Count > 0)
+        {
+            foreach (xml x in airsyncbaseStatus)
+            {                   
+                if (x.Value!= nothing || x.Value!= null)
+                {
+                    string xValue = x.Value.ToString(); 
+                    ValidationCheck(InRange<MSASAIRS.Status>(xValue), null, () => Format("Invalid Status value: {0}; ", x.Value.ToString()));
+                }                   
+            }
+        }
+    }
+    else
+    {
+        //MS-ASAIRS：
+        array<xml> airsyncbaseTruncationSize = updatedEncodedXml select xpath{//AirSyncBaseBodyPartPreference/AirSyncBaseTruncationSize};           
+        if (airsyncbaseTruncationSize.Count > 0)
+        {
+            foreach (xml x in airsyncbaseTruncationSize)
+            {                   
+                if (x.Value!= nothing || x.Value!= null)
+                {
+                    string xValue = x.Value.ToString(); 
+                    ValidationCheck((xValue as uint) < 4294967295, null, () => Format("The TruncationSize value: {0} should be little than 4294967295; ", x.Value.ToString()));
+                }                   
+            }
+        }
+    }
+}
+    
+pattern Status = enum string
+{
+    InvalidContent = "101",
+    InvalidWBXML = "102",
+    InvalidXML = "103",
+    InvalidDateTime = "104",
+    InvalidCombinationOfIDs = "105",
+    InvalidIDs = "106",
+    InvalidMIME = "107",
+    DeviceIdMissingOrInvalid = "108",
+    DeviceTypeMissingOrInvalid ="109",
+    ServerError = "110",
+    ServerErrorRetryLater = "111",
+    ActiveDirectoryAccessDenied = "112",
+    MailboxQuotaExceeded = "113",
+    MailboxServerOffline = "114",
+    SendQuotaExceeded = "115",
+    MessageRecipientUnresolved = "116",
+    MessageReplyNotAllowed = "117",
+    MessagePreviouslySent = "118",
+    MessageHasNoRecipient = "119",
+    MailSubmissionFailed = "120",
+    MessageReplyFailed = "121",
+    AttachmentIsTooLarge = "122",
+    UserHasNoMailbox = "123",
+    UserCannotBeAnonymous = "124",
+    UserPrincipalCouldNotBeFound = "125",
+    UserDisabledForSync = "126",
+    UserOnNewMailboxCannotSync = "127",
+    UserOnLegacyMailboxCannotSync = "128",
+    DeviceIsBlockedForThisUser = "129",
+    AccessDenied = "130",
+    AccountDisabled = "131",
+    SyncStateNotFound = "132",
+    SyncStateLocked = "133",
+    SyncStateCorrupt = "134",
+    SyncStateAlreadyExists = "135",
+    SyncStateVersionInvalid = "136",
+    CommandNotSupported = "137",
+    VersionNotSupported = "138",
+    DeviceNotFullyProvisionable = "139",
+    RemoteWipeRequested = "140",
+    LegacyDeviceOnStrictPolicy = "141",
+    DeviceNotProvisioned = "142",
+    PolicyRefresh = "143",
+    InvalidPolicyKey = "144",
+    ExternallyManagedDevicesNotAllowed = "145",
+    NoRecurrenceInCalendar = "146",
+    UnexpectedItemClass = "147",
+    RemoteServerHasNoSSL = "148",
+    InvalidStoredRequest = "149",
+    ItemNotFound = "150",
+    TooManyFolders = "151",
+    NoFoldersFound = "152",
+    ItemsLostAfterMove = "153",
+    FailureInMoveOperation = "154",
+    MoveCommandDisallowedForNonPersistentMoveAction = "155",
+    MoveCommandInvalidDestinationFolder = "156",
+    AvailabilityTooManyRecipients = "160",
+    AvailabilityDLLimitReached = "161",
+    AvailabilityTransientFailure = "162",
+    AvailabilityFailure = "163",
+    BodyPartPreferenceTypeNotSupported = "164",
+    DeviceInformationRequired = "165",
+    InvalidAccountId = "166",
+    AccountSendDisabled = "167",
+    IRM_FeatureDisabled = "168",
+    IRM_TransientError = "169",
+    IRM_PermanentError = "170",
+    IRM_InvalidTemplateID = "171",
+    IRM_OperationNotPermitted = "172",
+    NoPicture = "173",
+    PictureTooLarge = "174",
+    PictureLimitReached = "175",
+    BodyPart_ConversationTooLarge = "176",
+    MaximumDevicesReached = "177",
+    InvalidMimeBodyCombination = "178",
+    InvalidSmartForwardParameters = "179",
+    InvalidRecipients = "183",
+    OneOrMoreExceptionsFailed = "184"
+};
+
+// 2.2.3.22 CertificateRetrieval
+pattern CertificateRetrieval = enum string
+{
+    NotRetrieveCertificates = "1",
+    RetrieveFullCertificate = "2",
+    RetrieveMiniCertificate = "3"
+};
+
+// 2.2.3.34 Conflict
+pattern Conflict = enum string
+{
+    ClientObjectReplacesServerObject = "0",
+    ServerObjectReplacesClientObject = "1"
+};
+
+// 2.2.3.65.1   FilterType (GetItemEstimate)
+pattern FilterTypeForGetItemEstimate = enum string
+{
+    NoFilter = "0",
+    OneDay = "1",
+    ThreeDays = "2",
+    OneWeek = "3",
+    TwoWeeks = "4",
+    OneMonth = "5",
+    ThreeMonths = "6",
+    SixMonths = "7",
+    IncompleteTasks = "8"
+};
+
+// 2.2.3.65.1   FilterType (GetItemEstimate)
+pattern AirsyncFilterTypeForGetItemEstimate = enum string
+{
+    NoFilter = "0",
+    OneDay = "1",
+    ThreeDays = "2",
+    OneWeek = "3",
+    TwoWeeks = "4",
+    OneMonth = "5",
+    ThreeMonths = "6",
+    SixMonths = "7",
+    IncompleteTasks = "8",
+    ECCT = "9"
+};
+
+// 2.2.3.65.2   FilterType (Sync)
+pattern FilterTypeForSync = enum string
+{
+    NoFilterSynchronizeAllItems = "0",
+    OneDay = "1",
+    ThreeDays = "2",
+    OneWeek = "3",
+    TwoWeeks = "4",
+    OneMonth = "5",
+    ThreeMonths = "6",
+    SixMonths = "7",
+    FilterByIncompleteTasks = "8"
+};
+
+// 2.2.3.100    MergedFreeBusy
+pattern MergedFreeBusy = enum string
+{
+    Free = "0",
+    Tentative = "1",
+    Busy = "2",
+    OutOfOffice = "3",
+    NoData = "4"
+};
+
+// 2.2.3.103.1  MIMESupport (ItemOperations)
+pattern MIMESupportForItemOperations = enum string
+{
+    NeverSendMIMEData = "0",
+    SendMIMEDataForSMIMEMessages = "1",
+    SendMIMEDataForAllMessages = "2"
+};
+
+// 2.2.3.103.2  MIMESupport (Search)
+pattern MIMESupportForSearch = enum string
+{
+    NeverSendMIMEData = "0",
+    SendMIMEDataForSMIMEMessages = "1",
+    SendMIMEDataForAllMessages = "2"
+};
+
+// 2.2.3.103.3  MIMESupport (Sync)
+pattern MIMESupportForSync = enum string
+{
+    NeverSendMIMEData = "0",
+    SendMIMEDataForSMIMEMessages = "1",
+    SendMIMEDataForAllMessages = "2"
+};
+
+// 2.2.3.104    MIMETruncation
+pattern MIMETruncation = enum string
+{
+    TruncateAllBodyText = "0",
+    TruncateTextOver4096 = "1",
+    TruncateTextOver5120 = "2",
+    TruncateTextOver7168 = "3",
+    TruncateTextOver10240 = "4",
+    TruncateTextOver20480 = "5",
+    TruncateTextOver51200 = "6",
+    TruncateTextOver102400 = "7",
+    NotTruncate = "8"
+};
+
+// 2.2.3.117    OofState
+pattern OofState = enum string
+{
+    OofPropertyDisabled = "0",
+    OofPropertyGlobal = "1",
+    OofPropertyTimeBased = "2"
+};
+
+// 2.2.3.166.1  Status (Autodiscover)
+pattern StatusForAutodiscover = enum string
+{
+    Success = "1",
+    ProtocolError = "2"
+};
+
+// 2.2.3.166.2  Status (FolderCreate)
+pattern StatusForFolderCreate = enum string
+{
+    Success = "1",
+    FolderExists = "2",
+    SpecifiedParentFolderIsSpecialSystemFolder = "3",
+    SpecifiedParentFolderNotFound = "5",
+    ErrorOccurredOnServer = "6",
+    MismatchOrInvalidSynchronizationKey = "9",
+    MalformedRequest = "10",
+    UnknownErrorOccurred = "11",
+    CodeUnknown = "12"
+};
+
+// 2.2.3.166.3  Status (FolderDelete)
+pattern StatusForFolderDelete = enum string
+{
+    Success = "1",
+    SpecifiedParentFolderIsSpecialSystemFolder = "3",
+    SpecifiedFolderNotExist = "4",
+    ErrorOccurredOnServer = "6",
+    MismatchOrInvalidSynchronizationKey = "9",
+    IncorrectlyFormattedRequest = "10",
+    UnknownErrorOccurred = "11"
+};
+
+// 2.2.3.166.4  Status (FolderSync)
+pattern StatusForFolderSync = enum string
+{
+    Success = "1",
+    ErrorOccurredOnServer = "6",
+    MismatchOrInvalidSynchronizationKey = "9",
+    IncorrectlyFormattedRequest = "10",
+    UnknownErrorOccurred = "11",
+    CodeUnknown = "12"
+};
+
+// 2.2.3.166.5  Status (FolderUpdate)
+pattern StatusForFolderUpdate = enum string
+{
+    Success = "1",
+    FolderExistsOrSpecifiedFolderIsSpecialFolder = "2",
+    SpecifiedFolderIsRecipientInformationFolder = "3",
+    SpecifiedFolderNotExist = "4",
+    SpecifiedParentFolderNotFound = "5",
+    ErrorOccurredOnServer = "6",
+    MismatchOrInvalidSynchronizationKey = "9",
+    IncorrectlyFormattedRequest = "10",
+    UnknownErrorOccurred = "11"
+};
+
+// 2.2.3.166.6  Status (GetItemEstimate)
+pattern StatusForGetItemEstimate = enum string
+{
+    Success = "1",
+    InvalidCollectionOrInvalidCollectionIDs = "2",
+    SynchronizationStateNotPrimed = "3",
+    InvalidSynchronizationKey = "4"
+};
+
+// 2.2.3.166.7  Status (ItemOperations)
+pattern StatusForItemOperations = enum string
+{
+    Success = "1",
+    ProtocolError = "2",
+    ServerError = "3",
+    DocumentLibraryBadSpecifiedURI = "4",
+    DocumentLibraryAccessDenied = "5",
+    DocumentLibraryObjectNotFoundOrAccessDenied = "6",
+    DocumentLibraryFailedToConnectServer = "7",
+    InvalidOrTooLargeByteRange = "8",
+    UnknownOrUnsupportedStore = "9",
+    EmptyFile = "10",
+    RequestedDataIsTooLarge = "11",
+    FailedToDownload = "12",
+    FailedItemConversion = "14",
+    InvalidAttachmentOrID = "15",
+    AccessResourceDenied = "16",
+    PartialSuccess = "17",
+    CredentialsRequired = "18",
+    ProtocolErrorForTwoElements = "155",
+    ActionNotSupported = "156"
+};
+
+// 2.2.3.166.8  Status (MeetingResponse)
+pattern StatusForMeetingResponse = enum string
+{
+    Success = "1",
+    InvalidMeetingRequest = "2",
+    ErrorOccurredOnServerMailbox = "3",
+    ErrorOccurredOnServer = "4"
+};
+
+// 2.2.3.166.9  Status (MoveItems)
+pattern StatusForMoveItems = enum string
+{
+    InvalidSourceCollectionIDOrItemID = "1",
+    InvalidDestinationCollectionID = "2",
+    Success = "3",
+    SameCollectionIDsForSourceAndDestination = "4",
+    ItemCannotBeMovedOrSourceOrDestinationItemLocked = "5",
+    SourceOrDestinationItemWasLocked = "7"
+};
+
+// 2.2.3.166.10 Status (Ping)
+pattern StatusForPing = enum string
+{
+    HeartbeatIntervalExpired = "1",
+    ChangesOccurredInOneOrMoreMonitoredFolders = "2",
+    PingCommandRequestOmittedRequiredParameters = "3",
+    SyntaxErrorInPingCommandRequest = "4",
+    SpecifiedHeartbeatIntervalOutsideAllowedRange = "5",
+    PingCommandRequestSpecifiedMoreThanAllowedFolderNum = "6",
+    FolderHierarchySyncRequired = "7",
+    ErrorOccurredOnServer = "8"
+};
+
+
+// 2.2.3.166.11 Status (ResolveRecipients)
+pattern StatusForResolveRecipientsResponseOfResolveRecipients = enum string
+{
+    Success = "1",
+    ProtocolError = "5",
+    ErrorOccurredOnServer = "6"
+};
+
+// 2.2.3.166.11 Status (ResolveRecipients)
+pattern StatusForResolveRecipientsResponseOfResponse = enum string
+{
+    RecipientResolvedSuccessfully = "1",
+    RecipientFoundAmbiguousSuggestion = "2",
+    RecipientFoundAmbiguousPartialSuggestion = "3",
+    RecipientNotResolve = "4"
+};
+
+// 2.2.3.166.11 Status (ResolveRecipients)
+pattern StatusForResolveRecipientsResponseOfAvailability = enum string
+{
+    FreeBusySuccessfullyRetrieved = "1",
+    CommandReachedMaximumNumber = "160",
+    DistributionGroupIncludedMoreThanTwentyRecipients = "161",
+    FreeBusyNotRetrievedDueToTemporaryFailure = "162",
+    FreeBusyNotRetrievedForGivenRecipient = "163"
+};
+
+
+// 2.2.3.166.11 Status (ResolveRecipients)
+pattern StatusForResolveRecipientsResponseOfCertificates = enum string
+{
+    OneOrMoreCertificatesSuccessfullyReturned = "1",
+    RecipientNotHaveValidSMIMECertificate = "7",
+    GlobalCertificateLimitReached = "8"
+};
+
+// 2.2.3.166.11 Status (ResolveRecipients)
+pattern StatusForResolveRecipientsResponseOfPicture = enum string
+{
+    ContactPhotoRetrievedSuccessfully = "1",
+    UserNotHaveContactPhoto = "173",
+    ContactPhotoExceededSizeLimit = "174",
+    NumberOfContactPhotosExceededSizeLimit = "175"
+};
+
+// 2.2.3.166.12 Status (Search)
+pattern StatusForSearchResponseOfSearch = enum string
+{
+    Success = "1",
+    ServerError = "3"
+};
+
+// 2.2.3.166.12 Status (Search)
+pattern StatusForSearchResponseOfStore = enum string
+{
+    Success = "1",
+    RequestInvalid = "2",
+    ErrorOccurredOnServer = "3",
+    BadLink = "4",
+    AccessDenied = "5",
+    NotFound = "6",
+    ConnectionFailed = "7",
+    TooComplex = "8",
+    TimedOut = "10",
+    FolderSyncRequired = "11",
+    EndOfRetrievableRangeWarning = "12",
+    AccessBlocked = "13",
+    CredentialsRequired = "14"
+};
+
+// 2.2.3.166.12 Status (Search)
+pattern StatusForSearchResponseOfPicture = enum string
+{
+    ContactPhotoRetrievedSuccessfully = "1",
+    UserNotHaveContactPhoto = "173",
+    ContactPhotoExceededSizeLimit = "174",
+    NumberOfContactPhotosExceededSizeLimit = "175"
+};
+
+// 2.2.3.166.14 Status (Settings)
+pattern StatusForSettingsResponseOfSettings = enum string
+{
+    Success = "1",
+    ProtocolError = "2",
+    AccessDenied = "3",
+    ServerUnavailable = "4",
+    InvalidArguments = "5",
+    ConflictingArguments = "6",
+    DeniedByPolicy = "7"
+};
+
+// 2.2.3.166.14 Status (Settings)
+pattern StatusForSettingsResponseOfGetRMGetSetOOFSetDIGetUI = enum string
+{
+    Success ="1",
+    ProtocolError = "2",
+    InvalidArguments = "5",
+    ConflictingArguments = "6"
+};
+
+// 2.2.3.166.14 Status (Settings)
+pattern StatusForSettingsResponseOfDevicePassword = enum string
+{
+    Success ="1",
+    ProtocolError = "2",
+    InvalidArguments = "5",
+    DeniedByPolicy = "7"
+};
+
+// 2.2.3.166.16 Status (Sync)
+pattern StatusForSyncResponse = enum string
+{
+    Success ="1",
+    InvalidSyncKey = "3",
+    ProtocolError = "4",
+    ServerError = "5",
+    ErrorInClientOrServerConversion ="6",
+    ConflictMatchingClientAndServer = "7",
+    ObjectNotFound = "8",
+    SyncCommandCannotCompleted = "9",
+    FolderHierarchyChanged ="12",
+    SyncCommandRequestIsNotComplete = "13",
+    InvalidWaitOrHeartbeatIntervalValue = "14",
+    InvalidSyncCommandRequest = "15",
+    Retry = "16"
+};
+
+// 2.2.3.166.17 Status (ValidateCert)
+pattern StatusForValidateCert = enum string
+{
+    Success ="1",
+    ProtocolError = "2",
+    SignatureDigitalIDCannotBeValidated = "3",
+    DigitalIDWasIssuedByUntrustedSource = "4",
+    DigitalIDNotValid = "5",
+    DigitalIDNotValidForSigningEM = "6",
+    DigitalIDExpiredOrNotYetValid ="7",
+    TimePeriodsNotConsistent = "8",
+    DigitalIDInChainUsedIncorrectly = "9",
+    DigitalIDMissingOrIncorrect ="10",
+    DigitalIDUsedIncorrectly = "11",
+    DigitalIDNotMatchRecipientMail = "12",
+    DigitalIDSignMessageHasBeenRevoked = "13",
+    DigitalIDCannotBeDetermined = "14",
+    DigitalIDHasBeenRevoked = "15",
+    DigitalIDCannotBeValidate = "16",
+    UnknownServerError = "17"
+};
+
+
+// 2.2.3.174    Truncation
+pattern Truncation = enum string
+{
+    TruncateAllBodyText = "0",
+    TruncateTextOver512 = "1",
+    TruncateTextOver1024 = "2",
+    TruncateTextOver2048 = "3",
+    TruncateTextOver5120 = "4",
+    TruncateTextOver10240 = "5",
+    TruncateTextOver20480 = "6",
+    TruncateTextOver51200 = "7",
+    TruncateTextOver102400 = "8",
+    NotTruncate = "9"
+};
+
+// 2.2.3.175.1  Type (Autodiscover)
+pattern TypeForAutodiscover = enum string
+{
+    URLElementAccessedByClients = "MobileSync", 
+    URLElementAccessedByClientsObtainCertificateForSSL = "CertEnroll"
+};
+
+// 2.2.3.175.4  Type (GetHierarchy)
+pattern TypeForGetHierarchy = enum string
+{
+    UserCreatedFolder = "1", 
+    DefaultInboxFolder = "2",
+    DefaultDraftsFolder = "3",
+    DefaultDeletedItemsFolder = "4",
+    DefaultSentItemsFolder = "5",
+    DefaultOutboxFolder = "6"
+};
+
+// 2.2.3.183    UserResponse
+pattern UserResponse = enum string
+{
+    Accepted = "1",
+    TentativelyAccepted = "2",
+    Declined = "3"
+};
+
+
+

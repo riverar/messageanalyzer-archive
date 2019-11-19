@@ -1,0 +1,108 @@
+protocol MSOCSP with
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.DER},
+Documentation
+{
+    ProtocolName = "Online Certificate Status Protocol (OCSP) Extensions",
+    ShortName = "OCSP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-OCSP", Version = "2.0", Date = "11/14/2013", ProgramName = ProgramName.MCPP}
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "360841", Date = "03/24/2014"}
+    ]
+};
+
+using Standard;
+using Technologies.ASN1;
+using OCSP;
+
+autostart actor MsocspExtensionActor(OCSP.Server server)
+{
+    observe server issues res:OCSP.OCSPResponse
+    {
+        if (res.responseBytes is rb:OCSP.ResponseBytes)
+        {
+            OcspExtensions extensions = [];
+            if (rb.reponseType == idPkixOcspBasicOID && rb.reponse is basic:BasicOCSPResponse)
+            {
+                array<SingleResponse> responses = [];
+                foreach (var singleRes in basic.tbsResponseData.responses)
+                {
+                    if (singleRes.singleExtensions is ext:OCSP.OcspExtensions)
+                    {
+                        for (int i = 0; i < ext.Count; i++)
+                        {
+                            if (ext[i].ExtnID == crlNextPublishOID)
+                            {
+                                MsocspExtension msExt = new MsocspExtension
+                                {
+                                    ExtnID = ext[i].ExtnID,
+                                    Critical = ext[i].Critical,
+                                };
+
+                                if ((ext[i].ExtnValue is oct:OctetString) && (Asn1BerDecoder<MsocspTimeChoiceWrapper>(oct as binary) is t:MsocspTimeChoiceWrapper))
+                                {
+                                    msExt.ExtnValue = t.Time;
+                                    ext[i] = msExt;
+                                }
+                            }
+                        }
+                        singleRes.singleExtensions = ext;
+                    }
+                    responses += [singleRes];
+                }
+                basic.tbsResponseData.responses = responses;
+            }
+        } 
+    }
+}
+
+// http://msdn.microsoft.com/en-us/library/windows/desktop/aa379070(v=vs.85).aspx
+// XCN_OID_CRL_NEXT_PUBLISH (1.3.6.1.4.1.311.21.4)
+// [MS-OCSP] 3.2.5   Processing Events and Sequencing Rules
+const array<int> crlNextPublishOID = [1, 3, 6, 1, 4, 1, 311, 21, 4];
+
+// define the wrapper due to bug#73182
+type MsocspTimeChoiceWrapper
+{
+    MsocspTimeChoice Time;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+pattern MsocspTimeChoice = UTCTime | GeneralizedTime;
+
+type MsocspExtension : OcspExtension
+{
+    new MsocspTimeChoice ExtnValue;
+}
+
+bool get OCSPE(this OCSP.OCSPResponse res)
+{
+    if (res.responseBytes is rb:OCSP.ResponseBytes)
+    {
+        OcspExtensions extensions = [];
+        if (rb.reponseType == idPkixOcspBasicOID && rb.reponse is basic:BasicOCSPResponse)
+        {
+            foreach (var singleRes in basic.tbsResponseData.responses)
+            {
+                if (singleRes.singleExtensions is ext:OCSP.OcspExtensions)
+                {
+                    for (int i = 0; i < ext.Count; i++)
+                    {
+                        if (ext[i].ExtnID == crlNextPublishOID)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}

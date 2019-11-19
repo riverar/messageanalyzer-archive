@@ -1,0 +1,179 @@
+protocol KPP with
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "Key Provisioning Protocol",
+    ShortName = "KPP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-KPP", Version = "1.0", Date = "07/14/2016", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "381536", Date = "09/29/2015"},
+    ]
+};
+
+using Utility;
+using HTTP;
+using JWT;
+
+const string KPPUri = "/EnrollmentServer/key";
+
+endpoint Server
+    over HTTP.Server
+    accepts KeyProvisionRequest issues KeyProvisionResponse
+    issues ErrorDetails
+    provides VirtualOperation;
+
+autostart actor KPPOverHTTPS(HTTP.Server httpServer)
+{
+    process httpServer accepts req:HttpContract.Request where IsKPPRequest(req)
+    {
+        if (req.Headers.Keys["Authorization"] && req.Headers["Authorization"] is credentials:HTTP.Credentials && credentials.AuthSchema == "Bearer" && credentials.AuthParam is authStr:string)
+        {
+            req.Headers["Authorization"] = new KPPCredentials{AuthSchema = credentials.AuthSchema, AuthParam = DecodeJWT<JWS_Header, KPP_JWT_Claims, JWE_Header>(authStr)};
+        }
+
+        switch (req.Payload)
+        {
+            case kppReq:KeyProvisionRequest from JsonDecoder<KeyProvisionRequest> =>
+                    dispatch (endpoint Server over httpServer) accepts kppReq;
+            default =>
+                ThrowDecodingException("KPP", "KeyProvisionRequest");
+        }
+    }
+
+    process httpServer issues res:HttpContract.Response where IsKPPResponse(res)
+    {
+        if (res.StatusCode == 200)
+        {
+            switch (res.Payload)
+            {
+                case kppRes:KeyProvisionResponse from JsonDecoder<KeyProvisionResponse> =>
+                        dispatch (endpoint Server over httpServer) issues kppRes;
+                default =>
+                    ThrowDecodingException("KPP", "KeyProvisionResponse");
+            }
+        }
+        else if (res.StatusCode == 400 || res.StatusCode == 401)
+        {
+            switch (res.Payload)
+            {
+                case kppErr:ErrorDetails from JsonDecoder<ErrorDetails> =>
+                        dispatch (endpoint Server over httpServer) issues kppErr;
+                default =>
+                    ThrowDecodingException("KPP", "ErrorDetails");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("KPP");
+        }
+    }
+}
+
+bool IsKPPRequest(HttpContract.Request request)
+{
+    return request.Method == "POST" &&
+        (request.Uri.AbsPath is absPath:string && absPath == KPPUri);
+}
+
+bool IsKPPResponse(HttpContract.Response response)
+{
+    return (response#HttpMethod is method:string && method == "POST") &&
+        (response#Uri is uri:UriType && uri.AbsPath is absPath:string && absPath == KPPUri);
+}
+
+type KPPCredentials : HTTP.Credentials
+{
+    new (JSONWebToken | string) AuthParam;
+}
+
+type KPP_JWT_Claims:JWT_Claims
+{
+    string deviceid;
+    string upn;
+    string amr;
+}
+// 3.1.5.1.1.1 Request Body
+message KeyProvisionRequest
+{
+    string kngc;
+
+    override string ToString()
+    {
+        return "Key Provision Request, kngc: " + kngc;
+    }
+}
+
+// 3.1.5.1.1.2 Response  Body
+message KeyProvisionResponse
+{
+    string kid;
+    string upn;
+
+    override string ToString()
+    {
+        return "Key Provision Response, kid: " + kid + ", upn: " + upn;
+    }
+}
+
+// 2.2.3.1 ErrorDetails
+message ErrorDetails
+{
+    string code;
+    string $"message";
+    string response;
+    string target;
+    optional string clientrequestid;
+    string time;
+    optional innererror innererror;
+
+    override string ToString()
+    {
+        return "ErrorDetails, code: " + code + ", message: " + $"message";
+    }
+}
+
+type innererror
+{
+    string trace;
+    string context;
+}
+
+contract VirtualOperation
+{
+    issues virtual operation KeyProvision
+    {
+        in string kngc = kngcFromReq;
+        out string kid = kidFromRes;
+        out string upn = upnFromRes;
+
+        override string ToString()
+        {
+            return "Key Provision, kngc: " + kngc + ", kid: " + kid + ", upn: " + upn;
+        }
+    } =
+    accepts KeyProvisionRequest{kngc is kngcFromReq:string} ->
+    issues KeyProvisionResponse{kid is kidFromRes:string, upn is upnFromRes:string};
+
+    issues virtual operation KeyProvisionError
+    {
+        in string kngc = kngcFromReq;
+        out string code = codeFromRes;
+        out string $"message" = messageFromRes;
+
+        override string ToString()
+        {
+            return "Key Provision Error, kngc: " + kngc + ", code: " + code + ", message: " + $"message";
+        }
+    } =
+    accepts KeyProvisionRequest{kngc is kngcFromReq:string} ->
+    issues ErrorDetails{code is codeFromRes:string, $"message" is messageFromRes:string};
+}

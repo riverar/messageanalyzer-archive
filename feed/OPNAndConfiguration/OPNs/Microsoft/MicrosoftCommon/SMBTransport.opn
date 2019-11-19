@@ -1,0 +1,3806 @@
+protocol SMBTransport with
+BinaryEncodingDefaults{Endian = Endian.Little},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "MS-SMB2", Version = "53.0", Date = "09/15/2017", ProgramName = ProgramName.MCPP},
+            new Reference{Name = "MS-CIFS", Version = "26.0", Date = "07/14/2016", ProgramName = ProgramName.WSPP},
+            new Reference{Name = "MS-SMB", Version = "46.0", Date = "06/01/2017", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="382283", Date="10/20/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using DTYP;
+using ERREF;
+using NBTSS;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using MSRPCE;
+using NBF;
+using IANA;
+using FAS;
+using Diagnostics;
+using InfrastructureResources;
+using Configurations;
+
+// SMBOverTCP
+endpoint Server
+    over TCP.Server
+    accepts TransportPacket issues TransportPacket;
+
+client endpoint Client connected to Server;
+
+const ushort SMBDefaultPort = IANA.Port.SMB;
+
+// Actors
+autostart actor SMBTransportOverTCPServer(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+    SMBAndSMB2Configuration config = GetConfigurableValue<SMBAndSMB2Configuration>();
+
+    process server accepts s:TCP.Segment where (s.DestinationPort == SMBDefaultPort || s.DestinationPort in config.Ports)
+    {
+        InitializeDecodingHelperIfNull();
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+   
+    process server issues s:TCP.Segment where (s.SourcePort == SMBDefaultPort || s.SourcePort in config.Ports)
+    {
+        InitializeDecodingHelperIfNull();
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(TCP.Server e)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+        }
+    }
+
+    void InitializeDecodingHelperIfNull()
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new SMBTransport.SMBDecodingCache(),
+                                    new SMBTransport.SMBDecodingCache(),
+                                    "SMBTransport",
+                                    endpoint Server over server,
+                                    IsSMBOverTCP /*isCurrentProtocol*/,
+                                    IsSufficientForSingleMsg /*isSufficientForSingleMsg*/,
+                                    (stream s) => BinaryDecoder<TransportPacket>(s) as optional any message /*decodeSingleMessage*/,
+                                    (binary b) => BinaryDecoder<TransportPacket>(b) as optional any message /*decodeIncompleteMessage*/);
+        }
+    }
+}
+
+// Message
+message TransportPacket
+{
+    byte Zero where value == 0;
+    uint StreamProtocolLength with BinaryEncoding{Width = 24};
+    binary SMBMessage with BinaryEncoding{MaxLength = StreamProtocolLength};
+    
+    override string ToString()
+    {
+        return "SMB Transport Packet, StreamProtocolLength: " + (StreamProtocolLength as string);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Big};
+
+// Get the binary value of ProtocolId from NBTSS.SessionService message
+binary GetProtocolIdBin(NBTSS.SessionService m)
+{
+    if (m.Trailer is p:SessionMessagePacket && p.UserData.Count > 4)
+    {
+        return p.UserData.Segment(0, 4);
+    }
+    return $[];
+}
+
+// Get the binary value of ProtocolId from NBTSS.SessionService message
+binary GetProtocolIdBin(TransportPacket m)
+{
+    if (m.SMBMessage.Count > 4)
+    {
+        return m.SMBMessage.Segment(0, 4);
+    }
+    return $[];
+}
+
+// ------------------------------------------------------------------
+// SMB2
+const binary SMB2ProtocolId = $[FE534D42];
+const binary SMB3EncryptdProtocolId = $[FD534D42];
+const ulong InvalidSMB2FileId = 0xFFFFFFFFFFFFFFFF;
+
+// Mark if the message is reassembled or not
+annotation bool SMB2Messages.ResMessage#IsReassembled;
+
+// Keep the command name for SMB2HeaderOnly message
+annotation string SMB2Messages.SMB2HeaderOnly#CommandName;
+
+// Negotiate DialectRevision, some value of SMB2NegotiateResponseDialectRevision
+ushort SMB2DialectRevision = 0xFFFF;
+
+// Endpoint ---------------------------
+// Providing named pipe messages to upper layer protocols
+endpoint SMB2Server[ulong FileId, ulong SessionId]
+    provides SMB2Messages;
+
+// Declare a static to endpoint to hold global variable, so that globe variable is not shared by multiple MMA UI sessions.
+endpoint DummyEndpoint accepts any message issues any message
+{
+    // Store the file name by FileID, if SMB2 session supports multiple channel.
+    map<ulong, string> SMB2GlobalFileNames = {};
+};
+
+endpoint SMB2LowerServer
+    over Server | over NBTSS.Server
+    provides SMB2Messages
+{
+    // Indicates whether the server supports establishing multiple channels for sessions.
+    bool supportsMultiChannel = false;
+    DummyEndpoint dummyEp = endpoint DummyEndpoint;
+    
+    // key: MID, value: FID
+    map<ulong, ulong> fidByMid = {};
+    // key: FID, value: FileName
+    map<ulong, string> fileNameByFid = {};
+    // Key: MID, value: FileName
+    map<ulong, string> fileNameByMid = {};
+    
+    observe this issues m:SMB2Messages.NegotiateResponse
+    {
+        supportsMultiChannel =  (m.Response.Capabilities & SMB2NegotiateResponseCapabilities.SMB2GlobalCapMultiChannel) > 0;
+    }
+    
+    observe this accepts m:SMB2Messages.CreateRequest
+    {
+        ulong mid = m.Header.MessageId;
+        fileNameByMid[mid] = m.Request.Buffer.Name;
+    }
+    
+    observe this issues m:SMB2Messages.CreateResponse
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = m.Response.FileId.Persistent;
+        if (mid in fileNameByMid.Keys)
+        {
+            string fileName = fileNameByMid[mid];
+            fileNameByFid[fid] = fileName;
+            fileNameByMid = fileNameByMid.Remove(mid);
+            // Save FileName to global map if supportsMultiChannel
+            if (supportsMultiChannel)
+            {
+                dummyEp.SMB2GlobalFileNames[fid] = fileName;
+            }
+        }
+    }
+
+    process this accepts m:SMB2Messages.WriteRequest
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = m.Request.FileId.Persistent;
+        fidByMid[mid] = fid;
+        m#FileName = GetFileNameByFid(fid);
+        dispatch endpoint SMB2Server[fid, m.Header.SessionId] accepts m;
+    }
+    
+    process this issues m:SMB2Messages.WriteResponse
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = (mid in fidByMid) ? fidByMid[mid] : InvalidSMB2FileId;
+        m#FileName = GetFileNameByFid(fid);
+        dispatch endpoint SMB2Server[fid, m.Header.SessionId] issues m;
+        fidByMid = fidByMid.Remove(mid);
+    }
+    
+    process this accepts m:SMB2Messages.ReadRequest
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = m.Request.FileId.Persistent;
+        fidByMid[mid] = fid;
+        m#FileName = GetFileNameByFid(fid);
+        dispatch endpoint SMB2Server[fid, m.Header.SessionId] accepts m;
+    }
+    
+    process this issues m:SMB2Messages.ReadResponse
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = (mid in fidByMid) ? fidByMid[mid] : InvalidSMB2FileId;
+        m#FileName = GetFileNameByFid(fid);
+        dispatch (endpoint SMB2Server[fid, m.Header.SessionId]) issues m;
+        fidByMid = fidByMid.Remove(mid);
+    }
+    
+    process this accepts m:SMB2Messages.IoctlRequest
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = m.Request.FileId.Persistent;
+        fidByMid[mid] = fid;
+        dispatch endpoint SMB2Server[fid, m.Header.SessionId] accepts m;
+    }
+    
+    process this issues m:SMB2Messages.IoctlResponse
+    {
+        ulong mid = m.Header.MessageId;
+        ulong fid = (mid in fidByMid) ? fidByMid[mid] : InvalidSMB2FileId;
+        dispatch (endpoint SMB2Server[fid, m.Header.SessionId]) issues m;
+        fidByMid = fidByMid.Remove(mid);
+    }
+    
+    process this accepts m:SMB2Messages.CloseRequest
+    {
+        ulong fid = m.Request.FileId.Persistent;
+        m#FileName = GetFileNameByFid(fid);
+        if (fid in fileNameByFid.Keys)
+        {
+            fileNameByFid = fileNameByFid.Remove(fid);
+        }
+        if (dummyEp.SMB2GlobalFileNames != null && fid in dummyEp.SMB2GlobalFileNames.Keys)
+        {
+            dummyEp.SMB2GlobalFileNames = dummyEp.SMB2GlobalFileNames.Remove(fid);
+        }
+        dispatch endpoint SMB2Server[fid, m.Header.SessionId] accepts m;
+    }
+    
+    ~endpoint(SMB2LowerServer server)
+    {
+        fidByMid = null;
+    }
+        
+    optional string GetFileNameByFid(ulong fid)
+    {
+        if (fid in fileNameByFid.Keys)
+        {
+            return fileNameByFid[fid];
+        }
+        else if (supportsMultiChannel && (fid in dummyEp.SMB2GlobalFileNames.Keys))
+        {
+            return dummyEp.SMB2GlobalFileNames[fid];
+        }
+        return nothing;
+    }
+}
+
+// Actor that listens to SessionService messages on both possible directions.
+autostart actor SMBTransportOverNBTSS(NBTSS.Server server)
+{
+    SMB2DecodingCache dc = new SMB2DecodingCache{};
+    
+    // Parsing request message
+    process server accepts s:NBTSS.SessionService where GetProtocolIdBin(s) == SMB2ProtocolId
+    {
+        DecodeAndDispatchRequestMessages(dc, (s.Trailer as SessionMessagePacket).UserData, server);
+    }
+
+    // Parsing response message
+    process server issues s:NBTSS.SessionService where GetProtocolIdBin(s) == SMB2ProtocolId
+    {
+        DecodeAndDispatchResponseMessages(dc, (s.Trailer as SessionMessagePacket).UserData, server);
+    }
+
+    // Parsing Transform request message
+    process server accepts s:NBTSS.SessionService where GetProtocolIdBin(s) == SMB3EncryptdProtocolId
+    {
+        switch ((s.Trailer as SessionMessagePacket).UserData)
+        {
+            case m:SMB2Messages.TransformMessage from BinaryDecoder<SMB2Messages.TransformMessage> =>
+                dispatch (endpoint SMB2LowerServer over server) accepts m;
+            default =>
+                 ThrowDecodingException("SMBTransport", "TransformMessage");
+        }
+    }
+
+    // Parsing Transform response message
+    process server issues s:NBTSS.SessionService where GetProtocolIdBin(s) == SMB3EncryptdProtocolId
+    {
+        switch ((s.Trailer as SessionMessagePacket).UserData)
+        {
+            case m:SMB2Messages.TransformMessage from BinaryDecoder<SMB2Messages.TransformMessage> =>
+                dispatch (endpoint SMB2LowerServer over server) accepts m;
+            default =>
+                 ThrowDecodingException("SMBTransport", "TransformMessage");
+        }
+    }
+}
+
+// Actor that listens to TransportPacket messages on both possible directions.
+autostart actor SMB2OverSMBTransportWithoutFileSharing(Server server)
+{
+    SMB2DecodingCache dc = new SMB2DecodingCache{};
+    // Parsing request message
+    process server accepts s:TransportPacket where GetProtocolIdBin(s) == SMB2ProtocolId
+    {
+        DecodeAndDispatchRequestMessages(dc, s.SMBMessage, server);
+    }
+
+    // Parsing response message
+    process server issues s:TransportPacket where GetProtocolIdBin(s) == SMB2ProtocolId
+    {
+        DecodeAndDispatchResponseMessages(dc, s.SMBMessage, server);
+    }
+
+    // Parsing Transform request message
+    process server accepts s:TransportPacket where GetProtocolIdBin(s) == SMB3EncryptdProtocolId
+    {
+        switch (s.SMBMessage)
+        {
+            case m:SMB2Messages.TransformMessage from BinaryDecoder<SMB2Messages.TransformMessage> =>
+                dispatch (endpoint SMB2LowerServer over server) accepts m;
+            default =>
+                ThrowDecodingException("SMBTransport", "TransformMessage");
+        }
+    }
+
+    // Parsing Transform response message
+    process server issues s:TransportPacket where GetProtocolIdBin(s) == SMB3EncryptdProtocolId
+    {
+        switch (s.SMBMessage)
+        {
+            case m:SMB2Messages.TransformMessage from BinaryDecoder<SMB2Messages.TransformMessage> =>
+                dispatch (endpoint SMB2LowerServer over server) issues m;
+            default =>
+                ThrowDecodingException("SMBTransport", "TransformMessage");
+        }
+    }
+}
+
+autostart actor MsrpceOverSMB2Server(SMBTransport.SMB2Server server)
+{
+    MSRPCEOverNamedpipeDecodingHelper helper = null;
+    
+    process server issues s:SMBTransport.SMB2Messages.ReadResponse where helper != null && helper.IssuesCache.BufferCount() > 0 || 
+        IsRpcconnCommonHdrT(s.Response.Buffer) && s.Response.Buffer[2] in IssuesMsgTypeSet
+    {
+        EnsureInitialized();
+        helper.TryDecode(s.Response.Buffer, s, MessageDirection.Issues);
+    }
+
+    process server accepts s:SMBTransport.SMB2Messages.WriteRequest where helper != null && helper.AcceptsCache.BufferCount() > 0 || 
+        IsRpcconnCommonHdrT(s.Request.Buffer) && s.Request.Buffer[2] in AcceptsMsgTypeSet
+    {
+        EnsureInitialized();
+        helper.TryDecode(s.Request.Buffer, s, MessageDirection.Accepts);
+    }
+    
+    process server accepts s:SMBTransport.SMB2Messages.IoctlRequest where helper != null && helper.AcceptsCache.BufferCount() > 0 || 
+        IsRpcconnCommonHdrT(s.Request.Buffer) && s.Request.Buffer[2] in AcceptsMsgTypeSet
+    {
+        EnsureInitialized();
+        helper.TryDecode(s.Request.Buffer, s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:SMBTransport.SMB2Messages.IoctlResponse where helper != null && helper.IssuesCache.BufferCount() > 0 || 
+        IsRpcconnCommonHdrT(s.Response.Buffer) && s.Response.Buffer[2] in IssuesMsgTypeSet
+    {
+        EnsureInitialized();
+        helper.TryDecode(s.Response.Buffer, s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(SMBTransport.SMB2Server server)
+    {
+        if (helper != null)
+        {
+            helper.ClearInDestructor();
+        }
+    }
+    
+    void EnsureInitialized()
+    {
+        if (helper == null)
+        {
+            helper = new MSRPCEOverNamedpipeDecodingHelper{};
+            helper.Initialize(endpoint MSRPCE.Server over server);
+        }
+    }
+}
+
+// For performance consideration, file is reassembled only when there're upper layer file protocol implemented.
+autostart actor ReassembleFileOverSMB2FileServer(SMB2Server server)
+{
+    FAS.Server FASServer = null;
+    process server accepts req:SMB2Messages.WriteRequest 
+            where req#FileName is fileName:string && NeedFASReassemble(fileName) && req.Request.Offset == 0 || FASServer != null && 
+                    FASServer.Command == CommandType.Write
+    {   
+        if (req.Request.Offset == 0)
+        {
+            FASServer = FAS.InitializeFASServer(server, CommandType.Write, 
+                    (any message m, FAS.Server fasServer) => (m as SMB2Messages.WriteRequest).Request.Offset,
+                    (any message m) => (m as SMB2Messages.WriteRequest).Request.Buffer,
+                    fileName);
+        }
+        dispatch FASServer accepts req;
+    }
+    
+    observe server accepts req:SMB2Messages.ReadRequest 
+            where req#FileName is fileName:string && NeedFASReassemble(fileName) && req.Request.Offset == 0 || FASServer != null && 
+                FASServer.Command == CommandType.Read
+    {
+        if (req.Request.Offset == 0)
+        {
+            FASServer = FAS.InitializeFASServer(server, CommandType.Read, 
+                    (any message m, FAS.Server fasServer) => (fasServer.ReadResponseOffset != null ? (fasServer.ReadResponseOffset as ulong) : 0xFFFFFFFFFFFFFFFF), 
+                    (any message m) => (m as SMB2Messages.ReadResponse).Response.Buffer,
+                    fileName);
+        }
+        FASServer.ReadResponseOffset = req.Request.Offset;
+    }
+    
+    process server issues res:SMB2Messages.ReadResponse 
+            where res#FileName is fileName:string && NeedFASReassemble(fileName) && FASServer != null && 
+                    FASServer.Command == CommandType.Read
+    {
+        dispatch FASServer issues res;
+    }
+
+    process server accepts closeReq:SMB2Messages.CloseRequest where FASServer != null
+    {
+        dispatch FASServer accepts closeReq;
+        FASServer.HasCloseRequestAccepted = true;
+    }
+}
+
+annotation string SMB2Messages.ReqMessage#FileName;
+annotation string SMB2Messages.ResMessage#FileName;
+
+contract SMB2Messages
+{
+    // Base message for all the SMB2 messages except for CancelRequest
+    accepts message ReqMessage
+    {
+        SMB2PacketHeader[true] Header;
+    }
+
+    // Base message for all the response messages
+    issues message ResMessage 
+    {
+        SMB2PacketHeader[false] Header;
+    }
+
+    message TransformMessage
+    {
+        SMB2TransformHeader Header;
+        binary Data;
+        override string ToString()
+        {
+            return "SMB2 Transform, SessionId: " + DecToHexFormat(Header.SessionId).ToString();
+        }
+    }
+
+    // Header only message for in case that the data is insufficient for the body part or the body part can't be decoded successfully
+    message SMB2HeaderOnly[bool IsRequest]
+    {
+        SMB2PacketHeader[IsRequest] Header;
+        override string ToString()
+        {
+            string summary = "SMB2 " + GetSMB2CommandStringWithoutSpace(Header);
+            if (IsRequest)
+            {
+                summary += "Request, Header Only";
+            }
+            else
+            {
+                summary += "Response, Header Only, Status:" + StatusToText(Header);
+            }
+            return summary;
+        }
+    }
+    
+    issues NegotiateResponse:ResMessage
+    {
+        SMB2NegotiateResponse Response;
+        override string ToString()
+        {
+            return "SMB2 NegotiateResponse, Status: " + StatusToText(Header) + ", Revision: " + SMBTransport.DialectRevisionToText(Response.DialectRevision);
+        }
+    }
+    
+    issues TreeConnectResponse:ResMessage
+    {
+        SMB2TreeConnectResponse Response;
+        override string ToString()
+        {
+            return "SMB2 TreeConnectResponse, Status: " + StatusToText(Header);
+        }
+    }
+    
+    accepts CreateRequest:ReqMessage
+    {
+        SMB2CreateRequest Request;
+        override string ToString()
+        {    
+            return "SMB2 CreateRequest, Name: " + Request.Buffer.Name;
+        }
+    }
+    
+    issues CreateResponse:ResMessage
+    {
+        SMB2CreateResponse Response;
+        override string ToString()
+        {
+            string summary = "SMB2 CreateResponse" + (this#IsReassembled != nothing ? ", Reassembled" : "");
+            summary += ", Status: " + StatusToText(Header);
+            return summary;
+        }
+    }
+
+    accepts ReadRequest:ReqMessage
+    {
+        SMB2ReadRequest Request;
+        override string ToString()
+        {    
+            return "SMB2 ReadRequest";
+        }
+    }
+    
+    issues ReadResponse:ResMessage
+    {
+        SMB2ReadResponse Response;
+        override string ToString()
+        {
+            string summary = "SMB2 ReadResponse" + (this#IsReassembled != nothing ? ", Reassembled" : "");
+            summary += ", Status: " + StatusToText(Header);
+            return summary;
+        }
+    }
+    
+    accepts WriteRequest:ReqMessage
+    {
+        SMB2WriteRequest Request;
+        override string ToString()
+        {    
+            return "SMB2 WriteRequest";
+        }
+    }
+    
+    issues WriteResponse:ResMessage
+    {
+        SMB2WriteResponse Response;
+        override string ToString()
+        {
+            string summary = "SMB2 WriteResponse" + (this#IsReassembled != nothing ? ", Reassembled" : "");
+            summary += ", Status: " + StatusToText(Header);
+            return summary;
+        }
+    }
+    
+    accepts IoctlRequest:ReqMessage
+    {
+        SMB2IoctlRequest Request;
+        override string ToString()
+        {
+            return "SMB2 IoctlRequest, CtlCode: " + CtlCodeToText(Request.CtlCode);
+        }
+    }
+
+    issues IoctlResponse:SMB2Messages.ResMessage
+    {
+        SMB2IoctlResponse Response;
+        override string ToString()
+        {
+            string summary = "SMB2 IoctlResponse" + (this#IsReassembled != nothing ? ", Reassembled" : "");
+            summary += ", Status: " + StatusToText(Header);
+            return summary;
+        }
+    }
+
+    accepts CloseRequest:ReqMessage
+    {
+        SMB2CloseRequest Request;
+        override string ToString()
+        {
+            return "SMB2 CloseRequest";
+        }
+    }
+    
+    accepts CancelRequest
+    {
+        SMB2PacketHeader[true] Header;
+        binary Request;
+        override string ToString()
+        {    
+            return "SMB2 CancelRequest";
+        }
+    }
+    
+    accepts NonTransportRequest:ReqMessage
+    {
+        binary Request;
+        override string ToString()
+        {
+            return "SMB2 " + GetSMB2CommandStringWithoutSpace(Header) + "Request";
+        }
+    }
+    
+    issues NonTransportResponse:ResMessage
+    {
+        binary Response;
+        override string ToString()
+        {
+            return "SMB2 " + GetSMB2CommandStringWithoutSpace(Header) + "Response, Status: " + StatusToText(Header);
+        }
+    }
+}
+
+// Keep the values during the decoding
+type SMB2DecodingCache
+{
+    // Indicates what PduFull is set in etw provider
+    bool pduFull = true;
+}
+
+// Type ---------------------------------
+// Defined for look ahead the field values in the Header part
+type SMB2Header
+{
+    ushort StructureSize;
+    ushort CreditCharge;
+    uint Status;
+    ushort Command;
+    ushort Credit;
+    SMB2PacketHeaderFlags Flags;
+    uint NextCommand;
+    ulong MessageId;
+    ulong AsyncId;
+    ulong SessionId;
+}
+
+// 2.2.1   SMB2 Packet Header
+type SMB2PacketHeader[bool IsRequest]
+{
+    ULONG ProtocolId with BinaryEncoding {Endian = Endian.Big};
+    USHORT StructureSize;
+    USHORT CreditCharge;
+    optional [|IsRequest && SMB2DialectRevision == SMB2NegotiateResponseDialectRevision.SMB30DialectRevisionNumber|] USHORT ChannelSequence;
+    optional [|IsRequest && SMB2DialectRevision == SMB2NegotiateResponseDialectRevision.SMB30DialectRevisionNumber|] USHORT Reserved;
+    optional [|!IsRequest || SMB2DialectRevision != SMB2NegotiateResponseDialectRevision.SMB30DialectRevisionNumber|] ERREF.NTSTATUS Status;
+    SMB2PacketHeaderCommand Command;
+    USHORT Credit;
+    SMB2PacketHeaderFlags Flags;
+    ULONG NextCommand;
+    UINT64 MessageId;
+    optional [|(Flags & SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) == 0|] ULONG Reserved2;
+    optional [|(Flags & SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) == 0|] ULONG TreeId;
+    optional [|(Flags & SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) != 0|] UINT64 AsyncId;
+    UINT64 SessionId;
+    binary Signature with BinaryEncoding{Length = 16};
+}
+
+pattern SMB2PacketHeaderCommand = enum USHORT
+{
+    SMB2Negotiate      = 0x0000,
+    SMB2SessionSetup   = 0x0001,
+    SMB2Logoff         = 0x0002,
+    SMB2TreeConnect    = 0x0003,
+    SMB2TreeDisconnect = 0x0004,
+    SMB2Create         = 0x0005,
+    SMB2Close          = 0x0006,
+    SMB2Flush          = 0x0007,
+    SMB2Read           = 0x0008,
+    SMB2Write          = 0x0009,
+    SMB2Lock           = 0x000A,
+    SMB2Ioctl          = 0x000B,
+    SMB2Cancel         = 0x000C,
+    SMB2Echo           = 0x000D,
+    SMB2QueryDirectory = 0x000E,
+    SMB2ChangeNotify   = 0x000F,
+    SMB2QueryInfo      = 0x0010,
+    SMB2SetInfo        = 0x0011,
+    SMB2OplockBreak    = 0x0012
+};
+
+pattern SMB2PacketHeaderFlags = flags ULONG
+{
+    SMB2FlagsServerToRedir = 0x00000001,
+    SMB2FlagsAsyncCommand = 0x00000002,
+    SMB2FlagsRelatedOperations = 0x00000004,
+    SMB2FlagsSigned = 0x00000008,
+    SMB2FlagsPriorityMask = 0x00000070,
+    SMB2FlagsDFSOperations = 0x10000000,
+    SMB2FlagsReplayOperation = 0x20000000,
+    ...
+};
+
+type PathBuffer
+{
+    string SubstituteName;
+    string PrintName;
+}
+
+// 2.2.4   SMB2 NEGOTIATE Response
+type SMB2NegotiateResponse
+{
+    USHORT StructureSize;
+    SMB2NegotiateResponseSecurityMode SecurityMode;
+    SMB2NegotiateResponseDialectRevision DialectRevision;
+    USHORT Reserved;
+    GUID ServerGuid;
+    SMB2NegotiateResponseCapabilities Capabilities;
+    ULONG MaxTransactSize;
+    ULONG MaxReadSize;
+    ULONG MaxWriteSize;
+    FILETIME SystemTime;
+    FILETIME ServerStartTime;
+    USHORT SecurityBufferOffset;
+    USHORT SecurityBufferLength;
+    ULONG Reserved2;
+    optional [|SecurityBufferOffset > 128|] array<byte> BufferPadding with BinaryEncoding{Length = SecurityBufferOffset - 128};
+    (binary | any) Buffer;
+}
+
+pattern SMB2NegotiateResponseSecurityMode = flags USHORT
+{
+    SMB2NegotiateSigningEnabled = 0x0001,
+    SMB2NegotiateSigningRequired = 0x0002,
+    ...
+};
+
+pattern SMB2NegotiateResponseDialectRevision = enum USHORT
+{
+    SMB2002DialectRevisionNumber = 0x0202,
+    SMB21DialectRevisionNumber = 0x0210,
+    SMB30DialectRevisionNumber = 0x0300,
+    SMB302DialectRevisionNumber = 0x0302,
+    SMB311DialectRevisionNumber = 0x0311,
+    SMB2WildcardRevisionNumber = 0x02FF,
+    ...
+};
+
+pattern SMB2NegotiateResponseCapabilities = flags ULONG
+{
+    SMB2GlobalCapDfs = 0x00000001,
+    SMB2GlobalCapLeasing = 0x00000002,
+    SMB2GlobalCapLargeMtu = 0x00000004,
+    SMB2GlobalCapMultiChannel = 0x00000008,
+    SMB2GlobalCapPersistentHandles = 0x00000010,
+    SMB2GlobalCapDirectoryLeasing = 0x00000020,
+    SMB2GlobalCapEncryption = 0x00000040,
+    ...
+};
+
+// 2.2.10   SMB2 TREE_CONNECT Response
+type SMB2TreeConnectResponse
+{
+    USHORT StructureSize;
+    SMB2TreeConnectResponseShareType ShareType;
+    BYTE Reserved;
+    SMB2TreeConnectResponseShareFlags ShareFlags;
+    SMB2TreeConnectResponseCapabilities Capabilities;
+    ([|ShareType == SMB2TreeConnectResponseShareType.SMB2ShareTypeDisk|] DirectoryAccessMask
+        | FilePipePrinterAccessMask) MaximalAccess;
+}
+
+pattern SMB2TreeConnectResponseShareType = enum BYTE
+{
+    SMB2ShareTypeDisk = 0x01,
+    SMB2ShareTypePipe = 0x02,
+    SMB2ShareTypeprint = 0x03,
+    ...
+};
+
+pattern SMB2TreeConnectResponseShareFlags = flags ULONG
+{
+    SMB2ShareflagManualCaching = 0x00000000,
+    SMB2ShareflagAutoCaching = 0x00000010,
+    SMB2ShareflagVdoCaching = 0x00000020,
+    SMB2ShareflagNoCaching = 0x00000030,
+    SMB2ShareflagDfs = 0x00000001,
+    SMB2ShareflagDfsRoot = 0x00000002,
+    SMB2ShareflagRestrictExclusiveOpens = 0x00000100,
+    SMB2ShareflagForceSharedDelete = 0x00000200,
+    SMB2ShareflagAllowNamespaceCaching = 0x00000400,
+    SMB2ShareflagAccessBasedDirectoryEnum = 0x00000800,
+    SMB2ShareflagForceLeveliiOplock = 0x00001000,
+    SMB2ShareflagEnableHashV1 = 0x00002000,
+    SMB2ShareflagEnableHashV2 = 0x00004000,
+    SMB2ShareflagEncryptData = 0x00008000,
+    SMB2ShareflagIdentityRemoting = 0x00040000,
+    ...
+};
+ 
+pattern SMB2TreeConnectResponseCapabilities = flags ULONG
+{
+    SMB2ShareCapDfs = 0x00000008,
+    SMB2ShareCapContinuousAvailability = 0x00000010,
+    SMB2ShareCapScaleout = 0x00000020,
+    SMB2ShareCapCluster = 0x00000040,
+    SMB2ShareCapAsymmetric = 0x00000080,
+    SMB2ShareCapRedirectToOwner = 0x00000100,
+    ...
+};
+
+// 2.2.13   SMB2 CREATE Request
+type SMB2CreateRequest
+{
+    USHORT StructureSize;
+    BYTE SecurityFlags;
+    BYTE RequestedOplockLevel;
+    ULONG ImpersonationLevel;
+    UINT64 SmbCreateFlags;
+    UINT64 Reserved;
+    ULONG DesiredAccess;
+    uint FileAttributes;
+    ULONG ShareAccess;
+    ULONG CreateDisposition;
+    ULONG CreateOptions;
+    USHORT NameOffset;
+    USHORT NameLength;
+    ULONG CreateContextsOffset;
+    ULONG CreateContextsLength;
+    CreateRequestBuffer[NameOffset, NameLength, CreateContextsOffset, CreateContextsLength] Buffer;
+}
+
+type CreateRequestBuffer[ushort NameOffset, ushort NameLength, uint CreateContextsOffset, uint CreateContextsLength]
+{
+    optional [|NameOffset > 120|] array<byte> NamePadding with BinaryEncoding{Length = NameOffset - 120};
+    string Name with BinaryEncoding{Length = NameLength / 2}; // UTF16
+    optional [|CreateContextsOffset > NameLength + NameOffset|] array<byte> BufferPadding with BinaryEncoding{Length = CreateContextsOffset - NameLength - NameOffset};
+    optional [|CreateContextsLength > 0|] binary CreateContextList with BinaryEncoding{Length = CreateContextsLength};
+}
+
+// 2.2.13.1.1   File_Pipe_Printer_Access_Mask
+type FilePipePrinterAccessMask
+{
+    FilePipePrinterAccessMaskFilePipePrinterAccessMask FilePipePrinterAccessMaskFlags;
+}
+
+// 2.2.13.1.2   Directory_Access_Mask
+type DirectoryAccessMask
+{
+    DirectoryAccessMaskDirectoryAccessMask DirectoryAccessMaskValue;
+}
+
+pattern FilePipePrinterAccessMaskFilePipePrinterAccessMask = flags ULONG
+{
+    FileReadData = 0x00000001,
+    FileWriteData = 0x00000002,
+    FileAppendData = 0x00000004,
+    FileReadEa = 0x00000008,
+    FileWriteEa = 0x00000010,
+    FileExecute = 0x00000020,
+    FileDeleteChild = 0x00000040,
+    FileReadAttributes = 0x00000080,
+    FileWriteAttributes = 0x00000100,
+    Delete = 0x00010000,
+    ReadControl = 0x00020000,
+    WriteDac = 0x00040000,
+    WriteOwner = 0x00080000,
+    Synchronize = 0x00100000,
+    AccessSystemSecurity = 0x01000000,
+    MaximumAllowed = 0x02000000,
+    GenericAll = 0x10000000,
+    GenericExecute = 0x20000000,
+    GenericWrite = 0x40000000,
+    GenericRead = 0x80000000,
+    ...
+};
+
+type SMB2Fileid
+{
+    UINT64 Persistent;
+    UINT64 Volatile;
+
+    override string ToString()
+    {
+        return "Persistent: " + Utility.DecToHexFormat(Persistent) + ", Volatile: " + Utility.DecToHexFormat(Volatile);
+    }
+}
+
+type SMB2ReadRequest
+{
+    USHORT StructureSize;
+    UCHAR Padding;
+    UCHAR Reserved;
+    ULONG Length;
+    UINT64 Offset;
+    SMB2Fileid FileId;
+    ULONG MinimumCount;
+    ULONG Channel;
+    ULONG RemainingBytes;
+    USHORT ReadChannelInfoOffset;
+    USHORT ReadChannelInfoLength;
+    BYTE Buffer;
+}
+
+// 2.2.14   SMB2 CREATE Response
+type SMB2CreateResponse
+{
+    USHORT StructureSize;
+    BYTE OplockLevel;
+    BYTE Flags;
+    ULONG CreateAction;
+    FILETIME CreationTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME ChangeTime;
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndofFile;
+    uint FileAttributes;
+    ULONG Reserved2;
+    SMB2Fileid FileId;
+    ULONG CreateContextsOffset;
+    ULONG CreateContextsLength;
+    optional [|CreateContextsOffset > 152|] array<byte> BufferPadding with BinaryEncoding{Length = CreateContextsOffset - 152};
+    optional [|CreateContextsLength > 0|] binary Buffer with BinaryEncoding{Length = CreateContextsLength};
+}
+
+// 2.2.15   SMB2 CLOSE Request
+type SMB2CloseRequest
+{
+    USHORT StructureSize;
+    USHORT Flags;
+    ULONG Reserved;
+    SMB2Fileid FileId;
+}
+
+// 2.2.20   SMB2 READ Response
+type SMB2ReadResponse
+{
+    USHORT StructureSize;
+    UCHAR DataOffset;
+    UCHAR Reserved;
+    ULONG DataLength;
+    ULONG DataRemaining;
+    ULONG Reserved2;
+    optional [|DataOffset > 80|] array<byte> DataPadding with BinaryEncoding{Length = DataOffset - 80};
+    binary Buffer;
+};
+
+// 2.2.21   SMB2 WRITE Request
+type SMB2WriteRequest
+{
+    USHORT StructureSize;
+    USHORT DataOffset;
+    ULONG Length;
+    UINT64 Offset;
+    SMB2Fileid FileId;
+    SMB2WriteRequestChannel Channel;
+    ULONG RemainingBytes;
+    USHORT WriteChannelInfoOffset;
+    USHORT WriteChannelInfoLength;
+    SMB2WriteRequestFlags Flags;
+    optional [|DataOffset > 112|] array<byte> DataPadding with BinaryEncoding{Length = DataOffset - 112};
+    binary Buffer;
+}
+
+pattern SMB2WriteRequestFlags = flags ULONG
+{
+    SMB2WriteflagWriteThrough = 0x00000001,
+    ...
+};
+
+pattern SMB2WriteRequestChannel = flags ULONG
+{
+    SMB2ChannelRdmaV1 = 0x00000001,
+    ...
+};
+
+type SMB2WriteResponse
+{
+    USHORT StructureSize;
+    USHORT Reserved;
+    ULONG Count;
+    ULONG Remaining;
+    USHORT WriteChannelInfoOffset;
+    USHORT WriteChannelInfoLength;
+}
+
+pattern DirectoryAccessMaskDirectoryAccessMask = flags ULONG
+{
+    FileListDirectory = 0x00000001,
+    FileAddFile = 0x00000002,
+    FileAddSubdirectory = 0x00000004,
+    FileReadEa = 0x00000008,
+    FileWriteEa = 0x00000010,
+    FileTraverse = 0x00000020,
+    FileDeleteChild = 0x00000040,
+    FileReadAttributes = 0x00000080,
+    FileWriteAttributes = 0x00000100,
+    Delete = 0x00010000,
+    ReadControl = 0x00020000,
+    WriteDac = 0x00040000,
+    WriteOwner = 0x00080000,
+    Synchronize = 0x00100000,
+    AccessSystemSecurity = 0x01000000,
+    MaximumAllowed = 0x02000000,
+    GenericAll = 0x10000000,
+    GenericExecute = 0x20000000,
+    GenericWrite = 0x40000000,
+    GenericRead = 0x80000000,
+    ...
+};
+// 2.2.31   SMB2 IOCTL Request
+type SMB2IoctlRequest
+{
+    USHORT StructureSize;
+    USHORT Reserved;
+    ULONG CtlCode with DisplayInfo{ToText = CtlCodeToText};
+    SMB2Fileid FileId;
+    ULONG InputOffset;
+    ULONG InputCount;
+    ULONG MaxInputResponse;
+    ULONG OutputOffset;
+    ULONG OutputCount;
+    ULONG MaxOutputResponse;
+    SMB2IoctlRequestFlags Flags;
+    ULONG Reserved2;
+    optional [|InputOffset > 120|] array<byte> Padding with BinaryEncoding{Length = InputOffset - 120};
+    binary Buffer;
+}
+
+pattern SMB2IoctlRequestFlags = enum ULONG
+{
+    SMB20Ioctl = 0x00000000,
+    SMB20IoctlIsFsctl = 0x00000001,
+};
+
+// 2.2.31.2   SRV_READ_HASH Request
+type SrvReadHashRequest
+{
+    SrvReadHashHashType HashType;
+    SrvReadHashHashVersion HashVersion;
+    SrvReadHashHashRetrievalType HashRetrievalType;
+    ULONG Length;
+    UINT64 Offset;
+}
+
+pattern SrvReadHashHashType = enum ULONG
+{
+    SrvHashTypePeerDist = 0x00000001,
+};
+
+pattern SrvReadHashHashVersion = enum ULONG
+{
+    SrvHashVer1 = 0x00000001,
+    SrvHashVer2 = 0x00000002,
+};
+
+pattern SrvReadHashHashRetrievalType = enum ULONG
+{
+    SrvReadRetrieveHashBased = 0x00000001,
+    SrvReadRetrieveFileBased = 0x00000002,
+};
+
+// 2.2.32   SMB2 IOCTL Response
+type SMB2IoctlResponse
+{
+    USHORT StructureSize;
+    USHORT Reserved;
+    ULONG CtlCode with DisplayInfo{ToText = CtlCodeToText};
+    SMB2Fileid FileId;
+    ULONG InputOffset;
+    ULONG InputCount;
+    ULONG OutputOffset;
+    ULONG OutputCount;
+    ULONG Flags;
+    ULONG Reserved2;
+
+    // Buffer part
+    optional [|InputOffset > 112|] array<byte> InputBufferPadding with BinaryEncoding{Length = InputOffset - 112};
+    binary InputBuffer with BinaryEncoding{Length = InputCount};
+    optional [|OutputOffset > 112 && OutputOffset > InputOffset + InputCount|] array<byte> OutputBufferPadding with BinaryEncoding{Length = OutputOffset - InputOffset - InputCount};
+    binary Buffer;
+}
+
+// 2.2.41   SMB2 TRANSFORM_HEADER
+type SMB2TransformHeader
+{
+    ULONG ProtocolId with BinaryEncoding {Endian = Endian.Big};
+    binary Signature with BinaryEncoding{Length = 16};
+    binary Nonce with BinaryEncoding{Length = 16};
+    ULONG OriginalMessageSize;
+    USHORT Reserved;
+    SMB2TransformHeaderEncryptionAlgorithm EncryptionAlgorithm;
+    UINT64 SessionId;
+}
+
+pattern SMB2TransformHeaderEncryptionAlgorithm = enum USHORT
+{
+    SMB2EncryptionAes128Ccm = 0x00000001,
+    ...
+};
+
+// Function ----------------------------------
+// Decoding the request messages
+void DecodeAndDispatchRequestMessages(SMB2DecodingCache dc, binary payload, (Server | NBTSS.Server) server)
+{
+    // The beginning offset of current message
+    int offset = 0;
+    // The beginning offset of next message
+    int nextOffset = 0;
+    var streamLength = payload.Count;
+
+    while (offset + 64 < streamLength) // 64 is the total size of the Header part
+    {
+        switch (payload.Segment(offset + 4, 44))
+        {
+            case header:SMB2Header from BinaryDecoder<SMB2Header> =>
+                nextOffset = (header.NextCommand == 0 ? streamLength : header.NextCommand + offset) as int;
+                var messageData = payload.Segment(offset, nextOffset - offset);
+
+                switch (header.Command)
+                {
+                    case SMB2PacketHeaderCommand.SMB2Write =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.WriteRequest>(messageData, "WriteRequest");
+                        if (m != null)
+                        {
+                            if (messageData.Count < m.Request.DataOffset + m.Request.Length)
+                            {
+                                ReportInsufficientTruncation(m, "SMBTransport", "Buffer", "WriteRequest", !dc.pduFull);
+                                DisplayTopLevelMessage(m);
+                            }
+                            else
+                            {
+                                dispatch GetSMB2LowerServer(server) accepts m;
+                            }
+                        }
+                    case SMB2PacketHeaderCommand.SMB2Ioctl =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.IoctlRequest>(messageData, "IoctlRequest");
+                        if (m != null)
+                        {
+                            if (messageData.Count < m.Request.InputOffset + m.Request.InputCount)
+                            {
+                                ReportInsufficientTruncation(m, "SMBTransport", "Buffer", "IoctlRequest", !dc.pduFull);
+                                DisplayTopLevelMessage(m);
+                            }
+                            else
+                            {
+                                dispatch GetSMB2LowerServer(server) accepts m;
+                            }
+                        }
+                    case SMB2PacketHeaderCommand.SMB2Create =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.CreateRequest>(messageData, "CreateRequest");
+                        dispatch GetSMB2LowerServer(server) accepts m;
+                    case SMB2PacketHeaderCommand.SMB2Close =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.CloseRequest>(messageData, "CloseRequest");
+                        dispatch GetSMB2LowerServer(server) accepts m;
+                    case SMB2PacketHeaderCommand.SMB2Read =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.ReadRequest>(messageData, "ReadRequest");
+                        dispatch GetSMB2LowerServer(server) accepts m;
+                    case SMB2PacketHeaderCommand.SMB2Cancel =>
+                        var m = SMBTransportDecodeMessage<SMB2Messages.CancelRequest>(messageData, "CancelRequest");
+                        dispatch GetSMB2LowerServer(server) accepts m;
+                    case SMB2PacketHeaderCommand =>
+                        switch (messageData)
+                        {
+                            case msg: SMB2Messages.NonTransportRequest from BinaryDecoder<SMB2Messages.NonTransportRequest> =>
+                                dispatch GetSMB2LowerServer(server) accepts msg;
+                            default =>
+                                TryDecodeSMB2HeaderOnlyMessage(messageData, "NonTransportRequest");
+                        }
+                    default =>
+                        throw "SMBTransport: Unrecoverable decoding failure, unknown SMB2 request message";
+                }
+                offset = nextOffset;
+            default =>
+                throw "SMBTransport: Unrecoverable decoding failure for the SMB2Header type";
+        }
+    }
+}
+
+// Decoding the response messages
+void DecodeAndDispatchResponseMessages(SMB2DecodingCache dc, binary payload, (Server | NBTSS.Server) server)
+{
+    int offset = 0;
+    int nextOffset = 0;
+    var streamLength = payload.Count;
+
+    while (offset + 64 < streamLength) // 64 is the total size of the Header part
+    {
+        switch (payload.Segment(offset + 4, 44))
+        {
+            case header:SMB2Header from BinaryDecoder<SMB2Header> =>
+                nextOffset = (header.NextCommand == 0 ? streamLength : header.NextCommand + offset) as int;
+                var messageData = payload.Segment(offset, nextOffset - offset);
+                // Look ahead the value of the StructureSize field in response package
+                var structureSize = BinaryDecoder<ushort>(messageData.Segment(64, 2)) as ushort;
+                any message m;
+                bool isAsyncCommand = (header.Flags & SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) > 0;
+                if (IsErrorResponse(header.Command, header.Status, structureSize, isAsyncCommand))
+                {
+                    stream s = messageData;
+                    switch (s)
+                    {
+                        case tm:SMB2Messages.NonTransportResponse from BinaryDecoder<SMB2Messages.NonTransportResponse> =>
+                            m = tm;
+                        default =>
+                            TryDecodeSMB2HeaderOnlyMessage(messageData, "NonTransportResponse");
+                    }
+                }
+                else
+                {
+                    switch (header.Command)
+                    {
+                        case SMB2PacketHeaderCommand.SMB2Negotiate =>
+                            var tm = SMBTransportDecodeMessage<SMB2Messages.NegotiateResponse>(messageData, "NegotiateResponse");
+                            if (tm != null)
+                            {
+                                /* WORKAROUND: Assign the DialectRevision to global variable SMB2DialectRevision.
+                                 * Will remove this global variable in the Server endpoint when BUG#39968 and 43830 is fixed
+                                 * BUG#39968: The value parameter feature doesn't work properly when a type overriding a type with value parameters.
+                                 */
+                                SMB2DialectRevision = tm.Response.DialectRevision;
+                                if (messageData.Count < tm.Response.SecurityBufferLength + tm.Response.SecurityBufferOffset)
+                                {
+                                    ReportInsufficientTruncation(tm, "SMBTransport", "Buffer", "NegotiateResponse", !dc.pduFull);
+                                    DisplayTopLevelMessage(tm);
+                                }
+                                else
+                                {
+                                    m = tm;
+                                }
+                            }
+                        case SMB2PacketHeaderCommand.SMB2Create =>
+                            m = SMBTransportDecodeMessage<SMB2Messages.CreateResponse>(messageData, "CreateResponse");
+                        case SMB2PacketHeaderCommand.SMB2TreeConnect =>
+                            m = SMBTransportDecodeMessage<SMB2Messages.TreeConnectResponse>(messageData, "TreeConnectResponse");
+                        case SMB2PacketHeaderCommand.SMB2Write =>
+                            m = SMBTransportDecodeMessage<SMB2Messages.WriteResponse>(messageData, "WriteResponse");
+                        case SMB2PacketHeaderCommand.SMB2Read =>
+                            var tm = SMBTransportDecodeMessage<SMB2Messages.ReadResponse>(messageData, "ReadResponse");
+                            if (tm != null)
+                            {
+                                if (messageData.Count < tm.Response.DataOffset + tm.Response.DataLength)
+                                {
+                                    ReportInsufficientData(tm, DiagnosisLevel.Error, "SMBTransport: Insufficient data for Buffer field in message ReadResponse, due to missing lower-layer protocol segment.");
+                                    DisplayTopLevelMessage(tm);
+                                }
+                                else
+                                {
+                                    m = tm;
+                                }
+                            }
+                        case SMB2PacketHeaderCommand.SMB2Ioctl =>
+                            var tm = SMBTransportDecodeMessage<SMB2Messages.IoctlResponse>(messageData, "IoctlResponse");
+                            if (tm != null)
+                            {
+                                if (messageData.Count < tm.Response.OutputOffset + tm.Response.OutputCount)
+                                {
+                                    ReportInsufficientTruncation(tm, "SMBTransport", "Buffer", "ReadResponse", !dc.pduFull);
+                                    DisplayTopLevelMessage(tm);
+                                }
+                                else
+                                {
+                                    m = tm;
+                                }
+                            }
+                        case SMB2PacketHeaderCommand => 
+                            switch (messageData)
+                            {
+                                case msg: SMB2Messages.NonTransportResponse from BinaryDecoder<SMB2Messages.NonTransportResponse> =>
+                                    m = msg;
+                                default =>
+                                    TryDecodeSMB2HeaderOnlyMessage(messageData, "NonTransportResponse");
+                            }
+                        default =>
+                            throw "SMBTransport: Unrecoverable decoding failure, unknown SMB2 response message.";
+                    }
+                }
+                if (m != null)
+                {
+                    dispatch GetSMB2LowerServer(server) issues m;
+                }
+                offset = nextOffset;
+            default =>
+                throw "SMBTransport: Unrecoverable decoding failure for the SMB2Header type.";
+        }
+    }
+}
+
+// Judge an error response message according to section 3.3.4.4 Sending an Error Response
+bool IsErrorResponse(ushort commmand, uint status, ushort size, bool asyncCommand)
+{
+    // An error code other than one of the following indicates a failure:
+    if ((commmand == SMB2PacketHeaderCommand.SMB2SessionSetup && status == 0xC0000016) // STATUS_MORE_PROCESSING_REQUIRED in an SMB2 SESSION_SETUP Response
+        || ((commmand == SMB2PacketHeaderCommand.SMB2QueryInfo || commmand is SMB2PacketHeaderCommand.SMB2Read) && status == 0x80000005) // STATUS_BUFFER_OVERFLOW in an SMB2 QUERY_INFO Response/SMB2 READ Response
+        || (commmand == SMB2PacketHeaderCommand.SMB2ChangeNotify && status == 0x0000010C) // STATUS_NOTIFY_ENUM_DIR in an SMB2 CHANGE_NOTIFY Response
+        || (commmand == SMB2PacketHeaderCommand.SMB2Ioctl && status != 0 && size == 49)) // Any status other than STATUS_SUCCESS in a FSCTL_SRV_COPYCHUNK or FSCTL_SRV_COPYCHUNK_WRITE Response
+    {
+        return false;
+    }
+    else
+    {
+        return ((status & 0xC0000000) == 0xC0000000) || // Error code
+            (asyncCommand && (status == 0x0103)) || // Interim Response for an Asynchronous Operation
+            (status in {0x8000002D, 0x80000014}); // STATUS_STOPPED_ON_SYMLINK, STATUS_EA_LIST_INCONSISTENT
+    }
+}
+
+// Decode the message by the command type
+T SMBTransportDecodeMessage<T>(stream data, string command)
+{
+    switch (data)
+    {
+        case m:T from BinaryDecoder<T> =>
+            return m;
+        default =>
+            TryDecodeSMB2HeaderOnlyMessage(data, command);
+    }
+    T t;
+    return t; // return null
+}
+
+// Try to decode the insufficient data into the header only message
+void TryDecodeSMB2HeaderOnlyMessage(stream data, string msgName)
+{
+    bool isRequest = ((data.PeekByte(16 * 8) as int) & 0x01) == 0; // Look ahead the ServerToRedir bit
+    switch (data)
+    {
+        case m:SMB2Messages.SMB2HeaderOnly from BinaryDecoder<SMB2Messages.SMB2HeaderOnly[isRequest]> =>
+            m#CommandName = msgName;
+            DisplayTopLevelMessage(m);
+        default =>
+            ThrowDecodingException(msgName);
+    }
+}
+
+string GetSMB2CommandStringWithoutSpace(SMB2PacketHeader header)
+{
+    switch (header.Command)
+    {
+        case SMB2PacketHeaderCommand.SMB2Negotiate 
+            => return "Negotiate";
+        case SMB2PacketHeaderCommand.SMB2SessionSetup
+            => return "SessionSetup";
+        case SMB2PacketHeaderCommand.SMB2Logoff         
+            => return "Logoff";
+        case SMB2PacketHeaderCommand.SMB2TreeConnect    
+            => return "TreeConnect";
+        case SMB2PacketHeaderCommand.SMB2TreeDisconnect 
+            => return "TreeDisconnect";
+        case SMB2PacketHeaderCommand.SMB2Create         
+            => return "Create";
+        case SMB2PacketHeaderCommand.SMB2Close          
+            => return "Close";
+        case SMB2PacketHeaderCommand.SMB2Flush          
+            => return "Flush";
+        case SMB2PacketHeaderCommand.SMB2Read           
+            => return "Read";
+        case SMB2PacketHeaderCommand.SMB2Write          
+            => return "Write";
+        case SMB2PacketHeaderCommand.SMB2Lock           
+            => return "Lock";
+        case SMB2PacketHeaderCommand.SMB2Ioctl          
+            => return "Ioctl";
+        case SMB2PacketHeaderCommand.SMB2Cancel         
+            => return "Cancel";
+        case SMB2PacketHeaderCommand.SMB2Echo           
+            => return "Echo";
+        case SMB2PacketHeaderCommand.SMB2QueryDirectory 
+            => return "QueryDirectory";
+        case SMB2PacketHeaderCommand.SMB2ChangeNotify   
+            => return "ChangeNotify";
+        case SMB2PacketHeaderCommand.SMB2QueryInfo      
+            => return "QueryInformation";
+        case SMB2PacketHeaderCommand.SMB2SetInfo        
+            => return "SetInformation";
+        case SMB2PacketHeaderCommand.SMB2OplockBreak   
+            => return "OplockBreak";
+        default 
+            => return "Unknown";
+    }
+}
+
+SMB2LowerServer GetSMB2LowerServer((Server | NBTSS.Server) ls)
+{
+    SMB2LowerServer server;
+    switch (ls)
+    {
+        case lowerNode:Server =>
+            server = endpoint SMB2LowerServer over lowerNode;
+        case lowerNode:NBTSS.Server =>
+            server = endpoint SMB2LowerServer over lowerNode;
+        default =>
+            // No binding of the lower endpoint for other transports
+            server = endpoint SMB2LowerServer;
+    }
+    return server;
+}
+
+string DialectRevisionToText(ushort revision)
+{
+    if (revision == 0x0202) return "SMB 2.002";
+    else if (revision == 0x0210) return "SMB 2.1";
+    else if (revision == 0x02FF) return Utility.DecToHexFormat(revision);
+    else if (revision == 0x0300) return "SMB 3.0";
+    else if (revision == 0x0302) return "SMB 3.02";
+    else return "Unknown Value: " + Utility.DecToHexFormat(revision);
+}
+
+// Defined for DisplayInfo.
+string StatusToText(SMB2PacketHeader header)
+{
+    if (header.Status is status:ERREF.NTSTATUS)
+    {
+        return NTStatusLEToString(status);
+    }    
+    return "";
+}
+
+string NTStatusLEToString(ERREF.NTSTATUS status)
+{
+    return status.Value == 0 ? "Success": NtStatusValuesToText(status.Value);
+}
+
+string CtlCodeToText(any ctlCode)
+{
+    uint code = ctlCode as uint;
+    if (code in CtlCodeMap)
+    {
+        return CtlCodeMap[code];
+    }
+    else if (code in FsctlNameMap)
+    {
+        return FsctlNameMap[code];
+    }
+    else
+    {
+        return "Unknown value: " + Utility.DecToHexFormat(code);
+    }
+}
+
+const map<uint, string> CtlCodeMap = {
+    0x00060194 -> "FSCTL_DFS_GET_REFERRALS",
+    0x0011400C -> "FSCTL_PIPE_PEEK",
+    0x00110018 -> "FSCTL_PIPE_WAIT",
+    0x0011C017 -> "FSCTL_PIPE_TRANSCEIVE",
+    0x001440F2 -> "FSCTL_SRV_COPYCHUNK",
+    0x00144064 -> "FSCTL_SRV_ENUMERATE_SNAPSHOTS",
+    0x00140078 -> "FSCTL_SRV_REQUEST_RESUME_KEY",
+    0x001441BB -> "FSCTL_SRV_READ_HASH",
+    0x001480F2 -> "FSCTL_SRV_COPYCHUNK_WRITE",
+    0x001401D4 -> "FSCTL_LMR_REQUEST_RESILIENCY",
+    0x001401FC -> "FSCTL_QUERY_NETWORK_INTERFACE_INFO",
+    0x000900A4 -> "FSCTL_SET_REPARSE_POINT",
+    0x001400EC -> "FSCTL_LMR_SET_LINK_TRACKING_INFORMATION",
+    0x000601B0 -> "FSCTL_DFS_GET_REFERRALS_EX",
+    0x00090073 -> "FSCTL_GET_RETRIEVAL_POINTERS",
+    0x00094264 -> "FSCTL_OFFLOAD_READ",
+    0x00098268 -> "FSCTL_OFFLOAD_WRITE",
+    0x00098208 -> "FSCTL_FILE_LEVEL_TRIM",
+    0x00140204 -> "FSCTL_VALIDATE_NEGOTIATE_INFO",
+};
+
+const map<uint, string> FsctlNameMap =
+{
+    0x900C0 -> "FSCTL_CREATE_OR_GET_OBJECT_ID",
+    0x900A0 -> "FSCTL_DELETE_OBJECT_ID",
+    0x900AC -> "FSCTL_DELETE_REPARSE_POINT",
+    0x98208 -> "FSCTL_FILE_LEVEL_TRIM",
+    0x90060 -> "FSCTL_FILESYSTEM_GET_STATISTICS",
+    0x9008F -> "FSCTL_FIND_FILES_BY_SID",
+    0x9003C -> "FSCTL_GET_COMPRESSION",
+    0x9027C -> "FSCTL_GET_INTEGRITY_INFORMATION",
+    0x90064 -> "FSCTL_GET_NTFS_VOLUME_DATA",
+    0x9009C -> "FSCTL_GET_OBJECT_ID",
+    0x900A8 -> "FSCTL_GET_REPARSE_POINT",
+    0x90073 -> "FSCTL_GET_RETRIEVAL_POINTERS",
+    0x9002C -> "FSCTL_IS_PATHNAME_VALID",
+    0x1400EC -> "FSCTL_LMR_SET_LINK_TRACKING_INFORMATION",
+    0x94264 -> "FSCTL_OFFLOAD_READ",
+    0x98268 -> "FSCTL_OFFLOAD_WRITE",
+    0x11400C -> "FSCTL_PIPE_PEEK",
+    0x11C017 -> "FSCTL_PIPE_TRANSCEIVE",
+    0x110018 -> "FSCTL_PIPE_WAIT",
+    0x940CF -> "FSCTL_QUERY_ALLOCATED_RANGES",
+    0x90058 -> "FSCTL_QUERY_FAT_BPB",
+    0x9013C -> "FSCTL_QUERY_ON_DISK_VOLUME_INFO",
+    0x90138 -> "FSCTL_QUERY_SPARING_INFO",
+    0x900EB -> "FSCTL_READ_FILE_USN_DATA",
+    0x90117 -> "FSCTL_RECALL_FILE",
+    0x9C040 -> "FSCTL_SET_COMPRESSION",
+    0x98134 -> "FSCTL_SET_DEFECT_MANAGEMENT",
+    0x900D7 -> "FSCTL_SET_ENCRYPTION",
+    0x9C280 -> "FSCTL_SET_INTEGRITY_INFORMATION",
+    0x90098 -> "FSCTL_SET_OBJECT_ID",
+    0x900BC -> "FSCTL_SET_OBJECT_ID_EXTENDED",
+    0x900A4 -> "FSCTL_SET_REPARSE_POINT",
+    0x900C4 -> "FSCTL_SET_SPARSE",
+    0x980C8 -> "FSCTL_SET_ZERO_DATA",
+    0x90194 -> "FSCTL_SET_ZERO_ON_DEALLOCATION",
+    0x90100 -> "FSCTL_SIS_COPYFILE",
+    0x900EF -> "FSCTL_WRITE_USN_CLOSE_RECORD",
+    0x901B4 -> "FSCTL_SET_SHORT_NAME_BEHAVIOR",
+};
+    
+// List of ignored error code for ErrorCodeIf check
+array<uint> IgnoredErrorCode = [0xC0000016, // STATUS_MORE_PROCESSING_REQUIRED
+                                0xC000019C];  // STATUS_FS_DRIVER_REQUIRED
+
+// ------------------------------------------------------------------
+// SMB
+endpoint SMBServer[ushort FileId]
+    over LowestServer 
+    provides SMBMessages;
+
+const binary SMBProtocolId = $[FF534D42];
+const ushort InvalidSMBFileId = 0xFFFF;
+client endpoint SMBClient connected to SMBServer;
+
+type DecoderVariables
+{
+    // key: MID, value: SubCommand
+    map<USHORT, USHORT> Subcommand = {};
+    // key is FID, for conversation usage
+    map<USHORT, string> fileNameByFid = {};
+    // key is MID, for response usage
+    map<USHORT, string> fileNameByMid = {};
+    // Key is MID, for response referring FID
+    map<USHORT, USHORT> fidByMid = {};
+    
+    bool pduFull = true; // Indicates what PduFull is set in etw provider
+    
+    // used by Read/Write request.
+    string GetFileNameByFID(ushort fid)
+    {
+        if (fid in fileNameByFid)
+        {
+            return fileNameByFid[fid];
+        }
+        return fid as string;
+    }
+    
+    // used by Read/Write response
+    string GetFileNameByMID(ushort mid, out ushort fid)
+    {
+        fid = 0xFFFF;
+        if (mid in fidByMid)
+        {
+            fid = fidByMid[mid];
+            fidByMid = fidByMid.Remove(mid);
+            return GetFileNameByFID(fid);
+        }
+        return null;
+    }
+    
+    // Use by Create response
+    void UpdateRecordInFileNameFIDMap(ushort mid, ushort fid)
+    {
+        if (mid in fileNameByMid)
+        {
+            string fileName = fileNameByMid[mid];
+            fileNameByMid = fileNameByMid.Remove(mid);
+            fileNameByFid[fid] = fileName;
+        }
+    }
+    
+    // used by Create request
+    void UpdateRecordInFileNameMIDMap(ushort mid, string fileName)
+    {
+        fileNameByMid[mid] = fileName;
+    }
+}
+
+endpoint LowestServer
+    over Server | over NBTSS.Server | over NBF.Node
+    provides SMBMessages 
+{
+    DecoderVariables dvar = new DecoderVariables();
+    map<ushort, array<SMBMessages.ComTransactionResponse>> transMessages = {};
+    
+    observe this accepts m:SMBMessages.ComOpenRequest
+    {
+        string fileName = (m.Request.FileName.Value.Count == 0 || m.Request.FileName.Value == null) ? "*NULL*" : m.Request.FileName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComOpenResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    observe this accepts m:SMBMessages.ComCreateRequest
+    {
+        string fileName = (m.Request.FileName.Value.Count == 0 || m.Request.FileName.Value == null) ? "*NULL*" : m.Request.FileName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComCreateResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    observe this accepts m:SMBMessages.ComOpenAndxRequest
+    {
+        string fileName = (m.Request.FileName.Value.Count == 0 || m.Request.FileName.Value == null) ? "*NULL*" : m.Request.FileName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComOpenAndxResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    observe this accepts m:SMBMessages.ComCreateTemporaryRequest
+    {
+        string fileName = (m.Request.DirectoryName.Value.Count == 0 || m.Request.DirectoryName.Value == null) ? "*NULL*" : m.Request.DirectoryName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComCreateTemporaryResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    observe this accepts m:SMBMessages.ComCreateNewRequest
+    {
+        string fileName = (m.Request.FileName.Value.Count == 0 || m.Request.FileName.Value == null) ? "*NULL*" : m.Request.FileName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComCreateNewResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    observe this accepts m:SMBMessages.ComNTCreateAndxRequest
+    {
+        string fileName = (m.Request.FileName.Value.Count == 0 || m.Request.FileName.Value == null) ? "*NULL*" : m.Request.FileName.Value;
+        dvar.UpdateRecordInFileNameMIDMap(m.Mid, fileName);
+    }
+    
+    observe this issues m:SMBMessages.ComNTCreateAndxResponse
+    {
+        dvar.UpdateRecordInFileNameFIDMap(m.Mid, m.Response.Fid);
+    }
+    
+    process this accepts m:SMBMessages.ComReadRequest
+    {
+        dvar.fidByMid[m.Mid] = m.Request.Fid;
+        m#FileName = dvar.GetFileNameByFID(m.Request.Fid);
+        dispatch (endpoint SMBServer[m.Request.Fid] over this) accepts m;
+    }
+    
+    process this issues m:SMBMessages.ComReadResponse
+    {
+        ushort fid;
+        m#FileName = dvar.GetFileNameByMID(m.Mid, out fid);
+        dispatch (endpoint SMBServer[fid] over this) issues m;
+    }
+    
+    process this accepts m:SMBMessages.ComReadAndxRequest
+    {
+        dvar.fidByMid[m.Mid] = m.Request.Fid;
+        m#FileName = dvar.GetFileNameByFID(m.Request.Fid);
+        dispatch (endpoint SMBServer[m.Request.Fid] over this) accepts m;
+    }
+    
+    process this issues m:SMBMessages.ComReadAndxResponse
+    {
+        ushort fid;
+        m#FileName = dvar.GetFileNameByMID(m.Mid, out fid);
+        dispatch (endpoint SMBServer[fid] over this) issues m;
+    }
+    
+    process this accepts m:SMBMessages.ComWriteAndxRequest
+    {
+        dvar.fidByMid[m.Mid] = m.Request.Fid;
+        m#FileName = dvar.GetFileNameByFID(m.Request.Fid);
+        dispatch (endpoint SMBServer[m.Request.Fid] over this) accepts m;
+    }
+    
+    process this issues m:SMBMessages.ComWriteAndxResponse
+    {
+        ushort fid;
+        m#FileName = dvar.GetFileNameByMID(m.Mid, out fid);
+        dispatch (endpoint SMBServer[fid] over this) issues m;
+    }
+    
+    process this accepts m:SMBMessages.ComTransactionRequest
+    {
+        ushort fid = m.Request.Fid == nothing ? InvalidSMBFileId : m.Request.Fid as ushort;
+        dvar.fidByMid[m.Mid] = fid;
+        if (m.Request.Subcommand != nothing)
+        {
+            dvar.Subcommand[m.Mid] = m.Request.Subcommand as ushort;
+        }
+        dispatch (endpoint SMBServer[fid] over this) accepts m;
+    }
+    
+    process this issues m:SMBMessages.ComTransactionResponse
+    {
+        if (m.Response.TransData != nothing && (m.Response.TransData is binary) 
+            && (m.Response.TransData as binary).Count < m.Response.DataCount) // deal with messages contains insufficient data
+        {
+            DisplayTopLevelMessage(m);
+            if (m.Mid in transMessages)
+            {
+                foreach (var transRsp in transMessages[m.Mid])
+                {
+                    DisplayTopLevelMessage(transRsp);
+                }
+                transMessages = transMessages.Remove(m.Mid);
+            }
+            if (m.Mid in dvar.Subcommand)
+            {
+                dvar.Subcommand = dvar.Subcommand.Remove(m.Mid);
+            }
+        }
+        else if (IsCompletedResponse(m.Response.ParameterDisplacement, m.Response.ParameterCount, m.Response.TotalParameterCount) 
+            && IsCompletedResponse(m.Response.DataDisplacement, m.Response.DataCount, m.Response.TotalDataCount))
+        {
+            ushort fid = 0;
+            if (m.Mid in dvar.fidByMid)
+            {
+                fid = dvar.fidByMid[m.Mid];
+                dvar.fidByMid = dvar.fidByMid.Remove(m.Mid);
+            }
+            dispatch (endpoint SMBServer[fid] over this) issues m;
+        }
+        else
+        {
+            if (!(m.Mid in transMessages.Keys))
+            {
+                transMessages[m.Mid] = [m];
+            }
+            else
+            {
+                transMessages[m.Mid] = transMessages[m.Mid].InsertSorted<SMBMessages.ComTransactionResponse>(
+                    (SMBMessages.ComTransactionResponse r1, SMBMessages.ComTransactionResponse r2) => r1.Response.ParameterDisplacement == r2.Response.ParameterDisplacement ? r1.Response.DataDisplacement - r2.Response.DataDisplacement : r1.Response.ParameterDisplacement - r2.Response.ParameterDisplacement,
+                    m);
+                array<SMBMessages.ComTransactionResponse> comTransactionResponse = transMessages[m.Mid];
+                SMBMessages.ComTransactionResponse lastRsp = comTransactionResponse[comTransactionResponse.Count - 1];
+                /* The data part in response is made up of TransParameter and TransData, TransParameter is before TransData.
+                 * when there is no TransData, only check whether TransParameters is sequential and completed,
+                 * otherwise only check  whether TransData is sequential and completed.
+                 * if TransData is completed, TransParameter must be completed
+                */
+                if (lastRsp.Response.TotalDataCount == 0 ?
+                    IsFragmentsSequentialCompleted<SMBMessages.ComTransactionResponse>(comTransactionResponse,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.ParameterDisplacement == 0,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.ParameterDisplacement + r.Response.ParameterCount == r.Response.TotalParameterCount,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.ParameterDisplacement,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.ParameterDisplacement + r.Response.ParameterCount) :
+                    IsFragmentsSequentialCompleted<SMBMessages.ComTransactionResponse>(comTransactionResponse,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.DataDisplacement == 0,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.DataDisplacement + r.Response.DataCount == r.Response.TotalDataCount,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.DataDisplacement,
+                        (SMBMessages.ComTransactionResponse r) => r.Response.DataDisplacement + r.Response.DataCount))
+                {
+                    binary buffer = $[];
+                    for (int j = 0; j < comTransactionResponse.Count; j++)
+                    {
+                        if (j == 0)
+                        {
+                            binary temp = comTransactionResponse[0].SourceData as binary;
+                            buffer = temp.Segment(0, 39) + temp.Segment(33, 2) + // make ParameterCount same as TotalParameterCount
+                                temp.Segment(41, 4) + temp.Segment(35, 2) + // make DataCount same as TotalDataCount
+                                temp.Segment(47);
+                        }
+                        else
+                        {
+                            if (comTransactionResponse[j].Response.TransParameters != nothing)
+                            {
+                                buffer += comTransactionResponse[j].Response.TransParameters as binary;
+                            }
+                            if (comTransactionResponse[j].Response.TransData != nothing)
+                            {
+                                buffer += comTransactionResponse[j].Response.TransData as binary;
+                            }
+                        }
+                    }
+                    transMessages = transMessages.Remove(m.Mid);
+                    ushort fid = 0;
+                    if (m.Mid in dvar.fidByMid)
+                    {
+                        fid = dvar.fidByMid[m.Mid];
+                        dvar.fidByMid = dvar.fidByMid.Remove(m.Mid);
+                    }
+                    optional ushort subcommand = nothing;
+                    if (m.Mid in dvar.Subcommand)
+                    {
+                        subcommand = dvar.Subcommand[m.Mid];
+                        dvar.Subcommand = dvar.Subcommand.Remove(m.Mid);
+                    }
+                    switch (buffer)
+                    {
+                        case msg:SMBMessages.ComTransactionResponse from BinaryDecoder<SMBMessages.ComTransactionResponse[subcommand]> =>
+                            dispatch (endpoint SMBServer[fid] over this) issues msg;
+                        default =>
+                            TryDecodeSMBHeaderOnlyMessage(buffer, "ComTransactionResponse");
+                    }
+                }
+            }
+        }
+    }
+        
+    process this accepts m:SMBMessages.ComCloseRequest
+    {
+        if (m.Request.Fid in dvar.fileNameByFid)
+        {
+            string fileName = dvar.fileNameByFid[m.Request.Fid];
+            dvar.fileNameByFid = dvar.fileNameByFid.Remove(m.Request.Fid);
+            m#FileName = fileName;
+        }
+        dispatch (endpoint SMBServer[m.Request.Fid] over this) accepts m;
+    }
+    
+    ~endpoint(LowestServer lowestServer)
+    {
+        if (transMessages.Count > 0)
+        {
+            foreach (ushort key in transMessages.Keys)
+            {
+                foreach (var m in transMessages[key])
+                {
+                    DisplayTopLevelMessage(m);
+                }
+            }
+            transMessages = {};
+        }
+        dvar.fidByMid = {};
+        dvar.fileNameByFid = {};
+        dvar.fileNameByMid = {};
+    }
+}
+
+client endpoint LowestClient connected to LowestServer;
+
+autostart actor SMBOverSMBTransportWithoutFileSharing(Server server)
+{
+    process server accepts p:TransportPacket where p.SMBMessage.Segment(0, 4) == SMBProtocolId
+    {
+        LowestServer lowestServer = endpoint LowestServer over server;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, p.SMBMessage, lowestServer.dvar);
+    }
+
+    // parsing response message
+    process server issues p:TransportPacket where p.SMBMessage.Segment(0, 4) == SMBProtocolId
+    {
+        LowestServer lowestServer = endpoint LowestServer over server;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, p.SMBMessage, lowestServer.dvar);
+    }
+}
+
+autostart actor SmbOverNbtss(NBTSS.Server server)
+{
+    process server accepts p:NBTSS.SessionService where p.Trailer is packet:NBTSS.SessionMessagePacket 
+                                                        && packet.UserData.Segment(0, 4) == SMBProtocolId
+    {
+        LowestServer lowestServer = endpoint LowestServer over server;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, packet.UserData, lowestServer.dvar);
+    }
+
+    // parsing response message
+    process server issues p:NBTSS.SessionService where p.Trailer is packet:NBTSS.SessionMessagePacket  
+                                                        && packet.UserData.Segment(0, 4) == SMBProtocolId
+    {
+        LowestServer lowestServer = endpoint LowestServer over server;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, packet.UserData, lowestServer.dvar);
+    }
+}
+
+autostart actor SmbOverNbf(NBF.Node node)
+{
+    process node accepts d:NBF.Datagram where d.Payload != nothing && d.Payload is binary && IsSMBTrafficButNotMail(d.Payload as binary)
+    {
+        LowestServer lowestServer = endpoint LowestServer over node;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, d.Payload as binary, lowestServer.dvar);
+    }
+    process node accepts d:NBF.DatagramBroadcast where d.Payload != nothing && d.Payload is binary && IsSMBTrafficButNotMail(d.Payload as binary)
+    {
+        LowestServer lowestServer = endpoint LowestServer over node;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, d.Payload as binary, lowestServer.dvar);
+    }
+    process node accepts d:NBF.DataOnlyLast where d.UserData != nothing && d.UserData is binary && IsSMBTrafficButNotMail(d.UserData as binary)
+    {
+        LowestServer lowestServer = endpoint LowestServer over node;
+        SMBTransportDecodeAndDispatchMessages(lowestServer, d.UserData as binary, lowestServer.dvar);
+    }
+    
+   bool IsSMBTrafficButNotMail(binary bin)
+   {
+       return (bin.Count >= 4 && bin.Segment(0, 4) is SMBProtocolId) && !(bin.Segment(4, 1) is $[25] && bin.Count > 63 && (bin.Segment(59, 1) is $[03] && bin.Segment(61, 2) is $[0100]));
+   }
+}
+
+bool IsCompletedResponse(uint displacement, uint count, uint totalCount)
+{
+    return displacement == 0 && displacement + count == totalCount;
+}
+
+void DecodeTransactionResponse((LowestServer | SMBServer) server, stream s, optional ushort subcommand, bool isGreater, byte wordCount, string msgName)
+{
+    ushort mid = MakeWord(s.PeekByte(248), s.PeekByte(240));
+    switch (s)
+    {
+        case msg:SMBMessages.ComTransactionResponse from BinaryDecoder<SMBMessages.ComTransactionResponse[subcommand]> =>
+            if (server is LowestServer)
+            {
+                dispatch (server as LowestServer) issues msg;
+            }
+            else
+            {
+                dispatch (server as SMBServer) issues msg;
+            }
+            
+        default =>
+            TryDecodeSMBHeaderOnlyMessage(s, "ComTransactionResponse");
+    }
+}
+
+void SMBTransportDecodeAndDispatchMessages(LowestServer server, stream s, DecoderVariables dvar)
+{
+    bool isRequest = ((s.PeekByte(72) & 0x80) == 0x00);
+    byte command = s.PeekByte(32);
+    
+    if (IsErrorResponse(s))
+    {
+        switch (s)
+        {
+            case m:SMBMessages.NonTransportResponse from BinaryDecoder<SMBMessages.NonTransportResponse> =>
+                dispatch server issues m;
+            default =>
+                TryDecodeSMBHeaderOnlyMessage(s, "Error Response");
+        }
+        return;
+    }
+    
+    // Parsing message as per Command.
+    switch (command)
+    {
+        case SmbCommand.SmbComTransaction =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComTransactionRequest from BinaryDecoder<SMBMessages.ComTransactionRequest> =>
+                        if (m.Request.SetupCount > 0)
+                        {
+                            dvar.Subcommand[m.Mid] = (m.Request.Subcommand) as USHORT;
+                        }
+                        if (s.BytePosition < s.ByteLength && m.Request.ParameterOffset > s.BytePosition)
+                        {
+                            int padLength = m.Request.ParameterOffset - s.BytePosition;
+                            m.Request.AssignFieldEncodingInfo("Pad1", s.BitPosition, padLength * 8);
+                            m.Request.Pad1 = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (s.BytePosition < s.ByteLength && m.Request.ParameterCount > 0)
+                        {
+                            m.Request.AssignFieldEncodingInfo("TransParameters", s.BitPosition, m.Request.ParameterCount * 8);
+                            if (m.Request.SetupCount > 0)
+                            {
+                                m.Request.TransParameters = BinaryDecoder<TransactionSubCommandsRequestParameters[(m.Request.Subcommand) as USHORT, m.Request.ParameterCount]>(s);
+                            }
+                            else
+                            {
+                                m.Request.TransParameters = BinaryDecoder<Blob[(m.Request.ParameterCount) as uint]>(s);
+                            }
+                        }
+                        if (s.BytePosition < s.ByteLength && m.Request.DataOffset > s.BytePosition)
+                        {
+                            int padLength = m.Request.DataCount > 0 ? (m.Request.DataOffset - s.BytePosition) : (s.ByteLength - s.BytePosition);
+                            m.Request.AssignFieldEncodingInfo("Pad2", s.BitPosition, padLength * 8);
+                            m.Request.Pad2 = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (s.BytePosition < s.ByteLength && m.Request.DataCount > 0)
+                        {
+                            int dataCount = m.Request.DataCount > s.RemainingByteLength ? s.RemainingByteLength : m.Request.DataCount;
+                            m.Request.AssignFieldEncodingInfo("TransData", s.BitPosition, dataCount * 8);
+                            m.Request.TransData = (BinaryDecoder<Blob[dataCount as uint]>(s) as Blob).Data;
+                            if (dataCount < m.Request.DataCount)
+                            {
+                                ReportInsufficientTruncation(m, "SMBTransport", "TransData", "ComTransactionRequest", !dvar.pduFull);
+                                
+                                DisplayTopLevelMessage(m);
+                            }
+                            else
+                            {
+                                dispatch server accepts m;
+                            }
+                        }
+                        else
+                        {
+                            dispatch server accepts m;
+                        }
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComTransactionRequest");
+                }
+            }
+            else // response
+            {
+                ushort mid = MakeWord(s.PeekByte(248), s.PeekByte(240));
+                optional ushort subcommand = mid in dvar.Subcommand.Keys ? dvar.Subcommand[mid] : nothing;
+                switch (s)
+                {
+                    case msg:SMBMessages.ComTransactionResponse from BinaryDecoder<SMBMessages.ComTransactionResponse[subcommand]> =>
+                            dispatch server issues msg;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComTransactionResponse");
+                }
+            }
+        case SmbCommand.SmbComRead =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComReadRequest from BinaryDecoder<SMBMessages.ComReadRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComReadRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComReadResponse from BinaryDecoder<SMBMessages.ComReadResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComReadResponse");
+                }
+            }
+        case SmbCommand.SmbComOpen =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComOpenRequest from BinaryDecoder<SMBMessages.ComOpenRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComOpenRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComOpenResponse from BinaryDecoder<SMBMessages.ComOpenResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComOpenResponse");
+                }
+            } 
+        case SmbCommand.SmbComOpenAndx =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComOpenAndxRequest from BinaryDecoder<SMBMessages.ComOpenAndxRequest> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Request.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Request.AndXOffset ? s.ByteLength : m.Request.AndXOffset) - s.BytePosition;
+                            m.Request.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Request.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Request.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXRequests", s.BitPosition, s.RemainingBitLength);
+                            m.AndXRequestsData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server accepts m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComOpenAndxRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComOpenAndxResponse from BinaryDecoder<SMBMessages.ComOpenAndxResponse> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Response.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Response.AndXOffset ? s.ByteLength : m.Response.AndXOffset) - s.BytePosition;
+                            m.Response.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Response.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Response.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXResponses", s.BitPosition, s.RemainingBitLength);
+                            m.AndXResponsesData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server issues m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComOpenAndxResponse");
+                }
+            }
+        case SmbCommand.SmbComNTCreateAndx =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComNTCreateAndxRequest from BinaryDecoder<SMBMessages.ComNTCreateAndxRequest> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Request.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Request.AndXOffset ? s.ByteLength : m.Request.AndXOffset) - s.BytePosition;
+                            m.Request.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Request.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Request.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXRequests", s.BitPosition, s.RemainingBitLength);
+                            m.AndXRequestsData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server accepts m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComNTCreateAndxRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComNTCreateAndxResponse from BinaryDecoder<SMBMessages.ComNTCreateAndxResponse> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Response.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Response.AndXOffset ? s.ByteLength : m.Response.AndXOffset) - s.BytePosition;
+                            m.Response.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Response.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Response.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXResponses", s.BitPosition, s.RemainingBitLength);
+                            m.AndXResponsesData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server issues m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComNTCreateAndxResponse");
+                }
+            }
+        case SmbCommand.SmbComCreate =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateRequest from BinaryDecoder<SMBMessages.ComCreateRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateResponse from BinaryDecoder<SMBMessages.ComCreateResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateResponse");
+                }
+            }
+        case SmbCommand.SmbComCreateTemporary =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateTemporaryRequest from BinaryDecoder<SMBMessages.ComCreateTemporaryRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateTemporaryRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateTemporaryResponse from BinaryDecoder<SMBMessages.ComCreateTemporaryResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateTemporaryResponse");
+                }
+            }
+        case SmbCommand.SmbComCreateNew =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateNewRequest from BinaryDecoder<SMBMessages.ComCreateNewRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateNewRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCreateNewResponse from BinaryDecoder<SMBMessages.ComCreateNewResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCreateNewResponse");
+                }
+            }
+        case SmbCommand.SmbComNTCreateAndx =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComNTCreateAndxRequest from BinaryDecoder<SMBMessages.ComNTCreateAndxRequest> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Request.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Request.AndXOffset ? s.ByteLength : m.Request.AndXOffset) - s.BytePosition;
+                            m.Request.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Request.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Request.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXRequests", s.BitPosition, s.RemainingBitLength);
+                            m.AndXRequestsData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server accepts m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComNTCreateAndxRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComNTCreateAndxResponse from BinaryDecoder<SMBMessages.ComNTCreateAndxResponse> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Response.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Response.AndXOffset ? s.ByteLength : m.Response.AndXOffset) - s.BytePosition;
+                            m.Response.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Response.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Response.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXResponses", s.BitPosition, s.RemainingBitLength);
+                            m.AndXResponsesData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server issues m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComNTCreateAndxResponse");
+                }
+            }
+        case SmbCommand.SmbComReadAndx =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComReadAndxRequest from BinaryDecoder<SMBMessages.ComReadAndxRequest> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Request.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Request.AndXOffset ? s.ByteLength : m.Request.AndXOffset) - s.BytePosition;
+                            m.Request.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Request.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Request.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXRequestsData", s.BitPosition, s.RemainingBitLength);
+                            m.AndXRequestsData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server accepts m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComReadAndxRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComReadAndxResponse from BinaryDecoder<SMBMessages.ComReadAndxResponse> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        int dataLength1 = m.Response.DataLength < m.Response.ByteCount ? (m.Response.DataLength + (m.Response.DataLengthHigh << 16)) : m.Response.DataLength;
+                        int dataLength = dataLength1 > s.RemainingByteLength ? s.RemainingByteLength : dataLength1;
+                        m.Response.AssignFieldEncodingInfo("Data", s.BitPosition, dataLength * 8);
+                        m.Response.Data = (BinaryDecoder<Blob[dataLength as uint]>(s) as Blob).Data;
+                        if (dataLength < dataLength1)
+                        {
+                            ReportInsufficientTruncation(m, "SMBTransport", "Data", "ComReadAndxResponse", !dvar.pduFull);
+                            DisplayTopLevelMessage(m);
+                        }
+                        else
+                        {
+                            if (s.BytePosition < s.ByteLength && m.Response.AndXOffset > s.BytePosition)
+                            {
+                                int padLength = (s.ByteLength < m.Response.AndXOffset ? s.ByteLength : m.Response.AndXOffset) - s.BytePosition;
+                                m.Response.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                                m.Response.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                            }
+                            if (m.Response.AndXCommand != 0xff)
+                            {
+                                m.AssignFieldEncodingInfo("AndXResponsesData", s.BitPosition, s.RemainingBitLength);
+                                m.AndXResponsesData = s.PeekBytes(s.BitPosition);
+                            }
+                            dispatch server issues m;
+                        }
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComReadAndxResponse");
+                }
+            }
+        case SmbCommand.SmbComWriteAndx =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComWriteAndxRequest from BinaryDecoder<SMBMessages.ComWriteAndxRequest> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        int dataLength1 = m.Request.DataLength < m.Request.ByteCount ? (m.Request.DataLength + (m.Request.DataLengthHigh << 16)) : m.Request.DataLength;
+                        int dataLength = dataLength1 > s.RemainingByteLength ? s.RemainingByteLength : dataLength1;
+                        m.Request.AssignFieldEncodingInfo("Data", s.BitPosition, dataLength * 8);
+                        m.Request.Data = (BinaryDecoder<Blob[dataLength as uint]>(s) as Blob).Data;
+                        if (dataLength < dataLength1)
+                        {
+                            ReportInsufficientTruncation(m, "SMBTransport", "Data", "ComWriteAndxRequest", !dvar.pduFull);
+                            DisplayTopLevelMessage(m);
+                        }
+                        else
+                        {
+                            if (s.BytePosition < s.ByteLength && m.Request.AndXOffset > s.BytePosition)
+                            {
+                                int padLength = (s.ByteLength < m.Request.AndXOffset ? s.ByteLength : m.Request.AndXOffset) - s.BytePosition;
+                                m.Request.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                                m.Request.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                            }
+                            if (m.Request.AndXCommand != 0xff)
+                            {
+                                m.AssignFieldEncodingInfo("AndXRequestsData", s.BitPosition, s.RemainingBitLength);
+                                m.AndXRequestsData = s.PeekBytes(s.BitPosition);
+                            }
+                            dispatch server accepts m;
+                        }
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComWriteAndxRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComWriteAndxResponse from BinaryDecoder<SMBMessages.ComWriteAndxResponse> =>
+                        bool isFlags2Unicode = (m.Flags2 & 0x8000) == 0x8000;
+                        if (s.BytePosition < s.ByteLength && m.Response.AndXOffset > s.BytePosition)
+                        {
+                            int padLength = (s.ByteLength < m.Response.AndXOffset ? s.ByteLength : m.Response.AndXOffset) - s.BytePosition;
+                            m.Response.AssignFieldEncodingInfo("AndXPadding", s.BitPosition, padLength * 8);
+                            m.Response.AndXPadding = (BinaryDecoder<Blob[padLength as uint]>(s) as Blob).Data;
+                        }
+                        if (m.Response.AndXCommand != 0xff)
+                        {
+                            m.AssignFieldEncodingInfo("AndXResponsesData", s.BitPosition, s.RemainingBitLength);
+                            m.AndXResponsesData = s.PeekBytes(s.BitPosition);
+                        }
+                        dispatch server issues m;
+                        
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComWriteAndxResponse");
+                }
+            }
+        case SmbCommand.SmbComClose =>
+            if (isRequest) // request
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCloseRequest from BinaryDecoder<SMBMessages.ComCloseRequest> =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCloseRequest");
+                }
+            }
+            else // response
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.ComCloseResponse from BinaryDecoder<SMBMessages.ComCloseResponse> =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "ComCloseResponse");
+                }
+            }
+        case SmbCommand => 
+            if (isRequest)
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.NonTransportRequest from BinaryDecoder =>
+                        dispatch server accepts m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "NonTransportRequest");
+                }
+            }
+            else
+            {
+                switch (s)
+                {
+                    case m:SMBMessages.NonTransportResponse from BinaryDecoder =>
+                        dispatch server issues m;
+                    default =>
+                        TryDecodeSMBHeaderOnlyMessage(s, "NonTransportResponse");
+                }
+            }
+        default =>
+            throw ("SMBTransport: Unknown SMB command: " + command.ToString() + ".");
+    }
+}
+
+void TryDecodeSMBHeaderOnlyMessage(stream s, string msgName)
+{
+    bool isRequest = ((s.PeekByte(9 * 8) as int) & 0x80) == 0;
+    switch (s)
+    {
+        case m:SMBHeaderOnly from BinaryDecoder<SMBHeaderOnly[isRequest]> =>
+            DisplayTopLevelMessage(m);
+        default =>
+            ThrowDecodingException("SMBTransport", msgName);
+    }
+}
+
+bool IsErrorResponse(stream s)
+{
+    bool ret = true;
+    if (s.PeekBytes(s.BitPosition + 32 * 8, 1) != $[00]) // WordCount != 0
+    {
+        ret = false;
+    }
+    else if ((s.PeekByte(88) & 0x4000) > 0 && (s.PeekByte(64) & 0xC0) == 0) // ERREF.NTSTATUS Severity != 3
+    {
+        ret = false;
+    }
+    else if ((s.PeekByte(88) & 0x4000) == 0 && (s.PeekByte(40) & 0xFF) == 0) // SMBStatus ErrorClass == 0
+    {
+        ret = false;
+    }
+    return ret;
+}
+
+autostart actor MsrpceOverSMBServer(SMBServer server)
+{
+    MSRPCEOverNamedpipeDecodingHelper helper = null;
+    
+    process server accepts s:SMBMessages.ComTransactionRequest where s.Request.TransData is bin:binary && 
+        (helper != null && helper.AcceptsCache.BufferCount() > 0 || IsRpcconnCommonHdrT(bin) && bin[2] in AcceptsMsgTypeSet)
+    {
+        // set status nothing for request, because Status is meaningless for request messages
+        EnsureInitialized();
+        helper.TryDecode(bin, s, MessageDirection.Accepts);
+    }
+
+    process server issues s:SMBMessages.ComTransactionResponse where s.Response.TransData is bin:binary && 
+        (helper != null && helper.IssuesCache.BufferCount() > 0 || IsRpcconnCommonHdrT(bin) && bin[2] in IssuesMsgTypeSet)
+    {
+        EnsureInitialized();
+        helper.TryDecode(bin, s, MessageDirection.Issues);
+    }
+
+    process server accepts s:SMBMessages.ComWriteAndxRequest where s.Request.Data is bin:binary && 
+        (helper != null && helper.AcceptsCache.BufferCount() > 0 || IsRpcconnCommonHdrT(bin) && bin[2] in AcceptsMsgTypeSet)
+    {
+        // set status nothing for request, because Status is meaningless for request messages
+        EnsureInitialized();
+        helper.TryDecode(bin, s, MessageDirection.Accepts);
+    }
+
+    process server issues s:SMBMessages.ComReadAndxResponse where s.Response.Data is bin:binary && 
+        (helper != null && helper.IssuesCache.BufferCount() > 0 || IsRpcconnCommonHdrT(bin) && bin[2] in IssuesMsgTypeSet)
+    {
+        EnsureInitialized();
+        helper.TryDecode(bin, s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(SMBServer server)
+    {
+        if (helper != null)
+        {
+            helper.ClearInDestructor();
+        }
+    }
+
+    void EnsureInitialized()
+    {
+        if (helper == null)
+        {
+            helper = new MSRPCEOverNamedpipeDecodingHelper{};
+            helper.Initialize(endpoint MSRPCE.Server over server);
+        }
+    }
+}
+
+/* For performance consideration, file is reassembled only when there're upper layer file protocol implemented.
+ * For SMB, file accessed by command is reassembled: SMB_COM_READ, SMB_COM_READ_ANDX, SMB_COM_WRITE_ANDX
+ * File accessed by following commands is not reassembled due to there're obsoleted or deprecated:
+ *         SMB_COM_LOCK_AND_READ (deprecated)
+ *         SMB_COM_READ_RAW (deprecated)
+ *         SMB_COM_READ_MPX (obsolescent)
+ *         SMB_COM_WRITE (deprecated)
+ *         SMB_COM_WRITE_AND_UNLOCK (deprecated)
+ *         SMB_COM_WRITE_RAW (deprecated)
+ *         SMB_COM_WRITE_MPX (obsolescent)
+ *         SMB_COM_WRITE_AND_CLOSE (deprecated)
+ * File accessed by batched command is not reassembled.
+ */
+autostart actor ReassembleFileOverSMBActor(SMBServer smbServer)
+{
+    FAS.Server FASServer = null;
+    process smbServer accepts req:SMBMessages.ComWriteAndxRequest 
+                where req#FileName is fileName:string && NeedFASReassemble(fileName) && CalculateRealSmbOffset(req.Request.Offset, req.Request.OffsetHigh) is offset:ulong && offset == 0 || 
+                    FASServer != null && FASServer.Command == CommandType.Write
+    {   
+        if (offset == 0)
+        {
+            FASServer = FAS.InitializeFASServer(smbServer, CommandType.Write, 
+                (any message m, FAS.Server fasServer) => CalculateRealSmbOffset(((m as SMBMessages.ComWriteAndxRequest)).Request.Offset, ((m as SMBMessages.ComWriteAndxRequest)).Request.OffsetHigh), 
+                (any message m) => ((m as SMBMessages.ComWriteAndxRequest).Request.Data as binary), 
+                fileName);
+        }
+        dispatch FASServer accepts req;
+    }
+    
+    observe smbServer accepts req:SMBMessages.ComReadAndxRequest 
+                where req#FileName is fileName:string && NeedFASReassemble(fileName) && CalculateRealSmbOffset(req.Request.Offset, req.Request.OffsetHigh) is offset:ulong &&
+                    offset == 0 || FASServer != null && FASServer.Command == CommandType.Read
+    {
+        if (offset == 0)
+        {
+            FASServer = FAS.InitializeFASServer(smbServer, CommandType.Read, 
+                (any message m, FAS.Server fasServer) => (fasServer.ReadResponseOffset != null ? (fasServer.ReadResponseOffset as ulong) : 0xFFFFFFFFFFFFFFFF), 
+                (any message m) => ((m as SMBMessages.ComReadAndxResponse).Response.Data as binary), 
+                fileName);
+        }
+        FASServer.ReadResponseOffset = offset;
+    }
+    
+    process smbServer issues res:SMBMessages.ComReadAndxResponse 
+        where res#FileName is fileName:string && NeedFASReassemble(fileName) && FASServer != null && FASServer.Command == CommandType.Read
+    {
+        dispatch FASServer issues res;
+    }
+
+    observe smbServer accepts req:SMBMessages.ComReadRequest 
+        where req#FileName is fileName:string && NeedFASReassemble(fileName) && req.Request.ReadOffsetInBytes is offset:uint &&
+            offset == 0 || FASServer != null && FASServer.Command == CommandType.Read
+    {
+        if (offset == 0)
+        {
+            FASServer = FAS.InitializeFASServer(smbServer, CommandType.Read, 
+                (any message m, FAS.Server fasServer) => (fasServer.ReadResponseOffset != null ? (fasServer.ReadResponseOffset as ulong) : 0xFFFFFFFFFFFFFFFF), 
+                (any message m) => ((m as SMBMessages.ComReadResponse).Response.Bytes as binary), 
+                fileName);
+        }
+        FASServer.ReadResponseOffset = offset;
+    }
+    
+    process smbServer issues res:SMBMessages.ComReadResponse 
+        where res#FileName is fileName:string && NeedFASReassemble(fileName) && FASServer != null && FASServer.Command == CommandType.Read
+    {
+        dispatch FASServer issues res;
+        FASServer.ReadResponseOffset = null;
+    }
+    
+    process smbServer accepts closeReq:SMBMessages.ComCloseRequest where FASServer != null
+    {
+        dispatch FASServer accepts closeReq;
+        FASServer.HasCloseRequestAccepted = true;
+    }
+}
+
+// Message and contract
+message SMBHeaderOnly[bool IsRequest] : SmbHeader
+{
+    override string ToString()
+    {
+        string summary = "SMB " + GetSMBCommandNameWithoutSpace(Command);
+        if (IsRequest)
+        {
+            summary += "Request, Header Only";
+        }
+        else
+        {
+            summary += "Response, Header Only, Status: " + SmbStatusValuesToText(Status);
+        }
+        return summary;
+    }
+}
+
+annotation string SmbHeader#FileName;
+
+contract SMBMessages
+{
+    accepts ComTransactionRequest : SmbHeader
+    {
+        SmbComTransactionRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        
+        override string ToString()
+        {
+            if (Request.SetupCount > 0)
+            {
+                return "SMB ComTransactionRequest, Subcommand: " + GetTransactionSubcommandName(Request.SetupCount, Request.Subcommand as ushort);
+            }
+            else
+            {
+                return "SMB ComTransactionRequest, Remote Administration Protocol";
+            }
+        }
+    }
+    
+    issues ComTransactionResponse[optional ushort Subcommand] : SmbHeader
+    {
+        SmbComTransactionResponse[(Flags2 & 0x8000) == 0x8000, Subcommand] Response;
+        
+        override string ToString()
+        {
+            return "SMB ComTransactionResponse" + ", Status: " + SmbStatusValuesToText(Status);
+        }
+    }
+
+    accepts ComReadAndxRequest : SmbHeader
+    {
+        SmbComReadAndxRequest Request;
+        optional binary AndXRequestsData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComReadAndxRequest";
+        }
+    }
+    
+    issues ComReadAndxResponse : SmbHeader
+    {
+        SmbComReadAndxResponse[(Flags2 & 0x8000) == 0x8000] Response;
+        optional binary AndXResponsesData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComReadAndxResponse, Status: " + SmbStatusValuesToText(Status);
+        }
+    }
+    
+    accepts ComReadRequest : SmbHeader
+    {
+        SmbComReadRequest Request;
+        optional binary AndXRequestsData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComReadAndxRequest";
+        }
+    }
+    
+    issues ComReadResponse : SmbHeader
+    {
+        SmbComReadResponse Response;
+        optional binary AndXResponsesData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComReadAndxResponse, Status: " + SmbStatusValuesToText(Status);
+        }
+    }
+
+    accepts ComWriteAndxRequest : SmbHeader
+    {
+        SmbComWriteAndxRequest Request;
+        optional binary AndXRequestsData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComWriteAndxRequest";
+        }
+    }
+    
+    issues ComWriteAndxResponse : SmbHeader
+    {
+        SmbComWriteAndxResponse Response;
+        optional binary AndXResponsesData with Encoding{Ignore = true};
+        
+        override string ToString()
+        {
+            return "SMB ComWriteAndxResponse" + ", Status: " + SmbStatusValuesToText(Status);
+        }
+    }
+
+    accepts ComOpenRequest:SmbHeader
+    {
+        SmbComOpenRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        override string ToString()
+        {
+            return "ComOpenRequest, FileName: " + Request.FileName.Value;
+        }
+    }
+    
+    issues ComOpenResponse:SmbHeader
+    {
+        SmbComOpenResponse Response;
+        override string ToString()
+        {
+            return "ComOpenResponse";
+        }
+    }
+    
+    accepts ComOpenAndxRequest:SmbHeader
+    {
+        SmbComOpenAndxRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        optional binary AndXRequestsData with Encoding{Ignore = true};
+        override string ToString()
+        {
+            return "ComOpenAndxRequest, FileName: " + Request.FileName.Value;
+        }
+    }
+    
+    issues ComOpenAndxResponse:SmbHeader
+    {
+        SmbComOpenAndxResponse Response;
+        optional binary AndXResponsesData with Encoding{Ignore = true};
+        override string ToString()
+        {
+            return "ComOpenAndxResponse, Fid: " + DecToHexFormat(Response.Fid);
+        }
+    }
+
+    accepts ComNTCreateAndxRequest:SmbHeader
+    {
+        SmbComNTCreateAndxRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        optional binary AndXRequestsData with Encoding{Ignore = true};
+        override string ToString()
+        {
+            return "ComNTCreateAndxRequest, FileName: " + Request.FileName.Value;
+        }
+    }
+    
+    issues ComNTCreateAndxResponse:SmbHeader
+    {
+        SmbComNTCreateAndxResponse Response;
+        optional binary AndXResponsesData with Encoding{Ignore = true};
+        override string ToString()
+        {
+            return "ComNTCreateAndxResponse";
+        }
+    }
+    
+    accepts ComCreateRequest:SmbHeader
+    {
+        SmbComCreateRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        override string ToString()
+        {
+            return "ComCreateRequest, FileName: " + Request.FileName.Value;
+        }
+    }
+    
+    issues ComCreateResponse:SmbHeader
+    {
+        SmbComCreateResponse Response;
+        override string ToString()
+        {
+            return "ComCreateResponse";
+        }
+    }
+    
+    accepts ComCreateTemporaryRequest:SmbHeader
+    {
+        SmbComCreateTemporaryRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        override string ToString()
+        {
+            return "ComCreateTemporaryRequest, DirectoryName: " + Request.DirectoryName.Value;
+        }
+    }
+    
+    issues ComCreateTemporaryResponse:SmbHeader
+    {
+        SmbComCreateTemporaryResponse[(Flags2 & 0x8000) == 0x8000] Response;
+        override string ToString()
+        {
+            return "ComCreateTemporaryResponse, TemporaryFileName: " + Response.TemporaryFileName;
+        }
+    }
+    
+    accepts ComCreateNewRequest:SmbHeader
+    {
+        SmbComCreateNewRequest[(Flags2 & 0x8000) == 0x8000] Request;
+        override string ToString()
+        {
+            return "ComCreateNewRequest, FileName: " + Request.FileName.Value;
+        }
+    }
+    
+    issues ComCreateNewResponse:SmbHeader
+    {
+        SmbComCreateNewResponse Response;
+        override string ToString()
+        {
+            return "ComCreateNewResponse,  Fid: " + DecToHexFormat(Response.Fid);
+        }
+    }
+    
+    accepts ComCloseRequest:SmbHeader
+    {
+        SmbComCloseRequest Request;
+        override string ToString()
+        {
+            return "ComCloseRequest, Fid: " + DecToHexFormat(Request.Fid);
+        }
+    }
+    
+    issues ComCloseResponse:SmbHeader
+    {
+        SmbComCloseResponse Response;
+        override string ToString()
+        {
+            return "ComCloseResponse";
+        }
+    }
+    
+    accepts NonTransportRequest : SmbHeader
+    {
+        binary Request;
+        
+        override string ToString()
+        {
+            return "SMB " + GetSMBCommandNameWithoutSpace(Command) + "Request";
+        }
+    }
+    
+    issues NonTransportResponse : SmbHeader
+    {
+        binary Response;
+        
+        override string ToString()
+        {
+            return "SMB " + GetSMBCommandNameWithoutSpace(Command) + "Response, Status: " + SmbStatusValuesToText(Status);
+        }
+    }
+}
+
+message SmbHeader
+{
+    ULONG Protocol with BinaryEncoding{Endian = Endian.Big}, DisplayInfo{ToText = GetProtocolString};
+    SmbCommand Command with DisplayInfo{ToText = GetCommandString};
+    ERREF.NTSTATUS Status with DisplayInfo{ToText = GetStatusString};
+    SmbHeaderFlags Flags;
+    SmbHeaderFlags2 Flags2;
+    USHORT PidHigh;
+    SmbHeaderSecurityfeatures SecurityFeatures;
+    USHORT Reserved;
+    USHORT Tid;
+    USHORT PidLow;
+    USHORT Uid;
+    USHORT Mid;
+    
+    static string GetProtocolString(any data)
+    {
+        return "SMB";
+    }
+    
+    static string GetCommandString(any data)
+    {
+        UCHAR command = data as UCHAR;
+        return (GetSMBCommandNameWithoutSpace(command) + ", " + (command as string) + "(" + Utility.DecToHexFormat(2, command) + ")");
+    }
+    
+    static string GetStatusString(any data)
+    {
+        ERREF.NTSTATUS status = data as ERREF.NTSTATUS;
+        return ("" + Utility.DecToHexFormat(8, status.Value as uint) + ", " + SmbStatusValuesToText(status));
+    }
+}
+
+pattern SmbCommand = enum byte
+{
+    SmbComCreateDirectory       = 0x00,
+    SmbComDeleteDirectory       = 0x01,
+    SmbComOpen                  = 0x02,
+    SmbComCreate                = 0x03,
+    SmbComClose                 = 0x04,
+    SmbComFlush                 = 0x05,
+    SmbComDelete                = 0x06,
+    SmbComRename                = 0x07,
+    SmbComQueryInformation      = 0x08,
+    SmbComSetInformation        = 0x09,
+    SmbComRead                  = 0x0A,
+    SmbComWrite                 = 0x0B,
+    SmbComLockByteRange         = 0x0C,
+    SmbComUnlockByteRange       = 0x0D,
+    SmbComCreateTemporary       = 0x0E,
+    SmbComCreateNew             = 0x0F,
+    SmbComCheckDirectory        = 0x10,
+    SmbComProcessExit           = 0x11,
+    SmbComSeek                  = 0x12,
+    SmbComLockAndRead           = 0x13,
+    SmbComWriteAndUnlock        = 0x14,
+    SmbComReadRaw               = 0x1A,
+    SmbComReadMpx               = 0x1B,
+    SmbComReadMpxSecondary      = 0x1C,
+    SmbComWriteRaw              = 0x1D,
+    SmbComWriteMpx              = 0x1E,
+    SmbComWriteMpxSecondary     = 0x1F, // Obsolated
+    SmbComWriteComplete         = 0x20, // Obsolated
+    SmbComQueryServer           = 0x21, // Obsolated
+    SmbComSetInformation2       = 0x22,
+    SmbComQueryInformation2     = 0x23,
+    SmbComLockingAndx           = 0x24,
+    SmbComTransaction           = 0x25,
+    SmbComTransactionSecondary  = 0x26,
+    SmbComIoctl                 = 0x27,
+    SmbComIoctlSecondary        = 0x28, // Obsolated
+    SmbComCopy                  = 0x29, // Obsolated
+    SmbComMove                  = 0x2A, // Obsolated
+    SmbComEcho                  = 0x2B,
+    SmbComWriteAndClose         = 0x2C,
+    SmbComOpenAndx              = 0x2D,
+    SmbComReadAndx              = 0x2E,
+    SmbComWriteAndx             = 0x2F,
+    SmbComNewFileSize           = 0x30, // Obsolated
+    SmbComCloseAndTreeDisc      = 0x31, // Obsolated
+    SmbComTransaction2          = 0x32,
+    SmbComTransaction2Secondary = 0x33,
+    SmbComFindClose2            = 0x34,
+    SmbComFindNotifyClose       = 0x35, // Obsolated
+    SmbComTreeConnect           = 0x70,
+    SmbComTreeDisconnect        = 0x71,
+    SmbComNegotiate             = 0x72,
+    SmbComSessionSetupAndx      = 0x73,
+    SmbComLogoffAndx            = 0x74,
+    SmbComTreeConnectAndx       = 0x75,
+    SmbComSecurityPackageAndx   = 0x7E, // Obsolated
+    SmbComQueryInformationDisk  = 0x80,
+    SmbComSearch                = 0x81,
+    SmbComFind                  = 0x82,
+    SmbComFindUnique            = 0x83,
+    SmbComFindClose             = 0x84,
+    SmbComNTTransact            = 0xA0,
+    SmbComNTTransactSecondary   = 0xA1,
+    SmbComNTCreateAndx          = 0xA2,
+    SmbComNTCancel              = 0xA4,
+    SmbComNTRename              = 0xA5,
+    SmbComOpenPrintFile         = 0xC0,
+    SmbComWritePrintFile        = 0xC1,
+    SmbComClosePrintFile        = 0xC2,
+    SmbComGetPrintQueue         = 0xC3, // Obsolated
+    SmbComReadBulk              = 0xD8, // Obsolated
+    SmbComWriteBulk             = 0xD9, // Obsolated
+    SmbComWriteBulkData         = 0xDA, // Obsolated
+    SmbComInvalid               = 0xFE, // Obsolated
+    SmbComNOAndxCommand         = 0xFF // Obsolated
+};
+
+string GetSMBCommandNameWithoutSpace(UCHAR command)
+{
+    switch (command)
+    {
+        case 0x00 => return "CreateDirectory";
+        case 0x01 => return "DeleteDirectory";
+        case 0x02 => return "Open";
+        case 0x03 => return "Create";
+        case 0x04 => return "Close";
+        case 0x05 => return "Flush";
+        case 0x06 => return "Delete";
+        case 0x07 => return "Rename";
+        case 0x08 => return "QueryInformation";
+        case 0x09 => return "SetInformation";
+        case 0x0A => return "Read";
+        case 0x0B => return "Write";
+        case 0x0C => return "LockByteRange";
+        case 0x0D => return "UnlockByteRange";
+        case 0x0E => return "CreateTemporary";
+        case 0x0F => return "Create New";
+        case 0x10 => return "CheckDirectory";
+        case 0x11 => return "ProcessExit";
+        case 0x12 => return "Seek";
+        case 0x13 => return "LockAndRead";
+        case 0x14 => return "WriteAndUnlock";
+        case 0x1A => return "ReadRaw";
+        case 0x1B => return "ReadMpx";
+        case 0x1C => return "ReadMpxSecondary";
+        case 0x1D => return "WriteRaw";
+        case 0x1E => return "WriteMpx";
+        case 0x1F => return "WriteMpxSecondary"; // Obsolated
+        case 0x20 => return "WriteComplete"; // Obsolated
+        case 0x21 => return "QueryServer"; // Obsolated
+        case 0x22 => return "SetInformation2";
+        case 0x23 => return "QueryInformation2";
+        case 0x24 => return "LockingAndx";
+        case 0x25 => return "Transaction";
+        case 0x26 => return "TransactionSecondary";
+        case 0x27 => return "Ioctl";
+        case 0x28 => return "IoctlSecondary"; // Obsolated
+        case 0x29 => return "Copy"; // Obsolated
+        case 0x2A => return "Move"; // Obsolated
+        case 0x2B => return "Echo";
+        case 0x2C => return "WriteAndClose";
+        case 0x2D => return "OpenAndx";
+        case 0x2E => return "ReadAndx";
+        case 0x2F => return "WriteAndx";
+        case 0x30 => return "NewFileSize"; // Obsolated
+        case 0x31 => return "CloseAndTreeDisc"; // Obsolated
+        case 0x32 => return "Transaction2";
+        case 0x33 => return "Transaction2 Secondary";
+        case 0x34 => return "FindClose2";
+        case 0x35 => return "FindNotifyClose"; // Obsolated
+        case 0x70 => return "TreeConnect";
+        case 0x71 => return "TreeDisconnect";
+        case 0x72 => return "Negotiate";
+        case 0x73 => return "SessionSetupAndx";
+        case 0x74 => return "LogoffAndx";
+        case 0x75 => return "TreeConnectAndx";
+        case 0x7E => return "SecurityPackageAndx"; // Obsolated
+        case 0x80 => return "QueryInformationDisk";
+        case 0x81 => return "Search";
+        case 0x82 => return "Find";
+        case 0x83 => return "FindUnique";
+        case 0x84 => return "FindClose";
+        case 0xA0 => return "NTTransact";
+        case 0xA1 => return "NTTransactSecondary";
+        case 0xA2 => return "NTCreate Andx";
+        case 0xA4 => return "NTCancel";
+        case 0xA5 => return "NTRename";
+        case 0xC0 => return "OpenPrintFile";
+        case 0xC1 => return "WritePrintFile";
+        case 0xC2 => return "ClosePrintFile";
+        case 0xC3 => return "GetPrintQueue"; // Obsolated
+        case 0xD8 => return "ReadBulk"; // Obsolated
+        case 0xD9 => return "WriteBulk"; // Obsolated
+        case 0xDA => return "WriteBulk Data"; // Obsolated
+        case 0xFE => return "Invalid"; // Obsolated
+        case 0xFF => return "NOAndxCommand"; // Obsolated
+        default => return "Unknown command: " + Utility.DecToHexFormat(command);
+    }
+}
+
+string SmbStatusValuesToText(ERREF.NTSTATUS code)
+{
+    if (code.Value in SmbNtStatusMap)
+    {
+        return SmbNtStatusMap[code.Value];
+    }
+    else
+    {
+        return NtStatusValuesToText(code.Value);
+    }
+}
+
+// 2.2.2.4   SMB Error Classes and Codes
+map<uint, string> SmbNtStatusMap =
+{
+    0x00000000 -> "STATUS_SUCCESS",
+    0x00010002 -> "STATUS_INVALID_SMB",
+    0x00050002 -> "STATUS_SMB_BAD_TID",
+    0x00160002 -> "STATUS_SMB_BAD_COMMAND",
+    0x005B0002 -> "STATUS_SMB_BAD_UID",
+    0x00FB0002 -> "STATUS_SMB_USE_STANDARD",
+    0x80000005 -> "STATUS_BUFFER_OVERFLOW",
+    0x80000006 -> "STATUS_NO_MORE_FILES",
+    0x8000002D -> "STATUS_STOPPED_ON_SYMLINK",
+    0xC0000002 -> "STATUS_NOT_IMPLEMENTED",
+    0xC000000D -> "STATUS_INVALID_PARAMETER",
+    0xC000000E -> "STATUS_NO_SUCH_DEVICE",
+    0xC0000010 -> "STATUS_INVALID_DEVICE_REQUEST",
+    0xC0000016 -> "STATUS_MORE_PROCESSING_REQUIRED",
+    0xC0000022 -> "STATUS_ACCESS_DENIED",
+    0xC0000023 -> "STATUS_BUFFER_TOO_SMALL",
+    0xC0000034 -> "STATUS_OBJECT_NAME_NOT_FOUND",
+    0xC0000035 -> "STATUS_OBJECT_NAME_COLLISION",
+    0xC000003A -> "STATUS_OBJECT_PATH_NOT_FOUND",
+    0xC00000A5 -> "STATUS_BAD_IMPERSONATION_LEVEL",
+    0xC00000B5 -> "STATUS_IO_TIMEOUT",
+    0xC00000BA -> "STATUS_FILE_IS_A_DIRECTORY",
+    0xC00000BB -> "STATUS_NOT_SUPPORTED",
+    0xC00000C9 -> "STATUS_NETWORK_NAME_DELETED",
+    0xC0000203 -> "STATUS_USER_SESSION_DELETED",
+    0xC000035C -> "STATUS_NETWORK_SESSION_EXPIRED",
+    0xC000205A -> "STATUS_SMB_TOO_MANY_UIDS",
+    0xC0000002 -> "STATUS_NOT_IMPLEMENTED",
+    0xC00000AF -> "STATUS_ILLEGAL_FUNCTION",
+    0xC000000F -> "STATUS_NO_SUCH_FILE",
+    0xC0000039 -> "STATUS_OBJECT_PATH_INVALID",
+    0xC000003B -> "STATUS_OBJECT_PATH_SYNTAX_BAD",
+    0xC000009B -> "STATUS_DFS_EXIT_PATH_FOUND",
+    0xC00000FB -> "STATUS_REDIRECTOR_NOT_STARTED",
+    0xC000011F -> "STATUS_TOO_MANY_OPENED_FILES",
+    0xC000001E -> "STATUS_INVALID_LOCK_SEQUENCE",
+    0xC000001F -> "STATUS_INVALID_VIEW_SIZE",
+    0xC0000021 -> "STATUS_ALREADY_COMMITTED",
+    0xC0000041 -> "STATUS_PORT_CONNECTION_REFUSED",
+    0xC000004B -> "STATUS_THREAD_IS_TERMINATING",
+    0xC0000056 -> "STATUS_DELETE_PENDING",
+    0xC0000061 -> "STATUS_PRIVILEGE_NOT_HELD",
+    0xC000006D -> "STATUS_LOGON_FAILURE",
+    0xC00000D5 -> "STATUS_FILE_RENAMED",
+    0xC000010A -> "STATUS_PROCESS_IS_TERMINATING",
+    0xC0000101 -> "STATUS_DIRECTORY_NOT_EMPTY",
+    0xC0000121 -> "STATUS_CANNOT_DELETE",
+    0xC0000123 -> "STATUS_FILE_DELETED",
+    0x00060001 -> "STATUS_SMB_BAD_FID",
+    0xC0000008 -> "STATUS_INVALID_HANDLE",
+    0xC0000024 -> "STATUS_OBJECT_TYPE_MISMATCH",
+    0xC0000037 -> "STATUS_PORT_DISCONNECTED",
+    0xC0000042 -> "STATUS_INVALID_PORT_HANDLE",
+    0xC0000128 -> "STATUS_FILE_CLOSED",
+    0xC0000235 -> "STATUS_HANDLE_NOT_CLOSABLE",
+    0xC0000040 -> "STATUS_SECTION_TOO_BIG",
+    0xC0000097 -> "STATUS_TOO_MANY_PAGING_FILES",
+    0xC0000205 -> "STATUS_INSUFF_SERVER_RESOURCES",
+    0x000C0001 -> "STATUS_OS2_INVALID_ACCESS",
+    0xC0000022 -> "STATUS_ACCESS_DENIED",
+    0xC000009C -> "STATUS_DATA_ERROR",
+    0xC00000D4 -> "STATUS_NOT_SAME_DEVICE",
+    0x80000006 -> "STATUS_NO_MORE_FILES",
+    0xC0000001 -> "STATUS_UNSUCCESSFUL",
+    0xC0000043 -> "STATUS_SHARING_VIOLATION",
+    0xC0000054 -> "STATUS_FILE_LOCK_CONFLICT",
+    0xC0000055 -> "STATUS_LOCK_NOT_GRANTED",
+    0xC0000011 -> "STATUS_END_OF_FILE",
+    0XC00000BB -> "STATUS_NOT_SUPPORTED",
+    0xC0000035 -> "STATUS_OBJECT_NAME_COLLISION",
+    0xC000000D -> "STATUS_INVALID_PARAMETER",
+    0x007C0001 -> "STATUS_OS2_INVALID_LEVEL",
+    0x00830001 -> "STATUS_OS2_NEGATIVE_SEEK",
+    0xC000007E -> "STATUS_RANGE_NOT_LOCKED",
+    0x00710001 -> "STATUS_OS2_NO_MORE_SIDS",
+    0x00AD0001 -> "STATUS_OS2_CANCEL_VIOLATION",
+    0x00AE0001 -> "STATUS_OS2_ATOMIC_LOCKS_NOT_SUPPORTED",
+    0xC0000003 -> "STATUS_INVALID_INFO_CLASS",
+    0xC00000AD -> "STATUS_INVALID_PIPE_STATE",
+    0xC00000B4 -> "STATUS_INVALID_READ_MODE",
+    0x010A0001 -> "STATUS_OS2_CANNOT_COPY",
+    0xC00000AB -> "STATUS_INSTANCE_NOT_AVAILABLE",
+    0xC00000AC -> "STATUS_PIPE_NOT_AVAILABLE",
+    0xC00000AE -> "STATUS_PIPE_BUSY",
+    0xC00000B1 -> "STATUS_PIPE_CLOSING",
+    0xC00000D9 -> "STATUS_PIPE_EMPTY",
+    0xC00000B0 -> "STATUS_PIPE_DISCONNECTED",
+    0x80000005 -> "STATUS_BUFFER_OVERFLOW",
+    0xC0000016 -> "STATUS_MORE_PROCESSING_REQUIRED",
+    0xC0000050 -> "STATUS_EA_TOO_LARGE",
+    0x01130001 -> "STATUS_OS2_EAS_DIDNT_FIT",
+    0xC000004F -> "STATUS_EAS_NOT_SUPPORTED",
+    0x03E20001 -> "STATUS_OS2_EA_ACCESS_DENIED",
+    0x0000010C -> "STATUS_NOTIFY_ENUM_DIR",
+    0x00010002 -> "STATUS_INVALID_SMB",
+    0xC000006A -> "STATUS_WRONG_PASSWORD",
+    0xC0000257 -> "STATUS_PATH_NOT_COVERED",
+    0xC00000CA -> "STATUS_NETWORK_ACCESS_DENIED",
+    0xC00000C9 -> "STATUS_NETWORK_NAME_DELETED",
+    0x00050002 -> "STATUS_SMB_BAD_TID",
+    0xC00000CC -> "STATUS_BAD_NETWORK_NAME",
+    0xC00000CB -> "STATUS_BAD_DEVICE_TYPE",
+    0x00160002 -> "STATUS_SMB_BAD_COMMAND",
+    0xC00000C6 -> "STATUS_PRINT_QUEUE_FULL",
+    0xC00000C7 -> "STATUS_NO_SPOOL_SPACE",
+    0xC00000C8 -> "STATUS_PRINT_CANCELLED",
+    0xC0000002 -> "STATUS_NOT_IMPLEMENTED",
+    0xC00000C4 -> "STATUS_UNEXPECTED_NETWORK_ERROR",
+    0xC00000B5 -> "STATUS_IO_TIMEOUT",
+    0xC00000D0 -> "STATUS_REQUEST_NOT_ACCEPTED",
+    0xC00000CE -> "STATUS_TOO_MANY_SESSIONS",
+    0x005B0002 -> "STATUS_SMB_BAD_UID",
+    0x00FA0002 -> "STATUS_SMB_USE_MPX",
+    0x00FB0002 -> "STATUS_SMB_USE_STANDARD",
+    0x00FC0002 -> "STATUS_SMB_CONTINUE_MPX",
+    0xC0000072 -> "STATUS_ACCOUNT_DISABLED",
+    0xC0000193 -> "STATUS_ACCOUNT_EXPIRED",
+    0xC0000070 -> "STATUS_INVALID_WORKSTATION",
+    0xC000006F -> "STATUS_INVALID_LOGON_HOURS",
+    0xC0000071 -> "STATUS_PASSWORD_EXPIRED",
+    0xC0000224 -> "STATUS_PASSWORD_MUST_CHANGE",
+    0XFFFF0002 -> "STATUS_SMB_NO_SUPPORT",
+    0xC00000A2 -> "STATUS_MEDIA_WRITE_PROTECTED",
+    0xC0000013 -> "STATUS_NO_MEDIA_IN_DEVICE",
+    0xC0000184 -> "STATUS_INVALID_DEVICE_STATE",
+    0xC000003E -> "STATUS_DATA_ERROR",
+    0xC000003F -> "STATUS_CRC_ERROR",
+    0xC0000032 -> "STATUS_DISK_CORRUPT_ERROR",
+    0xC0000015 -> "STATUS_NONEXISTENT_SECTOR",
+    0x8000000E -> "STATUS_DEVICE_PAPER_EMPTY",
+    0xC0000043 -> "STATUS_SHARING_VIOLATION",
+    0xC0000054 -> "STATUS_FILE_LOCK_CONFLICT",
+    0xC0000012 -> "STATUS_WRONG_VOLUME",
+    0xC000007F -> "STATUS_DISK_FULL"
+};
+
+string GetTransactionSubcommandName(UCHAR setupCount, USHORT subcommand)
+{
+    if (setupCount <= 2)
+    {
+        switch (subcommand)
+        {
+            case 0x01 => return "Named Pipe, Set named pipe state";
+            case 0x11 => return "Named Pipe, Raw read named pipe";
+            case 0x21 => return "Named Pipe, Query named pipe state";
+            case 0x22 => return "Named Pipe, Query named pipe info";
+            case 0x23 => return "Named Pipe, peek named pipe";
+            case 0x26 => return "Named Pipe, Transact named pipe";
+            case 0x31 => return "Named Pipe, Raw write named pipe";
+            case 0x36 => return "Named Pipe, Read named pipe";
+            case 0x37 => return "Named Pipe, Write named pipe";
+            case 0x53 => return "Named Pipe, Wait named pipe";
+            case 0x54 => return "Named Pipe, Call named pipe";
+            default   => return "Named Pipe, Unknown subcommand";
+        }
+    }
+    else if (setupCount > 2)
+    {
+        switch (subcommand)
+        {
+            case 0x01 => return "Mail slot, Mail slot write";
+            default   => return "Mail slot, Unknown subcommand";
+        }
+    }
+    else
+    {
+        return "";
+    }
+}
+
+type SmbString[bool IsFlags2Unicode]
+{
+    string Value with BinaryEncoding{TextEncoding = (IsFlags2Unicode ? TextEncoding.UTF16 : TextEncoding.ASCII)};
+}
+
+pattern SmbHeaderFlags = flags byte
+{
+    SmbFlagsLockAndReadOk      = 0x01,
+    SmbFlagsBufAvail           = 0x02,
+    Reserved                   = 0x04,
+    SmbFlagsCaseInsensitive    = 0x08,
+    SmbFlagsCanonicalizedPaths = 0x10,
+    SmbFlagsOplock             = 0x20,
+    SmbFlagsOpbatch            = 0x40,
+    SMBFlagsReply              = 0x80,
+    ...
+};
+
+pattern SmbHeaderFlags2 = flags ushort
+{
+    SmbFlags2LongNames                 = 0x0001,
+    SmbFlags2Eas                       = 0x0002,
+    SmbFlags2SmbSecuritySignature      = 0x0004,
+    SmbFlags2Compressed                = 0x0008,
+    SmbFlags2SecuritySignatureRequired = 0x0010,
+    Reserved                           = 0x0020,
+    SmbFlags2IsLong_Name               = 0x0040,
+    Reserved2                          = 0x0380,
+    SmbFlags2ReparsePath               = 0x0400,
+    SmbFlags2ExtendedSecurity          = 0x0800,
+    SmbFlags2Dfs                       = 0x1000,
+    SmbFlags2PagingIO                  = 0x2000,
+    SmbFlags2NTStatus                  = 0x4000,
+    SmbFlags2Unicode                   = 0x8000,
+    ...
+};
+
+type SmbHeaderSecurityfeatures
+{
+    binary SecuritySignature with BinaryEncoding{Length = 8};
+}
+
+// 2.2.4.3   SMB_COM_OPEN (0x02)
+type SmbComOpenRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x02;
+    USHORT AccessMode;
+    ushort SearchAttributes;
+    USHORT ByteCount where value >= 0x0002;
+    byte BufferFormat where value == 0x04;
+    SmbString[IsFlags2Unicode] FileName;
+}
+
+type SmbComOpenResponse
+{
+    UCHAR WordCount where value == 0x0007;
+    USHORT Fid;
+    ushort FileAttrs;
+    uint LastModified;
+    ULONG FileSize;
+    USHORT AccessMode;
+    USHORT ByteCount where value == 0x0000;
+} 
+
+// 2.2.4.4   SMB_COM_CREATE (0x03)
+type SmbComCreateRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x03;
+    ushort FileAttributes;
+    uint CreationTime;
+    USHORT ByteCount where value >= 0x0002;
+    byte BufferFormat where value == 0x04;
+    SmbString[IsFlags2Unicode] FileName;
+};
+
+// 2.2.4.4   SMB_COM_CREATE (0x03)
+type SmbComCreateResponse
+{
+    UCHAR WordCount where value == 0x01;
+    USHORT Fid;
+    USHORT ByteCount where value == 0x0000;
+}
+
+// 2.2.4.5   SMB_COM_CLOSE (0x04)
+type SmbComCloseRequest
+{
+    UCHAR WordCount where value == 0x03;
+    USHORT Fid;
+    uint LastTimeModified;
+    USHORT ByteCount where value == 0x0000;
+}
+
+// 2.2.4.5   SMB_COM_CLOSE (0x04)
+type SmbComCloseResponse
+{
+    UCHAR WordCount where value == 0x00;
+    USHORT ByteCount where value == 0x00;
+}
+
+// 2.2.4.11   SMB_COM_READ (0x0A)
+type SmbComReadRequest
+{
+    UCHAR WordCount where value == 0x05;
+    USHORT Fid;
+    USHORT CountOfBytesToRead;
+    ULONG ReadOffsetInBytes;
+    USHORT EstimateOfRemainingBytesToBeRead;
+    USHORT ByteCount where value == 0x0000;
+}
+
+// 2.2.4.11   SMB_COM_READ (0x0A)
+type SmbComReadResponse
+{
+    UCHAR WordCount where value == 0x05;
+    USHORT CountOfBytesReturned;
+    binary Reserved where value == $[0000000000000000] with BinaryEncoding{Length = 8};
+    USHORT ByteCount where value >= 0x0003;
+    UCHAR BufferFormat where value == 0x01;
+    USHORT CountOfBytesRead;
+    binary Bytes with BinaryEncoding{Length = CountOfBytesRead};
+}
+
+// 2.2.4.15   SMB_COM_CREATE_TEMPORARY (0x0E)
+type SmbComCreateTemporaryRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x03;
+    ushort FileAttributes;
+    uint CreationTime;
+    USHORT ByteCount where value >= 0x0002;
+    byte BufferFormat where value == 0x04;
+    SmbString[IsFlags2Unicode] DirectoryName;
+}
+
+// 2.2.4.15   SMB_COM_CREATE_TEMPORARY (0x0E)
+type SmbComCreateTemporaryResponse[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x01;
+    USHORT Fid;
+    USHORT ByteCount where value >= 0x0002;
+    string TemporaryFileName;
+}
+
+// 2.2.4.16   SMB_COM_CREATE_NEW (0x0F)
+type SmbComCreateNewRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x03;
+    ushort FileAttributes;
+    uint CreationTime;
+    USHORT ByteCount where value >= 0x0002;
+    byte BufferFormat where value == 0x04;
+    SmbString[IsFlags2Unicode] FileName;
+}
+
+// 2.2.4.16   SMB_COM_CREATE_NEW (0x0F)
+type SmbComCreateNewResponse
+{
+    UCHAR WordCount where value == 0x01;
+    USHORT Fid;
+    USHORT ByteCount where value == 0x0000;
+}
+
+// 2.2.4.33   SMB_COM_TRANSACTION (0x25)
+type SmbComTransactionRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount;
+    USHORT TotalParameterCount;
+    USHORT TotalDataCount;
+    USHORT MaxParameterCount;
+    USHORT MaxDataCount;
+    UCHAR MaxSetupCount;
+    UCHAR Reserved1;
+    SmbComTransactionRequestParametersWordsFlags Flags;
+    ULONG Timeout;
+    USHORT Reserved2;
+    USHORT ParameterCount;
+    USHORT ParameterOffset;
+    USHORT DataCount;
+    USHORT DataOffset;
+    UCHAR SetupCount;
+    UCHAR Reserved3;
+    optional [|SetupCount > 0|] USHORT Subcommand;
+    optional [|SetupCount > 1 && (Subcommand as USHORT) in {0x01, 0x11, 0x21, 0x22, 0x23, 0x26, 0x31, 0x36, 0x37}|] USHORT Fid;
+    optional [|SetupCount > 1 && (Subcommand as USHORT) in {0x53, 0x54}|] USHORT Priority;
+    optional [|SetupCount > 2|] array<USHORT> Setup with BinaryEncoding{Length = (SetupCount - 2)};
+    USHORT ByteCount;
+    optional [|ByteCount > 0 && IsFlags2Unicode|] UCHAR Pad;
+    optional [|ByteCount > 0|] SmbString[IsFlags2Unicode] Name;
+    optional binary Pad1 with Encoding{Ignore = true};
+    optional (TransactionSubCommandsRequestParameters | Blob) TransParameters with Encoding{Ignore = true};
+    optional binary Pad2 with Encoding{Ignore = true};
+    optional binary TransData with Encoding{Ignore = true};
+}
+
+// 2.2.4.33   SMB_COM_TRANSACTION (0x25)
+type SmbComTransactionResponse[bool IsFlags2Unicode, optional ushort Subcommand]
+{
+    UCHAR WordCount;
+    USHORT TotalParameterCount;
+    USHORT TotalDataCount;
+    USHORT Reserved1;
+    USHORT ParameterCount;
+    USHORT ParameterOffset;
+    USHORT ParameterDisplacement;
+    USHORT DataCount;
+    USHORT DataOffset;
+    USHORT DataDisplacement;
+    UCHAR SetupCount;
+    UCHAR Reserved2;
+    USHORT ByteCount;
+    optional [|ParameterOffset > 35 + WordCount * 2|] binary Pad1 with BinaryEncoding{Length = (ParameterOffset - 32 - WordCount * 2 - 3)};
+    optional [|ParameterCount > 0|] ([|TotalParameterCount == ParameterCount && Subcommand != nothing && (Subcommand as ushort) == 0x21|] TransQueryNmpipeStateResponseTransParameters // 0x21
+            | [|TotalParameterCount == ParameterCount && Subcommand != nothing && (Subcommand as ushort) == 0x23|] TransPeekNmpipeResponseTransParameters // 0x23
+            | [|TotalParameterCount == ParameterCount && Subcommand != nothing && (Subcommand as ushort) == 0x31|] TransRawWriteNmpipeResponseTransParameters // 0x31
+            | [|TotalParameterCount == ParameterCount && Subcommand != nothing && (Subcommand as ushort) == 0x37|] TransWriteNmpipeResponseTransParameters // 0x37
+            | [|DataOffset != ParameterOffset|] Blob[ParameterCount as uint]) TransParameters;
+    optional [|ParameterOffset > 0 ? DataOffset > ParameterOffset + ParameterCount : DataOffset > 35 + WordCount * 2|] binary Pad2 
+        with BinaryEncoding{Length = (ParameterOffset > 0 ? DataOffset - ParameterOffset - ParameterCount : DataOffset - 35 - WordCount * 2)};
+    optional [|DataCount > 0|] ([|TotalDataCount == DataCount && Subcommand != nothing && (Subcommand as ushort) == 0x21|] SmbNMPipeStatus // 0x21
+            | [|TotalDataCount == DataCount && Subcommand != nothing && (Subcommand as ushort) == 0x22|] TransQueryNmpipeInfoResponse[IsFlags2Unicode]
+            | binary) TransData;
+}
+
+pattern SmbComTransactionRequestParametersWordsFlags = flags USHORT
+{
+    DisconnectTid = 0x0001,
+    NOResponse    = 0x0002,
+    ...
+};
+
+// 2.2.1.3   Named Pipe Status (SMB_NMPIPE_STATUS)
+pattern SmbNMPipeStatus = flags USHORT
+{
+    ICount        = 0x00FF,
+    ReadMode      = 0x0300,
+    NamedPipeType = 0x0C00,
+    Reserved      = 0x3000,
+    Endpoint      = 0x4000,
+    Nonblocking   = 0x8000,
+    ...
+};
+
+// 2.2.4.41   SMB_COM_OPEN_ANDX (0x2D)
+type SmbComOpenAndxRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x0F;
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Flags;
+    USHORT AccessMode;
+    ushort SearchAttrs;
+    ushort FileAttrs;
+    uint CreationTime;
+    USHORT OpenMode;
+    ULONG AllocationSize;
+    ULONG Timeout;
+    ULONG Reserved where value == 0x00000000;
+    USHORT ByteCount where value >= 0x0002;
+    optional [|IsFlags2Unicode|] UCHAR Pad;
+    SmbString[IsFlags2Unicode] FileName;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.4.41   SMB_COM_OPEN_ANDX (0x2D)
+type SmbComOpenAndxResponse
+{
+    UCHAR WordCount where (value == 0x0F || value == 0x13);
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Fid;
+    USHORT FileAttrs;
+    uint LastWriteTime;
+    ULONG FileDataSize;
+    USHORT AccessRights;
+    USHORT ResourceType;
+    USHORT NmpipeStatus;
+    ULONG OpenResults;
+    ULONG ServerFid;
+    USHORT Reserved1 where value == 0x0000;
+    optional [|WordCount == 0x13|] FilePipePrinterAccessMask MaximalAccessRights;
+    optional [|WordCount == 0x13|] FilePipePrinterAccessMask GuestMaximalAccessRights;
+    USHORT ByteCount;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.4.43   SMB_COM_WRITE_ANDX (0x2F)
+type SmbComWriteAndxRequest
+{
+    UCHAR WordCount where (value == 0x0C || value == 0x0E);
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Fid;
+    ULONG Offset;
+    ULONG Timeout;
+    SmbComWriteAndxRequestParametersWordsWriteMode WriteMode;
+    USHORT Remaining;
+    USHORT DataLengthHigh;
+    USHORT DataLength;
+    USHORT DataOffset;
+    optional [|WordCount == 0x0E|] ULONG OffsetHigh;
+    USHORT ByteCount;
+    optional [|DataOffset > 35 + WordCount * 2|] binary Pad with BinaryEncoding{Length = (DataOffset - 35 - WordCount * 2)};
+    optional binary Data with Encoding{Ignore = true};
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+pattern SmbComWriteAndxRequestParametersWordsWriteMode = flags USHORT
+{
+    WritethroughMode   = 0x0001,
+    ReadBytesAvailable = 0x0002,
+    RawMode            = 0x0004,
+    MsgStart           = 0x0008,
+    ...
+};
+
+// 2.2.4.43   SMB_COM_WRITE_ANDX (0x2F)
+type SmbComWriteAndxResponse
+{
+    UCHAR WordCount where value == 0x06;
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Count;
+    USHORT Available;
+    USHORT CountHigh;
+    USHORT Reserved where value == 0x0000;
+    USHORT ByteCount where value == 0x0000;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.4.64   SMB_COM_NT_CREATE_ANDX (0xA2)
+type SmbComNTCreateAndxRequest[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x18;
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    UCHAR Reserved;
+    USHORT NameLength;
+    ULONG Flags;
+    ULONG RootDirectoryFid;
+    ULONG DesiredAccess;
+    long AllocationSize;
+    SMB_EXT_FILE_ATTR ExtFileAttributes;
+    ULONG ShareAccess;
+    ULONG CreateDisposition;
+    ULONG CreateOptions;
+    ULONG ImpersonationLevel;
+    UCHAR SecurityFlags;
+    USHORT ByteCount;
+    optional [|IsFlags2Unicode|] byte Pad;
+    SmbString[IsFlags2Unicode] FileName;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.4.64   SMB_COM_NT_CREATE_ANDX (0xA2)
+type SmbComNTCreateAndxResponse
+{
+    UCHAR WordCount where (value == 0x22 || value == 0x2A);
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    UCHAR OpLockLevel;
+    USHORT Fid;
+    ULONG CreateDisposition;
+    FILETIME CreateTime;
+    FILETIME LastAccessTime;
+    FILETIME LastWriteTime;
+    FILETIME LastChangeTime;
+    SMB_EXT_FILE_ATTR ExtFileAttributes;
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    USHORT ResourceType;
+    SmbNMPipeStatus NmpipeStatus;
+    UCHAR Directory;
+    optional [|WordCount == 0x2A|] guid VolumeGuid;
+    optional [|WordCount == 0x2A|] LARGE_INTEGER FileID;
+    optional [|WordCount == 0x2A|] ULONG MaximalAccessRights;
+    optional [|WordCount == 0x2A|] ULONG GuestMaximalAccessRights;
+    USHORT ByteCount;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.1.2.3 SMB_EXT_FILE_ATTR in [MS-CIFS]
+pattern SMB_EXT_FILE_ATTR = flags uint
+{
+    ATTR_READONLY =     0x00000001,
+    ATTR_HIDDEN =       0x00000002,
+    ATTR_SYSTEM =       0x00000004,
+    ATTR_DIRECTORY =    0x00000010,
+    ATTR_ARCHIVE =      0x00000020,
+    ATTR_NORMAL =       0x00000080,
+    ATTR_TEMPORARY =    0x00000100,
+    ATTR_COMPRESSED =   0x00000800,
+    POSIX_SEMANTICS =   0x01000000,
+    BACKUP_SEMANTICS =  0x02000000,
+    DELETE_ON_CLOSE =   0x04000000,
+    SEQUENTIAL_SCAN =   0x08000000,
+    RANDOM_ACCESS =     0x10000000,
+    NO_BUFFERING =      0x20000000,
+    WRITE_THROUGH =     0x80000000,
+    ...
+};
+
+// 2.2.5   Transaction Subcommands, no specified response.
+type TransactionSubCommandsRequestParameters[ushort Subcommand, ushort Length]
+{
+    ([|Subcommand == 0x0001|] TransSetNmpipeStateRequest
+        | [|Subcommand == 0x0022|] TransQueryNmpipeInfoRequest
+        | Blob[Length as uint]) SmbParameters;
+}
+
+// 2.2.5.1   TRANS_SET_NMPIPE_STATE (0x0001)
+type TransSetNmpipeStateRequest
+{
+    TransSetNmpipeStateRequestParametersPipeState PipeState;
+};
+
+pattern TransSetNmpipeStateRequestParametersPipeState = flags USHORT
+{
+    Reserved1   = 0x00FF,
+    ReadMode    = 0x0100,
+    Reserved2   = 0x7E00,
+    Nonblocking = 0x8000,
+    ...
+};
+
+// 2.2.5.3   TRANS_QUERY_NMPIPE_STATE (0x0021)
+type TransQueryNmpipeStateResponseTransParameters
+{
+    SmbNMPipeStatus NmpipeStatus;
+}
+
+// 2.2.5.4   TRANS_QUERY_NMPIPE_INFO (0x0022)
+type TransQueryNmpipeInfoRequest
+{
+    USHORT Level;
+}
+
+type TransQueryNmpipeInfoResponse[bool IsFlags2Unicode]
+{
+    USHORT OutputBufferSize;
+    USHORT InputBufferSize;
+    UCHAR MaximumInstances;
+    UCHAR CurrentInstances;
+    UCHAR PipeNameLength;
+    optional [|IsFlags2Unicode|] UCHAR Pad;
+    SmbString[IsFlags2Unicode] PipeName;
+}
+
+// 2.2.5.5   TRANS_PEEK_NMPIPE (0x0023)
+type TransPeekNmpipeResponseTransParameters
+{
+    USHORT ReadDataAvailable;
+    USHORT MessageBytesLength;
+    TransPeekNmpipeResponseTransParametersNamedPipeState NamedPipeState;
+}
+
+pattern TransPeekNmpipeResponseTransParametersNamedPipeState = enum USHORT
+{
+    Disconnected  = 0x0001,
+    Listening = 0x0002,
+    ConnectionOkey  = 0x0003,
+    Closed = 0x0004,
+    ...
+};
+
+// 2.2.5.7   TRANS_RAW_WRITE_NMPIPE (0x0031)
+type TransRawWriteNmpipeResponseTransParameters
+{
+    USHORT BytesWritten;
+}
+
+// 2.2.5.9   TRANS_WRITE_NMPIPE (0x0037)
+type TransWriteNmpipeResponseTransParameters
+{
+    USHORT BytesWritten;
+}
+
+// 2.2.4.42   SMB_COM_READ_ANDX (0x2E)
+type SmbComReadAndxRequest
+{
+    UCHAR WordCount where (value == 0x0a || value == 0x0c);
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Fid;
+    ULONG Offset;
+    USHORT MaxCountOfBytesToReturn;
+    USHORT MinCountOfBytesToReturn;
+    ULONG TimeoutOrMaxCountHigh;
+    USHORT Remaining;
+    optional [|WordCount == 0x0C|] ULONG OffsetHigh;
+    USHORT ByteCount where value == 0x0000;
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// 2.2.4.42   SMB_COM_READ_ANDX (0x2E)
+type SmbComReadAndxResponse[bool IsFlags2Unicode]
+{
+    UCHAR WordCount where value == 0x0C;
+    UCHAR AndXCommand;
+    UCHAR AndXReserved;
+    USHORT AndXOffset;
+    USHORT Available;
+    USHORT DataCompactionMode;
+    USHORT Reserved1 where value == 0x0000;
+    USHORT DataLength;
+    USHORT DataOffset;
+    USHORT DataLengthHigh;
+    binary Reserved2 with BinaryEncoding{Length = 8};
+    USHORT ByteCount where value >= 0x0000;
+    optional [|DataOffset > 59|] binary Pad with BinaryEncoding{Length = (DataOffset - 59)};
+    optional binary Data with Encoding{Ignore = true};
+    optional binary AndXPadding with Encoding{Ignore = true};
+}
+
+// Stor File Id for SMB/SMB2 named pipe message.
+annotation ulong SMBFileId;
+
+uint? IsSufficientForSingleMsg(binary data)
+{
+    // data.Count must greater than 4 since it's passed the check of IsSMBOverTCP() to hit here.
+    uint streamProtocolLength= ((data[1] << 16) + (data[2] << 8) + data[3]) as uint; // big endian
+    uint msgLength= streamProtocolLength + 4;
+    return data.Count >= msgLength ? 0 : msgLength;
+}
+
+bool? IsSMBOverTCP(binary b)
+{
+    if (b.Count < 8)
+    {
+        return null;
+    }
+    return b[0] == 0 && b.Segment(5, 3) == $[534D42];
+}
+
+type SMBDecodingCache : TCPDecodingCache
+{
+    bool BeingDestructed = false;
+
+    override void DispatchIncompleteMessage(any message msg)
+    {
+        if (BeingDestructed)
+        {
+            DisplayTopLevelMessage(msg, Format(REASSEMBLY_INCOMPLETE_MESSAGE, ProtocolName));
+        }
+        else
+        {
+            ReportInsufficientData(msg, DiagnosisLevel.Warning, Format(REASSEMBLY_INCOMPLETE_MESSAGE, ProtocolName));
+            base.DispatchMessage(msg);
+        }
+    }
+
+    override void ClearInDestructor()
+    {
+        BeingDestructed = true;
+        base.ClearInDestructor();
+        BeingDestructed = false;
+    }
+}
+
+uint get PayloadLength(this TransportPacket s)
+{
+    return GetTCPPayloadsLength(s);
+}

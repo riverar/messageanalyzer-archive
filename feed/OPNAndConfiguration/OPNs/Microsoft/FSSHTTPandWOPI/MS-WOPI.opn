@@ -1,0 +1,999 @@
+protocol MSWOPI with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Web Application Open Platform Interface Protocol ",
+    ShortName = "MS-WOPI",
+    DocumentName = "MS-WOPI",
+    ProtocolType = "XML",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2014 Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-WOPI", Version = "2.1"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="10/01/2013"},
+            new Revision{Class=RevisionClass.Major, Version="1.1.0", Date="11/05/2014"},
+        ]
+};
+
+using Diagnostics;
+using HTTP;
+using SOAP;
+using Utility;
+using MSFSSHTTP;
+using MSFSSHTTPB;
+using FileSyncBasicType;
+
+annotation string WOPIContract.Request#OperationName;
+annotation string WOPIContract.Response#OperationName;
+
+endpoint Server over SOAP.Server | over HTTP.Server
+accepts WOPIContract.Request issues WOPIContract.Response;
+client endpoint Client connected to Server;
+
+autostart actor ActorOverSoapServer(SOAP.Server node)
+{
+    string opName = "";
+   
+    process node accepts soapMsg:SoapMessage where soapMsg.Origins[0] is httpReq:HttpContract.Request && IsWOPIUri(httpReq.Uri)
+    {
+        opName = GetWOPIOperationName(httpReq);
+        WOPIContract.Request msg = WOPIRequestDecoder(httpReq.Payload as binary, opName);
+        msg#OperationName = opName;
+        msg.URI = httpReq.Uri.ToString();
+        msg.Headers = httpReq.Headers;
+        
+        dispatch (endpoint Server over node) accepts msg;
+    }
+
+    process node issues soapMsg:SoapMessage where soapMsg.Origins[0] is httpRes:HttpContract.Response && IsWOPIUri(httpRes#Uri)
+    {
+        // WOKRAROUND for httpRequest -> soapResponse scenario
+        if (opName == "")
+        {
+            opName = "X-WOPI-RelativeUrl" in httpRes.Headers ? WOPIOperations.CellStorageRelativeRequest : WOPIOperations.CellStorageRequest;
+        }
+        
+        WOPIContract.Response msg = WOPIResponseDecoder(httpRes.Payload as binary, opName);
+        msg#OperationName = opName;
+        msg.Headers = httpRes.Headers;
+        msg.StatusCode = httpRes.StatusCode;
+        
+        dispatch (endpoint Server over node) issues msg;
+        opName = "";
+    }
+}
+
+autostart actor ActorOverHttpServer(HTTP.Server node)
+{
+    string opName = "";
+    
+    process node accepts httpReq:HttpContract.Request where IsWOPIUri(httpReq.Uri)
+    {
+        opName = GetWOPIOperationName(httpReq);
+        
+        WOPIContract.Request msg = WOPIRequestDecoder(httpReq.Payload as binary, opName);
+        msg#OperationName = opName;
+        msg.URI = httpReq.Uri.ToString();
+        msg.Headers = httpReq.Headers;
+
+        dispatch (endpoint Server over node) accepts msg;
+    }
+
+    process node issues httpRes:HttpContract.Response where IsWOPIUri(httpRes#Uri)
+    {
+        // WOKRAROUND for soapRequest -> httpResponse scenario
+        if (opName == "")
+        {
+            opName = "X-WOPI-RelativeUrl" in httpRes.Headers ? WOPIOperations.CellStorageRelativeRequest : WOPIOperations.CellStorageRequest;
+        }
+            
+        WOPIContract.Response msg = WOPIResponseDecoder(httpRes.Payload as binary, opName);
+        msg#OperationName = opName;
+        msg.Headers = httpRes.Headers;
+        msg.StatusCode = httpRes.StatusCode;
+        
+        dispatch (endpoint Server over node) issues msg;
+        opName = "";
+    }
+}
+
+contract WOPIContract
+{
+    message Request
+    {
+        optional RequestBodyBase Body with DisplayInfo{ToText = RequestBodyToText};
+        string URI with Encoding{Ignore = true};
+        HTTP.HttpHeadersType Headers with Encoding{Ignore = true};
+        
+        string RequestBodyToText(any data)
+        {
+            return "Request Body";
+        }
+        
+        override string ToString()
+        {
+            return (this#OperationName as string) + " Request";
+        }
+    }
+    
+    message Response
+    {
+        optional ResponseBodyBase Body with DisplayInfo{ToText = ResponseBodyToText};
+        uint StatusCode with Encoding{Ignore = true}, DisplayInfo{ToText = StatusCodeToText};
+        HTTP.HttpHeadersType Headers with Encoding{Ignore = true};
+
+        string ResponseBodyToText(any data)
+        {
+            return "Response Body";
+        }
+
+        string StatusCodeToText(any data)
+        {
+            uint status = data as uint;
+            string opName = this#OperationName as string;
+            
+            if (opName in WOPIResponseStatusMap
+                && status in WOPIResponseStatusMap[opName])
+            {
+                return WOPIResponseStatusMap[opName][status];
+            }
+            
+            return status as string;
+        }
+        
+        override string ToString()
+        {
+            return Format("{0} Response, Status: {1}", this#OperationName, StatusCodeToText(this.StatusCode));
+        }
+    }
+}
+
+WOPIContract.Request WOPIRequestDecoder(binary payload, string op)
+{
+    optional RequestBodyBase requestBody = nothing;
+    
+    if (payload != null && payload.Count > 0)
+    {
+        switch (op)
+        {
+            case WOPIOperations.Discovery => 
+                requestBody = DecodeBinaryMessage<DiscoveryRequestBody>(payload, "DiscoveryRequestBody");
+            case WOPIOperations.CheckFileInfo => 
+                requestBody = DecodeBinaryMessage<CheckFileInfoRequestBody>(payload, "CheckFileInfoRequestBody");
+            case WOPIOperations.PutRelativeFile =>
+                requestBody = DecodeBinaryMessage<PutRelativeFileRequestBody>(payload, "PutRelativeFileRequestBody");
+            case WOPIOperations.Lock =>
+                requestBody = DecodeBinaryMessage<LockRequestBody>(payload, "LockRequestBody");
+            case WOPIOperations.Unlock =>
+                requestBody = DecodeBinaryMessage<UnlockRequestBody>(payload, "UnlockRequestBody");
+            case WOPIOperations.RefreshLock =>
+                requestBody = DecodeBinaryMessage<RefreshLockRequestBody>(payload, "RefreshLockRequestBody");
+            case WOPIOperations.UnlockAndRelock =>
+                requestBody = DecodeBinaryMessage<UnlockAndRelockRequestBody>(payload, "UnlockAndRelockRequestBody");            
+            case WOPIOperations.CellStorageRequest =>
+                requestBody = ExecuteCellStorageRequestBody.Decode(payload);
+            case WOPIOperations.CellStorageRelativeRequest =>
+                requestBody = ExecuteCellStorageRelativeRequestBody.Decode(payload);
+            case WOPIOperations.DeleteFile =>
+                requestBody = DecodeBinaryMessage<DeleteFileRequestBody>(payload, "DeleteFileRequestBody");            
+            case WOPIOperations.ReadSecureStore =>
+                requestBody = DecodeBinaryMessage<ReadSecureStoreRequestBody>(payload, "ReadSecureStoreRequestBody");
+            case WOPIOperations.GetRestrictedLink =>
+                requestBody = DecodeBinaryMessage<GetRestrictedLinkRequestBody>(payload, "GetRestrictedLinkRequestBody");            
+            case WOPIOperations.RevokeRestrictedLink =>
+                requestBody = DecodeBinaryMessage<RevokeRestrictedLinkRequestBody>(payload, "RevokeRestrictedLinkRequestBody");            
+            case WOPIOperations.CheckFolderInfo =>
+                requestBody = DecodeBinaryMessage<CheckFolderInfoRequestBody>(payload, "CheckFolderInfoRequestBody");
+            case WOPIOperations.GetFile =>
+                requestBody = DecodeBinaryMessage<GetFileRequestBody>(payload, "GetFileRequestBody");
+            case WOPIOperations.PutFile =>
+                requestBody = DecodeBinaryMessage<PutFileRequestBody>(payload, "PutFileRequestBody");
+            case WOPIOperations.EnumerateChildren =>
+                requestBody = DecodeBinaryMessage<EnumerateChildrenRequestBody>(payload, "EnumerateChildrenRequestBody");            
+            default  =>
+                ThrowDecodingException("MSWOPI", "WOPI Request For " + op);
+        }
+    }
+    
+    return new WOPIContract.Request{Body = requestBody};
+}
+
+WOPIContract.Response WOPIResponseDecoder(binary payload, string op)
+{
+    optional ResponseBodyBase responseBody = nothing;
+    
+    if (payload != null && payload.Count > 0)
+    {
+        switch (op)
+        {
+            case WOPIOperations.Discovery => 
+                xml xmlBody = BuildXml(payload);
+                responseBody = new DiscoveryResponseBody{Body = xmlBody};
+            case WOPIOperations.CheckFileInfo => 
+                responseBody = DecodeJsonMessage<CheckFileInfoResponseBody>(payload, "CheckFileInfoResponseBody");
+            case WOPIOperations.PutRelativeFile =>
+                responseBody = DecodeJsonMessage<PutRelativeFileResponseBody>(payload, "PutRelativeFileResponseBody");
+            case WOPIOperations.Lock =>
+                responseBody = DecodeBinaryMessage<LockResponseBody>(payload, "LockResponseBody");
+            case WOPIOperations.Unlock =>
+                responseBody = DecodeBinaryMessage<UnlockResponseBody>(payload, "UnlockResponseBody");
+            case WOPIOperations.RefreshLock =>
+                responseBody = DecodeBinaryMessage<RefreshLockResponseBody>(payload, "RefreshLockResponseBody");
+            case WOPIOperations.UnlockAndRelock =>
+                responseBody = DecodeBinaryMessage<UnlockAndRelockResponseBody>(payload, "UnlockAndRelockResponseBody");            
+            case WOPIOperations.CellStorageRequest =>
+                responseBody = ExecuteCellStorageResponseBody.Decode(payload);
+            case WOPIOperations.CellStorageRelativeRequest =>
+                responseBody = ExecuteCellStorageRelativeResponseBody.Decode(payload);
+            case WOPIOperations.DeleteFile =>
+                responseBody = DecodeBinaryMessage<DeleteFileResponseBody>(payload, "DeleteFileResponseBody");            
+            case WOPIOperations.ReadSecureStore =>
+                responseBody = DecodeJsonMessage<ReadSecureStoreResponseBody>(payload, "ReadSecureStoreResponseBody");
+            case WOPIOperations.GetRestrictedLink =>
+                responseBody = DecodeBinaryMessage<GetRestrictedLinkResponseBody>(payload, "GetRestrictedLinkResponseBody");            
+            case WOPIOperations.RevokeRestrictedLink =>
+                responseBody = DecodeBinaryMessage<RevokeRestrictedLinkResponseBody>(payload, "RevokeRestrictedLinkResponseBody");            
+            case WOPIOperations.CheckFolderInfo =>
+                responseBody = DecodeJsonMessage<CheckFolderInfoResponseBody>(payload, "CheckFolderInfoResponseBody");
+            case WOPIOperations.GetFile =>
+                responseBody = DecodeBinaryMessage<GetFileResponseBody>(payload, "GetFileResponseBody");
+            case WOPIOperations.PutFile =>
+                responseBody = DecodeBinaryMessage<PutFileResponseBody>(payload, "PutFileResponseBody");
+            case WOPIOperations.EnumerateChildren =>
+                responseBody = DecodeJsonMessage<EnumerateChildrenResponseBody>(payload, "EnumerateChildrenResponseBody");            
+            default  =>
+                ThrowDecodingException("MSWOPI", "WOPI Response For " + op);
+        }
+    }
+    
+    return new WOPIContract.Response{Body = responseBody};
+}
+
+optional T DecodeJsonMessage<T>(binary s, string messageContext)
+{
+    switch (s)
+    {
+        case result:T from JsonDecoder<T> =>
+            return result;
+        default => ThrowDecodingException("MSWOPI", messageContext);
+    }
+    
+    return nothing;
+}
+
+optional T DecodeBinaryMessage<T>(binary s, string messageContext)
+{
+    switch (s)
+    {
+        case result:T from BinaryDecoder<T> =>
+            return result;
+        default => ThrowDecodingException("MSWOPI", messageContext);
+    }
+    
+    return nothing;
+}
+
+pattern WOPIOperations = enum string
+{
+    Discovery                  = "Discovery",
+    CheckFileInfo              = "CheckFileInfo",
+    PutRelativeFile            = "PutRelativeFile",
+    Lock                       = "Lock",
+    Unlock                     = "Unlock",
+    RefreshLock                = "RefreshLock",
+    UnlockAndRelock            = "UnlockAndRelock",
+    CellStorageRequest         = "ExecuteCellStorageRequest",
+    CellStorageRelativeRequest = "ExecuteCellStorageRelativeRequest",
+    DeleteFile                 = "DeleteFile",
+    ReadSecureStore            = "ReadSecureStore",
+    GetRestrictedLink          = "GetRestrictedLink", 
+    RevokeRestrictedLink       = "RevokeRestrictedLink",
+    CheckFolderInfo            = "CheckFolderInfo",
+    GetFile                    = "GetFile",
+    PutFile                    = "PutFile",
+    EnumerateChildren          = "EnumerateChildren",
+    Unknown                    = "Unknown"
+};
+
+pattern XWOPIOverrideValues = enum string
+{
+    PutRelativeFile      = "PUT_RELATIVE",
+    Unlock               = "UNLOCK",
+    RefreshLock          = "REFRESH_LOCK",
+    DeleteFile           = "DELETE",
+    ReadSecureStore      = "READ_SECURE_STORE",
+    GetRestrictedLink    = "GET_RESTRICTED_LINK",
+    RevokeRestrictedLink = "REVOKE_RESTRICTED_LINK",
+    PutFile              = "PUT",
+    Lock                 = "LOCK",  // Lock & UnlockAndRelock operation
+    CellStorageRequest   = "COBALT" // ExecuteCellStorageRequest & ExecuteCellStorageRelativeRequest operation
+};
+
+const map<uint, string> DiscoveryStatusMap =
+{
+    200 -> "Success"
+};
+
+const map<uint, string> CheckFileInfoStatusMap =
+{
+    200 -> "Success",
+    401 -> "Invalid Token",
+    404 -> "File unknown/User Unauthorized",
+    500 -> "Server error"
+};
+
+const map<uint, string> PutRelativeFileStatusMap =
+{
+    200 -> "Success",
+    400 -> "Specified name is illegal",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Target file already exists",
+    413 -> "File is too large. The maximum size is implementation-specific.",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> LockStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> UnlockStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> RefreshLockStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> UnlockAndRelockStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> ExecuteCellStorageRequestStatusMap = 
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> ExecuteCellStorageRelativeRequestStatusMap = 
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> DeleteFileStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> ReadSecureStoreStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> GetRestrictedLinkStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> RevokeRestrictedLinkStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> GetFileStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    412 -> "File is larger than X-WOPI-MaxExpectedSize",
+    500 -> "Server error"
+};
+
+const map<uint, string> PutFileStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    409 -> "Lock mismatch/Locked by another interface",
+    413 -> "File is too large. The maximum file size is implementation-specific",
+    500 -> "Server error",
+    501 -> "Unsupported"
+};
+
+const map<uint, string> EnumerateChildrenStatusMap =
+{
+    200 -> "Success",
+    401 -> "Token is invalid",
+    404 -> "File unknown/User unauthorized",
+    500 -> "Server error",
+    501 -> "Unsupported",
+};
+
+const map<string, map<uint, string>> WOPIResponseStatusMap = 
+{
+    WOPIOperations.Discovery                  -> DiscoveryStatusMap,
+    WOPIOperations.CheckFileInfo              -> CheckFileInfoStatusMap,
+    WOPIOperations.PutRelativeFile            -> PutRelativeFileStatusMap,
+    WOPIOperations.Lock                       -> LockStatusMap,
+    WOPIOperations.Unlock                     -> UnlockStatusMap,
+    WOPIOperations.RefreshLock                -> RefreshLockStatusMap,
+    WOPIOperations.UnlockAndRelock            -> UnlockAndRelockStatusMap,
+    WOPIOperations.CellStorageRequest         -> ExecuteCellStorageRequestStatusMap,
+    WOPIOperations.CellStorageRelativeRequest -> ExecuteCellStorageRelativeRequestStatusMap,
+    WOPIOperations.DeleteFile                 -> DeleteFileStatusMap,
+    WOPIOperations.ReadSecureStore            -> ReadSecureStoreStatusMap,
+    WOPIOperations.GetRestrictedLink          -> GetRestrictedLinkStatusMap,
+    WOPIOperations.RevokeRestrictedLink       -> RevokeRestrictedLinkStatusMap,
+    WOPIOperations.GetFile                    -> GetFileStatusMap,
+    WOPIOperations.PutFile                    -> PutFileStatusMap,
+    WOPIOperations.EnumerateChildren          -> EnumerateChildrenStatusMap
+};
+
+type RequestBodyBase
+{
+}
+
+type ResponseBodyBase
+{
+}
+
+type DiscoveryRequestBody : RequestBodyBase
+{
+}
+
+type DiscoveryResponseBody : ResponseBodyBase
+{
+    xml Body;
+}
+
+// Section 3.3.5.1.1   CheckFileInfo
+type CheckFileInfoRequestBody : RequestBodyBase
+{
+}
+
+type CheckFileInfoResponseBody : ResponseBodyBase
+{
+    optional bool AllowExternalMarketplace;
+    string BaseFileName;
+    optional string BreadcrumbBrandName;
+    optional string BreadcrumbBrandUrl;
+    optional string BreadcrumbDocName;
+    optional string BreadcrumbDocUrl;
+    optional string BreadcrumbFolderName;
+    optional string BreadcrumbFolderUrl;
+    optional string ClientUrl;
+    optional bool CloseButtonClosesWindow;
+    optional string CloseUrl;
+    optional bool DisableBrowserCachingOfUserContent;
+    optional bool DisablePrint;
+    optional bool DisableTranslation;
+    optional string DownloadUrl;
+    optional string FileSharingUrl;
+    optional string FileUrl;
+    optional string HostAuthenticationId;
+    optional string HostEditUrl;
+    optional string HostEmbeddedEditUrl;
+    optional string HostEmbeddedViewUrl;
+    optional string HostName;
+    optional string HostNotes;
+    optional string HostRestUrl;
+    optional string HostViewUrl;
+    optional string IrmPolicyDescription;
+    optional string IrmPolicyTitle;
+    string OwnerId;
+    optional string PresenceProvider;
+    optional string PresenceUserId;
+    optional string PrivacyUrl;
+    optional bool ProtectInClient;
+    optional bool ReadOnly;
+    optional bool RestrictedWebViewOnly;
+    optional string SHA256;
+    optional string SignoutUrl;
+    int Size;
+    optional bool SupportsCoauth;
+    optional bool SupportsCobalt;
+    optional bool SupportsFolders;
+    optional bool SupportsLocks;
+    optional bool SupportsScenarioLinks;
+    optional bool SupportsSecureStore;
+    optional bool SupportsUpdate;
+    optional string TenantId;
+    optional string TermsOfUseUrl;
+    optional string TimeZone;
+    optional bool UserCanAttend;
+    optional bool UserCanNotWriteRelative;
+    optional bool UserCanPresent;
+    optional bool UserCanWrite;
+    optional string UserFriendlyName;
+    optional string UserId;
+    string Version;
+    optional bool WebEditingDisabled;
+}
+
+// Section 3.3.5.1.2   PutRelativeFile
+type PutRelativeFileRequestBody : RequestBodyBase
+{
+    binary FileContent;
+}
+
+type PutRelativeFileResponseBody : ResponseBodyBase
+{
+    string Name;
+    string Url;
+    optional string HostViewUrl;
+    optional string HostEditUrl;
+}
+
+// Section 3.3.5.1.3   Lock
+type LockRequestBody : RequestBodyBase
+{
+}
+
+type LockResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.4   Unlock
+type UnlockRequestBody : RequestBodyBase
+{
+}
+
+type UnlockResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.5   RefreshLock
+type RefreshLockRequestBody : RequestBodyBase
+{
+}
+
+type RefreshLockResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.6   UnlockAndRelock
+type UnlockAndRelockRequestBody : RequestBodyBase
+{
+}
+
+type UnlockAndRelockResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.7   ExecuteCellStorageRequest
+type ExecuteCellStorageRequestBody : RequestBodyBase
+{
+    optional (MSFSSHTTP.RequestMessage | MSFSSHTTPB.RequestMessage) FileSyncRequest with DisplayInfo{ToText = FSSHTTPRequestToText};
+    
+    static ExecuteCellStorageRequestBody Decode(binary payload)
+    {
+        ExecuteCellStorageRequestBody obj = new ExecuteCellStorageRequestBody();
+        
+        if (payload == null || payload.Count == 0)
+            return obj;
+        
+        if (IsFSSHTTPBStart(payload)) 
+        {
+            obj.FileSyncRequest = BinaryDecoder<MSFSSHTTPB.RequestMessage>(payload);
+        }
+        else
+        {
+            xml soapBody = GetSoapBody(payload);
+            obj.FileSyncRequest = XmlDecoder<MSFSSHTTP.RequestMessage>(soapBody);
+        }
+
+        return obj;
+    }
+}
+
+type ExecuteCellStorageResponseBody : ResponseBodyBase
+{
+    optional (MSFSSHTTP.ResponseMessage | MSFSSHTTPB.ResponseMessage) FileSyncResponse with DisplayInfo{ToText = FSSHTTPResponseToText};
+    
+    static ExecuteCellStorageResponseBody Decode(binary payload)
+    {
+        ExecuteCellStorageResponseBody obj = new ExecuteCellStorageResponseBody();
+        
+        if (payload == null || payload.Count == 0)
+            return obj;
+        
+        if (IsFSSHTTPBStart(payload)) 
+        {
+            obj.FileSyncResponse = BinaryDecoder<MSFSSHTTPB.ResponseMessage>(payload);
+        }
+        else
+        {
+            xml soapBody = GetSoapBody(payload);
+            obj.FileSyncResponse = XmlDecoder<MSFSSHTTP.ResponseMessage>(soapBody);
+        }
+
+        return obj;
+    }
+}
+
+// Section 3.3.5.1.8   ExecuteCellStorageRelativeRequest
+type ExecuteCellStorageRelativeRequestBody : RequestBodyBase
+{
+    optional (MSFSSHTTP.RequestMessage | MSFSSHTTPB.RequestMessage) FileSyncRequest with DisplayInfo{ToText = FSSHTTPRequestToText};
+    
+    static ExecuteCellStorageRelativeRequestBody Decode(binary payload)
+    {
+        ExecuteCellStorageRelativeRequestBody obj = new ExecuteCellStorageRelativeRequestBody();
+        
+        if (payload == null || payload.Count == 0)
+            return obj;
+
+        if (IsFSSHTTPBStart(payload)) 
+        {
+            obj.FileSyncRequest = BinaryDecoder<MSFSSHTTPB.RequestMessage>(payload);
+        }
+        else
+        {
+            xml soapBody = GetSoapBody(payload);
+            obj.FileSyncRequest = XmlDecoder<MSFSSHTTP.RequestMessage>(soapBody);
+        }
+
+        return obj;
+    }
+}
+
+type ExecuteCellStorageRelativeResponseBody : ResponseBodyBase
+{
+    optional (MSFSSHTTP.ResponseMessage | MSFSSHTTPB.ResponseMessage) FileSyncResponse with DisplayInfo{ToText = FSSHTTPResponseToText};
+    
+    static ExecuteCellStorageRelativeResponseBody Decode(binary payload)
+    {
+        ExecuteCellStorageRelativeResponseBody obj = new ExecuteCellStorageRelativeResponseBody();
+        
+        if (payload == null || payload.Count == 0)
+            return obj;
+        
+        if (IsFSSHTTPBStart(payload)) 
+        {
+            obj.FileSyncResponse = BinaryDecoder<MSFSSHTTPB.ResponseMessage>(payload);
+        }
+        else
+        {
+            xml soapBody = GetSoapBody(payload);
+            obj.FileSyncResponse = XmlDecoder<MSFSSHTTP.ResponseMessage>(soapBody);
+        }
+
+        return obj;
+    }
+}
+
+// Section 3.3.5.1.9   DeleteFile
+type DeleteFileRequestBody : RequestBodyBase
+{
+}
+
+type DeleteFileResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.10   ReadSecureStore
+type ReadSecureStoreRequestBody : RequestBodyBase
+{
+}
+
+type ReadSecureStoreResponseBody : ResponseBodyBase
+{
+    string UserName;
+    string Password;
+    optional bool IsWindowsCredentials;
+    optional bool IsGroup;
+}
+
+// Section 3.3.5.1.11   GetRestrictedLink
+type GetRestrictedLinkRequestBody : RequestBodyBase
+{
+}
+
+type GetRestrictedLinkResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.1.12   RevokeRestrictedLink
+type RevokeRestrictedLinkRequestBody : RequestBodyBase
+{
+}
+
+type RevokeRestrictedLinkResponseBody : ResponseBodyBase
+{
+}
+
+// Section 3.3.5.2.1   CheckFolderInfo
+type CheckFolderInfoRequestBody : RequestBodyBase
+{
+}
+
+type CheckFolderInfoResponseBody : ResponseBodyBase
+{
+    string FolderName;
+    optional string BreadcrumbBrandIconUrl;
+    optional string BreadcrumbBrandName;
+    optional string BreadcrumbBrandUrl;
+    optional string BreadcrumbDocName;
+    optional string BreadcrumbDocUrl;
+    optional string BreadcrumbFolderName;
+    optional string BreadcrumbFolderUrl;
+    optional string ClientUrl;
+    optional bool CloseButtonClosesWindow;
+    optional string CloseUrl;
+    optional string FileSharingUrl;
+    optional string HostAuthenticationId;
+    optional string HostEditUrl;
+    optional string HostEmbeddedEditUrl;
+    optional string HostEmbeddedViewUrl;
+    optional string HostName;
+    optional string HostViewUrl;
+    string OwnerId;
+    optional string PresenceProvider;
+    optional string PresenceUserId;
+    optional string PrivacyUrl;
+    optional string SignoutUrl;
+    optional bool SupportsSecureStore;
+    optional string TenantId;
+    optional string TermsOfUseUrl;
+    optional bool UserCanWrite;
+    optional string UserFriendlyName;
+    optional string UserId;
+    optional bool WebEditingDisabled;
+}
+
+// Section 3.3.5.3.1   GetFile
+type GetFileRequestBody : RequestBodyBase
+{
+}
+
+type GetFileResponseBody : ResponseBodyBase
+{
+    binary FileContent;
+}
+
+// Section 3.3.5.3.2   PutFile
+type PutFileRequestBody : RequestBodyBase
+{
+    binary FileContent;
+}
+
+type PutFileResponseBody : ResponseBodyBase
+{
+    binary FileContent;
+}
+
+// Section 3.3.5.4.1   EnumerateChildren
+type EnumerateChildrenRequestBody : RequestBodyBase
+{
+}
+
+type EnumerateChildrenResponseBody : ResponseBodyBase
+{
+    array<ChildType> Children;
+}
+
+type ChildType
+{
+    string Name;
+    string Url;
+    string Version;
+}
+
+// ----------------- Utility functions ----------------
+string FSSHTTPRequestToText(any data)
+{
+    return "MSFSSHTTP Request Body";
+}
+
+string FSSHTTPResponseToText(any data)
+{
+    return "MSFSSHTTP Response Body";
+}
+
+xml GetSoapBody(binary payload)
+{
+    xml soapXmlValue = null;
+    binary xmlStart = $[3C];
+    binary xmlEnd   = $[3E];
+    
+    int xmlStartIndex = payload.IndexOf(xmlStart);
+    int xmlEndIndex = payload.LastIndexOf(xmlEnd);
+    
+    if (xmlStartIndex < 0 || xmlEndIndex < 0)
+    {
+        return soapXmlValue;
+    }
+    
+    soapXmlValue = BuildXml(payload.Segment(xmlStartIndex, xmlEndIndex - xmlStartIndex + 1));
+    bool hasBodyElem = false;
+    
+    if (soapXmlValue != null)
+    {
+        var envelope = (soapXmlValue.Children).Filter(e => e is (xml where value.Kind == XmlKind.Element && (value.Name as XmlName).LocalName == "Envelope"));
+        
+        if (envelope.Count > 0)
+        {
+            soapXmlValue = envelope[0];
+            var body = (soapXmlValue.Children).Filter(e => e is (xml where value.Kind == XmlKind.Element && (value.Name as XmlName).LocalName == "Body"));
+            if (body.Count > 0)
+            {
+                hasBodyElem = true;
+                soapXmlValue = body[0];
+            }
+        }
+    }
+    
+    if (!hasBodyElem)
+    {
+        string tmp = Format("<Body>{0}</Body>", soapXmlValue.OuterXml);
+        soapXmlValue = BuildXml(tmp);
+    }
+    
+    return soapXmlValue;
+}
+
+bool IsWOPIUri(optional UriType uri)
+{
+    if (uri == nothing)
+    {
+		return false; 
+	}
+    
+    UriType tmpUriType = uri as UriType;
+    
+    if (tmpUriType.AbsPath is uriString:string)
+    {
+        if (uriString.EndsWith("hosting/discovery"))
+		{
+			return true;
+		}
+
+		if (uriString.Contains("/wopi"))
+		{
+			return uriString.Contains("/files") ||
+				   uriString.Contains("/folders") ||
+				   uriString.Contains("/contents") ||
+				   uriString.Contains("/children");
+		}
+    }
+
+	return false;
+}
+
+WOPIOperations GetWOPIOperationName(HttpContract.Request httpReq)
+{
+    string reqUri = (httpReq.Uri as UriType).AbsPath as string;
+    
+    if (reqUri.EndsWith("hosting/discovery"))
+        return WOPIOperations.Discovery;
+
+    if ("X-WOPI-Override" in httpReq.Headers)
+    {
+        switch (httpReq.Headers["X-WOPI-Override"] as string)
+        {
+            case XWOPIOverrideValues.PutRelativeFile      => return WOPIOperations.PutRelativeFile;
+            case XWOPIOverrideValues.Unlock               => return WOPIOperations.Unlock;
+            case XWOPIOverrideValues.RefreshLock          => return WOPIOperations.RefreshLock;
+            case XWOPIOverrideValues.DeleteFile           => return WOPIOperations.DeleteFile;
+            case XWOPIOverrideValues.ReadSecureStore      => return WOPIOperations.ReadSecureStore;
+            case XWOPIOverrideValues.GetRestrictedLink    => return WOPIOperations.GetRestrictedLink;
+            case XWOPIOverrideValues.RevokeRestrictedLink => return WOPIOperations.RevokeRestrictedLink;
+            case XWOPIOverrideValues.PutFile              => return WOPIOperations.PutFile;
+            case XWOPIOverrideValues.Lock                 => 
+                if ("X-WOPI-OldLock" in httpReq.Headers)
+                {
+                    return WOPIOperations.UnlockAndRelock;
+                }
+                else
+                {
+                    return WOPIOperations.Lock;
+                }
+            case XWOPIOverrideValues.CellStorageRequest   =>
+                if ("X-WOPI-RelativeTarget" in httpReq.Headers)
+                {
+                    return WOPIOperations.CellStorageRelativeRequest;
+                }
+                else
+                {
+                    return WOPIOperations.CellStorageRequest;
+                }
+            default => return WOPIOperations.Unknown;
+        }
+    }
+    
+    if (reqUri.EndsWith("/contents"))
+    {
+        return WOPIOperations.GetFile;
+    }
+
+    if (reqUri.EndsWith("/children"))
+    {
+        return WOPIOperations.EnumerateChildren;
+    }
+
+    if (reqUri.Contains("/files/"))
+    {
+        return WOPIOperations.CheckFileInfo;
+    }
+    
+    if (reqUri.Contains("/folders/"))
+    {
+        return WOPIOperations.CheckFolderInfo;
+    }
+    
+    return WOPIOperations.Unknown;
+}
+
+bool EndsWith(this string source, string val)
+{
+    if (source == null || source == "" || val == null || val == "")
+    {
+        return false;
+    }
+    
+    int srcLen = source.Count;
+    int valLen = val.Count;
+
+    if (srcLen < valLen)
+    {
+        return false;
+    }
+    
+    return source.Segment(srcLen - valLen) == val;
+}

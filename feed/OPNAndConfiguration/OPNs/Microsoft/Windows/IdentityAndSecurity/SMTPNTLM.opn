@@ -1,0 +1,102 @@
+protocol SMTPNTLM with
+Documentation
+{
+    ProtocolName = "NT LAN Manager (NTLM) Authentication: Simple Mail Transfer Protocol (SMTP) Extension",
+    ProtocolType = "",
+    ShortName = "SMTPNTLM",
+    Description = "NT LAN Manager (NTLM) Authentication: Simple Mail Transfer Protocol (SMTP) Extension"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-SMTPNTLM", Version = "16.0", Date="05/15/2014", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major}
+    ]
+};
+
+using SMTP;
+using NLMP;
+using Utility;
+
+endpoint Server over SMTP.Server accepts SMTPNTLMMessage issues SMTPNTLMMessage;
+
+autostart actor SMTPNTLMOverSMTP(SMTP.Server server)
+{
+    process server accepts mailPacket:MailPacket where IsSmtpNtlm(mailPacket)
+    {
+        if (!SMTPNTLMDecoding(mailPacket, server))
+        {
+            ThrowDecodingException("SMTPNTLM", "SMTPNTLMMessage");
+        }
+    }
+    
+    process server issues mailPacket:MailPacket where IsSmtpNtlm(mailPacket)
+    {
+        if (!SMTPNTLMDecoding(mailPacket, server))
+        {
+            ThrowDecodingException("SMTPNTLM", "SMTPNTLMMessage");
+        }
+    }
+}
+
+bool IsSmtpNtlm(MailPacket mailPacket)
+{
+    if (mailPacket.Payload == nothing)
+    {
+        return false;
+    }
+    
+    binary smtpPayload = mailPacket.Payload as binary;
+    return smtpPayload.Count >= 8 && smtpPayload.Segment(0, 8) == Base64EncodedNtlmPrefix;
+}
+
+bool SMTPNTLMDecoding(MailPacket mailPacket, SMTP.Server server)
+{
+    if (mailPacket.Payload is smtpPayload:binary && Base64Text(smtpPayload) is text:string &&
+        Base64StringToBinary(text) is ntlmBinary:binary)
+    {
+        var ntlmMessage = NlmpDecoder(ntlmBinary);
+        SMTPNTLMMessage msg = null;
+        if (ntlmMessage is negotiateMessage:NegotiateMessage)
+        {
+            msg = new SMTPNTLMMessage{SmtpNtlmData = negotiateMessage};
+            dispatch endpoint SMTPNTLM.Server over server accepts msg;
+        }
+        else if (ntlmMessage is challengeMessage:ChallengeMessage)
+        {
+            msg = new SMTPNTLMMessage{SmtpNtlmData = challengeMessage};
+            dispatch endpoint SMTPNTLM.Server over server issues msg;
+        }
+        else if (ntlmMessage is authenticateMessage:AuthenticateMessage)
+        {
+            msg = new SMTPNTLMMessage{SmtpNtlmData = authenticateMessage};
+            dispatch endpoint SMTPNTLM.Server over server accepts msg;
+        }
+        else
+        {
+            return false;
+        }
+        
+        AssociateFieldPosition(msg, "SmtpNtlmData", ntlmBinary, 0, ntlmBinary.Count * 8);
+        return true;
+    }
+
+    return false;
+}
+
+syntax Base64Text = regex{[^=\r\n]+(=)*};
+
+message SMTPNTLMMessage
+{
+    NlmpMessage SmtpNtlmData;
+    
+    override string ToString()
+    {
+        return SmtpNtlmData.ToString();
+    }
+}

@@ -1,0 +1,769 @@
+protocol SOCKS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "SOCKS Protocol",
+    ShortName = "SOCKS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1928"},
+            new Reference{Name = "RFC 1929"},
+            new Reference{Name = "RFC 1961"},
+            new Reference{Name = "RFC 3089"},
+            new Reference{Name = "SOCKSv4", Link = "http://ftp.icm.edu.pl/packages/socks/socks4/SOCKS4.protocol"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382141", Date = "10/13/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using HTTP2;
+using UDP;
+using FTP;
+using TELNET;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+
+endpoint Server
+    over TCP.Server | over UDP.Host
+    provides SOCKSv4Msg provides SOCKSv5Msg;
+
+client endpoint Client connected to Server;
+
+// Sequence of SOCKS:
+// For SOCKS version 4:
+// 1. Client send connection request and server response
+// 2. Send real data over SOCKS proxy
+// 
+// For SOCKS Version 5
+// 1. Select the method: GSSAPI or USERNAME/PASSWORD
+// 2. Client sends the command to server;
+// 3. Send real data over SOCKS proxy
+//
+// SOCKS OPN assumes the rare case that part of the SOCKS connection data is captured.
+// In most situation, we captured all the SOCKS connection messages or we only captured the protocol data over SOCKS;
+// 
+// Logic of SOCKS OPN: only decodes the SOCKS message from the first SOCKS connection request message, if first message
+// of SOCKS connection is missing (for SOCKSv4, SOCKSv4Msg.Request, for SOCKSv5, SOCKSv5Msg.AuthNegotiateRequest)
+//
+// For the situation that SOCKS connetion messages are not decoded, the protocol data like HTTP will decode its protocol
+// on dynamic port.
+//
+autostart actor SocksOverTCP(TCP.Server server)
+{
+    SocksDecodingHelper socksDecodingHelper = null;
+    binary serverAddress = null;
+    FTPTransportType ftpTransportType = FTPTransportType.NotDetermined;
+    // FTP decoding
+    FtpCtrlDecodingHelper ctrlMsgDecodingHelper = null;
+    FtpDataDecodingHelper dataMsgDecodingHelper = null;
+
+    process server accepts s:TCP.Segment
+        where s.DestinationPort == IANA.Port.SOCKS && (socksDecodingHelper != null || IsSocksProtocol(s.Payload)) // Request
+    {
+        // for relay message
+        if (socksDecodingHelper.ConnectionContext.State == ConnectoinState.ConnectGranted)
+        {
+            switch (socksDecodingHelper.ConnectionContext.PortNumber)
+            {
+                case IANA.Port.HTTP =>
+                    dispatch (endpoint HTTP2.HttpForwarder over server) accepts s;
+                case IANA.Port.TELNET =>
+                    dispatch (endpoint TELNET.ReassemblyServer over server) accepts s;
+                default =>
+                    if (ftpTransportType == FTPTransportType.FTPControl || ftpTransportType == FTPTransportType.FTPData ||
+                        ftpTransportType == FTPTransportType.NotDetermined && 
+                        CheckFTPTransportType(s#DestinationAddrBin as binary, socksDecodingHelper.ConnectionContext.PortNumber as ushort, 
+                        Utility.EmptyBinary, 0, false, Utility.EmptyBinary, out ftpTransportType))
+                    {
+                        switch (ftpTransportType)
+                        {
+                            case FTPTransportType.FTPControl =>
+                                if (ctrlMsgDecodingHelper == null)
+                                {
+                                    ctrlMsgDecodingHelper = new FtpCtrlDecodingHelper(endpoint FTP.Server over server);
+                                }
+                                ctrlMsgDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+                            case FTPTransportType.FTPData =>
+                                if (dataMsgDecodingHelper == null)
+                                {
+                                    serverAddress = s#DestinationAddrBin as binary;
+                                    dataMsgDecodingHelper = new FtpDataDecodingHelper(endpoint FTP.Server over server);
+                                }
+                                dataMsgDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+                            default =>
+                                // never reached
+                        }
+                    }
+                    else
+                    {
+                        // Future Reference: Add protocol "WAIS"/"GOPHER". Which is defined in section 2 of http://tools.ietf.org/html/rfc1928.
+                        reject;
+                    }
+            }
+            
+            return;
+        }
+        
+        socksDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment
+        where s.SourcePort != IANA.Port.HTTP && socksDecodingHelper != null // Response
+    {
+        // for relay message
+        if (socksDecodingHelper.ConnectionContext.State == ConnectoinState.ConnectGranted)
+        {
+            switch (socksDecodingHelper.ConnectionContext.PortNumber)
+            {
+                case IANA.Port.HTTP =>
+                    dispatch (endpoint HTTP2.HttpForwarder over server) issues s;
+                case IANA.Port.TELNET =>
+                    dispatch (endpoint TELNET.ReassemblyServer over server) issues s;
+                default =>
+                    if (ftpTransportType == FTPTransportType.FTPControl || ftpTransportType == FTPTransportType.FTPData ||
+                        ftpTransportType == FTPTransportType.NotDetermined && 
+                        CheckFTPTransportType(s#SourceAddrBin as binary, socksDecodingHelper.ConnectionContext.PortNumber as ushort, 
+                        Utility.EmptyBinary, 0, false, Utility.EmptyBinary, out ftpTransportType))
+                    {
+                        switch (ftpTransportType)
+                        {
+                            case FTPTransportType.FTPControl =>
+                                if (ctrlMsgDecodingHelper == null)
+                                {
+                                    ctrlMsgDecodingHelper = new FtpCtrlDecodingHelper(endpoint FTP.Server over server);
+                                }
+                                ctrlMsgDecodingHelper.TryDecode(s, MessageDirection.Issues);
+                            case FTPTransportType.FTPData =>
+                                if (dataMsgDecodingHelper == null)
+                                {
+                                    serverAddress = s#SourceAddrBin as binary;
+                                    dataMsgDecodingHelper = new FtpDataDecodingHelper(endpoint FTP.Server over server);
+                                }
+                                dataMsgDecodingHelper.TryDecode(s, MessageDirection.Issues);
+                            default =>
+                                // never reached
+                        }
+                    }
+                    else
+                    {
+                        // Future Reference: Add protocol "WAIS"/"GOPHER". Which is defined in section 2 of http://tools.ietf.org/html/rfc1928.
+                        reject;
+                    }
+            }
+            
+            return;
+        }        
+        socksDecodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (socksDecodingHelper != null)
+        {
+            socksDecodingHelper.ClearInDestructor();
+            
+            // For FTP Data Port
+            if (socksDecodingHelper.ConnectionContext.State == ConnectoinState.ConnectGranted &&
+                FTP.IsFTPDataPort(serverAddress, socksDecodingHelper.ConnectionContext.PortNumber as ushort))
+            {
+                FTP.RemoveFTPDataPort(serverAddress, socksDecodingHelper.ConnectionContext.PortNumber as ushort);
+            }
+        }
+    }
+
+    bool IsSocksProtocol(binary data)
+    {
+        if (data.Count > 2 && 
+            ((data[0] == 4 && data[1] in {1, 2}) || // version 4 (Request), the second byte is "Commmand" field(must be 1, 2).
+            data[0] == 5 && data[1] + 2 == data.Count)) // version 5 (AuthNegotiateRequest), the second byte indicates bytes length following it.
+        {
+            socksDecodingHelper = new SocksDecodingHelper();
+            socksDecodingHelper.InitializeSocksDecodingHelper(new SocksDecodingCache(), new SocksDecodingCache(), data[0], server);
+            return true;
+        }
+        return false;
+    }
+}
+
+type ConnectionContext
+{
+    // Protocol version
+    Version? Version = null;
+    // The negotiated athentication method, only be available for version 5.
+    byte? Method = null;
+    // The port number indicating protocol transfered by SOCKS.
+    ushort? PortNumber = null;
+    // State of SOCKS connection.
+    ConnectoinState State = ConnectoinState.None;
+}
+
+pattern Version = enum byte
+{
+    V4 = 4,
+    V5 = 5,
+};
+
+pattern ConnectoinState = enum byte
+{
+    None,
+    SubnegotiationCompleted,
+    ConnectGranted,
+};
+
+autostart actor SOCKSOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.DestinationPort == IANA.Port.SOCKS && IsSockOverUDP(d.Payload)
+    {
+        switch (d.Payload)
+        {
+            case uDPBasedRequest:SOCKSv5Msg.UDPBasedConnectionRequest from BinaryDecoder<SOCKSv5Msg.UDPBasedConnectionRequest> =>
+                dispatch (endpoint Server over host) accepts uDPBasedRequest;
+            default =>
+                ThrowDecodingException("SOCKSv5", "UDPBasedConnectionRequest");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram where d.SourcePort == IANA.Port.SOCKS && IsSockOverUDP(d.Payload)
+    {
+        switch (d.Payload)
+        {
+            case uDPBasedReply:SOCKSv5Msg.UDPBasedConnectionReply from BinaryDecoder<SOCKSv5Msg.UDPBasedConnectionReply> =>
+                dispatch (endpoint Server over host) issues uDPBasedReply;
+            default =>
+                ThrowDecodingException("SOCKSv5", "UDPBasedConnectionReply");
+        }
+    }
+
+    bool IsSockOverUDP(binary payload)
+    {
+        return payload.Count > 4 && payload[0] == 0 && payload[1] == 0 && (payload[3] == 1 || payload[3] == 3 || payload[3] == 4);
+    }
+}
+
+/*--------------------------------------------------------SOCKS Decoding-----------------------------------------------------------------------*/
+type SocksDecodingHelper : TCPDecodingHelper
+{
+    ConnectionContext ConnectionContext;
+
+    void InitializeSocksDecodingHelper(SocksDecodingCache acceptsCache, SocksDecodingCache issuesCache,
+        Version socksVersion /* V4 or V5 */, TCP.Server server)
+    {
+        ConnectionContext = new ConnectionContext();
+        ConnectionContext.Version = socksVersion;
+
+        AcceptsCache = acceptsCache;
+        acceptsCache.InitializeSocksDecodingCache(server, MessageDirection.Accepts, ConnectionContext);
+        IssuesCache = issuesCache;
+        issuesCache.InitializeSocksDecodingCache(server, MessageDirection.Issues, ConnectionContext);
+    }
+}
+
+type SocksDecodingCache : TCPDecodingCache
+{
+    ConnectionContext ConnectionContext;
+
+    void InitializeSocksDecodingCache(TCP.Server server, MessageDirection direction, ConnectionContext ConnectionContext)
+    {
+        assert ConnectionContext != null;
+
+        base.Initialize("SOCKS", endpoint SOCKS.Server over server, direction, IsSocksV5Protocol,
+            IsSufficientForSingleSocksV5Msg, DecodeSingleSocksV5Message, (x) => nothing);
+        this.ConnectionContext = ConnectionContext;
+    }
+
+    override void TryDecodeAndDispatchMessage()
+    {
+        // for SOCKS V5
+        if (ConnectionContext.Version == Version.V5)
+        {
+            base.TryDecodeAndDispatchMessage();
+            return;
+        }
+
+        // for SOCKS v4
+        optional any message socksV4Message = nothing;
+        if (Direction == MessageDirection.Accepts)
+        {
+            switch (Buffer)
+            {
+                case request:SOCKSv4Msg.Request from BinaryDecoder<SOCKSv4Msg.Request> =>
+                    ConnectionContext.PortNumber = request.Dstport;
+                    socksV4Message = request;
+                default =>
+                    socksV4Message = nothing;
+            }
+        }
+        else
+        {
+            // for response
+            switch (Buffer)
+            {
+                case response:SOCKSv4Msg.Reply from BinaryDecoder<SOCKSv4Msg.Reply> =>
+                    ConnectionContext.State = (response.Cd == CommandCode.RequestGranted) ? ConnectoinState.ConnectGranted : ConnectoinState.None;
+                    socksV4Message = response;
+                default =>
+                    socksV4Message = nothing;
+            }
+        }
+
+        if (socksV4Message is msg:any message)
+        {
+            msg.Origins = Origins;
+            
+            DispatchMessage(msg);
+            CompleteMessages.Add(msg, BufferStartSequenceNumber, BufferEndSequenceNumber);
+            ResetAfterSucceed(null);
+        }
+        else
+        {
+            ClearExceptionally();
+        }
+    }
+
+    bool? IsSocksV5Protocol(binary data)
+    {
+        // assume that data contains at least one byte when invoking this function
+        return data[0] == 5;
+    }
+
+    uint? IsSufficientForSingleSocksV5Msg(binary data)
+    {
+        if (ConnectionContext.State == ConnectoinState.None &&
+            ConnectionContext.Method == 1)
+        {
+            // decode SocksV5 GSSAPI AUTH request or response
+            if (Direction == MessageDirection.Accepts)
+            {
+                if (data.Count < 4)
+                {
+                    return null;
+                }
+
+                int gssapiRequestLength = ((data[2] as ushort) << 8) + data[3];
+                return gssapiRequestLength <= data.Count ? 0 : (gssapiRequestLength as uint);
+            }
+
+            // for response
+            if (data.Count < 2)
+            {
+                return null;
+            }
+
+            int gssapiResponseLength = 0;
+            if (data[1] == 0xFF) // Mtyp == 0xFF, message length is fixed length 2.
+            {
+                gssapiResponseLength = 2;
+            }
+            else
+            {
+                if (data.Count < 4)
+                {
+                    return null;
+                }
+                gssapiResponseLength = ((data[2] as ushort) << 8) + data[3];
+            }
+
+            return gssapiResponseLength <= data.Count ? 0 : (gssapiResponseLength as uint);
+        }
+
+        // for other connection state and method, length of message will not exceed 512,
+        // so there is no need to consider the TCP reassembly for these messages.
+        return 0;
+    }
+
+    optional any message DecodeSingleSocksV5Message(stream s)
+    {
+        if (Direction == MessageDirection.Accepts)
+        {
+            return DecodingSocksV5Request(s);
+        }
+        return DecodingSocksV5Response(s);
+    }
+
+    optional any message DecodingSocksV5Request(stream s)
+    {
+        assert ConnectionContext.Version == Version.V5;
+
+        if (ConnectionContext.State == ConnectoinState.None) // Connection negotiation phase.
+        {
+            if (ConnectionContext.Method == null)
+            {
+                return BinaryDecoder<SOCKSv5Msg.AuthNegotiateRequest>(s) as optional any message;
+            }
+            else if (ConnectionContext.Method == 1) // GSSAPI
+            {
+                return BinaryDecoder<SOCKSv5Msg.GSSAPIRequest>(s) as optional any message;
+            }
+            else if (ConnectionContext.Method == 2) // USERNAME/PASSWORD
+            {
+                return BinaryDecoder<SOCKSv5Msg.UsernamePasswordRequest>(s) as optional any message;
+            }
+            else
+            {
+                // Future Reference: Add protocol "WAIS"/"GOPHER". Which is defined in section 2 of http://tools.ietf.org/html/rfc1928.
+                return nothing;
+            }
+        }
+        else if (ConnectionContext.State == ConnectoinState.SubnegotiationCompleted)
+        {
+            switch (s)
+            {
+                case cmdRequest:SOCKSv5Msg.CmdRequest from BinaryDecoder<SOCKSv5Msg.CmdRequest> =>
+                    ConnectionContext.PortNumber = cmdRequest.DstPort;
+                    return cmdRequest;
+                default =>
+                    return nothing;
+            }
+        }
+
+        // below code should not be reached
+        return nothing;
+    }
+
+    optional any message DecodingSocksV5Response(stream s)
+    {
+        assert ConnectionContext.Version == Version.V5;
+        optional any message retMessage = nothing;
+
+        if (ConnectionContext.State == ConnectoinState.None) // Connection negotiation phrase.
+        {
+            if (ConnectionContext.Method == null)
+            {
+                switch (s)
+                {
+                    case authReply:SOCKSv5Msg.AuthNegotiateReply from BinaryDecoder<SOCKSv5Msg.AuthNegotiateReply> =>
+                        ConnectionContext.Method = authReply.Method;
+                        retMessage = authReply;
+                    default =>
+                        retMessage = nothing;
+                }
+            }
+            else if (ConnectionContext.Method == 1) // GSSAPI req and resp use the same MessageType;
+            {
+                switch (s)
+                {
+                    case gssReply:SOCKSv5Msg.GSSAPIReply from BinaryDecoder<SOCKSv5Msg.GSSAPIReply> =>
+                        ConnectionContext.State = ConnectoinState.SubnegotiationCompleted;
+                        retMessage = gssReply;
+                    default =>
+                        retMessage = nothing;
+                }
+            }
+            else if (ConnectionContext.Method == 2)
+            {
+                switch (s)
+                {
+                    case uNameReply:SOCKSv5Msg.UsernamePasswordReply from BinaryDecoder<SOCKSv5Msg.UsernamePasswordReply> =>
+                        ConnectionContext.State = ConnectoinState.SubnegotiationCompleted;
+                        retMessage = uNameReply;
+                    default =>
+                        retMessage = nothing;
+                }
+            }
+            else
+            {
+                // Future Reference: Add protocol "WAIS"/"GOPHER". Which is defined in section 2 of http://tools.ietf.org/html/rfc1928.
+                retMessage = nothing;
+            }
+        }
+        else if (ConnectionContext.State == ConnectoinState.SubnegotiationCompleted)
+        {
+            switch (s)
+            {
+                case cmdReply:SOCKSv5Msg.CmdReply from BinaryDecoder<SOCKSv5Msg.CmdReply> =>
+                    ConnectionContext.State = ConnectoinState.ConnectGranted;
+                    retMessage = cmdReply;
+                default =>
+                    retMessage = nothing;
+            }
+        }
+
+        return retMessage;
+    }
+}
+
+/*--------------------------------------------------------Messages-----------------------------------------------------------------------*/
+
+// SOCKSv4
+contract SOCKSv4Msg
+{
+    accepts message Request
+    {
+        byte Vn where value == 4;
+        Command Cd;
+        ushort Dstport;
+        IPv4Address DstIp;
+        string UserId with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+        
+        override string ToString()
+        {
+            return "Request, Version: 4, Command: " + EnumToStringInSummary<Command>(Cd) +
+                ", DstIp: " + DstIp.ToString() + 
+                ", DstPort: " + EnumToString<IANA.Port>(Dstport, true);
+        }
+    }
+    
+    issues message Reply
+    {
+        byte Vn where value == 0;
+        CommandCode Cd;
+        ushort Dstport;
+        IPv4Address DstIp;
+        
+        override string ToString()
+        {
+            return "Response, Version: 4, Command: " + EnumToStringInSummary<CommandCode>(Cd) +
+                ", DstIp: " + DstIp.ToString() + 
+                ", DstPort: " + EnumToString<IANA.Port>(Dstport, true);
+        }
+    }
+} 
+
+pattern CommandCode = enum byte
+{
+    RequestGranted           = 90,
+    RequestRejectedorFailed  = 91,
+    RequestRejectedServer    = 92,
+    RequestRejectedClient    = 93,
+    ...
+};
+
+pattern Command = enum byte
+{
+    BIND     = 1,
+    CONNECT  = 2,
+    ...
+};
+
+// SOCKSv5
+contract SOCKSv5Msg
+{
+    // RFC 1928
+    // the method-dependent subnegotiation
+    // The client connects to the server, and sends a Ver
+    // identifier/method selection message
+    accepts message AuthNegotiateRequest
+    {
+        byte Ver where value == 5;
+        byte NMethods;
+        binary Methods with BinaryEncoding{Length = NMethods};
+        
+        override string ToString()
+        {
+            return "SOCKSv5Msg, NMethods: " + (NMethods as string) + ", Version: 5";
+        }
+    }
+    
+    issues message AuthNegotiateReply
+    {
+        byte Ver where value == 5;
+        byte Method;
+        
+        override string ToString()
+        {
+            string summary = "AuthNegotiateReply, Method: " + (Method == 0x0 ? "NO AUTHENTICATION REQUIRED": 
+                (Method == 0x1 ? "GSSAPI" : 
+                (Method == 0x2 ? "USERNAME/PASSWORD" : 
+                (Method == 0x3 ? "Challenge-Handshake Authentication Protocol" : 
+                (Method == 0x4 ? "Unassigned" : 
+                (Method == 0x5 ? "Challenge-Response Authentication Method" : 
+                (Method == 0x6 ? "Secure Sockets Layer" : 
+                (Method == 0x7 ? "NDS Authentication" : 
+                (Method == 0x8 ? "Multi-Authentication Framework" : 
+                (Method >= 0x9 && Method <= 0x7F? "Unassigned" : 
+                (Method >= 0x80 && Method >= 0xFE ? "RsvD FOR PRIVATE METHODS" : "NO ACCEPTABLE METHODS")))))))))));
+            return summary + ", Version: 5";
+        }
+    }
+
+    accepts message CmdRequest
+    {
+        byte Ver where value == 5;
+        Cmds Cmd;
+        byte Rsv where ValidationCheck(value == 0, this, "Rsvd must be zero.");
+        Atyps Atyp;
+        ( [|Atyp == Atyps.IPv4Address|] IPv4Address 
+        | [|Atyp == Atyps.IPv6Address|] IPv6Address 
+        | [|Atyp == Atyps.DomainName|] DomainName) DstAddr;
+        ushort DstPort;
+        
+        override string ToString()
+        {
+            return "CmdRequest, Cmd: " + (Cmd == 1 ? "Connect" : (Cmd == 2 ? "Bind" : (Cmd == 3 ? "UDP Associate" : "Unknow Data"))) + ", Version: 5";
+        }
+    }
+    
+    issues message CmdReply
+    {
+        byte Ver where value == 5;
+        Rep Rep;
+        byte Rsv where ValidationCheck(value == 0, this, "Rsvd must be zero.");
+        Atyps Atyp;
+        ( [|Atyp == 1|] IPv4Address 
+        | [|Atyp == 4|] IPv6Address 
+        | [|Atyp == 3|] DomainName) BndAddr;
+        ushort BndPort;
+        
+        override string ToString()
+        {
+            return "CmdReply, Reply: " + EnumToStringInSummary<SOCKS.Rep>(Rep) + ", Version: 5";
+        }
+    }
+    
+    accepts message UDPBasedConnectionRequest
+    {
+        ushort Rsv where ValidationCheck(value == 0, this, "Rsvd must be zero.");
+        byte Frag;
+        Atyps Atyp;
+        ( [|Atyp == 1|] IPv4Address 
+        | [|Atyp == 4|] IPv6Address 
+        | [|Atyp == 3|] DomainName) DstAddr;
+        ushort DstPort;
+        binary Data;
+        
+        override string ToString()
+        {
+            return "UDPBasedConnectionRequest, Current Fragment Number:" + (Frag as string) + ", Address Type: " + EnumToStringInSummary<SOCKS.Atyps>(Atyp) + ", Version: 5";
+        }
+    }
+    
+    issues message UDPBasedConnectionReply
+    {
+        ushort Rsv where ValidationCheck(value == 0, this, "Rsvd must be zero.");
+        byte Frag;
+        Atyps Atyp;
+        ( [|Atyp == 1|] IPv4Address 
+        | [|Atyp == 4|] IPv6Address 
+        | [|Atyp == 3|] DomainName) DstAddr;
+        ushort DstPort;
+        binary Data with BinaryEncoding{Length = 0};
+        
+        override string ToString()
+        {
+            return "UDPBasedConnectionReply, Current fragment number is " + (Frag as string) + ", Address Type: " + EnumToStringInSummary<SOCKS.Atyps>(Atyp) + ", Version: 5";
+        }
+    }
+    
+    // RFC 1929
+    accepts message UsernamePasswordRequest
+    {
+        byte Ver;
+        byte Ulen;
+        string Uname with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Ulen};
+        byte Plen;
+        binary Passwd with BinaryEncoding{Length = Plen};
+        
+        override string ToString()
+        {
+            return "UsernamePasswordRequest, UserName: " + (Uname as string) + ", Password: " + (Passwd as string) + ", Version: " + (Ver as string);
+        }
+    }
+    
+    issues message UsernamePasswordReply
+    {
+        byte Ver;
+        byte Status;
+        
+        override string ToString()
+        {
+            return "UsernamePasswordReply, Status: " + (Status == 0 ? "Success" : "Failure") + ", Version: " + (Ver as string);
+        }
+    }
+    
+    // rfc 1961
+    accepts message GSSAPIRequest
+    {
+        byte Ver;
+        Mtyps Mtyp;
+        ushort Len;
+        binary Token with BinaryEncoding{Length = Len};
+        
+        override string ToString()
+        {
+            string str = "GSSAPIRequest, Message Type: ";
+            switch (Mtyp)
+            {
+                case Mtyps.Authentication             => str += "Authentication";
+                case Mtyps.ProtectionLevelNegotiation => str += "Protection Level Negotiation";
+                case Mtyps.EncapulatedUserData        => str += "Encapulated User Data";
+                case Mtyps.Abort                      => str += "Abort";
+                default                               => str += "Unknow";
+            }
+            return str + ", Version: " + (Ver as string);
+        };
+    }
+    
+    issues message GSSAPIReply
+    {
+        byte Ver;
+        Mtyps Mtyp;
+        optional [|Mtyp != 0xFF|] ushort Len;
+        optional [|Mtyp != 0xFF|] binary Token with BinaryEncoding{Length = (Len == nothing ? 0 : Len as ushort)};
+        
+        override string ToString()
+        {
+            string str = "GSSAPIReply, Message Type: ";
+            switch (Mtyp)
+            {
+                case Mtyps.Authentication             => str += "Authentication";
+                case Mtyps.ProtectionLevelNegotiation => str += "Protection Level Negotiation";
+                case Mtyps.EncapulatedUserData        => str += "Encapulated User Data";
+                case Mtyps.Abort                      => str += "Abort";
+                default                               => str += "Unknow";
+            }
+            return str + ", Version: " + (Ver as string);
+        };
+    }
+}
+
+type DomainName
+{
+    byte NameLength;
+    string DomainName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = NameLength};
+}
+
+pattern Cmds = enum byte
+{
+    Connect = 1,
+    Bind = 2,
+    UDPAssociate = 3,
+};
+
+pattern Atyps = enum byte
+{
+    IPv4Address = 1,
+    DomainName = 3,
+    IPv6Address = 4,
+};
+
+pattern Mtyps = enum byte
+{
+    Authentication = 1,
+    ProtectionLevelNegotiation = 2,
+    EncapulatedUserData = 3,
+    Abort = 0xFF,
+};
+
+pattern Rep = enum byte
+{
+    $"Succeeded" = 0,
+    $"General SOCKS server failure" = 1,
+    $"Connection not allowed by ruleset" = 2,
+    $"Network unreachable" = 3,
+    $"Host unreachable" = 4,
+    $"Connection refused" = 5,
+    $"TTL expired" = 6,
+    $"Cmd not supported" = 7,
+    $"Address type not supported" = 8,
+    ...
+};

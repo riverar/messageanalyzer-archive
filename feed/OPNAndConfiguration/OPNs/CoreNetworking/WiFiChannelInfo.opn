@@ -1,0 +1,360 @@
+protocol WiFiChannelInfo with
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class=RevisionClass.Major, Version="382201", Date="10/19/2015"}
+        ]
+};
+
+using EtwEvent;
+using PefNdisProvider;
+using NdisEtwProvider;
+using WiFi;
+using Utility;
+
+endpoint WiFiChannelNode
+    accepts NdisEtwWiFiChannelMessage
+    accepts NetMon3WiFiChannelMessage
+    accepts PefNdisWiFiChannelMessage
+{
+    process this accepts m:NdisEtwWiFiChannelMessage
+    {
+        if (!DecodeWiFiMessageAndDispatch(m.WiFiFrame))
+        {
+            ThrowDecodingException("WiFiChannelInfo", "NDIS WiFi");
+        }
+    }
+    
+    process this accepts m:NetMon3WiFiChannelMessage
+    {
+        bool isMonitorMode = false;
+        if (m.Metadata != null && m.Metadata is NetMon3MetaData)
+        {
+            var metaData = m.Metadata as NetMon3MetaData;
+            isMonitorMode = metaData.OpMode.MonitorMode;
+        }
+        if (!DecodeWiFiMessageAndDispatch(m.WiFiFrame, isMonitorMode))
+        {
+            ThrowDecodingException("WiFiChannelInfo", "NetMon3 WiFi");
+        }
+    }
+    
+    process this accepts m:PefNdisWiFiChannelMessage
+    {
+        var isMonitorMode = ((m.MetaData.OperationMode & 0x10) != 0);
+        if (!DecodeWiFiMessageAndDispatch(m.WiFiFrame, isMonitorMode))
+        {
+            ThrowDecodingException("WiFiChannelInfo", "PEF NDIS WiFi");
+        }
+    }
+}
+
+/*
+    Part 1. NDIS ETW WiFi
+*/
+
+autostart actor WiFiChannelOverNdisEtw(NdisEtwNode ndisEtw)
+{
+    NdisEtwVirtualDataMessage metaDataMsg = null;
+    
+    process ndisEtw accepts m:NdisEtwVirtualDataMessage
+        where (m#IsNdisEtwMetaData != nothing) && (m#IsNdisEtwMetaData as bool)
+    {
+        if (metaDataMsg != null)
+        {
+            DisplayTopLevelMessage(metaDataMsg, "WiFiChannelInfo: Missing continuation WiFi message");
+        }
+        metaDataMsg = m;
+    }
+    
+    process ndisEtw accepts m:NdisEtwVirtualDataMessage
+        where (m#IsNdisEtwMetaData == nothing || !(m#IsNdisEtwMetaData as bool))
+            // 0x00010000 NdisMediumNative802_11 Data carried in LLC/SNAP
+            && m#EtwKeywords != nothing && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumNative802_11) != 0)
+    {
+        if (metaDataMsg == null)
+        {
+            // the outbound traffice doesn't have NDIS ETW WiFi MetaData
+            if (!DecodeWiFiMessageAndDispatch(m.Payload))
+            {
+                ThrowDecodingException("WiFiChannelInfo", "NDIS ETW WiFi without MetaData");
+            }
+        }
+        else
+        {
+            var wifiWithMetaData = metaDataMsg.Payload + m.Payload;
+            switch (wifiWithMetaData)
+            {
+                case ndisWifi:NdisEtwWiFiChannelMessage from BinaryDecoder<NdisEtwWiFiChannelMessage> =>
+                    ndisWifi.Origins = [metaDataMsg as any message, m as any message];
+                    dispatch endpoint WiFiChannelNode accepts ndisWifi;
+                default => 
+                    ThrowDecodingException("WiFiChannelInfo", "NDIS ETW WiFi with MetaData");
+            }
+            metaDataMsg = null;
+        }
+    }
+    
+    process ndisEtw accepts m:NdisEtwVirtualDataMessage
+        where (m#IsNdisEtwMetaData == nothing || !(m#IsNdisEtwMetaData as bool))
+            // 0x00000200 NdisMediumWirelessWan
+            && m#EtwKeywords != nothing && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumWirelessWan) != 0)
+    {
+        if (!DecodeWirelessWanMessage(m.Payload))
+        {
+            ThrowDecodingException("WiFiChannelInfo", "NDIS ETW Wireless Wan");
+        }
+    }
+    
+    ~endpoint(NdisEtwNode ndisEtw)
+    {
+        if (metaDataMsg != null)
+        {
+            DisplayTopLevelMessage(metaDataMsg, "WiFiChannelInfo: Missing continuation WiFi message");
+        }
+    }
+}
+
+// MetaData part of WiFi Message by ETW Message adapter
+message NdisEtwWiFiChannelMessage
+{
+    NdisEtwMetaData MetaData;
+    binary WiFiFrame;
+
+    override string ToString()
+    {
+        return "NdisEtwWiFiChannelMessage, " + GetWiFiMetaDataDisplayInfo(MetaData.lRSSI, MetaData.ucDataRate);
+    }
+}
+
+int get PayloadLength(this WiFiChannelInfo.NdisEtwWiFiChannelMessage msg)
+{
+    return msg.WiFiFrame.Count;
+}
+
+type NdisEtwMetaData
+{
+    byte Type where value == 0x80;
+    byte Revision where value == 1;
+    ushort size;
+    uint uReceiveFlags;
+    uint uPhyId;
+    uint uChCenterFrequency;
+    ushort usNumberOfMPDUsReceived with BinaryEncoding{TrailPadding = 16};
+    int lRSSI;
+    byte ucDataRate with BinaryEncoding{TrailPadding = 24};
+    uint uSizeMediaSpecificInfo;
+    ([|size == 48|] ulong | uint) pvMediaSpecificInfo;
+    ulong ullTimestamp;
+}
+
+type Padding[byte Length]
+{
+    array<byte> Padding with BinaryEncoding{Length = Length};
+}
+
+/*
+    Part 2. NetMon3 WiFi
+*/
+
+// WiFi message provided by NetMon3 Capture file
+message NetMon3WiFiChannelMessage
+{
+    ([|stream.CurrentByte == 2|]NetMon3MetaData | NetMon3UnknownMetaData) Metadata;
+    binary WiFiFrame;
+    
+    override string ToString()
+    {
+        if ((Metadata is NetMon3MetaData))
+        {
+            var desc = (Metadata as NetMon3MetaData).MetadataDesc;
+            if (desc != null && desc != nothing)
+            {
+                return "NetMon3WiFiChannelMessage, " + GetWiFiMetaDataDisplayInfo((desc as MetadataDesc).lRSSI, (desc as MetadataDesc).Rate);
+            }
+        }
+        return "NetMon3WiFiChannelMessage";
+    }
+}
+
+int get PayloadLength(this WiFiChannelInfo.NetMon3WiFiChannelMessage msg)
+{
+    return msg.WiFiFrame.Count;
+}
+
+type NetMon3UnknownMetaData
+{
+    byte Version where value != 8 && value != 2;
+    ushort Length;
+    array<byte> UnknownMetaData with BinaryEncoding{Length = (Length - 3)};
+}
+
+type NetMon3MetaData
+{
+    byte Version where value == 2;
+    ushort Length;
+    OpMode OpMode;
+    uint Flags;
+    optional [|Flags != 0xFFFFFFFF|] MetadataDesc MetadataDesc;
+    optional [|Flags == 0xFFFFFFFF|] array<byte> RemData with BinaryEncoding{ Length = 13};
+    ulong TimeStamp;
+}
+
+type MetadataDesc
+{
+    uint PhyType;
+    uint Channel;
+    int lRSSI;
+    byte Rate;
+}
+
+type OpMode
+{
+    byte Unused1                with BinaryEncoding{Width = 5};
+    bool ExtensibleStationMode  with BinaryEncoding{Width = 1};
+    bool APMode                 with BinaryEncoding{Width = 1};
+    bool StationMode            with BinaryEncoding{Width = 1};
+    short Unused2               with BinaryEncoding{Width = 16};
+    bool MonitorMode            with BinaryEncoding{Width = 1};
+    byte Unused3                with BinaryEncoding{Width = 7};
+}
+
+pattern StandardRate = byte
+    where value in {0x02,
+                    0x04,
+                    0x06,
+                    0x09,
+                    0x0B,
+                    0x0C,
+                    0x12,
+                    0x16,
+                    0x18,
+                    0x24,
+                    0x2C,
+                    0x30,
+                    0x36,
+                    0x42,
+                    0x48,
+                    0x60,
+                    0x6C};
+
+/*
+    Part 3. PEF NDIS WiFi
+*/
+
+autostart actor WiFiChannelOverPefNdis(PefNdisNode pefNdis)
+{
+    PefNdisWifiMetaMsg metaDataMsg = null;
+    
+    process pefNdis accepts m:PefNdisWifiMetaMsg
+    {
+        if (metaDataMsg != null)
+        {
+            DisplayTopLevelMessage(metaDataMsg, "WiFiChannelInfo: Missing continuation PefNdisMsg");
+        }
+        metaDataMsg = m;
+    }
+    
+    process pefNdis accepts m:PefNdisMsg
+        // 0x00010000 NdisMediumNative802_11 Data carried in LLC/SNAP
+        where m#EtwKeywords != nothing && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumNative802_11) != 0)
+    {
+        if (metaDataMsg == null)
+        {
+            // the outbound traffice doesn't have PEF NDIS WiFi MetaData
+            if (!DecodeWiFiMessageAndDispatch(m.FrameData))
+            {
+                ThrowDecodingException("WiFiChannelInfo", "PEF NDIS WiFi without MetaData");
+            }
+        }
+        else
+        {
+            var wifiWithMetaData = metaDataMsg.MetaData + m.FrameData;
+            switch (wifiWithMetaData)
+            {
+                case ndisWifi:PefNdisWiFiChannelMessage from BinaryDecoder<PefNdisWiFiChannelMessage> =>
+                    ndisWifi.Origins = [metaDataMsg as any message, m as any message];
+                    dispatch endpoint WiFiChannelNode accepts ndisWifi;
+                default => 
+                    ThrowDecodingException("WiFiChannelInfo", "PEF NDIS WiFi with MetaData");
+            }
+            metaDataMsg = null;
+        }
+    }
+    
+    process pefNdis accepts m:PefNdisMsg
+        // 0x00000200 NdisMediumWirelessWan
+        where m#EtwKeywords != nothing && (((m#EtwKeywords as ulong) & NdisMedium.NdisMediumWirelessWan) != 0)
+    {
+        if (!DecodeWirelessWanMessage(m.FrameData))
+        {
+            ThrowDecodingException("WiFiChannelInfo", "PEF NDIS Wireless Wan");
+        }
+    }
+    
+    ~endpoint(PefNdisNode pefNdis)
+    {
+        if (metaDataMsg != null)
+        {
+            DisplayTopLevelMessage(metaDataMsg, "WiFiChannelInfo: Missing continuation PefNdisMsg");
+        }
+    }
+}
+
+// MetaData part of WiFi Message by PEF NDIS provider
+message PefNdisWiFiChannelMessage
+{
+    PefNdisMetaData MetaData;
+    binary WiFiFrame;
+
+    override string ToString()
+    {
+        return "PefNdisWiFiChannelMessage, " + GetWiFiMetaDataDisplayInfo(MetaData.lRSSI, MetaData.DataRate);
+    }
+}
+
+int get PayloadLength(this WiFiChannelInfo.PefNdisWiFiChannelMessage msg)
+{
+    return msg.WiFiFrame.Count;
+}
+
+type PefNdisMetaData
+{
+    uint OperationMode;
+    uint Flags;
+    uint PhyId;
+    uint ChCenterFrequency;
+    int lRSSI;
+    byte DataRate;
+    ulong TimeStamp;
+}
+
+/*
+    Part 4. Common Library
+*/
+string GetWiFiMetaDataDisplayInfo(int lRSSI, byte rate)
+{
+    string str = "RSSI: " + (lRSSI as string) + " dBm";
+    if (rate is StandardRate)
+    {
+        str = str + ", Rate: " + ((rate / 2)as string);
+        if (rate % 2 > 0)
+        {
+            str = str + ".5 Mbps";
+        }
+        else
+        {
+            str = str + ".0 Mbps";
+        }
+    }
+    else
+    {
+        str = str + ", Data Rate Cannot be Determined(Nonstandard Data Rate used)";
+    }
+    return str;
+}

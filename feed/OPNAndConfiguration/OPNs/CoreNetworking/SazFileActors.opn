@@ -1,0 +1,78 @@
+protocol SessionArchiveZip with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376443", Date = "04/03/2015"}
+        ]
+};
+
+using HTTP;
+using Utility;
+using SazFile;
+
+autostart actor SazSessionToHttp(SazFile.SazSessionEndpoint saz)
+{
+    // Shared variables for whole connection.
+    ConnectionContext context = new ConnectionContext();
+
+    // HTTP over SazFile doesn't need reassembly, 'DecodeCaches' are used here to reuse code.
+    HttpDecodingCache<HttpContract.Request> inboundCache = 
+        new HttpDecodingCache<HttpContract.Request>().
+            InitializeHttpCache(context, MessageDirection.Accepts, endpoint HTTP.Server over saz, false, TryDecodeRequestHeader, TryDecodeRequestBodyAndDispatch, SetAnnotationForRequest);
+    HttpDecodingCache<HttpContract.Response> outboundCache = 
+        new HttpDecodingCache<HttpContract.Response>().
+            InitializeHttpCache(context, MessageDirection.Issues, endpoint HTTP.Server over saz, false, TryDecodeResponseHeader, TryDecodeResponseBodyAndDispatch, SetAnnotationForResponse);
+    
+    // for setting annotation.
+    map<string, string> SessionFlags = null;
+
+    process saz accepts fm:SazSession
+    {
+        SessionFlags = fm.SessionFlags;
+        // request
+        inboundCache.Buffer = fm.ClientPayload; // 'Buffer' will be used to assign SourceData of decoded message.
+        stream s = fm.ClientPayload;
+        if (TryDecodeRequestHeader(inboundCache, s) && TryDecodeRequestBodyAndDispatch(inboundCache, s))
+        {
+            inboundCache.ResetAfterSucceed(s, false);
+        }
+        else
+        {
+            ValidationCheckDecodingFailure(fm, "SazFile", "HTTP Request"); // Not abort decoding even if request message decodes failed.
+        }
+
+        // response
+        outboundCache.Buffer = fm.ServerPayload; // 'Buffer' will be used to assign SourceData of decoded message.
+        stream ss= fm.ServerPayload;
+        if (TryDecodeResponseHeader(outboundCache, ss) && TryDecodeResponseBodyAndDispatch(outboundCache, ss))
+        {
+            outboundCache.ResetAfterSucceed(s, false);
+        }
+        else
+        {
+            ThrowDecodingException("SazFile", "HTTP Response");
+        }
+    }
+
+    // destructor
+    ~endpoint(SazFile.SazSessionEndpoint saz)
+    {
+        inboundCache.ClearInDestructor();
+        outboundCache.ClearInDestructor();
+    }
+
+    void SetAnnotationForRequest(HttpContract.Request req)
+    {   
+        req#SourceAddress = SessionFlags != null && "x-clientip" in SessionFlags ? SessionFlags["x-clientip"] : "Local";
+    }
+
+    void SetAnnotationForResponse(HttpContract.Response res)
+    {   
+        res#DestinationAddress = SessionFlags != null && "x-clientip" in SessionFlags ? SessionFlags["x-clientip"] : "Local";
+    }
+}

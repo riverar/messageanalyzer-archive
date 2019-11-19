@@ -1,0 +1,4001 @@
+protocol MSRPCE with 
+BinaryEncodingDefaults{Endian = Endian.Little, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Microsoft Remote Procedure Call Protocol Extensions",
+    ShortName = "MSRPCE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+    new Reference{Name = "X/Open C706", Link = "http://www.opengroup.org/pubs/catalog/c706.htm"},
+    new Reference{Name = "MS-RPCE", Version = "29.0", Date = "06/01/2017", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary =
+    [
+    new Revision{Class = RevisionClass.Major, Version = "383115", Date = "12/03/2015"}
+    ]
+};
+
+using Standard;
+using RPCH;
+using UDP;
+using IANA;
+using Utility;
+using TCP;
+using TLS;
+using GSSAPI;
+using NLMP;
+using GSSAPIKRB5;
+using MicrosoftCommonResources;
+using Diagnostics;
+using DecodingUtility;
+using Reassembly;
+using KerberosV5;
+
+annotation bool DcRpcClPktHdrT#FirstFrag;
+annotation bool DcRpcClPktHdrT#LastFrag;
+
+// _______________________________________________________________________Common________________________________________________________________________
+pattern PDUType = enum byte
+{
+    Request            = 0,
+    Ping               = 1,
+    Response           = 2,
+    Fault              = 3,
+    Working            = 4,
+    NoCall             = 5,
+    Reject             = 6,
+    Ack                = 7,
+    ClCancel           = 8,
+    Fack               = 9,
+    CancelAck          = 10,
+    Bind               = 11,
+    BindAck            = 12,
+    BindNak            = 13,
+    AlterContext       = 14,
+    AlterContextResp   = 15,
+    Auth3              = 16,
+    Shutdown           = 17,
+    CoCancel           = 18,
+    Orphaned           = 19,
+    ...
+};
+
+pattern RejectStatusCodes = enum uint
+{
+    // MS-RPCE section 3.2.3.5.1   Failure Semantics(for value == 0x00000005)
+    ERROR_ACCESS_DENIED              = 0x00000005,
+    nca_s_comm_failure               = 0x1C010001, /* unable to get response from server: */
+    nca_s_op_rng_error               = 0x1C010002, /* bad operation number in call: */
+    nca_s_unk_if                     = 0x1C010003, /* unknown interface: */
+    nca_s_wrong_boot_time            = 0x1C010006, /* client passed server wrong server boot time: */
+    nca_s_you_crashed                = 0x1C010009, /* a restarted server called back a client: */
+    nca_s_proto_error                = 0x1C01000B, /* someone messed up the protocol: */
+    nca_s_out_args_too_big           = 0x1C010013, /* output args too big: */
+    nca_s_server_too_busy            = 0x1C010014, /* server is too busy to handle call: */
+    nca_s_fault_string_too_long      = 0x1C010015, /* string argument longer than declared max len: */
+    nca_s_unsupported_type           = 0x1C010017, /* no implementation of generic operation for object: */
+
+    nca_s_fault_int_div_by_zero      = 0x1C000001,
+    nca_s_fault_addr_error           = 0x1C000002,
+    nca_s_fault_fp_div_zero          = 0x1C000003,
+    nca_s_fault_fp_underflow         = 0x1C000004,
+    nca_s_fault_fp_overflow          = 0x1C000005,
+    nca_s_fault_invalid_tag          = 0x1C000006,
+    nca_s_fault_invalid_bound        = 0x1C000007,
+    nca_s_rpc_version_mismatch       = 0x1C000008,
+    nca_s_unspec_reject              = 0x1C000009, /* call rejected, but no more detail: */
+    nca_s_bad_actid                  = 0x1C00000A,
+    nca_s_who_are_you_failed         = 0x1C00000B,
+    nca_s_manager_not_entered        = 0x1C00000C,
+    nca_s_fault_cancel               = 0x1C00000D,
+    nca_s_fault_ill_inst             = 0x1C00000E,
+    nca_s_fault_fp_error             = 0x1C00000F,
+    nca_s_fault_int_overflow         = 0x1C000010,
+    /*                   unused: 0x1C000011; */
+    nca_s_fault_unspec               = 0x1C000012,
+    nca_s_fault_remote_comm_failure = 0x1C000013,
+    nca_s_fault_pipe_empty           = 0x1C000014,
+    nca_s_fault_pipe_closed          = 0x1C000015,
+    nca_s_fault_pipe_order           = 0x1C000016,
+    nca_s_fault_pipe_discipline      = 0x1C000017,
+    nca_s_fault_pipe_comm_error      = 0x1C000018,
+    nca_s_fault_pipe_memory          = 0x1C000019,
+    nca_s_fault_context_mismatch     = 0x1C00001A,
+    nca_s_fault_remote_no_memory     = 0x1C00001B,
+    nca_s_invalid_pres_context_id    = 0x1C00001C,
+    nca_s_unsupported_authn_level    = 0x1C00001D,
+    nca_s_invalid_checksum           = 0x1C00001F,
+    nca_s_invalid_crc                = 0x1C000020,
+    nca_s_fault_user_defined         = 0x1C000021,
+    nca_s_fault_tx_open_failed       = 0x1C000022,
+    nca_s_fault_codeset_conv_error   = 0x1C000023,
+    nca_s_fault_object_not_found     = 0x1C000024,
+    nca_s_fault_no_client_stub       = 0x1C000025,
+    ...
+};
+
+// [MS-RPCE] section 3.2.3.5.1   Failure Semantics 
+pattern RpcconnFaultHdrT_Status = enum uint
+{
+    ERROR_SUCCESS = 0x00000000,
+    STATUS_GUARD_PAGE_VIOLATION = 0x80000001,
+    STATUS_DATATYPE_MISALIGNMENT = 0x80000002,
+    STATUS_BREAKPOINT = 0x80000003,
+    STATUS_ACCESS_VIOLATION = 0xC0000005,
+    STATUS_IN_PAGE_ERROR = 0xC0000006,
+    STATUS_ILLEGAL_INSTRUCTION = 0xC000001D,
+    STATUS_PRIVILEGED_INSTRUCTION = 0xC0000096,
+    STATUS_INSTRUCTION_MISALIGNMENT = 0xC00000AA,
+    STATUS_STACK_OVERFLOW = 0xC00000FD,
+    STATUS_POSSIBLE_DEADLOCK = 0xC0000194,
+    STATUS_HANDLE_NOT_CLOSABLE = 0xC0000235,
+    STATUS_STACK_BUFFER_OVERRUN = 0xC0000409,
+    STATUS_ASSERTION_FAILURE = 0xC0000420,
+};
+// __________________________________________________________________________Connectionless____________________________________________________________________________
+
+const map<PDUType, string> ClMsgNameMap = 
+{
+    PDUType.Request -> "DcRpcClRequest",
+    PDUType.Response -> "DcRpcClResponse",
+    PDUType.Ping -> "DcRpcClPing",
+    PDUType.Fault -> "DcRpcClFault",
+    PDUType.Working -> "DcRpcClWorking",
+    PDUType.NoCall -> "DcRpcClNocall",
+    PDUType.Reject -> "DcRpcClReject",
+    PDUType.Ack -> "DcRpcClAck",
+    PDUType.ClCancel -> "DcRpcClCancel",
+    PDUType.Fack -> "DcRpcClFack",
+    PDUType.CancelAck -> "DcRpcClCancelAck",
+};
+
+string GetClMsgName(PDUType pduType)
+{
+    return (pduType in ClMsgNameMap) ? ClMsgNameMap[pduType] : "DcRpcClPktHdrT";
+}
+
+message DcRpcClPktHdrT : IComparable<DcRpcClPktHdrT>
+{
+    byte RpcVers where value == 4; // RPC protocol major version (4 LSB only)//
+    PDUType PType;      // Packet type (5 LSB only) //
+    RpcClPktHdrFlag1 Flags1;     // Packet flags //
+    RpcClPktHdrFlag2 Flags2 where ValidationCheck((value & 0x3F) == 0, null, DiagnosisLevel.Error, "MSRPCE: The Flags2 in message DcRpcClPktHdrT is not expected, its Reserved04 - Reserved80 are reserved for future use, they must be set to zero.");     // Packet flags //
+    // Future Reference: add NDR Format Label and decode in details.
+    ClDrepFormatLabel Drep;    // Data representation format label //
+    byte SerialHi;  // High byte of serial number //
+    guid Object with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};     // Object identifier //
+    guid IfId with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};      // Interface identifier //
+    guid ActId with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};     // Activity identifier //
+    uint  ServerBoot with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}, DisplayInfo{ToText = ServerBootToUTC}; // Server boot time //
+    uint  IfVers with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};    // Interface version //
+    uint  Seqnum with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};     // Sequence number //
+    ushort Opnum with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};      // Operation number //
+    ushort Ihint with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};      // Interface hint //
+    ushort Ahint with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};      // Activity hint //
+    ushort Len where ValidationCheck(value <= 65528, null, DiagnosisLevel.Error, "MSRPCE: The Len in message DcRpcClPktHdrT should be less than or equal to 65528, and the maximum PDU body size is 65528 bytes.")
+               with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; // Length of packet body //
+    ushort Fragnum with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};    // Fragment number //
+    AuthnType AuthProto with BinaryEncoding{Endian = Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little};  // Authentication protocol identifier //
+    byte SerialLo;  // Low byte of serial number //
+    
+    override string ToString()
+    {
+        string serialNum = Utility.DecToHexFormat(((SerialHi << 8) + SerialLo) as ushort);
+        if (PType == PDUType.Fack)
+        {
+            optional RpcDgFackBodyT fackBody = (this as DcRpcClFack).Body;
+            if (fackBody != nothing)
+            {
+                serialNum = Utility.DecToHexFormat((fackBody as RpcDgFackBodyT).SerialNum);
+            }
+        }
+        return GetClMsgName(PType) + (this#FirstFrag != nothing ? ", FirstFrag" : "") + (this#LastFrag != nothing ? ", LastFrag" : "") + 
+            (this#Retransmission != nothing ? ", Retransmission" : "") + ", Seq: " + Utility.DecToHexFormat(Seqnum) + 
+            ", Opnum: " + Utility.DecToHexFormat(Opnum) + ", Frag: " + Utility.DecToHexFormat(Fragnum) + 
+            ", Serial: " + serialNum + ", Act Id: " + UuidToText(ActId);
+    }
+
+    int CompareTo(DcRpcClPktHdrT other)
+    {
+        if (other == null)
+        {
+            return this.Fragnum;
+        }
+
+        return this.Fragnum - other.Fragnum;
+    }
+}
+
+string ServerBootToUTC(any input)
+{
+    if (!(input is uint))
+    {
+        return "";
+    }
+    uint data = input as uint;
+    
+    return CreateDateTime(1970, 1, 1).AddSeconds(data as double).ToString("MM/dd/yyyy HH:mm:ss K");
+}
+
+bool IsLeapYear(ulong year)
+{
+    // multiple of 4 or multiple of 400 but not multiple of 100.
+    return (year % 400 == 0) || (year % 4 == 0 && year % 100 != 0);
+}
+
+bool get IsBigEndian(this DcRpcClPktHdrT rpcclpkt)
+{
+    return rpcclpkt.Drep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian;
+}
+
+pattern RpcClPktHdrFlag1 = flags byte
+{
+    Reserved01  = 0x01, /* Reserved for use by implementations.*/
+    Lastfrag    = 0x02, /*Meaningful in either direction. If set, the PDU is the last fragment of a multi-PDU transmission.*/
+    Frag        = 0x04, /*Meaningful in either direction. If set, the PDU is a fragment of a multi-PDU transmission.*/
+    Nofack      = 0x08, /* Meaningful for fragments sent in either direction. If set, the
+                         *receiver is not requested to send a fack PDU for the fragment.
+                         *Otherwise, if not set, the receiver acknowledges the received
+                         *PDU with a fack PDU. Note that both client and server may
+                         *send fack PDUs independent of the status of this flag.*/
+    Maybe       = 0x10, /*Meaningful only from client to server. If set, the PDU is for a  maybe request.*/
+    Idempotent  = 0x20, /*Meaningful only from client to server. If set, the PDU is for an idempotent request.*/
+    Broadcast   = 0x40, /*Meaningful only from client to server. If set, the PDU is for a broadcast request.*/
+    Reserved80  = 0x80, /* Reserved for use by implementations.*/
+};
+
+pattern RpcClPktHdrFlag2 = flags byte
+{
+    Reserved01      = 0x01, // Reserved for use by implementations.
+    CancelPending   = 0x02, // Cancel pending at the call end.
+    Reserved04      = 0x04, // Reserved for future use. Must be set to 0.
+    Reserved08      = 0x08, // Reserved for future use. Must be set to 0.
+    Reserved10      = 0x10, // Reserved for future use. Must be set to 0.
+    Reserved20      = 0x20, // Reserved for future use. Must be set to 0.
+    Reserved40      = 0x40, // Reserved for future use. Must be set to 0.
+    Reserved80      = 0x80, // Reserved for future use. Must be set to 0.
+};
+
+// Security Providers
+// The extensions could be found: http://msdn.microsoft.com/en-us/library/windows/desktop/aa373556(v=vs.85).aspx
+pattern AuthnType = enum byte
+{
+    RpcCAuthnNone           = 0, // No Authentication
+    RpcCAuthnDcePrivate     = 1, // DCE's private-key authentication is derived from Kerberos";
+    RpcCAuthnDcePublic      = 2, // DCE public key authentication (reserved for future use).";
+    RpcCAuthnDecPublic      = 4, // DEC public key authentication (reserved for future use).";
+    RpcCAuthnGssNegotiate   = 9, // The Simple and Protected GSS-API Negotiation (SPNEGO) mechanism selects either NT LAN Manager (NTLM) or Kerberos authentication.";
+    RpcCAuthnWinnt          = 10, // NTLM authentication will be used.";
+    RpcCAuthnGssSchannel    = 14, // Transport Layer Security (TLS) or Secure Socket Layer (SSL) authentication for packet privacy will be used.";
+    RpcCAuthnGssKerberos    = 16, // Kerberos authentication will be used.";
+    RpcCAuthnDpa            = 17, // Distributed Password Authentication.  Not currently supported.";
+    RpcCAuthnMsn            = 18, // Authentication protocol SSP used for the Microsoft Network (MSN). Not currently supported.";
+    RpcCAuthnDigest         = 21, // Not currently supported.";
+    RpcCAuthnNetlogon       = 68, // Netlogon authentication will be used.";
+    RpcCAuthnMq             = 100, // This SSP provides an SSPI-compatible wrapper for the Microsoft Message Queue (MSMQ) transport-level protocol. Not currently supported.";
+    RpcCAuthnDefault        = 255,
+};
+
+// Connectionless PDUs contain an authentication verifier if the PDU header field auth_proto is non-zero. Otherwise, the authentication verifier is not present.
+type AuthTrailerClT 
+{
+    AuthnLevel ProtectionLevel;
+    byte KeyVersNum;
+    array<byte> Pad with BinaryEncoding{Length = (ProtectionLevel == AuthnLevel.RpcCAuthnLevelPktPrivacy ? 6 : 2)};
+    ([|ProtectionLevel == AuthnLevel.RpcCAuthnLevelPkt|] PktAuthValue | array<byte>) AuthValue where ValidationCheck(value is array<byte> && (value as array<byte>).Count < 16, null, DiagnosisLevel.Error, "MSRPCE: The AuthValue in type AuthTrailerClT is not 16 bytes in length."); // with BinaryEncoding{Length = 16};
+}
+
+// Authentication Levels
+// The extended protection level could be found: http://msdn.microsoft.com/en-us/library/windows/desktop/ms678435(v=vs.85).aspx
+pattern AuthnLevel = enum byte
+{
+    RpcCAuthnLevelDefault       = 0, // MSRPC use this instead: RpcCAuthnLEVEL_DEFAULT
+    RpcCAuthnLevelNone          = 1,
+    RpcCAuthnLevelConnect       = 2,
+    RpcCAuthnLevelCall          = 3,
+    RpcCAuthnLevelPkt           = 4,
+    RpcCAuthnLevelPktIntegrity  = 5,
+    RpcCAuthnLevelPktPrivacy    = 6,
+    ...
+};
+
+type Plaintext
+{
+    uint Seqnum;
+    uint Fragnum;
+}
+
+type PktAuthValue
+{
+    Plaintext Checksum;
+    array<byte> RestAuthValue where ValidationCheck(value.Count == 16, null, DiagnosisLevel.Error, "MSRPCE: The RestAuthValue in type PktAuthValue is not 8 bytes in length."); // with BinaryEncoding{Length = 8};
+}
+
+type ClDrepFormatLabel
+{
+    IntergerFloatingPointByteOrder IntegerRepresentation with BinaryEncoding{Width = 4};
+    CharacterRepresentation CharacterRepresentation with BinaryEncoding{Width = 4};
+    FloatingPointRepresentation FloatingPointRepresentation;
+    byte Reserved;
+}
+
+pattern IntergerFloatingPointByteOrder = enum byte
+{
+    BigEndian = 0,
+    LittleEndian = 1,
+};
+
+pattern CharacterRepresentation = enum byte
+{
+    Ascii   = 0,
+    Ebcdic  = 1,
+};
+
+pattern FloatingPointRepresentation = enum byte
+{
+    Ieee    = 0,
+    Vax     = 1,
+    Cray    = 2,
+    Ibm     = 3,
+};
+
+// An ack PDU contains no body data.
+message DcRpcClAck : DcRpcClPktHdrT
+{
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Ack;
+}
+
+// A cancel_ack PDUs can optionally have a body.
+message DcRpcClCancelAck : DcRpcClPktHdrT
+{
+    optional [|Len > 0|] RpcDgCancelAckBodyT Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.CancelAck;
+}
+
+type RpcDgCancelAckBodyT
+{
+    uint Vers where value == 0; /* cancel-request body format version. This is independent of the protocol version number contained in the PDU header. This specification is for version 0. */
+    uint CancelId;/* id of a cancel-request event being ack'd */
+    bool ServerIsAccepting; /* server accepting cancels ? */
+}
+
+// A client sends a cancel PDU when it has incurred a cancel fault.
+message DcRpcClCancel : DcRpcClPktHdrT
+{
+    RpcDgCancelBodyT Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.ClCancel;
+}
+
+type RpcDgCancelBodyT
+{
+    uint Vers where value == 0; /* cancel body format version. This is independent of the protocol version number contained in the PDU header. This specification is for version 0. */
+    uint CancelId;/* id of a cancel-request event */
+}
+
+// A fack PDU may contain a body with data
+message DcRpcClFack : DcRpcClPktHdrT
+{
+    optional [|Len > 0|] RpcDgFackBodyT[Len] Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Fack;
+}
+
+type RpcDgFackBodyT[ushort Len]
+{
+    // Windows implementation always set Vers = 1. ref: http://msdn.microsoft.com/en-us/library/9039a59f-3075-4680-9517-19239bebf155(v=prot.13)#id48
+    byte Vers; /* Fack packet body version */ 
+    byte Pad1;
+    ushort WindowSize;   /* Sender's receive window size (in pkts) */
+    uint MaxTsdu;      /* largest local TPDU size */
+    uint MaxFragSize; /* largest TPDU not fragmented */
+    ushort SerialNum;    /* serial # of packet that induced this fack */
+    ushort SelackLen;    /* number of elements in the selack array    */
+    array<uint> Selack with BinaryEncoding{Length = SelackLen};     /* variable number of 32 bit selective ack bit masks. */
+    optional [|(Len - 16 - 4 * SelackLen) > 0|] binary BodyPadding with BinaryEncoding{Length = (Len - 16 - 4 * SelackLen) as ushort};
+}
+
+// A server sends a fault PDU if an operation incurs a fault while executing on the server side.
+message DcRpcClFault : DcRpcClPktHdrT
+{
+    RpcDgFaultBodyT Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Fault;
+}
+
+type RpcDgFaultBodyT
+{
+    RejectStatusCodes St where ErrorCodeIf(InRange<RejectStatusCodes>(value), null, "MSRPCE: The Status of the message is St(" + EnumToString(value as uint, "MSRPCE.RejectStatusCodes") + "). Please refer to St in Technical Document MS-RPCE."); /*status code */
+}
+
+// A server sends a nocall PDU in reply to a ping PDU. A nocall PDU can optionally carry a body whose format is the same as the optional fack PDU body.
+message DcRpcClNocall: DcRpcClPktHdrT
+{
+    optional [|Len > 0|] RpcDgFackBodyT Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.NoCall;
+}
+
+// A ping PDU contains no body data.
+message DcRpcClPing: DcRpcClPktHdrT
+{
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Ping;
+}
+
+// The reject PDU body format is the same as that of the fault PDU. A server sends a reject PDU if an RPC request is rejected.
+message DcRpcClReject: DcRpcClPktHdrT
+{
+    RpcDgFaultBodyT Body;
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Reject;
+}
+
+// The body of a request PDU consists of an NDR representation of the input parameters for the request.
+message DcRpcClRequest : DcRpcClPktHdrT
+{
+    binary Body with BinaryEncoding{Length = Len};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Request;
+}
+
+// The body of a response PDU consists of the NDR representation of the output parameters for the response.
+message DcRpcClResponse : DcRpcClPktHdrT
+{
+    binary Body with BinaryEncoding{Length = Len};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone && Len % 8 != 0|] array<byte> Pad with BinaryEncoding{Length = ((8 - Len % 8) % 8)};
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Response;
+}
+
+// A server sends a working PDU in reply to a ping PDU. A working PDU contains no body data.
+message DcRpcClWorking : DcRpcClPktHdrT
+{
+    optional [|AuthProto != AuthnType.RpcCAuthnNone|] AuthTrailerClT AuthVerifier;
+    invariant PType == PDUType.Working;
+}
+
+message DcRpcClIncompleteMessage : DcRpcClPktHdrT
+{
+    binary Payload;
+    
+    override string ToString()
+    {
+        return "[Incomplete] " + GetClMsgName(PType);
+    }
+}
+
+// Identifier for Connectionless DCERPC, Pre-check and if successfully decode then parse the whole payload according to PDUType
+type ClMessageIdentifier
+{
+    byte RpcVers where value == 4; // RPC protocol major version (4 LSB only)//
+    byte PType where value <= 10; // Packet type (5 LSB only) //
+    RpcClPktHdrFlag1 Flags1; // Packet flags //
+    RpcClPktHdrFlag2 Flags2 where (value & 0x3F) == 0; // Packet flags //
+    array<byte> Drep with BinaryEncoding{Length = 3};
+    invariant (Drep[0] & 0xEE) == 0 && Drep[1] < 4 && Drep[2] == 0;
+}
+
+// ____________________________________________________________________Connection-oriented_________________________________________________________________
+
+const map<PDUType, string> ConnMsgNameMap =
+{
+    PDUType.Bind -> "RpcconnBindHdrT",
+    PDUType.BindAck -> "RpcconnBindAckHdrT",
+    PDUType.BindNak -> "RpcconnBindNakHdrT",
+    PDUType.AlterContext -> "RpcconnAlterContextHdrT",
+    PDUType.AlterContextResp -> "RpcconnAlterContextResponseHdrT",
+    PDUType.Auth3 -> "RpcconnRpcAuth3HdrT",
+    PDUType.CoCancel -> "RpcconnCancelHdrT",
+    PDUType.Fault -> "RpcconnFaultHdrT",
+    PDUType.Orphaned -> "RpcconnOrphanedHdrT",
+    PDUType.Request -> "RpcconnRequestHdrT",
+    PDUType.Response -> "RpcconnResponseHdrT",
+    PDUType.Shutdown -> "RpcconnShutdownHdrT",
+};
+
+string GetConnMsgName(PDUType ptype)
+{
+    return (ptype in ConnMsgNameMap) ? ConnMsgNameMap[ptype] : "RpcconnCommonHdrT";
+}
+
+pattern PContextIdT = ushort;
+
+type PSyntaxIdT[Endian endian]
+{
+    guid IfUuid with BinaryEncoding{Endian = endian};
+    uint IfVersion with BinaryEncoding{Endian = endian};
+    
+    override string ToString()
+    {
+        return "{" + IfUuid.ToString() + "} " + GetRPCUuidString(IfUuid);
+    }
+}
+
+type PContElemT[Endian endian]
+{
+    PContextIdT PContId with BinaryEncoding{Endian = endian};
+    byte NTransferSyn; /* number of items */
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved in type PContElemT must be zero.");/* alignment pad, m.b.z. */
+    PSyntaxIdT[endian] AbstractSyntax;
+    array<PSyntaxIdT[endian]> TransferSyntaxes with BinaryEncoding{Length = NTransferSyn}; /* transfer syntax list */
+}
+
+type PContListT[Endian endian]
+{
+    byte NContextElem; /* number of items */
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved in type PContListT must be zero."); /* alignment pad, m.b.z. */
+    ushort Reserved2 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved2 in type PContListT must be zero.") /* alignment pad, m.b.z. */
+        with BinaryEncoding{Endian = endian};
+    array<PContElemT[endian]> PContElem with BinaryEncoding{Length = NContextElem};
+}
+
+pattern PContDefResultT = enum short
+{
+    Acceptance,
+    UserRejection,
+    ProviderRejection,
+    NegotiateAck // [MSRPCE] 2.2.2.4, These extensions specify a new member, negotiate_ack, which is added to the p_cont_def_result_t enumeration (specified in [C706] section 12.6), with the numeric value of 3.
+};
+
+pattern PProviderReasonT = enum short
+{
+    ReasonNotSpecified,
+    AbstractSyntaxNotSupported,
+    ProposedTransferSyntaxesNotSupported,
+    LocalLimitExceeded
+};
+
+type PResultT[Endian endian]
+{
+    PContDefResultT Result with BinaryEncoding{Endian = endian};
+    PProviderReasonT Reason with BinaryEncoding{Endian = endian}; /* only relevant if result != acceptance */
+    PSyntaxIdT[endian] TransferSyntax where ValidationCheck(Result == PContDefResultT.Acceptance ||
+    (value.IfUuid == {00000000-0000-0000-0000-000000000000} && value.IfVersion == 0),
+    null, DiagnosisLevel.Error, "MSRPCE: The TransferSyntax in type PResultT should be zero if the Result in type PResultT is not Acceptance.");/* tr syntax selected 0 if result not accepted */
+}
+
+/* Same order and number of elements as in bind request */
+type PResultListT[Endian endian]
+{
+    byte NResults; /* count */
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved in type PResultListT must be zero."); /* alignment pad, m.b.z. */
+    ushort Reserved2 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved2 in type PResultListT must be zero.") /* alignment pad, m.b.z. */
+        with BinaryEncoding{Endian = endian};
+    array<PResultT[endian]> PResults with BinaryEncoding{Length = NResults};
+}
+
+type VersionT
+{
+    byte Major;
+    byte Minor;
+}
+
+// The run-time version data type Is synonymous:
+pattern PRtVersionT = VersionT;
+
+type PRtVersionsSupportedT
+{
+    byte NProtocols; /* count */
+    array<PRtVersionT> PProtocols with BinaryEncoding{Length = NProtocols};
+}
+
+type PortAnyT[Endian endian]
+{
+    ushort Length with BinaryEncoding{Endian = endian}; // The length includes the C NULL string termination.
+    string PortSpec with BinaryEncoding{Length = Length};
+}
+
+// Reasons for rejection of association return in the BindNak PDU
+pattern PRejectReasonT = enum ushort
+{
+    ReasonNotSpecified              = 0,
+    TemporaryCongestion             = 1,
+    LocalLimitExceeded              = 2,
+    CalledPaddrUnknown              = 3, /* not used */
+    ProtocolVersionNotSupported     = 4,
+    DefaultContextNotSupported      = 5, /* not used */
+    UserDataNotReadable             = 6, /* not used */
+    NoPsapAvailable                 = 7, /* not used */
+    AuthenticationTypeNotRecognized = 8,
+    InvalidChecksum                 = 9,
+};
+
+pattern RpcrtReasonCodeT = ushort; /* 0..65535 */
+
+type RpcrtOptionalDataT
+{
+    byte RpcVers;
+    byte RpcVersMinor;
+    ushort Reserved1 where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The Reserved1 in type RpcrtOptionalDataT must be zero.") with BinaryEncoding{Length = 2};/* must be zero */
+    array<byte> PackedDrep with BinaryEncoding{Length = 4};
+    uint RejectStatus;
+    array<byte> Reserved2 with BinaryEncoding{Length = 4};
+}
+
+// Future Reference: find the reference places.
+type RpcconnRejectOptionalDataT
+{
+    RpcrtReasonCodeT ReasonCode; /* 0..65535 */
+    RpcrtOptionalDataT RpcInfo; /* may be RPC specific */
+}
+
+// Future Reference: find the reference places.
+type RpcconnDiscOptionalDataT
+{
+    RpcrtReasonCodeT ReasonCode; /* 0..65535 */
+    RpcrtOptionalDataT RpcInfo; /* may be RPC-specific */
+}
+
+pattern AuthnSvc = enum byte
+{
+    RpcCAuthnNone = 0,
+    RpcCAuthnDceSecret = 1,
+    RpcCAuthnDefault = 2,
+};
+
+// byteOrder is retrieved from data source, the value of little endian is 0x10.
+type AuthVerifierCoT[ushort AuthLength, int AuthPadLengthValue, Endian endian]
+{
+    /* restore 4 byte Alignment */
+    array<byte> AuthPad with BinaryEncoding{Length = AuthPadLengthValue}; /* align(4) */
+    AuthnType AuthType; /* :01 which authent service */
+    AuthnLevel AuthLevel; /* :01 which level within service */
+    byte AuthPadLength; /* :01 */
+    byte AuthReserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The AuthReserved in type AuthVerifierCoT must be zero."); /* :01 reserved, m.b.z. */
+    uint AuthContextId with BinaryEncoding{Endian = endian}; /* :04 */
+    (binary | GssapiType | KerberosToken | KrbMessage | NlmpMessage | NL_AUTH_MESSAGE | RecordLayer |
+     NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity | NTLMSSP_MESSAGE_SIGNATURE |
+     NL_AUTH_SIGNATURE | NL_AUTH_SHA2_SIGNATURE) AuthValue with BinaryEncoding{Length = AuthLength}; /* credentials */
+    /* The auth_value field may contain a variety of security-related data. For the bind, bind_ack,
+     *alter_context and alter_context_response PDUs, this field encodes credentials. For other PDUs,
+     *this field holds checksums and other per-PDU security data that depend on the protection level. */
+}
+
+type SecTrailer[Endian endian]
+{
+    AuthnType AuthType; // MUST contain an authentication type.
+    AuthnLevel AuthLevel; // MUST contain one of the authentication levels as specified in section 2.2.1.1.8.
+    byte AuthPadLength; // The number of padding octets, used to 4-byte align the sec_trailer structure,
+    byte AuthReserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSRPCE: The AuthReserved in type SecTrailer should be zero on store, and should be ignored on read.");
+    uint AuthContextId with BinaryEncoding{Endian = endian};
+}
+
+pattern RpcCoPfcFlags = flags byte
+{
+    PfcFirstFrag          = 0x01,/* First fragment */
+    PfcLastFrag           = 0x02,/* Last fragment */
+    $"PfcPendingCancel | PfcSupportHeaderSign"      = 0x04,/* Cancel was pending at sender */
+    PfcReserved1          = 0x08,
+    PfcConcMpx            = 0x10,/* supports concurrent multiplexing  of a single connection. */
+    PfcDidNotExecute      = 0x20,/* only meaningful on 'fault' packet; if true, guaranteed call did not execute. */
+    PfcMaybe              = 0x40,/* 'maybe' call semantics requested */
+    PfcObjectUuid         = 0x80,/* if true, a non-nil object UUID
+                                  * was specified in the handle, and
+                                  * is present in the optional object
+                                  * field. If false, the object field
+                                  * is omitted. */
+};
+
+type CoDrepFormatLabel
+{
+    IntergerFloatingPointByteOrder IntegerRepresentation with BinaryEncoding{Width = 4};
+    CharacterRepresentation CharacterRepresentation with BinaryEncoding{Width = 4};
+    FloatingPointRepresentation FloatingPointRepresentation;
+    byte Reserved;
+    byte Reserved2;
+}
+
+//// Identifier for Connection-Oriented DCERPC, Pre-check and if successfully decode then parse the whole payload according to PDUType
+//type CoMessageIdentifier
+//{
+    //byte RpcVers where value == 5;/* 00:01 RPC version */ 
+    //byte RpcVersMinor where (value == 0 || value == 1); /* 01:01 minor version */
+    //byte PTYPE where (value == 0 || value == 2 || value == 3 || (value >= 11 && value <= 19)); /* 02:01 packet type */
+    //RpcCoPfcFlags PfcFlags; /* 03:01 flags (see PFC_... ) */
+    //array<byte> PackedDrep with BinaryEncoding{Length = 4}; /* 04:04 NDR data rep format label*/
+    //ushort FragLength where value >= 16;
+    //invariant ((PackedDrep[0] & 0xEE) == 0) && (PackedDrep[1] < 4) && (PackedDrep[2] == 0) && (PackedDrep[3] == 0);
+//}
+
+message RpcconnCommonHdrT
+{
+    /* start 8-octet aligned */
+    /* common fields */
+    byte RpcVers where value == 5;/* 00:01 RPC version */
+    byte RpcVersMinor where value == 0 || value == 1; /* 01:01 minor version */
+    PDUType PTYPE; /* 02:01 packet type */
+    RpcCoPfcFlags PfcFlags; /* 03:01 flags (see PFC_... ) */
+    CoDrepFormatLabel PackedDrep; /* 04:04 NDR data rep format label*/
+    ushort FragLength with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 08:02 total length of fragment */
+    ushort AuthLength with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 10:02 length of authValue */
+    uint CallId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 12:04 call identifier */
+    /* end common fields */
+}
+
+bool get IsBigEndian(this RpcconnCommonHdrT rpcconn)
+{
+    return rpcconn.PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian;
+}
+
+message RpcconnIncompleteMessage : RpcconnCommonHdrT
+{
+    binary Payload;
+    
+    override string ToString()
+    {
+        return "[Incomplete] " + GetConnMsgName(PTYPE);
+    }
+}
+
+message RpcconnRpcAuth3HdrT : RpcconnCommonHdrT
+{
+    binary Pad with BinaryEncoding{Length = 4};
+    optional [|AuthLength != 0|] SecTrailer[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] SecTrailer;
+    optional [|AuthLength != 0|] (binary | any) AuthenticationTokens with BinaryEncoding{Length = AuthLength};
+    
+    invariant PTYPE == PDUType.Auth3;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#KeyInformation == nothing ? "" : ", " + this#KeyInformation.ToString()) + 
+            (this#PContextUuid == nothing ? "" : (", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            ", UUID: " + UuidToText(this#PContextUuid as guid))) + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+message RpcconnAlterContextHdrT : RpcconnCommonHdrT
+{
+    ushort MaxXmitFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    ushort MaxRecvFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    uint AssocGroupId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    /* presentation context list */
+    PContListT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] PContextElem; /* variable size */
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional ([|AuthLength != 0|] AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true};
+    
+    invariant PTYPE == PDUType.AlterContext;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#KeyInformation == nothing ? "" : ", " + this#KeyInformation.ToString()) + 
+            (this#PContextUuid == nothing ? "" : (", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            ", UUID: " + UuidToText(this#PContextUuid as guid))) + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+message RpcconnAlterContextResponseHdrT : RpcconnCommonHdrT
+{
+    ushort MaxXmitFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    ushort MaxRecvFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    uint AssocGroupId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* ignored */
+    PortAnyT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] SecAddr; /* ignored */
+    /* restore 4-octet alignment */
+    array<byte> Pad2 with BinaryEncoding{Length = ((4 - (SecAddr.Length + 26) % 4) % 4)};
+    /* presentation context result list, including hints */
+    PResultListT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] PResultList; /* variable size */
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional ([|AuthLength != 0|] AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.AlterContextResp;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#KeyInformation == nothing ? "" : ", " + this#KeyInformation.ToString()) + 
+            (this#PContextUuid == nothing ? "" : (", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            ", UUID: " + UuidToText(this#PContextUuid as guid))) + ", Call: " + Utility.DecToHexFormat(CallId) + 
+            ", AssocGrp: " + Utility.DecToHexFormat(AssocGroupId) + ", Xmit: " + Utility.DecToHexFormat(MaxXmitFrag) + 
+            ", Recv: " + Utility.DecToHexFormat(MaxRecvFrag);
+    }
+}
+
+message RpcconnBindHdrT : RpcconnCommonHdrT
+{    
+    ushort MaxXmitFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 16:02 max transmit frag size, bytes */
+    ushort MaxRecvFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 18:02 max receive frag size, bytes */
+    uint AssocGroupId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 20:04 incarnation of client-server
+    * assoc group */
+    /* presentation context list */
+    PContListT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] PContextElem; /* variable size */
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional ([|AuthLength != 0|] AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true};
+    invariant PTYPE == PDUType.Bind;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#KeyInformation == nothing ? "" : ", " + this#KeyInformation.ToString()) + 
+            (this#PContextUuid == nothing ? "" : (", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            ", UUID: " + UuidToText(this#PContextUuid as guid))) + ", Call: " + Utility.DecToHexFormat(CallId) + 
+            ", AssocGrp: " + Utility.DecToHexFormat(AssocGroupId) + ", Xmit: " + Utility.DecToHexFormat(MaxXmitFrag) + 
+            ", Recv: " + Utility.DecToHexFormat(MaxRecvFrag);
+    }
+}
+
+message RpcconnBindAckHdrT : RpcconnCommonHdrT
+{
+    ushort MaxXmitFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 16:02 max transmit frag size */
+    ushort MaxRecvFrag with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 18:02 max receive frag size */
+    uint AssocGroupId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 20:04 returned assocGroupId */
+    PortAnyT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] SecAddr; /* 24:yy optional secondary address
+    * for process incarnation; local port
+    * part of address only */
+    /* restore 4-octet alignment */
+    array<byte> Pad2 with BinaryEncoding{Length = ((4 - (SecAddr.Length + 26) % 4) % 4)};
+    /* presentation context result list, including hints */
+    PResultListT[PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little] PResultList; /* variable size */
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional ([|AuthLength != 0|] AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.BindAck;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#KeyInformation == nothing ? "" : ", " + this#KeyInformation.ToString()) + 
+            (this#PContextUuid == nothing ? "" : (", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            ", UUID: " + UuidToText(this#PContextUuid as guid))) + ", Call: " + Utility.DecToHexFormat(CallId) + 
+            ", AssocGrp: " + Utility.DecToHexFormat(AssocGroupId) + ", Xmit: " + Utility.DecToHexFormat(MaxXmitFrag) + 
+            ", Recv: " + Utility.DecToHexFormat(MaxRecvFrag);
+    }
+}
+
+message RpcconnBindNakHdrT : RpcconnCommonHdrT
+{
+    /* 16:02 presentation context reject */
+    PRejectReasonT ProviderRejectReason with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; 
+    PRtVersionsSupportedT Versions; /* 18:yy array of protocol
+    * versions supported */
+    
+    invariant PTYPE == PDUType.BindNak;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+message RpcconnCancelHdrT : RpcconnCommonHdrT
+{
+    /* optional authentication verifier
+    * following fields present iff authLength != 0 */
+    optional [|AuthLength != 0|] (AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.CoCancel;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+message RpcconnFaultHdrT : RpcconnCommonHdrT
+{
+    /* needed for request, response, fault */
+    uint AllocHint with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 16:04 allocation hint */
+    PContextIdT PContId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 20:02 pres context, i.e. data rep */
+    /* needed for response or fault */
+    byte CancelCount; /* 22:01 received cancel count */
+    byte Reserved; /* 23:01 reserved, m.b.z. */ // These extensions specify the least significant bit of the reserved field to be a flag indicating the presence of RPC extended error information.
+    // So removed these ValidationCheck:  where ValidationCheck(value == 0, this, "RpcconnFaultHdrT.Reserved, reserved, must be zero.")
+    /* fault code */
+    RejectStatusCodes Status where ErrorCodeIf(InRange<RejectStatusCodes>(value), this, "MSRPCE: The Status in message RpcconnFaultHdrT is " + EnumToString(value as uint, "MSRPCE.RejectStatusCodes") + ".")
+        && ValidationCheck(!(value is RpcconnFaultHdrT_Status), this, "MSRPCE: The Status in message RpcconnFaultHdrT must not send status code " + EnumToString(value as uint, "MSRPCE.RpcconnFaultHdrT_Status") + " to the client. The status codes have special significance, and it presence in the status field may be flagged as a protocol error by the client.")
+         with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 24:04 run-time fault code or zero */
+    /* always pad to next 8-octet boundary */
+    // Reserved2 is optional, because 'If a non-zero value is present, no stub data is allowed.'
+    optional binary Reserved2 with BinaryEncoding{Length = 4}; /* 28:04 reserved padding, m.b.z. */
+    /* stub data here, 8-octet aligned... */
+    optional [|Status > 0|] binary StubData with Encoding{Ignore = true}; // If a non-zero value is present, no stub data is allowed.
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional [|AuthLength != 0|] AuthVerifierCoT AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.Fault;
+    
+    override string ToString()
+    {
+        string statusToText;
+        if (InRange<RejectStatusCodes>(Status))
+            statusToText = EnumToString(Status as uint, "MSRPCE.RejectStatusCodes");
+        else if (Status is RpcconnFaultHdrT_Status)
+            statusToText = EnumToString(Status as uint, "MSRPCE.RpcconnFaultHdrT_Status");
+        else
+            statusToText = DecToHexFormat(Status);
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + ", Call: " + Utility.DecToHexFormat(CallId) + 
+            ", Context: " + Utility.DecToHexFormat(PContId) + 
+            ", Status: " + statusToText + ", Cancels: " + Utility.DecToHexFormat(CancelCount);
+    }
+}
+
+message RpcconnOrphanedHdrT : RpcconnCommonHdrT
+{
+    /* optional authentication verifier
+    * following fields present iff authLength != 0 */
+    optional [|AuthLength != 0|] (AuthVerifierCoT | binary) AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.Orphaned;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+message RpcconnRequestHdrT : RpcconnCommonHdrT
+{   
+    // needed on request, response, fault //
+    uint AllocHint with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; // 16:04 allocation hint //
+    PContextIdT PContId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; // 20:02 pres context, i.e. data rep //
+    ushort Opnum with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; // 22:02 operation # within the interface //
+    // optional field for request, only present if the PfcObjectUuid field is non-zero //
+    optional [|(PfcFlags & RpcCoPfcFlags.PfcObjectUuid) == RpcCoPfcFlags.PfcObjectUuid|] guid Object
+         with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; // 24:16 object UID 
+    // stub data, 8-octet aligned //
+    binary StubData with Encoding{Ignore = true};
+    // optional authentication verifier //
+    // following fields present iff authLength != 0 //
+    optional [|AuthLength != 0|] AuthVerifierCoT AuthVerifier with Encoding{Ignore = true}; // xx:yy //
+    
+    invariant PTYPE == PDUType.Request;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#PContextUuid == nothing ? "" : ", " + 
+            GetRPCUuidString(this#PContextUuid as guid) + " " + UuidToText(this#PContextUuid as guid)) + 
+            ", Call: " + Utility.DecToHexFormat(CallId) + ", Opnum: " + Utility.DecToHexFormat(Opnum) + 
+            ", Context: " + Utility.DecToHexFormat(PContId) + ", Hint: " + Utility.DecToHexFormat(AllocHint);
+    }
+}
+
+bool get IsEncrypted(this RpcconnRequestHdrT request)
+{
+    return request.AuthLength > 0 && (request.AuthVerifier as AuthVerifierCoT).AuthLevel >= 6; // greater than AuthnLevel.RpcCAuthnLevelPktPrivacy
+}
+
+message RpcconnResponseHdrT : RpcconnCommonHdrT
+{
+    /* needed for request, response, fault */
+    uint AllocHint with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 16:04 allocation hint */
+    PContextIdT PContId with BinaryEncoding{Endian = PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.BigEndian ? Endian.Big : Endian.Little}; /* 20:02 pres context, i.e.* data rep */
+    /* needed for response or fault */
+    byte CancelCount; /* 22:01 cancel count */
+    byte Reserved; /* 23:01 reserved, m.b.z. */
+    /* stub data here, 8-octet aligned */
+    binary StubData with Encoding{Ignore = true};
+    /* optional authentication verifier */
+    /* following fields present iff authLength != 0 */
+    optional [|AuthLength != 0|] AuthVerifierCoT AuthVerifier with Encoding{Ignore = true}; /* xx:yy */
+    
+    invariant PTYPE == PDUType.Response;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + PfcFlagsToSummaryWithComma(PfcFlags) + (this#PContextUuid == nothing ? "" : ", " + GetRPCUuidString(this#PContextUuid as guid) + 
+            " " + UuidToText(this#PContextUuid as guid)) + ", Call: " + Utility.DecToHexFormat(CallId) + 
+            ", Context: " + Utility.DecToHexFormat(PContId) + ", Hint: " + Utility.DecToHexFormat(AllocHint) + 
+            ", Cancels: " + Utility.DecToHexFormat(CancelCount);
+    }
+}
+
+bool get IsEncrypted(this RpcconnResponseHdrT response)
+{
+    return response.AuthLength > 0 && (response.AuthVerifier as AuthVerifierCoT).AuthLevel >= 6; // greater than AuthnLevel.RpcCAuthnLevelPktPrivacy
+}
+
+message RpcconnShutdownHdrT : RpcconnCommonHdrT
+{
+    invariant PTYPE == PDUType.Shutdown;
+    
+    override string ToString()
+    {
+        return ConnMsgNameMap[PTYPE] + ", Call: " + Utility.DecToHexFormat(CallId);
+    }
+}
+
+type PresentationContext
+{
+    guid AbstractSyntax; // guid, equal with guid used throughout MSRPCE which is referenced from DTYP
+    uint AbstractSyntaxVersion;
+    guid TransferSyntax; // guid, equal with guid used throughout MSRPCE which is referenced from DTYP
+    uint TransferSyntaxVersion;
+}
+
+//_______________________________________________________________________Endpoint & Actors_____________________________________________________________________
+
+//_______________________________________________________________________Connection-oriented Functions_____________________________________________________________________
+
+// for nested rpc case2 (server callback client as issues request and accepts response), the conversation is just converted without any other Bind/BindAck,
+// for nested rpc case1 (server call another server and then give response the the original caller), it will be covered in another RPC call endpoint as normal client -> server with Bind/BindAck/Request/Response.
+endpoint Server over UDP.Host | over TCP.Server | over RPCH.Proxy
+// Connection-oriented
+accepts RpcconnCommonHdrT issues RpcconnCommonHdrT
+accepts RpcconnBindHdrT issues RpcconnBindAckHdrT issues RpcconnBindNakHdrT
+accepts RpcconnAlterContextHdrT accepts RpcconnRpcAuth3HdrT issues RpcconnAlterContextResponseHdrT
+accepts RpcconnRequestHdrT issues RpcconnResponseHdrT
+issues RpcconnRequestHdrT accepts RpcconnResponseHdrT // Nested RPC
+accepts RpcconnCancelHdrT
+issues RpcconnFaultHdrT
+accepts RpcconnOrphanedHdrT
+issues RpcconnShutdownHdrT
+// Connectionless
+accepts DcRpcClRequest issues DcRpcClResponse
+accepts DcRpcClAck
+accepts DcRpcClCancel issues DcRpcClCancelAck
+accepts DcRpcClFack issues DcRpcClFack
+issues DcRpcClFault
+accepts DcRpcClPing issues DcRpcClNocall issues DcRpcClWorking
+issues DcRpcClReject
+{
+    // A table of PresentationContext that have been negotiated for this connection.
+    // indexed by the presentation context ID which is same as the value
+    // of the p_cont_id field in the request PDU header, as specified in [C706] section 12.6.4.9
+    map<ushort, PresentationContext> NegotiatedPresentationContexts = {};
+    // this Nonegotiated cache used for only Bind/AlterContext request exist in traffic but without BindAck/AlterContextResp.
+    // we can benefit from this that following RPC Request/Response could be parsed successfully as possible as we can.
+    map<ushort, PresentationContext> NonegotiatedPresentationContexts = {};
+    // A caching table of Ndr64 encoding indexed by the presentation context ID
+    map<ushort, bool> Ndr64Map = {};
+    // CallId -> Opnum for Response#RpcOpnum
+    map<uint, ushort> OpnumMap = {};
+    // Cached Bind/AlterContext, waiting Ack/Response, then complete the NegotiatedPresentationContexts
+    RpcconnBindHdrT CachedBindMsg;
+    RpcconnAlterContextHdrT CachedAlterContextMsg;
+    // Cache uuid for Auth3
+    optional guid UuidForAuth3 = nothing;
+    // A flag for NLMP signature decoding.
+    bool IsNLMPExtendedSecurity = false;
+    
+    // Function that check whether a context id is NDR64 encoded
+    bool IsNdr64(ushort contextId)
+    {
+        if (contextId in Ndr64Map)
+        {
+            return Ndr64Map[contextId];
+        }
+        var isNdr64 = false;
+        if (contextId in NegotiatedPresentationContexts)
+        {
+            var context = NegotiatedPresentationContexts[contextId];
+            if (context != null)
+            {
+                isNdr64 = context.TransferSyntax == NDR64TransferSyntaxIdentifier &&
+                    context.TransferSyntaxVersion == NDR64TransferSyntaxVersion;
+            }
+        }
+        if (!isNdr64)
+        {
+            if (contextId in NonegotiatedPresentationContexts)
+            {
+                var context = NonegotiatedPresentationContexts[contextId];
+                if (context == null)
+                {
+                    Ndr64Map[contextId] = false;
+                    return false;
+                }
+                var isNdr64InStandalone = context.TransferSyntax == NDR64TransferSyntaxIdentifier &&
+                    context.TransferSyntaxVersion == NDR64TransferSyntaxVersion;
+                Ndr64Map[contextId] = isNdr64InStandalone;
+                return isNdr64InStandalone;
+            }
+            Ndr64Map[contextId] = false;
+            return false;
+        }
+        Ndr64Map[contextId] = true;
+        return true;
+    }
+        
+    // Function that check whether the given context id, uuid and version matches 
+    // one of the negotiated presentation contexts or one of standalone presentation contexts.
+    bool MatchInterface(ushort contextId, guid uuid, uint version)
+    {
+        bool negotiatedInterfaceMatch = false;
+        if (contextId in NegotiatedPresentationContexts)
+        {
+            var context = NegotiatedPresentationContexts[contextId];
+            if (context != null)
+            {
+                negotiatedInterfaceMatch = uuid == context.AbstractSyntax && MatchVersion(context.AbstractSyntaxVersion, version);
+            }
+        }
+        if (!negotiatedInterfaceMatch)
+        {
+            if (contextId in NonegotiatedPresentationContexts)
+            {
+                var context = NonegotiatedPresentationContexts[contextId];
+                if (context != null)
+                {
+                    var nonegotiatedInterfaceMatch = uuid == context.AbstractSyntax && MatchVersion(context.AbstractSyntaxVersion, version);
+                    if (nonegotiatedInterfaceMatch) 
+                    { 
+                        ReportInsufficientData(null, DiagnosisLevel.Warning, 
+                        "MSRPCE: Incomplete MSRPCE binding, missing context acceptance for this PContId: " + (contextId as string) + ", Abstract Syntax: " + (uuid as string) + ", and Version: " + (version as string) + ".");
+                        return true;
+                    }
+                }
+            }
+            
+            return false;
+        }
+        return true;
+    }
+    
+    bool MatchVersion(uint decodedVersion, uint docVersion)
+    {
+        if (decodedVersion == docVersion)
+        {
+            return true;
+        }
+        // Compare major version, should be the same
+        if ((decodedVersion & 0xFFFF) != (docVersion & 0xFFFF))
+        {
+            return false;
+        }
+        // Compare minor Version, docVersion.minor >= decodedVersion.minor is acceptable
+        // Since major versions are the same, compare the combined version here
+        return decodedVersion < docVersion;
+    }
+
+    observe this accepts bind:RpcconnBindHdrT
+    {
+        CachedBindMsg = bind;
+        ObserveNegotiateRequest(bind.PContextElem, bind);
+    }
+    
+    observe this issues bindAck:RpcconnBindAckHdrT
+    {
+        if (CachedBindMsg != null)
+        {
+            ObserveNegotiateResponse(bindAck.PResultList, CachedBindMsg.PContextElem, CachedBindMsg, bindAck);
+        }
+    }
+
+    observe this accepts auth3:RpcconnRpcAuth3HdrT
+    {
+        auth3#PContextUuid = UuidForAuth3;
+    }
+    
+    observe this accepts alterContext:RpcconnAlterContextHdrT
+    {
+        CachedAlterContextMsg = alterContext;
+        ObserveNegotiateRequest(alterContext.PContextElem, alterContext);
+    }
+    
+    observe this issues alterContextResp:RpcconnAlterContextResponseHdrT
+    {
+        if (CachedAlterContextMsg != null)
+        {
+            ObserveNegotiateResponse(alterContextResp.PResultList, CachedAlterContextMsg.PContextElem, CachedAlterContextMsg, alterContextResp);
+        }
+    }
+    
+    void ObserveNegotiateRequest(PContListT pContList, RpcconnCommonHdrT requestMsg)
+    {
+        bool allConsistentSyntax = true;
+        guid? annotationContextUuid = null;
+        foreach (PContElemT contElem in pContList.PContElem)
+        {
+            NonegotiatedPresentationContexts[contElem.PContId] = new PresentationContext
+            {
+                AbstractSyntax = contElem.AbstractSyntax.IfUuid,
+                AbstractSyntaxVersion = contElem.AbstractSyntax.IfVersion,
+            };
+            // so far, the first TransferSyntax in array is always the right one.
+            if (contElem.TransferSyntaxes.Count > 0)
+            {
+                NonegotiatedPresentationContexts[contElem.PContId].TransferSyntax = contElem.TransferSyntaxes[0].IfUuid;
+                NonegotiatedPresentationContexts[contElem.PContId].TransferSyntaxVersion = contElem.TransferSyntaxes[0].IfVersion;
+            }
+            if (annotationContextUuid == null)
+            {
+                annotationContextUuid = contElem.AbstractSyntax.IfUuid;
+            }
+            else if (annotationContextUuid != contElem.AbstractSyntax.IfUuid)
+            {
+                allConsistentSyntax = false;
+            }
+        }
+        if (allConsistentSyntax && annotationContextUuid != null)
+        {
+            requestMsg#PContextUuid = annotationContextUuid;
+            UuidForAuth3 = annotationContextUuid;
+        }
+    }
+    
+    // Function that is used for adding PresentationContext to NegotiatedPresentationContexts
+    void ObserveNegotiateResponse(PResultListT pResultList, PContListT pContList, RpcconnCommonHdrT cachedRequestMsg, RpcconnCommonHdrT currentResponseMsg)
+    {
+        int index = 0; // We assume the AckResult using the same PResults index coincide with PContElem in CachedBindMsg.
+        guid? acceptedUuid = null;
+        for (; index < pResultList.NResults; index++)
+        {
+            PResultT result = pResultList.PResults[index];
+            if (result.Result == PContDefResultT.Acceptance)
+            {
+                acceptedUuid = result.TransferSyntax.IfUuid;
+            }
+        }
+        if (acceptedUuid != null)
+        {
+            foreach (PContElemT contElem in pContList.PContElem)
+            {
+                foreach (PSyntaxIdT syntaxId in contElem.TransferSyntaxes)
+                {
+                    if (acceptedUuid == syntaxId.IfUuid)
+                    {
+                        NegotiatedPresentationContexts[contElem.PContId] = new PresentationContext
+                        {
+                            AbstractSyntax = contElem.AbstractSyntax.IfUuid,
+                            AbstractSyntaxVersion = contElem.AbstractSyntax.IfVersion,
+                            TransferSyntax = acceptedUuid as guid,
+                            TransferSyntaxVersion = syntaxId.IfVersion,
+                        };
+                        cachedRequestMsg#PContextUuid = contElem.AbstractSyntax.IfUuid;
+                        currentResponseMsg#PContextUuid = contElem.AbstractSyntax.IfUuid;
+                        UuidForAuth3 = contElem.AbstractSyntax.IfUuid;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    observe this accepts request:RpcconnRequestHdrT
+    {
+        if (request.PContId in NegotiatedPresentationContexts)
+        {
+            OpnumMap[request.CallId] = request.Opnum;
+            request#PContextUuid = NegotiatedPresentationContexts[request.PContId].AbstractSyntax;
+        }
+        else if (request.PContId in NonegotiatedPresentationContexts)
+        {
+            OpnumMap[request.CallId] = request.Opnum;
+            request#PContextUuid = NonegotiatedPresentationContexts[request.PContId].AbstractSyntax;
+        }
+        else
+        {
+             ErrorCodeIf(true, request, DiagnosisLevel.Warning, MSRPCE_MISSING_BINDING_MESSAGES);
+        }
+    }
+    
+    observe this issues response:RpcconnResponseHdrT
+    {
+        if (response.CallId in OpnumMap)
+        {
+            response#RpcOpnum = OpnumMap[response.CallId];
+        }
+        if (response.PContId in NegotiatedPresentationContexts)
+        {
+            response#PContextUuid = NegotiatedPresentationContexts[response.PContId].AbstractSyntax;
+        }
+        else if (response.PContId in NonegotiatedPresentationContexts)
+        {
+            response#PContextUuid = NonegotiatedPresentationContexts[response.PContId].AbstractSyntax;
+        }
+        else
+        {
+             ErrorCodeIf(true, response, DiagnosisLevel.Warning, MSRPCE_MISSING_BINDING_MESSAGES);
+        }
+    }
+}
+
+client endpoint Client connected to Server;
+
+// Identifies that whether it's MSPRCE protocol data or not
+bool IsRpcconnCommonHdrT(binary data)
+{
+    // Check whether header is CoMessageIdentifier
+    return data.Count >= 16 && (data[0] == 5) && (data[1] in {0, 1}) && ((data[2] in {0, 2, 3}) || (data[2] >= 11 && data[2] <= 19)) &&
+        ((data[4] & 0xEE) == 0) && (data[5] < 4) && (data[6] == 0) && (data[7] == 0) && (GetRPCLength(data) >= 16);
+}
+
+void DispatchOriginsToRevive(ref array<any message> msgOrigins)
+{
+    foreach (var msg in msgOrigins)
+    {
+        DisplayTopLevelMessage(msg);
+    }
+    msgOrigins = [];
+}
+
+// Merge the decoding logic for MSRPCE and RPCH to improve performance, to remove the keyword follows between MSRPCE and RPCH
+autostart actor MsrpceOverTcpServer(TCP.Server server) 
+{
+    /******************RPCH Logic**********************/
+    // Decoding logic for RPCH over TCP
+    // Record the state of current TCP connection.
+    RPCHOverTCPDecodingHelper rpchDecodingHelper = null;
+
+    // Decoding logic for MSRPCE over TCP
+    MSRPCEDecodingHelper msrpceDecodingHelper = null;
+
+    process server issues s:TCP.Segment where ((IsRPCH(s) is isRPCH:bool && isRPCH == true) || IsMSRPCE(s))
+    {
+        if (isRPCH) // Decoding logic for RPCH over TCP
+        {
+            InitializeRPCHDecodingHelper();
+            rpchDecodingHelper.TryDecode(s, MessageDirection.Issues);
+        }
+        else // Decoding logic for MSRPCE over TCP
+        {
+            InitializeMSRCPEDecodingHelper();
+            msrpceDecodingHelper.TryDecode(s, MessageDirection.Issues);
+        }
+    }
+    
+    process server accepts s:TCP.Segment where ((IsRPCH(s) is isRPCH:bool && isRPCH == true) || IsMSRPCE(s))
+    {
+        if (isRPCH) // Decoding logic for RPCH over TCP
+        {
+            InitializeRPCHDecodingHelper();
+            rpchDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+        }
+        else // Decoding logic for MSRPCE over TCP
+        {
+            InitializeMSRCPEDecodingHelper();
+            msrpceDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+        }
+    }
+
+    // Decoding logic for RPCH over TCP
+    bool IsRPCH(TCP.Segment s)
+    {
+        bool result = false;
+        // We have known current TCP connection is transferring RPCH message or MSRCPE(over RPCH) message.
+        if (rpchDecodingHelper != null)
+        {
+            result = true;
+        }
+        // Check first TCP message of connection which we have not detected yet.
+        else if (s.PayloadLength > 0)
+        {
+            // !(s.SourcePort in HTTPPorts) && !(s.DestinationPort in HTTPPorts): To avoid RPCHOverTCP execute before HTTPOverTCP
+            // IsRPCHMessage(s.Payload): RPCH over TCP message
+            // MSRPCE over RPCH(over TCP) message: (rpchDecodingHelper != null && rpchDecodingHelper.SessionContext != null && rpchDecodingHelper.SessionContext.Proxy.VirtualConnectionCookie != GUID_NULL && IsMSRPCEMessage(s.Payload))))
+            if (!(s.SourcePort in HTTPPorts) && !(s.DestinationPort in HTTPPorts) && IsRPCHMessage(s.Payload))
+            {
+                result = true;
+            }
+        }
+        return result;
+    }
+
+    void InitializeRPCHDecodingHelper()
+    {
+        if (rpchDecodingHelper == null)
+        {
+            rpchDecodingHelper = new RPCHOverTCPDecodingHelper();
+            rpchDecodingHelper.InitializeRPCHOverTCPDecodingHelper();
+        }
+    }
+
+    // Decoding logic for MSRPCE over TCP
+    bool IsMSRPCE(TCP.Segment s)
+    {
+        bool result = false;
+        if (msrpceDecodingHelper != null)
+        {
+            result = true;
+        }
+        else if (s.SourcePort == Port.DCERPC || s.DestinationPort == Port.DCERPC)
+        {
+            result = true;
+        }
+        // !(s.SourcePort in HTTPPorts) && !(s.DestinationPort in HTTPPorts): To avoid MSRPCEOverTCP execute before HTTPOverTCP
+        else if (!(s.SourcePort in HTTPPorts) && !(s.DestinationPort in HTTPPorts) && IsRpcconnCommonHdrT(s.Payload))
+        {
+            result = true;
+        }
+        return result;
+    }
+
+    void InitializeMSRCPEDecodingHelper()
+    {
+        if (msrpceDecodingHelper == null)
+        {
+            msrpceDecodingHelper = new MSRPCEDecodingHelper();
+            msrpceDecodingHelper.InitializeMSRPCEHelper(endpoint Server over server);
+        }
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        // Decoding logic for RPCH over TCP
+        if (rpchDecodingHelper != null)
+        {
+            rpchDecodingHelper.ClearInDestructor();
+            rpchDecodingHelper = null;
+        }
+
+        // Decoding logic for MSRPCE over TCP
+        if (msrpceDecodingHelper != null)
+        {
+            msrpceDecodingHelper.ClearInDestructor();
+            msrpceDecodingHelper = null;
+        }
+    }
+}
+
+autostart actor MsrpceOverRPCHServer(RPCH.Proxy proxy)
+{
+    MSRPCEOverRPCHEDecodingCache requestCache = null;
+    MSRPCEOverRPCHEDecodingCache responseCache = null;
+
+    process proxy accepts s:RPCHPayload
+        where IsRpcconnCommonHdrT(s.Payload)
+    {
+        var rpceServer = endpoint Server over proxy;
+        var direction = proxy.ProxyToServer ? MessageDirection.Issues : MessageDirection.Accepts;
+        if (requestCache == null)
+        {
+            requestCache = new MSRPCEOverRPCHEDecodingCache();
+            requestCache.InitializeMSRPCEOverRPCHCache(direction, rpceServer, proxy);
+        }
+        requestCache.AddRPCHPayload(s);
+        requestCache.TryDecodeAndDispatchMessage();
+    }
+
+    process proxy issues s:RPCHPayload
+        where IsRpcconnCommonHdrT(s.Payload)
+    {
+        var rpceServer = endpoint Server over proxy;
+        var direction = proxy.ProxyToServer ? MessageDirection.Accepts : MessageDirection.Issues;
+        if (responseCache == null)
+        {
+            responseCache = new MSRPCEOverRPCHEDecodingCache();
+            responseCache.InitializeMSRPCEOverRPCHCache(direction, rpceServer, proxy);
+        }
+        responseCache.AddRPCHPayload(s);
+        responseCache.TryDecodeAndDispatchMessage();
+    }
+}
+
+type MSRPCEOverRPCHEDecodingCache : StreamDecodingCache
+{
+    RPCH.Proxy rpchProxy;
+    RpcconnReassemblyHelper helper;
+
+    void InitializeMSRPCEOverRPCHCache(MessageDirection direction, Server server, RPCH.Proxy proxy)
+    {
+        rpchProxy = proxy;
+        base.Initialize("MSRPCE", server, direction, RPCH.IsRPCHOrMSRPCEMessage, IsDataSufficient, DecodeMSRPCEOrRPCHMessage, DecodeIncompleteMSRPCEMessage);
+        helper = new RpcconnReassemblyHelper(direction, server);
+    }
+
+    void AddRPCHPayload(RPCH.RPCHPayload rpchPayload)
+    {
+        TCP.Segment seg = null;
+        if ((rpchPayload.Origins).Count > 0
+            && (rpchPayload.Origins)[0] is v:TCP.Segment)
+        {
+            seg = v;
+        }
+        // If detect TCP segment-lost, clear cache first.
+        if (seg != null && IsTrue(seg#SegmentLost))
+        {
+            ClearExceptionally();
+        }
+        Buffer += rpchPayload.Payload;
+        Origins += [rpchPayload];
+    }
+
+    // There could be MSRPCE or RPCH message in HTTP's payload
+    optional any message DecodeMSRPCEOrRPCHMessage(stream s)
+    {
+        optional any message result = nothing;
+        if (IsRPCHMessage(Buffer))
+        {
+            if (rpchProxy.ProxyToServer)
+            {
+                result = ProcessTCPPayload(s);
+            }
+            else
+            {
+                result = ProcessHTTPMessage(s);
+            }
+        }
+        else
+        {
+            int fragmentLength = GetRPCLength(Buffer);
+            PDUType ptype;
+            result = ProcessConnectionOrientedRpcMessage(s, fragmentLength, helper.strongTypedEPT, out ptype);
+        }
+        return result;
+    }
+
+    bool IsRPCHMessage(binary data)
+    {
+        // Check whether header is RPCHMessageIdentifier
+        return data.Count >= 20 && (data[0] == 5) && (data[1] in {0, 1}) && (data[2] == 20) && (data[3] == 3) && (GetRPCLength(data) >= 20) &&
+            (data[10] == 0) && (data[11] == 0)&& (data[12] == 0) && (data[13] == 0)&& (data[14] == 0) && (data[15] == 0);
+    }
+
+    optional any message DecodeIncompleteMSRPCEMessage(binary buffer)
+    {
+        if (buffer != null && IsRpcconnCommonHdrT(buffer))
+        {
+            if (BinaryDecoder<RpcconnIncompleteMessage>(buffer) is m:RpcconnIncompleteMessage)
+            {
+                return m as any message;
+            }
+            else
+            {
+                ThrowDecodingException("MSRPCE", "RpcconnIncompleteMessage");
+            }
+        }
+        return nothing;
+    }
+
+    override void DispatchMessage(any message msg)
+    {
+        // MSRPCE Message
+        if (msg is common:RpcconnCommonHdrT)
+        {
+            helper.Reassemble(common);
+        }
+        // RPCH Message
+        else
+        {
+            if (rpchProxy.ProxyToServer)
+            {
+                if (Direction is MessageDirection.Accepts)
+                {
+                    dispatch rpchProxy issues msg;
+                }
+                else
+                {
+                    dispatch rpchProxy accepts msg;
+                }
+            }
+            else
+            {
+                if (Direction is MessageDirection.Accepts)
+                {
+                    dispatch rpchProxy accepts msg;
+                }
+                else
+                {
+                    dispatch rpchProxy issues msg;
+                }
+            }
+        }
+    }
+
+    override void ClearInDestructor()
+    {
+        helper.ClearInDestructor();
+        base.ClearInDestructor();
+    }
+}
+
+type MSRPCEOverNamedpipeDecodingHelper
+{
+    MSRPCEOverNamedpipeDecodingCache AcceptsCache = null;
+    MSRPCEOverNamedpipeDecodingCache IssuesCache = null;
+
+    void Initialize(Server server)
+    {
+        AcceptsCache = new MSRPCEOverNamedpipeDecodingCache{};
+        AcceptsCache.InitializeMSRPCEOverNamedpipeCache(server, MessageDirection.Accepts);
+        IssuesCache = new MSRPCEOverNamedpipeDecodingCache{};
+        IssuesCache.InitializeMSRPCEOverNamedpipeCache(server, MessageDirection.Issues);
+    }
+
+    void TryDecode(binary bin, any message msg, MessageDirection direction)
+    {
+        if (direction == MessageDirection.Accepts)
+        {
+            AcceptsCache.AddNamedpipeMsg(bin, msg);
+            AcceptsCache.TryDecodeAndDispatchMessage();
+        }
+        else
+        {
+            IssuesCache.AddNamedpipeMsg(bin, msg);
+            IssuesCache.TryDecodeAndDispatchMessage();
+        }
+    }
+
+    void ClearInDestructor()
+    {
+        if (AcceptsCache != null)
+        {
+            AcceptsCache.ClearInDestructor();
+        }
+        if (IssuesCache != null)
+        {
+            IssuesCache.ClearInDestructor();
+        }
+    }
+}
+
+type MSRPCEOverNamedpipeDecodingCache : StreamDecodingCache
+{
+    internal int msgLength;
+    internal PDUType pduType;
+    internal RpcconnReassemblyHelper helper;
+
+    void InitializeMSRPCEOverNamedpipeCache(Server server, MessageDirection direction)
+    {
+        base.Initialize("MSRPCE", server, direction, IsRPCEMessage, IsCompleteRPCMessage, DecodeRPCEMessage,
+            (binary bin) => BinaryDecoder<RpcconnIncompleteMessage>(bin) as optional any message);
+        helper = new RpcconnReassemblyHelper(direction, server);
+    }
+
+    void AddNamedpipeMsg(binary bin, any message msg)
+    {
+        assert Initliazed == true;
+
+        if (BufferCount() > 0 && IsRpcconnCommonHdrT(bin)) // If it is a RPC header, it might be have segment lost in transport layer
+        {
+            ClearExceptionally();
+        }
+
+        if (bin != null && bin.Count > 0 && msg != null)
+        {
+            Buffer += bin;
+            Origins += [msg];
+        }
+    }
+
+    uint? IsCompleteRPCMessage(binary bin)
+    {
+        msgLength = GetRPCLength(bin);
+        return msgLength >= 0 ? (msgLength <= bin.Count ? 0 : (msgLength as uint)) : null;
+    }
+
+    optional any message DecodeRPCEMessage(stream s)
+    {
+        PDUType ptype;
+        int sPos = s.BytePosition;
+        var res = ProcessConnectionOrientedRpcMessage(s, msgLength, helper.strongTypedEPT, out ptype);
+        pduType = ptype;
+        // Consume the trailing padding bytes
+        int consumedBytes = s.BytePosition - sPos;
+        if (res != nothing && consumedBytes < msgLength)
+        {
+            BinaryDecoder<Blob[(msgLength - consumedBytes) as uint]>(s);
+        }
+
+        return res;
+    }
+
+    override void DispatchMessage(any message msg)
+    {
+        helper.Reassemble(msg as RpcconnCommonHdrT);
+    }
+
+    override void ClearInDestructor()
+    {
+        helper.ClearInDestructor();
+        base.ClearInDestructor();
+    }
+}
+
+// _______________________________________________________________________Connectionless Functions_____________________________________________________________________
+
+autostart actor DceRpcOverUDP(UDP.Host host)
+{
+    RpcclReassemblyHelper acceptsHelper = null;
+    RpcclReassemblyHelper issuesHelper = null;
+    
+    // 80 is DcRpcClPktHdrT content length and larger than ClMessageIdentifier's content length;
+    process host accepts d:UDP.Datagram where d.Payload.Count >= 80 && 
+        (((d.SourcePort == Port.DCERPC || d.DestinationPort == Port.DCERPC) && d.Payload[0] == 4) ||
+            (!InRange<IANA.Port>(d.SourcePort) && !InRange<IANA.Port>(d.DestinationPort) && 
+                BinaryDecoder<ClMessageIdentifier>(d.Payload.Segment(0, 7)) != nothing))
+    {
+        if (ProcessConnectionlessRpc(d.Payload) is msg:DcRpcClPktHdrT)
+        {
+            msg.Origins = [d];
+            EnsureInitialized();
+            MessageDirection direct = MessageDirection.Accepts;
+            if ((msg.PType == PDUType.Fack && RpcclReassemblyHelper.GetKey(msg) in issuesHelper.msgCaches) ||
+                msg.PType in ClIssuesMsgTypeSet)
+            {
+                direct = MessageDirection.Issues;
+            }
+
+            if (direct == MessageDirection.Accepts)
+            {
+                acceptsHelper.Reassemble(msg);
+            }
+            else
+            {
+                issuesHelper.Reassemble(msg);
+            }
+        }
+        else
+        {
+            ThrowDecodingException("MSRPCE", GetClMsgName(d.Payload[1]));
+        }
+    }
+
+    void EnsureInitialized()
+    {
+        if (acceptsHelper == null)
+        {
+            acceptsHelper = new RpcclReassemblyHelper(MessageDirection.Accepts, endpoint Server over host);
+        }
+        if (issuesHelper == null)
+        {
+            issuesHelper = new RpcclReassemblyHelper(MessageDirection.Issues, endpoint Server over host);
+        }
+    }
+
+    ~endpoint(UDP.Host host)
+    {
+        if (acceptsHelper != null)
+        {
+            acceptsHelper.ClearInDestructor();
+        }
+        if (issuesHelper != null)
+        {
+            issuesHelper.ClearInDestructor();
+        }
+    }
+}
+
+const set<PDUType> ClAcceptsMsgTypeSet = 
+{
+    PDUType.Request,
+    PDUType.Ping,
+    PDUType.Ack,
+    PDUType.ClCancel,
+};
+
+const set<PDUType> ClIssuesMsgTypeSet = 
+{
+    PDUType.Response,
+    PDUType.Fault,
+    PDUType.Working,
+    PDUType.NoCall,
+    PDUType.Reject,
+    PDUType.CancelAck,
+};
+
+optional DcRpcClPktHdrT ProcessConnectionlessRpc(binary bin)
+{
+    optional DcRpcClPktHdrT msg;
+
+    byte pType = bin[1];
+    switch (pType)
+    {
+        case PDUType.Request =>
+            msg = BinaryDecoder<DcRpcClRequest>(bin);
+        case PDUType.Response =>
+            msg = BinaryDecoder<DcRpcClResponse>(bin);
+        case PDUType.Ping =>
+            msg = BinaryDecoder<DcRpcClPing>(bin);
+        case PDUType.Fault =>
+            msg = BinaryDecoder<DcRpcClFault>(bin);
+        case PDUType.Working =>
+            msg = BinaryDecoder<DcRpcClWorking>(bin);
+        case PDUType.NoCall =>
+            msg = BinaryDecoder<DcRpcClNocall>(bin);
+        case PDUType.Reject =>
+            msg = BinaryDecoder<DcRpcClReject>(bin);
+        case PDUType.Ack =>
+            msg = BinaryDecoder<DcRpcClAck>(bin);
+        case PDUType.ClCancel =>
+            msg = BinaryDecoder<DcRpcClCancel>(bin);
+        case PDUType.Fack =>
+            msg = BinaryDecoder<DcRpcClFack>(bin);
+        case PDUType.CancelAck =>
+            msg = BinaryDecoder<DcRpcClCancelAck>(bin);
+        default =>
+            msg = nothing;
+    }
+
+    return msg;
+}
+
+(binary | GssapiType | KerberosToken | KrbMessage | NlmpMessage | NL_AUTH_MESSAGE | RecordLayer |
+     NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity | NTLMSSP_MESSAGE_SIGNATURE |
+     NL_AUTH_SIGNATURE | NL_AUTH_SHA2_SIGNATURE) DecodeAuthValue(binary authData, AuthnType authType, PDUType pduType, RpcconnCommonHdrT rpcMessage, string rpcMessageName, Server server)
+{
+    if (authData.Count == 0)
+    {
+        return $[];
+    }
+    
+    string fieldName = "AuthVerifierCoT.AuthValue";
+    if (pduType in {PDUType.Bind, PDUType.BindAck, PDUType.Auth3, PDUType.AlterContext, PDUType.AlterContextResp})
+    {
+        if (pduType == PDUType.Auth3)
+        {
+            fieldName = "AuthenticationTokens";
+        }
+        // AuthTypes indicating the AuthValue is GSSAPI, NTLM, Kerberos.
+        switch (authType)
+        {
+            case (AuthnType.RpcCAuthnGssNegotiate | AuthnType.RpcCAuthnGssKerberos) =>
+                if (IsGSSAPIByCheckingTag(authData))
+                {
+                    if (DecodeGssapiAndSetAnnotation(authData, rpcMessage) is g:GssapiType)
+                    {
+                        rpcMessage#KeyInformation = g#KeyInformation;
+                        return g;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "GSSAPI"));
+                    }
+                }
+                else if (IsGssapiKrb(authData))
+                {
+                    if (BinaryDecoder<KerberosToken>(authData) is k:KerberosToken)
+                    {
+                        rpcMessage#Embedded = {"Kerberos" -> ""};
+                        rpcMessage#KeyInformation = GetSummaryInfo(k);
+                        return k;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "Kerberos"));
+                    }
+                }
+                // Finally try to decode normal Kerberos messages.
+                else if (authType == AuthnType.RpcCAuthnGssKerberos)
+                {
+                    if (BinaryDecoder<KrbMessage[false]>(authData) is krbMsg:KrbMessage)
+                    {
+                        rpcMessage#Embedded = {"Kerberos" -> ""};
+                        string keySummary = "Kerberos";
+                        if (krbMsg.Message is krbError:KrbErrorType)
+                        {
+                            keySummary += ", " + EnumToString<KerberosV5.ErrorCode>(krbError.ErrorCode);
+                        }
+                        rpcMessage#KeyInformation = keySummary;
+                    
+                        return krbMsg;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "Kerberos"));
+                    }
+                }
+            case (AuthnType.RpcCAuthnWinnt | AuthnType.RpcCAuthnDefault) =>
+                if (IsNLMP(authData))
+                {
+                    if (NlmpDecoder(authData) is nlmp:NlmpMessage)
+                    {
+                        rpcMessage#Embedded = {"NLMP" -> ""};
+                        rpcMessage#KeyInformation = GetSummaryInfo(nlmp);
+                        if (nlmp is auth:AuthenticateMessage)
+                        {
+                            server.IsNLMPExtendedSecurity = (auth.NegotiateFlags & NLMP.NegotiateFlags.NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY) > 0;
+                        }
+                        return nlmp;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NLMP"));
+                    }
+                }
+            case AuthnType.RpcCAuthnNetlogon =>
+                if (IsNL_AUTH_MESSAGE(authData))
+                {
+                    if (BinaryDecoder<NL_AUTH_MESSAGE>(authData) is nlAuth:NL_AUTH_MESSAGE)
+                    {
+                        rpcMessage#Embedded = {"Netlogon" -> ""};
+                        rpcMessage#KeyInformation = "Netlogon";
+                        return nlAuth;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NL_AUTH_MESSAGE"));
+                    }
+                }
+            case AuthnType.RpcCAuthnGssSchannel =>
+                if (IsTlsHeader(authData))
+                {
+                    if (BinaryDecoder<RecordLayer[false, 0]>(authData) is record:RecordLayer)
+                    {
+                        rpcMessage#Embedded = {"Schannel" -> ""};
+                        rpcMessage#KeyInformation = "Schannel";
+                        return record;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "TLS.RecordLayer"));
+                    }
+                }
+            default =>
+                ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_NOT_KNOW_HOW_TO_DECODE_AUTHVALUE, fieldName, rpcMessageName, EnumToString(authType, "MSRPCE.AuthnType")));
+        }
+    }
+    else
+    {
+        switch (authType)
+        {
+            case (AuthnType.RpcCAuthnGssNegotiate | AuthnType.RpcCAuthnGssKerberos) =>
+                if (IsGSSAPIByCheckingTag(authData))
+                {
+                    if (DecodeGssapiAndSetAnnotation(authData, rpcMessage) is gssapi:GssapiType)
+                    {
+                        return gssapi;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "GSSAPI"));
+                    }
+                }
+                else if (IsNLMPSignature(authData))
+                {
+                    if (server.IsNLMPExtendedSecurity && BinaryDecoder<NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity>(authData) is nlmpSig1:NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity)
+                    {
+                        rpcMessage#Embedded = {"NLMP" -> ""};
+                        return nlmpSig1;
+                    }
+                    else if (!server.IsNLMPExtendedSecurity && BinaryDecoder<NTLMSSP_MESSAGE_SIGNATURE>(authData) is nlmpSig2:NTLMSSP_MESSAGE_SIGNATURE)
+                    {
+                        rpcMessage#Embedded = {"NLMP" -> ""};
+                        return nlmpSig2;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NLMP"));
+                    }
+                }
+                else if (IsGssapiKrb(authData))
+                {
+                    if (BinaryDecoder<KerberosToken>(authData) is krb:KerberosToken)
+                    {
+                        rpcMessage#Embedded = {"Kerberos" -> ""};
+                        return krb;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "Kerberos"));
+                    }
+                }
+            case (AuthnType.RpcCAuthnWinnt | AuthnType.RpcCAuthnDefault) =>
+                if (IsNLMPSignature(authData))
+                {
+                    if (server.IsNLMPExtendedSecurity && BinaryDecoder<NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity>(authData) is nlmpSig1:NTLMSSP_MESSAGE_SIGNATUREforExtendedSessionSecurity)
+                    {
+                        rpcMessage#Embedded = {"NLMP" -> ""};
+                        return nlmpSig1;
+                    }
+                    else if (!server.IsNLMPExtendedSecurity && BinaryDecoder<NTLMSSP_MESSAGE_SIGNATURE>(authData) is nlmpSig2:NTLMSSP_MESSAGE_SIGNATURE)
+                    {
+                        rpcMessage#Embedded = {"NLMP" -> ""};
+                        return nlmpSig2;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NLMP"));
+                    }
+                }
+            case AuthnType.RpcCAuthnNetlogon =>
+                if (IsNL_AUTH_SIGNATURE(authData))
+                {
+                    if (BinaryDecoder<NL_AUTH_SIGNATURE>(authData) is nlAuthSig:NL_AUTH_SIGNATURE)
+                    {
+                        rpcMessage#Embedded = {"Netlogon" -> ""};
+                        return nlAuthSig;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NL_AUTH_SIGNATURE"));
+                    }
+                }
+                else if (IsNL_AUTH_SHA2_SIGNATURE(authData))
+                {
+                    if (BinaryDecoder<NL_AUTH_SHA2_SIGNATURE>(authData) is nlAuthSig:NL_AUTH_SHA2_SIGNATURE)
+                    {
+                        rpcMessage#Embedded = {"Netlogon" -> ""};
+                        return nlAuthSig;
+                    }
+                    else
+                    {
+                        ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_DECODING_AUTHVALUE_FAILURE, fieldName, rpcMessageName, "NL_AUTH_SHA2_SIGNATURE"));
+                    }
+                }
+            case AuthnType.RpcCAuthnGssSchannel =>
+                ; // In this case, it is alright to keep AuthValue as a binary.
+            default =>
+                ValidationCheck(false, rpcMessage, DiagnosisLevel.Warning, () => Format(MSRPCE_NOT_KNOW_HOW_TO_DECODE_AUTHVALUE, fieldName, rpcMessageName, EnumToString(authType, "MSRPCE.AuthnType")));
+        }
+    }
+    return authData;
+}
+
+/*--------------------------------Utility annotations and functions -----------------------------------------------*/
+
+annotation bool DcRpcClPktHdrT#Retransmission; // for diagnosis column value of connectionless RPC messages
+annotation guid RpcconnCommonHdrT#PContextUuid; // for display summary for connection oriented RPC messages
+annotation string RpcconnCommonHdrT#KeyInformation;
+const guid TSGUInterface = {44e265dd-7daf-42cd-8560-3cdb6e7a2729};
+
+string UuidToText(guid u)
+{
+    return "{" + u.ToString() + "}";
+}
+
+const guid NDR64TransferSyntaxIdentifier = {71710533-BEBA-4937-8319-B5DBEF9CCC36};
+const uint NDR64TransferSyntaxVersion = 0x00000001;
+
+const guid NDRTransferSyntaxIdentifier = {8A885D04-1CEB-11C9-9FE8-08002B104860};
+const uint NDRTransferSyntaxVersion = 0x00000002;
+
+// The annotation will be attached to MSRPCE message and upper layer messages
+annotation ushort RpcOpnum;
+
+// The decoding function decode a message T and return it as any if success, otherwize throw exception
+any MsrpceMessageDecoder<T>(binary data, NdrInfo ndrInfo, string protocolName, string errorMsg)
+{
+    // Future Reference: the parameter ndrInfo is not added yet
+    //var m = NdrDecoder<T>(data, ndrInfo);
+    optional T m = NdrDecoder<T>(data);
+    if (m == nothing)
+    {
+        ThrowDecodingException(protocolName, errorMsg);
+    }
+    return m as T;
+}
+
+string GetRPCUuidString(guid uuid)
+{
+    switch (uuid)
+    {
+        case {22e5386d-8b12-4bf0-b0ec-6a1ea419e366} => return "LREC (LREC)";
+        case {1FF70682-0A51-30E8-076D-740BE8CEE98B} => return "ATSvc (TSCH)";
+        case {86D35949-83C9-4044-B424-DB363231FD0C} => return "SchRpc (TSCH)";
+        case {0b1c2170-5732-4e0e-8cd3-d9b16f3b84d7} => return "authzr (RAA)";
+        case {3DDE7C30-165D-11D1-AB8F-00805F14DB40} => return "BackupKey (BKRP)";
+        case {E3D0D746-D2AF-40FD-8A7A-0D7078BB7092} => return "BitsPeerAuth (BPAU)";
+        case {6BFFD098-A112-3610-9833-012892020162} => return "Browser (BRWSA)";
+        case {B97DB8B2-4C63-11CF-BFF6-08002BE23F2F} => return "CMRP (CMRP)";
+        case {333A2276-0000-0000-0D00-00809C000000} => return "Conv (MSRPC)";
+        case {6BFFD098-A112-3610-9833-46C3F874532D} => return "DHCPM (DHCPM)";
+        case {5b821720-f63b-11d0-aad2-00c04fc324db} => return "DHCPM (DHCPM)";
+        case {4BB8AB1D-9EF9-4100-8EB6-DD4B4E418B72} => return "IADProxy (DFSRH)";
+        case {C4B0C7D9-ABE0-4733-A1E1-9FDEDF260C7A} => return "IADProxy2 (DFSRH)";
+        case {E65E8028-83E8-491b-9AF7-AAF6BD51A0CE} => return "IServerHealthReport (DFSRH)";
+        case {20D15747-6C48-4254-A358-65039FD8C63C} => return "IServerHealthReport2 (DFSRH)";
+        case {12108A88-6858-4467-B92F-E6CF4568DFB6} => return "IClusterStorage2 (CSVP)";
+        case {2931C32C-F731-4c56-9FEB-3D5F1C5E72BF} => return "IClusterNetwork2 (CSVP)";
+        case {D6105110-8917-41A5-AA32-8E0AA2933DC9} => return "IClusterCleanup (CSVP)";
+        case {491260B5-05C9-40D9-B7F2-1F7BDAE0927F} => return "IClusterSetup (CSVP)";
+        case {85923CA7-1B6B-4E83-A2E4-F5BA3BFBB8A3} => return "IClusterLog (CSVP)";
+        case {8165B19E-8D3A-4D0B-80C8-97DE310DB583} => return "IServicedComponentInfo (IOI)";
+        case {C3FCC19E-A970-11D2-8B5A-00A0C9B7C9C4} => return "IManagedObject (IOI)";
+        case {6619A740-8154-43BE-A186-0319578E02DB} => return "IRemoteDispatch (IOI)";
+        case {97199110-DB2E-11D1-A251-0000F805CA53} => return "ITransactionStream (COM)";
+        case {4D9F4AB8-7D1C-11CF-861E-0020AF6E7C57} => return "IActivation (DCOM)";
+        case {99FCFEC4-5260-101B-BBCB-00AA0021347A} => return "IObjectExporter (DCOM)";
+        case {000001A0-0000-0000-C000-000000000046} => return "IRemoteSCMActivator (DCOM)";
+        case {00000131-0000-0000-C000-000000000046} => return "IRemUnknown (DCOM)";
+        case {00000143-0000-0000-C000-000000000046} => return "IRemUnknown2 (DCOM)";
+        case {4E6CDCC9-FB25-4FD5-9CC5-C9F4B6559CEC} => return "icomtrackinginfoevents (COMT)";
+        case {B60040E0-BCF3-11D1-861D-0080C729264D} => return "igettrackingdata (COMT)";
+        case {C2BE6970-DF9E-11D1-8B87-00C04FD7A924} => return "iimport (COMA)";
+        case {0E3D6630-B46B-11D1-9D2D-006008B0E5CA} => return "icatalogtableread (COMA)";
+        case {971668DC-C3FE-4EA1-9643-0C7230F494A1} => return "iregister2 (COMA)";
+        case {A8927A41-D3CE-11D1-8472-006008B0E5CA} => return "icatalogtableinfo (COMA)";
+        case {182C40FA-32E4-11D0-818B-00A0C9231C29} => return "icatalogsession (COMA)";
+        case {CFADAC84-E12C-11D1-B34C-00C04F990D54} => return "iexport (COMA)";
+        case {1F7B1697-ECB2-4CBB-8A0E-75C427F4A6F0} => return "iimport2 (COMA)";
+        case {47CDE9A1-0BF6-11D2-8016-00C04FB9988E} => return "icapabilitysupport (COMA)";
+        case {6C935649-30A6-4211-8687-C4C83E5FE1C7} => return "icontainercontrol2 (COMA)";
+        case {F131EA3E-B7BE-480E-A60D-51CB2785779E} => return "iexport2 (COMA)";
+        case {C726744E-5735-4F08-8286-C510EE638FB6} => return "ICatalogUtils2 (COMA)";
+        case {456129E2-1078-11D2-B0F9-00805FC73204} => return "icatalogutils (COMA)";
+        case {3F3B1B86-DBBE-11D1-9DA6-00805F85CFE3} => return "icontainercontrol (COMA)";
+        case {7F43B400-1A0E-4D57-BBC9-6B0C65F7A889} => return "ialternatelaunch (COMA)";
+        case {8DB2180E-BD29-11D1-8B7E-00C04FD7A924} => return "iregister (COMA)";
+        case {0E3D6631-B46B-11D1-9D2D-006008B0E5CA} => return "icatalogtablewrite (COMA)";
+        case {1D118904-94B3-4A64-9FA6-ED432666A7B9} => return "icatalog64bitsupport (COMA)";
+        case {98315903-7BE5-11D2-ADC1-00A02463D6E7} => return "IReplicationUtil";
+        case {4E14FB9F-2E22-11D1-9964-00C04FBBB345} => return "IEventSystem (COMEV)";
+        case {FB2B72A0-7A68-11D1-88F9-0080C7D771BF} => return "IEventClass (COMEV)";
+        case {FB2B72A1-7A68-11D1-88F9-0080C7D771BF} => return "IEventClass2 (COMEV)";
+        case {4A6B0E15-2E38-11D1-9965-00C04FBBB345} => return "IEventSubscription (COMEV)";
+        case {F4A07D63-2E25-11D1-9964-00C04FBBB345} => return "IEnumEventObject (COMEV)";
+        case {F89AC270-D4EB-11D1-B682-00805FC79216} => return "IEventObjectCollection (COMEV)";
+        case {7FB7EA43-2D76-4EA8-8CD9-3DECC270295E} => return "IEventClass3 (COMEV)";
+        case {4A6B0E16-2E38-11D1-9965-00C04FBBB345} => return "IEventSubscription2 (COMEV)";
+        case {FBC1D17D-C498-43A0-81AF-423DDD530AF6} => return "IEventSubscription3 (COMEV)";
+        case {99CC098F-A48A-4E9C-8E58-965C0AFC19D5} => return "IEventSystem2 (COMEV)";
+        case {A0E8F27A-888C-11D1-B763-00C04FB926AF} => return "IEventSystemInitialize (COMEV)";
+        case {D2D79DF7-3400-11D0-B40B-00AA005FF586} => return "IDMNotify (DMRP)";
+        case {3A410F21-553F-11D1-8E5E-00A0C92C9D5D} => return "IDMRemoteServer (DMRP)";
+        case {D2D79DF5-3400-11D0-B40B-00AA005FF586} => return "IVolumeClient (DMRP)";
+        case {4BDAFC52-FE6A-11D2-93F8-00105A11164A} => return "IVolumeClient2 (DMRP)";
+        case {135698D2-3A37-4D26-99DF-E2BB6AE3AC61} => return "IVolumeClient3 (DMRP)";
+        case {DEB01010-3A37-4D26-99DF-E2BB6AE3AC61} => return "IVolumeClient4 (DMRP)";
+        case {118610B7-8D94-4030-B5B8-500889788E4E} => return "IEnumVdsObject (VDS)";
+        case {6E6F6B40-977C-4069-BDDD-AC710059F8C0} => return "IVdsAdvancedDisk (DMRP)";
+        case {8326CD1D-CF59-4936-B786-5EFC08798E25} => return "IVdsAdviseSink (VDS)";
+        case {D5D23B6D-5A55-4492-9889-397A3C2D2DBC} => return "IVdsAsync (VDS)";
+        case {07E5C822-F00C-47A1-8FCE-B244DA56FD06} => return "IVdsDisk (VDS)";
+        case {3B69D7F5-9D94-4648-91CA-79939BA263BF} => return "IVdsPack (VDS)";
+        case {10C5E575-7984-4E81-A56B-431F5F92AE42} => return "IVdsProvider (VDS)";
+        case {0316560B-5DB4-4ED9-BBB5-213436DDC0D9} => return "IVdsRemovable (VDS)";
+        case {0818A8EF-9BA9-40D8-A6F9-E22833CC771E} => return "IVdsService (VDS)";
+        case {E0393303-90D4-4A97-AB71-E9B671EE2729} => return "IVdsServiceLoader (VDS)";
+        case {9AA58360-CE33-4F92-B658-ED24B14425B8} => return "IVdsSwProvider (VDS)";
+        case {88306BB2-E71F-478C-86A2-79DA200A0F11} => return "IVdsVolume (VDS)";
+        case {EE2D5DED-6236-4169-931D-B9778CE03DC6} => return "IVdsVolumeMF (VDS)";
+        case {4DAA0135-E1D1-40f1-AAA5-3CC1E53221C3} => return "IVdsVolumePlex (VDS)";
+        case {2ABD757F-2851-4997-9A13-47D2A885D6CA} => return "IVdsHbaPort (VDS)";
+        case {B07FEDD4-1682-4440-9189-A39B55194DC5} => return "IVdsIscsiInitiatorAdapter (VDS)";
+        case {38A0A9AB-7CC8-4693-AC07-1F28BD03C3DA} => return "IVdsIscsiInitiatorPortal (VDS)";
+        case {0AC13689-3134-47C6-A17C-4669216801BE} => return "IVdsServiceHba (VDS)";
+        case {14FBE036-3ED7-4E10-90E9-A5FF991AFF01} => return "IVdsServiceIscsi (VDS)";
+        case {B6B22DA8-F903-4BE7-B492-C09D875AC9DA} => return "IVdsServiceUninstallDisk (VDS)";
+        case {83BFB87F-43FB-4903-BAA6-127F01029EEC} => return "IVdsSubSystemImportTarget (VDS)";
+        case {13B50BFF-290A-47DD-8558-B7C58DB1A71A} => return "IVdsPack2 (VDS)";
+        case {40F73C8B-687D-4A13-8D96-3D7F2E683936} => return "IVdsDisk2 (VDS)";
+        case {9723F420-9355-42DE-AB66-E31BB15BEEAC} => return "IVdsAdvancedDisk2 (VDS)";
+        case {4DBCEE9A-6343-4651-B85F-5E75D74D983C} => return "IVdsVolumeMF2 (VDS)";
+        case {538684E0-BA3D-4BC0-ACA9-164AFF85C2A9} => return "IVdsDiskPartitionMF (VDS)";
+        case {D68168C9-82A2-4F85-B6E9-74707C49A58F} => return "IVdsVolumeShrink (VDS)";
+        case {1BE2275A-B315-4F70-9E44-879B3A2A53F2} => return "IVdsVolumeOnline (VDS)";
+        case {B481498C-8354-45F9-84A0-0BDD2832A91F} => return "IVdsVdProvider (VDS)";
+        case {4AFC3636-DB01-4052-80C3-03BBCB8D3C69} => return "IVdsServiceInitialization (VDS)";
+        case {6788FAF9-214E-4B85-BA59-266953616E09} => return "IVdsVolumeMF3 (VDS)";
+        case {D99BDAAE-B13A-4178-9FDB-E27F16B4603E} => return "IVdsHwProvider (VDS)";
+        case {90681B1D-6A7F-48E8-9061-31B7AA125322} => return "IVdsDiskOnline (VDS)";
+        case {FC5D23E8-A88B-41A5-8DE0-2D2F73C5A630} => return "IVdsServiceSAN (VDS)";
+        case {1E062B84-E5E6-4B4B-8A25-67B81E8F13E8} => return "IVdsVDisk (VDS)";
+        case {9CBE50CA-F2D2-4BF4-ACE1-96896B729625} => return "IVdsDiskPartitionMF2 (VDS)";
+        case {9882F547-CFC3-420B-9750-00DFBEC50662} => return "IVdsCreatePartitionEx (VDS)";
+        case {8F4B2F5D-EC15-4357-992F-473EF10975B9} => return "IVdsDisk3 (VDS)";
+        case {72AE6713-DCBB-4A03-B36B-371F6AC6B53D} => return "IVdsVolume2 (VDS)";
+        case {FA7DF749-66E7-4986-A27F-E2F04AE53772} => return "IVssSnapshotMgmt (SCMP)";
+        case {AE1C7110-2F60-11d3-8A39-00C04F72D8E3} => return "IVssEnumObject (SCMP)";
+        case {214A0F28-B737-4026-B847-4F9E37D79529} => return "IVssDifferentialSoftwareSnapshotMgmt (SCMP)";
+        case {01954E6B-9254-4e6e-808C-C9E05D007696} => return "IVssEnumMgmtObject (SCMP)";
+        case {50ABC2A4-574D-40B3-9D66-EE4FD5FBA076} => return "DNSP (DNSP)";
+        case {E3514235-4B06-11D1-AB04-00C04FC2DCD2} => return "DRSR (DRSR)";
+        case {7c44d7d4-31d5-424c-bd5e-2b3e1f323d22} => return "DSaop (DRSR)";
+        case {77DF7A80-F298-11D0-8358-00A024C480A8} => return "DSCOMM (MQDS)";
+        case {708CCA10-9569-11D1-B2A5-0060977D8118} => return "DSCOMM2 (MQDS)";
+        case {3919286A-B10C-11D0-9BA8-00C04FD92EF5} => return "DSSETUP (DSSP)";
+        case {1CBCAD78-DF0B-4934-B558-87839EA501C9} => return "DSROLE";
+        case {8D9F4E40-A03D-11CE-8F69-08003E30051B} => return "PNP (PNPR)";
+        case {C681D488-D850-11D0-8C52-00C04FD90F7E} => return "EFSRPC (EFSR)";
+        case {DF1941C5-fE89-4E79-BF10-463657ACf44D} => return "EFSRPC (EFSR)";
+        case {E1AF8308-5D1F-11C9-91A4-08002B14A0FA} => return "EPT (EPMP)";
+        case {82273FDC-E32A-18C3-3F78-827929DC23EA} => return "EventLog (EVEN)";
+        case {F6BEAFF7-1E19-4FBB-9F8F-B89E2018337C} => return "IEventService (EVEN6)";
+        case {5261574A-4572-206E-B268-6B199213B4E4} => return "Exchange Server STORE Async EMSMDB Interface";
+        case {A4F1DB00-CA47-1067-B31F-00DD010662DA} => return "Exchange Server STORE EMSMDB Interface";
+        case {DA107C01-2B50-44D7-9D5F-BFD4FD8E95ED} => return "Exchange Server STORE ADMIN Interface";
+        case {99E64010-B032-11D0-97A4-00C04FD6551D} => return "Exchange Server STORE ADMIN Interface";
+        case {89742ACE-A9ED-11CF-9C0C-08002BE7AE86} => return "Exchange Server STORE ADMIN Interface";
+        case {A4F1DB00-CA47-1067-B31E-00DD010662DA} => return "Exchange Server STORE ADMIN Interface";
+        case {D99E6E71-FC88-11D0-B498-00A0C90312F3} => return "ICertAdminD (CSRA)";
+        case {7FE0D935-DDA6-443F-85D0-1CFB58FE41DD} => return "ICertAdminD2 (CSRA)";
+        case {91AE6020-9E3C-11CF-8D7C-00AA00C091BE} => return "ICPR (ICPR)";
+        case {D99E6E70-FC88-11D0-B498-00A0C90312F3} => return "ICertRequestD (WCCE)";
+        case {5422FD3A-D4B8-4CEF-A12E-E87D4CA22E90} => return "ICertRequestD2 (WCCE)";
+        case {00020400-0000-0000-C000-000000000046} => return "IDispatch (OAUT)";
+        case {00020404-0000-0000-C000-000000000046} => return "IEnumVariant (OAUT)";
+        case {0000002F-0000-0000-C000-000000000046} => return "IID_IRecordInfo (OAUT)";
+        case {00020403-0000-0000-C000-000000000046} => return "IID_ITypeComp (OAUT)";
+        case {00020401-0000-0000-C000-000000000046} => return "IID_ITypeInfo (OAUT)";
+        case {00020412-0000-0000-C000-000000000046} => return "IID_ITypeInfo2 (OAUT)";
+        case {00020402-0000-0000-C000-000000000046} => return "IID_ITypeLib (OAUT)";
+        case {00020411-0000-0000-C000-000000000046} => return "IID_ITypeLib2 (OAUT)";
+        case {E8FB8620-588F-11D2-9D61-00C04F79C5FE} => return "IIisServiceControl (IISS)";
+        case {70B51430-B6CA-11D0-B9B9-00A0C922E750} => return "IMSAdminBaseW (IMSA)";
+        case {8298D101-F992-43B7-8ECA-5052D885B995} => return "IMSAdminBase2W (IMSA)";
+        case {F612954D-3B0B-4C56-9563-227B7BE624B4} => return "IMSAdminBase3W (IMSA)";
+        case {29822AB8-F302-11D0-9953-00C04FD919C1} => return "IWamAdmin2";
+        case {29822AB7-F302-11D0-9953-00C04FD919C1} => return "IWamAdmin";
+        case {7C4E1804-E342-483D-A43E-A850CFCC8D18} => return "IIISApplicationAdmin";
+        case {BD0C73BC-805B-4043-9C30-9A28D64DD7D2} => return "IIISCertObj";
+        case {82AD4280-036B-11CF-972C-00AA006887B0} => return "INetInfo (INETINFO)";
+        case {833E4100-AFF7-4AC3-AAC2-9F24C1457BCE} => return "IPCHCollection (RAI)";
+        case {833E4200-AFF7-4AC3-AAC2-9F24C1457BCE} => return "IPCHService (RAI)";
+        case {833E41AA-AFF7-4AC3-AAC2-9F24C1457BCE} => return "ISAFSession (RAI)";
+        case {F120A684-B926-447F-9DF4-C966CB785648} => return "IRASrv (RAI)";
+        case {6099FC12-3EFF-11D0-ABD0-00C04FD91A4E} => return "FaxClient (FAX)";
+        case {EA0A3165-4834-11D2-A6F8-00C04FA346CC} => return "Fax (FAX)";
+        case {D049B186-814F-11D1-9A3C-00C04FC9B232} => return "FrsApi (FRS1)";
+        case {F5CC59B4-4264-101A-8C59-08002B2F8426} => return "FrsRpc (FRS1)";
+        case {AFC07E2E-311C-4435-808C-C483FFEEC7C9} => return "Lsacap (CAPR)";
+        case {12345778-1234-ABCD-EF00-0123456789AB} => return "LSARpc (LSAT/LSAD)";
+        case {AFA8BD80-7D8A-11C9-BEF4-08002B102989} => return "MGMT (MSRPC)";
+        case {BF6DD426-77B4-44B3-984E-D413FC075562} => return "Microsoft Information Store";
+        case {0E4A0156-DD5D-11D2-8C2F-00C04FB6BCDE} => return "Microsoft Information Store";
+        case {1453C42C-0FA6-11D2-A910-00C04F990F3B} => return "Microsoft Information Store";
+        case {A9E05B20-6F57-4E24-A540-52412017E6FF} => return "Microsoft Information Store";
+        case {10F24E8E-0FA6-11D2-A910-00C04F990F3B} => return "Microsoft Information Store";
+        case {17FDD703-1827-4E34-79D4-24A55C53BB37} => return "MSGSVC (MSRP)";
+        case {5A7B91F8-FF00-11D0-A9B2-00C04FB6E6FC} => return "MSGSVCSend (MSRP)";
+        case {1544F5E0-613C-11D1-93DF-00C04FD7BD09} => return "MS Exchange Directory RFR";
+        case {3CB4BE69-9BA1-448C-9A44-A1F759A1878A} => return "MS Exchange Recipient Update Service RPC";
+        case {F930C514-1215-11D3-99A5-00A0C9B61B04} => return "MS Exchange System Attendant Cluster Interface";
+        case {83D72BF0-0D89-11CE-B13F-00AA003BAC6C} => return "MS Exchange System Attendant Private Interface";
+        case {469D6EC0-0D87-11CE-B13F-00AA003BAC6C} => return "MS Exchange System Attendant Public Interface";
+        case {F5CC5A18-4264-101A-8C59-08002B2F8426} => return "MS NT Directory NSP (NSPI)";
+        case {12345678-1234-ABCD-EF00-01234567CFFB} => return "Netlogon (NRPC)";
+        case {906B0CE0-C70B-1067-B317-00DD010662DA} => return "OleTx (CMPO)";
+        case {DA5A86C5-12C2-4943-AB30-7F74A813D853} => return "PerfLibV2 (PCQ)";
+        case {76F03F96-CDFD-44FC-A22C-64950A001209} => return "IRemoteWinspool (PAR)";
+        case {0B6EDBFA-4A24-4FC6-8A23-942B1ECA65D1} => return "IRPCAsyncNotify (PAN)";
+        case {AE33069B-A2A8-46EE-A235-DDFD339BE281} => return "IRPCRemoteObject (PAN)";
+        case {1A9134DD-7B39-45BA-AD88-44D01CA47F28} => return "RemoteRead (MQRR)";
+        case {2F5F6521-CA47-1068-B319-00DD010662DB} => return "remotesp (TRP)";
+        case {2F5F6520-CA46-1067-B319-00DD010662DA} => return "tapsrv (TRP)";
+        case {E33C0CC4-0482-101A-BC0C-02608C6BA218} => return "LocToLoc (RPCL)";
+        case {894DE0C0-0D55-11D3-A322-00C04FA321A1} => return "InitShutdown (RSP)";
+        case {D95AFE70-A6D5-4259-822E-2C84DA1DDB0D} => return "WindowsShutdown (RSP)";
+        case {4E934F30-341A-11D1-8FB1-00A024CB6019} => return "INtmsLibraryControl1 (RSMP)";
+        case {D02E4BE0-3419-11D1-8FB1-00A024CB6019} => return "INtmsMediaServices1 (RSMP)";
+        case {BB39332C-BFEE-4380-AD8A-BADC8AFF5BB6} => return "INtmsNotifySink (RSMP)";
+        case {69AB7050-3059-11D1-8FAF-00A024CB6019} => return "INtmsObjectInfo1 (RSMP)";
+        case {B057DC50-3059-11D1-8FAF-00A024CB6019} => return "INtmsObjectManagement1 (RSMP)";
+        case {8DA03F40-3419-11D1-8FB1-00A024CB6019} => return "INtmsSession1 (RSMP)";
+        case {879C8BBE-41B0-11d1-BE11-00C04FB6BF70} => return "IClientSink (RSMP)";
+        case {081E7188-C080-4FF3-9238-29F66D6CABFD} => return "IMessenger (RSMP)";
+        case {DB90832F-6910-4D46-9F5E-9FD6BFA73903} => return "INtmsLibraryControl2 (RSMP)";
+        case {895A2C86-270D-489D-A6C0-DC2A9B35280E} => return "INtmsObjectManagement2 (RSMP)";
+        case {3BBED8D9-2C9A-4B21-8936-ACB2F995BE6C} => return "INtmsObjectManagement3 (RSMP)";
+        case {7D07F313-A53F-459A-BB12-012C15B1846E} => return "IRobustNtmsMediaServices1 (RSMP)";
+        case {12345778-1234-ABCD-EF00-0123456789AC} => return "Samr (SAMR)";
+        case {378E52B0-C0A9-11CF-822D-00AA0051E40F} => return "SaSec (TSCH)";
+        case {4B324FC8-1670-01D3-1278-5A47BF6EE188} => return "srvs (SRVS)";
+        case {367ABB81-9844-35F1-AD32-98F038001003} => return "scmr (SCMR)";
+        case {4DA1C422-943D-11D1-ACAE-00C04FC2AA3F} => return "TrkSvr (DLTM)";
+        case {300F3532-38CC-11D0-A3F0-0020AF6B0ADD} => return "TrkWks (DLTM)";
+        case {8FB6D884-2388-11D0-8C35-00C04FDA2795} => return "W32Time (W32T)";
+        case {338CD001-2244-31F1-AAAA-900038001003} => return "winreg (RRP)";
+        case {12345678-1234-ABCD-EF00-0123456789AB} => return "WINSPOOL (RPRN)";
+        case {6BFFD098-A112-3610-9833-46C3F87E345A} => return "WKSSVC (WKST)";
+        case {6C19BE32-7500-11D1-AD94-00C04FD8FDFF} => return "IWbemMetaData (WMIRP)";
+        case {755F9DA6-7508-11D1-AD94-00C04FD8FDFF} => return "IWbemMultiTarget (WMIRP)";
+        case {755F9DA7-7508-11D1-AD94-00C04FD8FDFF} => return "IWbemEventProviderRequirements (WMIRP)";
+        case {37196B38-CCCF-11D2-B35C-00105A1F8177} => return "IWbemSmartMultiTarget (WMIRP)";
+        case {37196B39-CCCF-11D2-B35C-00105A1F8177} => return "IWbemFetchSmartMultiTarget (WMIRP)";
+        case {60E512D4-C47B-11D2-B338-00105A1F4AAF} => return "IWbemFilterProxy (WMIRP)";
+        case {6C19BE34-7500-11D1-AD94-00C04FD8FDFF} => return "IWbemFilterStub (WMIRP)";
+        case {04963311-C399-408E-AD51-05D01506EED0} => return "IWmiObjectSinkSecurity (WMIRP)";
+        case {F1E9C5B2-F59B-11D2-B362-00105A1F8177} => return "IWbemRemoteRefresher (WMIRP)";
+        case {2C9273E0-1DC3-11D3-B364-00105A1F8177} => return "IWbemRefreshingServices (WMIRP)";
+        case {423EC01E-2E35-11D2-B604-00104B703EFD} => return "IWbemWCOSmartEnum (WMIRP)";
+        case {1C1C45EE-4395-11D2-B60B-00104B703EFD} => return "IWbemFetchSmartEnum (WMIRP)";
+        case {D4781CD6-E5D3-44DF-AD94-930EFE48A887} => return "IWbemLoginClientID (WMIRP)";
+        case {92B9503D-19C3-4181-9F42-57FFC1A4BF37} => return "IWinmgmtMofCompilerOOP (WMIRP)";
+        case {2A504CA2-CA90-4731-87BC-6E99CA2019AF} => return "IWmiProvSSSink (WMIRP)";
+        case {E8107BDF-BAAF-4C7C-BB5F-9D732E8D8F07} => return "IWmiProvSS (WMIRP)";
+        case {07435309-D440-41B7-83F3-EB82DB6C622F} => return "IWmiProviderHost (WMIRP)";
+        case {21CD80A2-B305-4F37-9D4C-4534A8D9B568} => return "IWmiProviderFactory (WMIRP)";
+        case {BAC6B661-167E-4957-AD77-286AB256585E} => return "IWmiDynamicPropertyResolver (WMIRP)";
+        case {5FBA5051-3124-4112-B723-46BFBAF1D622} => return "IWmiProviderInitialize (WMIRP)";
+        case {B1B55910-8BA0-47A5-A16E-2B733B1D987C} => return "IWmiProviderStack (WMIRP)";
+        case {06413D98-405C-4A5A-8D6F-19B8B7C6ACF7} => return "IWmiProviderFactoryInitialize (WMIRP)";
+        case {FEC1B0AC-5808-4033-A915-C0185934581E} => return "IWmiProviderSite (WMIRP)";
+        case {EB658B8A-7A64-4DDC-9B8D-A92610DB0206} => return "IWmiProviderQuota (WMIRP)";
+        case {48FF3109-A366-4B56-B340-01FAE758BA64} => return "IWmiProviderAbnormalShutdown (WMIRP)";
+        case {F0E4EDDE-475A-498A-93D7-D4347F68A8F3} => return "IWmiProviderCache (WMIRP)";
+        case {6B3FC272-BF37-4968-933A-6DF9222A2607} => return "IWmiProviderConfiguration (WMIRP)";
+        case {484E3ECE-1F81-4591-B9D4-943BA13B609D} => return "IWmiProviderLoad (WMIRP)";
+        case {41AA40E6-2FBA-4E80-ADE9-34306567206D} => return "IWmiProviderSubsystemRegistrar (WMIRP)";
+        case {B60EF4F1-A411-462B-B51E-477CBDBB90B4} => return "IWbemRefresherMgr (WMIRP)";
+        case {6963B029-B969-40AA-9180-2B2F84075973} => return "IWbemFetchRefresherMgr (WMIRP)";
+        case {25411283-46FC-4326-8DF2-FF5D34B2DFEF} => return "IWbemConfigureRefreshingSvcs (WMIRP)";
+        case {6919DD07-1637-4611-A8A7-C16FAC5B2D53} => return "Internal_IWbemProviderInit (WMIRP)";
+        case {2B322B6E-A9DF-44E3-97BF-259E3583FDA4} => return "Internal_IWbemProviderIdentity (WMIRP)";
+        case {F50A28CF-5C9C-4F7E-9D80-E25E16E18C59} => return "Internal_IWbemServices (WMIRP)";
+        case {2DB9FA90-9973-46CF-B310-9865B644699D} => return "Internal_IWbemObjectSink (WMIRP)";
+        case {AC9EA02A-2C8A-4ACD-B562-D7E8EBEE8E8E} => return "Internal_IEnumWbemClassObject (WMIRP)";
+        case {11CAA957-4E80-474E-A819-7FD72148ADA9} => return "Internal_IWbemPropertyProvider (WMIRP)";
+        case {FD450835-CF1B-4C87-9FD2-5E0D42FDE081} => return "Internal_IWbemEventProvider (WMIRP)";
+        case {DF2373F5-EFB2-475C-AD58-3102D61967D4} => return "Internal_IWbemEventProviderSecurity (WMIRP)";
+        case {854D745C-6742-42C0-8BB9-01EC466B6E87} => return "Internal_IWbemEventConsumerProvider (WMIRP)";
+        case {88F3781C-6902-4647-9A6B-A74F450AF861} => return "Internal_IWbemEventConsumerProviderEx (WMIRP)";
+        case {8A0DC377-A9D3-41CB-BD69-AE1FDAF2DC68} => return "Internal_IWbemEventProviderQuerySink (WMIRP)";
+        case {A210BFE9-C9F7-4919-B114-0D98B3D5341E} => return "Internal_IWbemUnboundObjectSink (WMIRP)";
+        case {0FC8C622-1728-4149-A57F-AD19D0970710} => return "Internal_IWmiProviderConfiguration (WMIRP)";
+        case {E246107B-B06E-11D0-AD61-00C04FD8FDFF} => return "IWbemUnboundObjectSink (WMIRP)";
+        case {E245105B-B06E-11D0-AD61-00C04FD8FDFF} => return "IWbemEventProvider (WMIRP)";
+        case {580ACAF8-FA1C-11D0-AD72-00C04FD8FDFF} => return "IWbemEventProviderQuerySink (WMIRP)";
+        case {631F7D96-D993-11D2-B339-00105A1F4AAF} => return "IWbemEventProviderSecurity (WMIRP)";
+        case {631F7D97-D993-11D2-B339-00105A1F4AAF} => return "IWbemProviderIdentity (WMIRP)";
+        case {E246107A-B06E-11D0-AD61-00C04FD8FDFF} => return "IWbemEventConsumerProvider (WMIRP)";
+        case {1BE41571-91DD-11D1-AEB2-00C04FB68820} => return "IWbemProviderInitSink (WMIRP)";
+        case {1BE41572-91DD-11D1-AEB2-00C04FB68820} => return "IWbemProviderInit (WMIRP)";
+        case {7EC196FE-7005-11D1-AD90-00C04FD8FDFF} => return "IWbemQualifierSetv (WMIRP)";
+        case {7C857801-7381-11CF-884D-00AA004B2E24} => return "IWbemObjectSink (WMIRP)";
+        case {027947E1-D731-11CE-A357-000000000001} => return "IEnumWbemClassObject (WMIRP)";
+        case {44ACA675-E8FC-11D0-A07C-00C04FB68820} => return "IWbemCallResult (WMIRP)";
+        case {9556DC99-828C-11CF-A37E-00AA003240C7} => return "IWbemServices (WMIRP)";
+        case {C1E2D759-CABD-11D3-A11B-00105A1F515A} => return "IWbemRawSdAccessor (WMIRP))";
+        case {B7B31DF9-D515-11D3-A11C-00105A1F515A} => return "IWbemShutdown (WMIRP))";
+        case {1CFABA8C-1523-11D1-AD79-00C04FD8FDFF} => return "IUnsecuredApartment (WMIRP)";
+        case {C49E32C7-BC8B-11D2-85D4-00105A1F8304} => return "IWbemBackupRestore (WMIRP)";
+        case {A359DEC5-E813-4834-8A2A-BA7F1D777D76} => return "IWbemBackupRestoreEx (WMIRP)";
+        case {CE61E841-65BC-11D0-B6BD-00AA003240C7} => return "IWbemPropertyProvider (WMIRP)";
+        case {3AE0080A-7E3A-4366-BF89-0FEEDC931659} => return "IWbemEventSink (WMIRP)";
+        case {F309AD18-D86A-11D0-A075-00C04FB68820} => return "IWbemLevel1Login (WMIRP)";
+        case {D8EC9CB1-B135-4F10-8B1B-C7188BB0D186} => return "IWbemConnectorLogin (WMIRP)";
+        case {17CF534A-D8A3-4AD0-AC92-5E3D01717151} => return "IWbemEventConsumerProviderEx (WMIRP)";
+        case {75ABD540-F492-4161-86A5-37FC8898F69E} => return "IWbemSecureObjectSink (WMIRP)";
+        case {541679AB-2E5F-11d3-B34E-00104BCC4B4A} => return "IWbemLoginHelper (WMIRP)";
+        case {FDB3A030-065F-11D1-BB9B-00A024EA5525} => return "QMCOMM (MQMP)";
+        case {76D12B80-3467-11D3-91FF-0090272F9EA3} => return "QMCOMM2 (MQMP)";
+        case {1088A980-EAE5-11D0-8D9B-00A02453C337} => return "QM2QM (MQQP)";
+        case {41208EE0-E970-11D1-9B9E-00E02C064C39} => return "QMMGMT (MQMR)";
+        case {71710533-BEBA-4937-8319-B5DBEF9CCC36} => return "NDR64";
+        case {8A885D04-1CEB-11C9-9FE8-08002B104860} => return "NDR";
+        case {897e2e5f-93f3-4376-9c9c-fd2277495c27} => return "FRS2 (FRS2)";
+        case {6b5bdd1e-528c-422c-af8c-a4079be4fe48} => return "FASP (FASP)";
+        case {4FC742E0-4A10-11CF-8273-00AA004AE673} => return "netdfs (DFSNMGMT)";
+        case {03837520-098B-11D8-9414-505054503030} => return "IDataCollectorSet (PLA)";
+        case {03837541-098B-11D8-9414-505054503030} => return "IDataManager (PLA)";
+        case {03837543-098B-11D8-9414-505054503030} => return "IFolderAction (PLA)";
+        case {03837544-098B-11D8-9414-505054503030} => return "IFolderActionCollection (PLA)";
+        case {038374FF-098B-11D8-9414-505054503030} => return "IDataCollector (PLA)";
+        case {03837506-098B-11D8-9414-505054503030} => return "IPerformanceCounterDataCollector (PLA)";
+        case {03837514-098B-11D8-9414-505054503030} => return "IConfigurationDataCollector (PLA)";
+        case {03837516-098B-11D8-9414-505054503030} => return "IAlertDataCollector (PLA)";
+        case {0383750B-098B-11D8-9414-505054503030} => return "ITraceDataCollector (PLA)";
+        case {0383751A-098B-11D8-9414-505054503030} => return "IApiTracingDataCollector (PLA)";
+        case {03837512-098B-11D8-9414-505054503030} => return "ITraceDataProvider (PLA)";
+        case {0383753A-098B-11D8-9414-505054503030} => return "ISchedule (PLA)";
+        case {03837510-098B-11D8-9414-505054503030} => return "ITraceDataProviderCollection (PLA)";
+        case {0383753D-098B-11D8-9414-505054503030} => return "IScheduleCollection (PLA)";
+        case {03837502-098B-11D8-9414-505054503030} => return "IDataCollectorCollection (PLA)";
+        case {03837524-098B-11D8-9414-505054503030} => return "IDataCollectorSetCollection (PLA)";
+        case {03837533-098B-11D8-9414-505054503030} => return "IValueMapItem (PLA)";
+        case {03837534-098B-11D8-9414-505054503030} => return "IValueMap (PLA)";
+        case {44e265dd-7daf-42cd-8560-3cdb6e7a2729} => return "TSGU (TSGU)";
+        case {11899a43-2b68-4a76-92e3-a3d6ad8c26ce} => return "TermSrvNotification (TSTS)";
+        case {484809d6-4239-471b-b5bc-61df8c23ac48} => return "TermSrvSession (TSTS)";
+        case {bde95fdf-eee0-45de-9e12-e5a61cd0d4fe} => return "RCMPublic (TSTS)";
+        case {88143fd0-c28d-4b2b-8fef-8d882f6a9390} => return "TermSrvEnumeration (TSTS)";
+        case {497d95a6-2d27-4bf5-9bbd-a6046957133c} => return "RCMListener (TSTS)";
+        case {2f59a331-bf7d-48cb-9e5c-7c090d76e8b8} => return "LCRPC (TSTS)";
+        case {5ca4a760-ebb1-11cf-8611-00a0245420ed} => return "IcaApi (TSTS)";
+        case {D3FBB514-0E3B-11CB-8FAD-08002B1D29C3} => return "NsiC (RPCL)";
+        case {D6D70EF0-0E3B-11CB-ACC3-08002B1D29C4} => return "NsiM (RPCL)";
+        case {D6D70EF0-0E3B-11CB-ACC3-08002B1D29C3} => return "NsiS (RPCL)";
+        case {8f09f000-b7ed-11ce-bbd2-00001a181cad} => return "ROUTER (RRASM)";
+        case {F5CC5A7C-4264-101A-8C59-08002B2F8426} => return "Rxds (RXDS)";
+        case {F76FBF3B-8DDD-4B42-B05A-CB1C3FF1FEE8} => return "IFsrmCollection (FSRM)";
+        case {1BB617B8-3886-49DC-AF82-A6C90FA35DDA} => return "IFsrmMutableCollection (FSRM)";
+        case {96DEB3B5-8B91-4A2A-9D93-80A35D8AA847} => return "IFsrmCommittableCollection (FSRM)";
+        case {6CD6408A-AE60-463B-9EF1-E117534D69DC} => return "IFsrmAction (FSRM)";
+        case {D646567D-26AE-4CAA-9F84-4E0AAD207FCA} => return "IFsrmActionEmail (FSRM)";
+        case {8276702F-2532-4839-89BF-4872609A2EA4} => return "IFsrmActionEmail2 (FSRM)";
+        case {2DBE63C4-B340-48A0-A5B0-158E07FC567E} => return "IFsrmActionReport (FSRM)";
+        case {4C8F96C3-5D94-4F37-A4F4-F56AB463546F} => return "IFsrmActionEventLog (FSRM)";
+        case {12937789-E247-4917-9C20-F3EE9C7EE783} => return "IFsrmActionCommand (FSRM)";
+        case {22BCEF93-4A3F-4183-89F9-2F8B8A628AEE} => return "IFsrmObject (FSRM)";
+        case {F411D4FD-14BE-4260-8C40-03B7C95E608A} => return "IFsrmSetting (FSRM)";
+        case {6F4DBFFF-6920-4821-A6C3-B7E94C1FD60C} => return "IFsrmPathMapper (FSRM)";
+        case {EFCB0AB1-16C4-4A79-812C-725614C3306B} => return "IFsrmExportImport (FSRM)";
+        case {39322A2D-38EE-4D0D-8095-421A80849A82} => return "IFsrmDerivedObjectsResult (FSRM)";
+        case {1568A795-3924-4118-B74B-68D8F0FA5DAF} => return "IFsrmQuotaBase (FSRM)";
+        case {42DC3511-61D5-48AE-B6DC-59FC00C0A8D6} => return "IFsrmQuotaObject (FSRM)";
+        case {377F739D-9647-4B8E-97D2-5FFCE6D759CD} => return "IFsrmQuota (FSRM)";
+        case {F82E5729-6ABA-4740-BFC7-C7F58F75FB7B} => return "IFsrmAutoApplyQuota (FSRM)";
+        case {8BB68C7D-19D8-4FFB-809E-BE4FC1734014} => return "IFsrmQuotaMaagern (FSRM)";
+        case {A2EFAB31-295E-46BB-B976-E86D58B52E8B} => return "IFsrmQuotaTemplate (FSRM)";
+        case {9A2BF113-A329-44CC-809A-5C00FCE8DA40} => return "IFsrmQuotaTemplateImported (FSRM)";
+        case {4173AC41-172D-4D52-963C-FDC7E415F717} => return "IFsrmQuotaTemplateManager (FSRM)";
+        case {8DD04909-0E34-4D55-AFAA-89E1F1A1BBB9} => return "IFsrmFileGroup (FSRM)";
+        case {AD55F10B-5F11-4BE7-94EF-D9EE2E470DED} => return "IFsrmFileGroupImported (FSRM)";
+        case {426677D5-018C-485C-8A51-20B86D00BDC4} => return "IFsrmFileGroupManager (FSRM)";
+        case {F3637E80-5B22-4A2B-A637-BBB642B41CFC} => return "IFsrmFileScreenBase (FSRM)";
+        case {5F6325D3-CE88-4733-84C1-2D6AEFC5EA07} => return "IFsrmFileScreen (FSRM)";
+        case {BEE7CE02-DF77-4515-9389-78F01C5AFC1A} => return "IFsrmFileScreenException (FSRM)";
+        case {FF4FA04E-5A94-4BDA-A3A0-D5B4D3C52EBA} => return "IFsrmFileScreenManager (FSRM)";
+        case {205BEBF8-DD93-452A-95A6-32B566B35828} => return "IFsrmFileScreenTemplate (FSRM)";
+        case {E1010359-3E5D-4ECD-9FE4-EF48622FDF30} => return "IFsrmFileScreenTemplateImported (FSRM)";
+        case {CFE36CBA-1949-4E74-A14F-F1D580CEAF13} => return "IFsrmFileScreenTemplateManager (FSRM)";
+        case {27B899FE-6FFA-4481-A184-D3DAADE8A02B} => return "IFsrmReportManager (FSRM)";
+        case {38E87280-715C-4C7D-A280-EA1651A19FEF} => return "IFsrmReportJob (FSRM)";
+        case {D8CC81D9-46B8-4FA4-BFA5-4AA9DEC9B638} => return "IFsrmReport (FSRM)";
+        case {6879CAF9-6617-4484-8719-71C3D8645F94} => return "IFsrmReportScheduler (FSRM)";
+        case {EE321ECB-D95E-48E9-907C-C7685A013235} => return "IFsrmFileManagementJobManager (FSRM)";
+        case {0770687E-9F36-4D6F-8778-599D188461C9} => return "IFsrmFileManagementJob (FSRM)";
+        case {326AF66F-2AC0-4F68-BF8C-4759F054FA29} => return "IFsrmPropertyCondition (FSRM)";
+        case {EDE0150F-E9A3-419C-877C-01FE5D24C5D3} => return "IFsrmPropertyDefinition (FSRM)";
+        case {4A73FEE4-4102-4FCC-9FFB-38614F9EE768} => return "IFsrmProperty (FSRM)";
+        case {CB0DF960-16F5-4495-9079-3F9360D831DF} => return "IFsrmRule (FSRM)";
+        case {AFC052C2-5315-45AB-841B-C6DB0E120148} => return "IFsrmClassificationRule (FSRM)";
+        case {515C1277-2C81-440E-8FCF-367921ED4F59} => return "IFsrmPipelineModuleDefinition (FSRM)";
+        case {BB36EA26-6318-4B8C-8592-F72DD602E7A5} => return "IFsrmClassifierModuleDefinition (FSRM)";
+        case {B15C0E47-C391-45B9-95C8-EB596C853F3A} => return "IFsrmClassificationManager (FSRM)";
+        case {21546AE8-4DA5-445E-987F-627FEA39C5E8} => return "iwrmconfig (WSRM)";
+        case {481E06CF-AB04-4498-8FFE-124A0A34296D} => return "iwrmcalendar (WSRM)";
+        case {4F7CA01C-A9E5-45B6-B142-2332A1339C1D} => return "iwrmaccounting (WSRM)";
+        case {59602EB6-57B0-4FD8-AA4B-EBF06971FE15} => return "iwrmpolicy (WSRM)";
+        case {BC681469-9DD9-4BF4-9B3D-709F69EFE431} => return "iwrmresourcegroup (WSRM)";
+        case {C5CEBEE2-9DF5-4CDD-A08C-C2471BC144B4} => return "iresourcemanager (WSRM)";
+        case {F31931A9-832D-481C-9503-887A0E6A79F0} => return "iwrmprotocol (WSRM)";
+        case {784B693D-95F3-420B-8126-365C098659F2} => return "IOcspAdminD (OCSPA)";
+        case {70184AC9-7673-4770-96B1-445CE035CF70} => return "IAppHostMethodExtension (IISA)";
+        case {31A83EA0-C0E4-4A2C-8A01-353CC2A4C60A} => return "IAppHostMappingExtension (IISA)";
+        case {0191775E-BCFF-445A-B4F4-3BDDA54E2816} => return "IAppHostPropertyCollection (IISA)";
+        case {9BE77978-73ED-4A9A-87FD-13F09FEC1B13} => return "IAppHostAdminManager (IISA)";
+        case {450386DB-7409-4667-935E-384DBBEE2A9E} => return "IISAIAppHostPropertySchema (IISA)";
+        case {370AF178-7758-4DAD-8146-7391F6E18585} => return "IAppHostConfigLocation (IISA)";
+        case {ADA4E6FB-E025-401E-A5D0-C3134A281F07} => return "IAppHostConfigFile (IISA)";
+        case {8BED2C68-A5FB-4B28-8581-A0DC5267419F} => return "IAppHostPropertySchemaCollection (IISA)";
+        case {832A32F7-B3EA-4B8C-B260-9A2923001184} => return "IAppHostConfigLocationCollection (IISA)";
+        case {ED35F7A1-5024-4E7B-A44D-07DDAF4B524D} => return "IAppHostProperty (IISA)";
+        case {FA7660F6-7B3F-4237-A8BF-ED0AD0DCBBD9} => return "IAppHostWritableAdminManager (IISA)";
+        case {64FF8CCC-B287-4DAE-B08A-A72CBF45F453} => return "IAppHostElement (IISA)";
+        case {C8550BFF-5281-4B1E-AC34-99B6FA38464D} => return "IAppHostElementCollection (IISA)";
+        case {09829352-87C2-418D-8D79-4133969A489D} => return "IAppHostChangeHandler (IISA)";
+        case {B80F3C42-60E0-4AE0-9007-F52852D3DBED} => return "IAppHostMethodInstance (IISA)";
+        case {E7927575-5CC3-403B-822E-328A6B904BEE} => return "IAppHostPathMapper (IISA)";
+        case {0F80E901-8F4C-449A-BF90-13D5D082F187} => return "IAppHostPathMapper2 (IISA)";
+        case {8F6D760F-F0CB-4D69-B5F6-848B33E9BDC6} => return "IAppHostConfigManager (IISA)";
+        case {0716CAF8-7D05-4A46-8099-77594BE91394} => return "IAppHostConstantValue (IISA)";
+        case {B7D381EE-8860-47A1-8AF4-1F33B2B1F325} => return "IAppHostSectionDefinitionCollection (IISA)";
+        case {5B5A68E6-8B9F-45E1-8199-A95FFCCDFFFF} => return "IAppHostConstantValueCollection (IISA)";
+        case {0DD8A158-EBE6-4008-A1D9-B7ECC8F1104B} => return "IAppHostSectionGroup (IISA)";
+        case {7883CA1C-1112-4447-84C3-52FBEB38069D} => return "IAppHostMethod (IISA)";
+        case {DE095DB1-5368-4D11-81F6-EFEF619B7BCF} => return "IAppHostCollectionSchema (IISA)";
+        case {EF13D885-642C-4709-99EC-B89561C6BC69} => return "IAppHostElementSchema (IISA)";
+        case {D6C7CD8F-BB8D-4F96-B591-D3A5F1320269} => return "IAppHostMethodCollection (IISA)";
+        case {518EB37D-1FF4-42DD-86C3-3140BC35B823} => return "IAppHostElementExtension (IISA)";
+        case {88E220F3-33E8-4534-AFAC-B4A98ECCF9AE} => return "IAppHostPropertyExtension (IISA)";
+        case {08A90F5F-0702-48D6-B45F-02A9885A9768} => return "IAppHostChildElementCollection (IISA)";
+        case {4DFA1DF3-8900-4BC7-BBB5-D1A458C52410} => return "IAppHostConfigException (IISA)";
+        case {0344CDDA-151E-4CBF-82DA-66AE61E97754} => return "IAppHostElementSchemaCollection (IISA)";
+        case {C5C04795-321C-4014-8FD6-D44658799393} => return "IAppHostSectionDefinition (IISA)";
+        case {2D9915FB-9D42-4328-B782-1B46819FAB9E} => return "IAppHostMethodSchema (IISA)";
+        case {EAFE4895-A929-41EA-B14D-613E23F62B71} => return "IAppHostPropertyException (IISA)";
+        case {FF9A1BB6-1E96-11D3-BFCC-00C04FA3490A} => return "ILinkQueue (IISIAQ)";
+        case {EA4DFDF2-9E87-4C57-B845-123872C5649F} => return "IUniqueId (IISIAQ)";
+        case {3F962F94-1ECD-11D3-BFCC-00C04FA3490A} => return "IVSAQLink (IISIAQ)";
+        case {1EB44A71-1E95-11D3-BFCC-00C04FA3490A} => return "IAQMessageAction (IISIAQ)";
+        case {476D70A6-1A90-11D3-BFCB-00C04FA3490A} => return "IAQAdmin (IISIAQ)";
+        case {BA7AF302-7373-11D2-94E4-00C04FA379F1} => return "IAQEnumMessages (IISIAQ)";
+        case {BA7AF300-7373-11D2-94E4-00C04FA379F1} => return "IEnumVSAQLinks (IISIAQ)";
+        case {BA7AF303-7373-11D2-94E4-00C04FA379F1} => return "IEnumLinkQueues (IISIAQ)";
+        case {E2ED3340-1E96-11D3-BFCC-00C04FA3490A} => return "IVSAQAdmin (IISIAQ)";
+        case {BA7AF305-7373-11D2-94E4-00C04FA379F1} => return "IAQMessage (IISIAQ)";
+        case {1A927394-352E-4553-AE3F-7CF4AAFCA620} => return "WDSC";
+        // start ISA and TMG common
+        case {B347203C-14BB-4878-8B7A-0A12F9B8076A} => return "WspAdmin";
+        case {A9B96D49-2C75-4917-A178-06B6F08261CC} => return "PrefetcherAPI";
+        case {b3df47c0-a95a-11cf-aa26-00aa00c148b9} => return "RwsAdmin";
+        case {45FCCD57-C817-418A-90DA-6A00DA164FEB} => return "W3ProxyAdmin";
+        case {1A77DCB2-97B3-4ffb-9EE7-8F42529841AB} => return "StgAdmin";
+        case {D87F0FF3-CBAA-40A2-AF04-A12BCAF352FA} => return "VpnAuth";
+        case {B960D772-4691-483f-A43B-FB3435DA1BE7} => return "ISASCMAdmin";
+        // end ISA and TMG common
+        // start Forefront TMG
+        case {3fb70b3f-e2eb-46fd-9610-8d1ba842d737} => return "ManagedServiceAdmin";
+        case {80a74b95-4a73-40b3-83b9-c977a2773647} => return "SmtpProtectionAdmin";
+        case {3BC75947-EA23-4502-B4EF-0C0F8D196F1C} => return "ReportingServicesAdmin";
+        // end Forefront TMG
+        case {ccd8c074-d0e5-4a40-92b4-d074faa6ba28} => return "Witness (SWN)";
+        case {A8E0653C-2744-4389-A61D-7373DF8B2292} => return "FileServerVssAgent (FSRVP)";
+        default => return "unknown";
+    }
+}
+
+// 2.2.6   Type Serialization Version 1
+
+// 2.2.6.1 Common Type Header for the Serialization Stream
+type CommonTypeHeaderfortheSerializationStream
+{
+    byte Version where value == 1;
+    Endianness Endianness 
+        where ValidationCheckEnumValue(InRange<Endianness>(value), null, true, ReferenceType.Type, "MSRPCE", "Endianness", "CommonTypeHeaderfortheSerializationStream", "0x00, 0x10", value);
+    ushort CommonHeaderLength 
+        where ValidationCheckValue(value == 8, null, true, ReferenceType.Type, "MSRPCE", "CommonHeaderLength", "CommonTypeHeaderfortheSerializationStream", "8", value);
+    uint Filler
+        where ValidationCheckValue(value == 0xcccccccc, null, true, ReferenceType.Type, "MSRPCE", "Filler", "CommonTypeHeaderfortheSerializationStream", "0xcccccccc", value);
+}
+
+pattern Endianness = enum byte
+{
+    Little_endian = 0x10,
+    Big_endian = 0x00,
+    ...
+};
+
+// 2.2.6.2 Private Header for Constructed Type
+type PrivateHeaderforConstructedType
+{
+    uint ObjectBufferLength;
+    uint Filler
+        where ValidationCheckValue(value == 0, null, true, ReferenceType.Type, "MSRPCE", "Filler", "PrivateHeaderforConstructedType", "0", value);
+};
+
+// 2.2.7 Type Serialization Version 2
+
+// 2.2.7.1 Common Type Header
+type CommonTypeHeader
+{
+    byte Version where value == 2;
+    Endianness Endianness
+        where ValidationCheckValue(value is Endianness.Little_endian, null, true, ReferenceType.Type, "MSRPCE", "Endianness", "CommonTypeHeader", "0x10", value);
+    ushort CommonHeaderLength 
+        where ValidationCheckValue(value == 0x40, null, true, ReferenceType.Type, "MSRPCE", "CommonHeaderLength", "CommonTypeHeader", "0x40", value);
+    uint endianInfo
+        where ValidationCheckValue(value == 0xcccccccc, null, true, ReferenceType.Type, "MSRPCE", "endianInfo", "CommonTypeHeader", "0xcccccccc", value);
+    binary Reserved
+        where ValidationCheckValue(value == $[cccccccccccccccccccccccccccccccc], null, true, ReferenceType.Type, "MSRPCE", "Reserved", "CommonTypeHeader", "$[cccccccccccccccccccccccccccccccc]", value)
+        with BinaryEncoding{Length = 16};
+    PSyntaxIdT[Endianness == 0x10 ? Endian.Little : Endian.Big] TransferSyntax;
+    rpc_if_id_t InterfaceID;
+}
+
+// C706 3.1.9 Interface Identifier
+type rpc_if_id_t
+{
+    guid uuid;
+    ushort vers_major;
+    ushort vers_minor;
+}
+
+// 2.2.7.2 Private Header
+type PrivateHeader
+{
+    uint ObjectBufferLength;
+    binary Filler
+        where ValidationCheckValue(value == $[000000000000000000000000], null, true, ReferenceType.Type, "MSRPCE", "Filler", "PrivateHeader", "$[000000000000000000000000]", value)
+        with BinaryEncoding{Length = 12};
+}
+
+optional T NDRTypeSerializationVersion1Decoder<T>(stream s, bool isConstructedType)
+{
+    NdrInfo ndrInfo = new NdrInfo{};
+    var data1 = BinaryDecoder<CommonTypeHeaderfortheSerializationStream>(s);
+    long remainingBytes = 0;
+    if (data1 is cth:CommonTypeHeaderfortheSerializationStream)
+    {
+        ndrInfo.isBigEndian = cth.Endianness == Endianness.Big_endian;
+    }
+    else
+    {
+        return nothing;
+    }
+    
+    if (isConstructedType)
+    {
+        var data2 = BinaryDecoder<PrivateHeaderforConstructedType>(s);
+        if (data2 == nothing)
+        {
+            return nothing;
+        }
+        remainingBytes = (data2 as PrivateHeaderforConstructedType).ObjectBufferLength;
+    }
+    
+    int StartPos = s.BytePosition;
+    optional T res = NdrDecoder<T>(s, ndrInfo);
+    
+    // Consume the remaining bytes;
+    remainingBytes -= s.BytePosition - StartPos;
+    if (remainingBytes > 0)
+        BinaryDecoder<Blob[remainingBytes as uint]>(s);
+        
+    return res;
+}
+
+optional T NDRTypeSerializationVersion2Decoder<T>(stream s, bool isConstructedType)
+{
+    NdrInfo ndrInfo = new NdrInfo{};
+    var data1 = BinaryDecoder<CommonTypeHeader>(s);
+    long remainingBytes = 0;
+    if (data1 is cth:CommonTypeHeader)
+    {
+        ndrInfo.isNdr64 = (cth.TransferSyntax.IfUuid == {71710533-BEBA-4937-8319-B5DBEF9CCC36} && cth.TransferSyntax.IfVersion == 1);
+    }
+    else
+    {
+        return nothing;
+    }
+    
+    if (isConstructedType)
+    {
+        var data2 = BinaryDecoder<PrivateHeader>(s);
+        if (data2 == nothing)
+        {
+            return nothing;
+        }
+        remainingBytes = (data2 as PrivateHeader).ObjectBufferLength;
+    }
+    
+    int StartPos = s.BytePosition;
+    optional T res = NdrDecoder<T>(s, ndrInfo);
+    
+    // Consume the remaining bytes;
+    remainingBytes -= s.BytePosition - StartPos;
+    if (remainingBytes > 0)
+        BinaryDecoder<Blob[remainingBytes as uint]>(s);
+        
+    return res;
+}
+
+//----------------------------------------------------------
+// Define the following structures here for getting rid of cyclic reference issue
+
+// [MS-NRPC] 2.2.1.3.1 NL_AUTH_MESSAGE
+type NL_AUTH_MESSAGE
+{
+    NL_AUTH_MESSAGE_MessageType MessageType where ValidationCheckEnumValue(InRange<NL_AUTH_MESSAGE_MessageType>(value), null, true, ReferenceType.Type, "NRPC", "MessageType", "NL_AUTH_MESSAGE", "0x00000000, 0x00000001", value);
+    NL_AUTH_MESSAGE_Flags Flags where ValidationCheckCombinationValueTooManyItems(InRange<NL_AUTH_MESSAGE_Flags>(value), null, true, ReferenceType.Type, "NRPC", "Flags", "NL_AUTH_MESSAGE", "NL_AUTH_MESSAGE", "MS-NRPC");
+    optional [|CountBitSetInUint(Flags) > 0|] array<string> Buffer with BinaryEncoding{Length = CountBitSetInUint(Flags), TextEncoding = TextEncoding.ASCII};
+}
+
+int CountBitSetInUint(uint uintValue)
+{
+    int count;
+    for (count = 0; uintValue != 0; count++)
+    {
+        uintValue = (uintValue & (uintValue - 1));
+    }
+    return count;
+}
+
+pattern NL_AUTH_MESSAGE_MessageType = enum uint
+{
+    NegotiateRequest = 0x00000000,
+    NegotiateResponse  = 0x00000001,
+    ...
+};
+
+pattern NL_AUTH_MESSAGE_Flags = flags uint
+{
+    A = 0x00000001,
+    B = 0x00000002,
+    C = 0x00000004,
+    D = 0x00000008,
+    E = 0x00000010,
+    ...
+};
+
+// [MS-NRPC] 2.2.1.3.2 NL_AUTH_SIGNATURE
+type NL_AUTH_SIGNATURE
+{
+    NL_AUTH_SIGNATURE_SignatureAlgorithm SignatureAlgorithm 
+        where ValidationCheckEnumValue(InRange<NL_AUTH_SIGNATURE_SignatureAlgorithm>(value), null, true, ReferenceType.Type, "NRPC", "SignatureAlgorithm", "NL_AUTH_SIGNATURE", "0x0077", value)
+        with BinaryEncoding{Endian = Endian.Little};
+    NL_AUTH_SIGNATURE_SealAlgorithm SealAlgorithm
+        where ValidationCheckEnumValue(InRange<NL_AUTH_SIGNATURE_SealAlgorithm>(value), null, true, ReferenceType.Type, "NRPC", "SealAlgorithm", "NL_AUTH_SIGNATURE", "0x007A, 0xFFFF", value)
+        with BinaryEncoding{Endian = Endian.Little};
+    ushort Pad where ValidationCheckValue(value == 0xFFFF, null, true, ReferenceType.Type, "NRPC", "Pad", "NL_AUTH_SIGNATURE", "0xFFFF", value);
+    ushort Flags where ValidationCheckValue(value == 0x0000, null, true, ReferenceType.Type, "NRPC", "Flags", "NL_AUTH_SIGNATURE", "0x0000", value);
+    ulong SequenceNumber with BinaryEncoding{Endian = Endian.Little};
+    binary Checksum with BinaryEncoding{Length = 8};
+    binary Confounder with BinaryEncoding{Length = 8};
+}
+
+pattern NL_AUTH_SIGNATURE_SignatureAlgorithm = enum ushort
+{
+    $"HMAC-MD5" = 0x0077,
+    ...    
+};
+
+pattern NL_AUTH_SIGNATURE_SealAlgorithm = enum ushort
+{
+    NotEncrypted = 0xFFFF,
+    EncryptedUsingRC4  = 0x007A,
+};
+
+// [MS-NRPC] 2.2.1.3.3 NL_AUTH_SHA2_SIGNATURE
+type NL_AUTH_SHA2_SIGNATURE
+{
+    NL_AUTH_SHA2_SIGNATURE_SignatureAlgorithm SignatureAlgorithm 
+        where ValidationCheckEnumValue(InRange<NL_AUTH_SHA2_SIGNATURE_SignatureAlgorithm>(value), null, true, ReferenceType.Type, "NRPC", "SignatureAlgorithm", "NL_AUTH_SHA2_SIGNATURE", "0x0013", value)
+        with BinaryEncoding{Endian = Endian.Little};
+    NL_AUTH_SHA2_SIGNATURE_SealAlgorithm SealAlgorithm
+        where ValidationCheckEnumValue(InRange<NL_AUTH_SHA2_SIGNATURE_SealAlgorithm>(value), null, true, ReferenceType.Type, "NRPC", "SealAlgorithm", "NL_AUTH_SHA2_SIGNATURE", "0x001A, 0xFFFF", value)
+        with BinaryEncoding{Endian = Endian.Little};
+    ushort Pad where ValidationCheckValue(value == 0xFFFF, null, true, ReferenceType.Type, "NRPC", "Pad", "NL_AUTH_SHA2_SIGNATURE", "0xFFFF", value);
+    ushort Flags where ValidationCheckValue(value == 0x0000, null, true, ReferenceType.Type, "NRPC", "Flags", "NL_AUTH_SHA2_SIGNATURE", "0x0000", value);
+    ulong SequenceNumber with BinaryEncoding{Endian = Endian.Little};
+    binary Checksum with BinaryEncoding{Length = 32};
+    binary Confounder with BinaryEncoding{Length = 8};
+}
+
+pattern NL_AUTH_SHA2_SIGNATURE_SignatureAlgorithm = enum ushort
+{
+    $"HMAC-SHA256" = 0x0013,
+    ...    
+};
+
+pattern NL_AUTH_SHA2_SIGNATURE_SealAlgorithm = enum ushort
+{
+    NotEncrypted = 0xFFFF,
+    EncryptedUsingAES128 = 0x001A,
+};
+
+bool IsNL_AUTH_MESSAGE(binary bin)
+{
+    return bin.Count > 4 && (bin.Segment(0, 4) == $[01000000] || bin.Segment(0, 4) == $[00000000]);
+}
+
+bool IsNL_AUTH_SIGNATURE(binary bin)
+{
+    return bin.Count > 2 && bin.Segment(0, 2) == $[7700];
+}
+
+bool IsNL_AUTH_SHA2_SIGNATURE(binary bin)
+{
+    return bin.Count > 2 && bin.Segment(0, 2) == $[1300];
+}
+
+//----------------------------------------------------------
+// Decoding Helper
+type MSRPCEDecodingHelper : TCPDecodingHelper
+{
+    void InitializeMSRPCEHelper(Server server)
+    {
+        var acceptsCache = new MSRPCEDecodingCache();
+        acceptsCache.InitializeMSRPCEDecodingCache(server, MessageDirection.Accepts);
+        var issuesCache = new MSRPCEDecodingCache();
+        issuesCache.InitializeMSRPCEDecodingCache(server, MessageDirection.Issues);
+        AcceptsCache = acceptsCache;
+        IssuesCache = issuesCache;
+    }
+}
+
+// Decoding Cache
+type MSRPCEDecodingCache : TCP.TCPDecodingCache
+{
+    internal int msgLength;
+    internal RpcconnReassemblyHelper helper;
+
+    void InitializeMSRPCEDecodingCache(Server server, MessageDirection direction)
+    {
+        base.Initialize("MSRPCE", server, direction, IsRPCEMessage, IsCompleteRPCMessage, DecodeRPCEMessage, 
+            (binary bin) => BinaryDecoder<RpcconnIncompleteMessage>(bin) as optional any message);
+        helper = new RpcconnReassemblyHelper(direction, server);
+    }
+
+    override void DispatchMessage(any message msg)
+    {
+        helper.Reassemble(msg as RpcconnCommonHdrT);
+    }
+
+    override void ClearInDestructor()
+    {
+        helper.ClearInDestructor();
+        base.ClearInDestructor();
+    }
+
+    uint? IsCompleteRPCMessage(binary bin)
+    {
+        msgLength = GetRPCLength(bin);
+        return msgLength >= 0 ? (msgLength <= bin.Count ? 0 : (msgLength as uint)) : null;
+    }
+
+    optional any message DecodeRPCEMessage(stream s)
+    {
+        int sPos = s.BytePosition;
+        PDUType ptype;
+        var res = ProcessConnectionOrientedRpcMessage(s, msgLength, helper.strongTypedEPT, out ptype);
+        // Consume the trailing padding bytes
+        int consumedBytes = s.BytePosition - sPos;
+        if (res != nothing && consumedBytes < msgLength)
+        {
+            BinaryDecoder<Blob[(msgLength - consumedBytes) as uint]>(s);
+        }
+
+        return res;
+    }
+}
+
+bool? IsRPCEMessage(binary bin)
+{
+    if (bin.Count < 16)
+    {
+        return null;
+    }
+    
+    return IsRpcconnCommonHdrT(bin);
+}
+
+// Get RpcconnCommonHdrT.FragLength on byte 9-10, 
+// the byte order is determinded by PackedDrep.IntegerRepresentation field.
+internal int GetRPCLength(binary bin)
+{
+    if (bin.Count < 10)
+    {
+        return -1;
+    }
+    int byteOrder = bin[4] & 0xF0;
+    if (byteOrder == 0x10) // 0x10: little, 0x00: big
+    {
+        return MakeWord(bin[9], bin[8]) as int;
+    }
+    else
+    {
+        return MakeWord(bin[8], bin[9]) as int;
+    }
+}
+
+const set<PDUType> AcceptsMsgTypeSet = 
+{
+    PDUType.Request,
+    PDUType.Bind,
+    PDUType.AlterContext,
+    PDUType.Auth3,
+    PDUType.CoCancel,
+    PDUType.Orphaned
+};
+
+const set<PDUType> IssuesMsgTypeSet = 
+{
+    PDUType.Response,
+    PDUType.Fault,
+    PDUType.BindAck,
+    PDUType.BindNak,
+    PDUType.AlterContextResp,
+    PDUType.Shutdown
+};
+
+optional RpcconnCommonHdrT ProcessConnectionOrientedRpcMessage(stream s, int fragmentLength, Server ept, out PDUType pduType)
+{
+    optional RpcconnCommonHdrT result;
+    pduType = s.PeekByte(s.BitPosition + 2 * 8);
+    byte pfcFlags = s.PeekByte(s.BitPosition + 3 * 8);
+    byte byteOrder = (s.PeekByte(s.BitPosition + 4 * 8) & 0xF0) as byte;
+    Endian endian = byteOrder == 0x10 ? Endian.Little : Endian.Big;
+    ushort authLength = s.PeekUShort(s.BitPosition + 10 * 8, endian);
+    // If authLength not zero, then get authPadLength and authVerifierLength from Payload.
+    int authPadLength = 0;
+    int authVerifierLength = 0;
+    
+    switch (pduType)
+    {
+        case PDUType.Bind =>
+            if (BinaryDecoder<RpcconnBindHdrT>(s) is bind:RpcconnBindHdrT)
+            {
+                if ((bind.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    bind.AuthVerifier = s.PeekBytes(s.BitPosition, bind.FragLength - s.BytePosition);
+                    AssociateFieldPosition(bind, "AuthVerifier", s, s.BitPosition, bind.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    // In [MS-RPCE] section 2.2.2.11: All PDUs that carry sec_trailer information share certain common fields: frag_length and auth_length. 
+                    // The beginning of the sec_trailer structure for each PDU MUST be calculated to start from offset (frag_length ¨C auth_length ¨C 8) from the beginning of the PDU.
+                    // But in C706 section 13.2.6, the length of AuthPad should rely on the AuthPadLength.
+                    // We calculate the authPathLength as what the [MS-RPCE] described for command Bind, BindAck, AlterContext, AlterContextResp, Orphaned, CoCancel.
+                    // For Request, Response, Fault, we will still rely the length of padding on AuthPadLength in type AuthVerifierCoT. It is because we don't want to
+                    // conflict with the calculation of the StubData's length.
+                    authPadLength = bind.FragLength - bind.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, bind, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[bind.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, bind, "RpcconnBindHdrT", ept);
+                        }
+                    }
+                    bind.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(bind, "AuthVerifier", s, authBeginPosition);
+                }
+                result = bind;
+            }
+        case PDUType.AlterContext =>
+            if (BinaryDecoder<RpcconnAlterContextHdrT>(s) is alterContext:RpcconnAlterContextHdrT)
+            {
+                if ((alterContext.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    alterContext.AuthVerifier = s.PeekBytes(s.BitPosition, alterContext.FragLength - s.BytePosition);
+                    AssociateFieldPosition(alterContext, "AuthVerifier", s, s.BitPosition, alterContext.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    authPadLength = alterContext.FragLength - alterContext.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, alterContext, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[alterContext.AuthLength, authPadLength]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, alterContext, "RpcconnAlterContextHdrT", ept);
+                        }
+                    }
+                    alterContext.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(alterContext, "AuthVerifier", s, authBeginPosition);
+                }
+                result = alterContext;
+            }
+        case PDUType.Auth3 =>
+            if (BinaryDecoder<RpcconnRpcAuth3HdrT>(s) is auth3:RpcconnRpcAuth3HdrT)
+            {
+                if (((auth3.PfcFlags & 0x03) == 0x03) && auth3.AuthenticationTokens is b:binary)
+                {
+                    auth3.AuthenticationTokens = DecodeAuthValue(b, (auth3.SecTrailer as SecTrailer).AuthType, pduType, auth3, "RpcconnRpcAuth3HdrT", ept);
+                }
+                result = auth3;
+            }
+        case PDUType.Request =>
+            if (BinaryDecoder<RpcconnRequestHdrT>(s) is request:RpcconnRequestHdrT)
+            {
+                if (authLength != 0)
+                {
+                    authPadLength = s.PeekByte((fragmentLength - authLength - 6) * 8);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                }
+                int stubBeginPosition = s.BitPosition;
+                request.StubData = (BinaryDecoder<Blob[(request.FragLength - s.BytePosition - authVerifierLength) as uint]>(s) as Blob).Data;
+                AssociateFieldPosition(request, "StubData", s, stubBeginPosition);
+                if (authVerifierLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[request.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, request, "RpcconnRequestHdrT", ept);
+                        }
+                    }
+                    request.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(request, "AuthVerifier", s, authBeginPosition);
+                }
+                result = request;
+            }
+        case PDUType.Orphaned =>
+            if (BinaryDecoder<RpcconnOrphanedHdrT>(s) is orphaned:RpcconnOrphanedHdrT)
+            {
+                if ((orphaned.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    orphaned.AuthVerifier = s.PeekBytes(s.BitPosition, orphaned.FragLength - s.BytePosition);
+                    AssociateFieldPosition(orphaned, "AuthVerifier", s, s.BitPosition, orphaned.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    authPadLength = orphaned.FragLength - orphaned.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, orphaned, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[orphaned.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, orphaned, "RpcconnOrphanedHdrT", ept);
+                        }
+                    }
+                    orphaned.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(orphaned, "AuthVerifier", s, authBeginPosition);
+                }
+                result = orphaned;
+            }
+        case PDUType.CoCancel =>
+            if (BinaryDecoder<RpcconnCancelHdrT>(s) is cancel:RpcconnCancelHdrT)
+            {
+                if ((cancel.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    cancel.AuthVerifier = s.PeekBytes(s.BitPosition, cancel.FragLength - s.BytePosition);
+                    AssociateFieldPosition(cancel, "AuthVerifier", s, s.BitPosition, cancel.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    authPadLength = cancel.FragLength - cancel.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, cancel, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[cancel.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, cancel, "RpcconnCancelHdrT", ept);
+                        }
+                    }
+                    cancel.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(cancel, "AuthVerifier", s, authBeginPosition);
+                }
+                result = cancel;
+            }
+        case PDUType.BindAck =>
+            if (BinaryDecoder<RpcconnBindAckHdrT>(s) is bindAck:RpcconnBindAckHdrT)
+            {
+                if ((bindAck.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    bindAck.AuthVerifier = s.PeekBytes(s.BitPosition, bindAck.FragLength - s.BytePosition);
+                    AssociateFieldPosition(bindAck, "AuthVerifier", s, s.BitPosition, bindAck.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    authPadLength = bindAck.FragLength - bindAck.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, bindAck, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[bindAck.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, bindAck, "RpcconnBindAckHdrT", ept);
+                        }
+                    }
+                    bindAck.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(bindAck, "AuthVerifier", s, authBeginPosition);
+                }
+                result = bindAck;
+            }
+        case PDUType.AlterContextResp =>
+            if (BinaryDecoder<RpcconnAlterContextResponseHdrT>(s) is alterContextResp:RpcconnAlterContextResponseHdrT)
+            {
+                if ((alterContextResp.PfcFlags & 0x03) != 0x03) // need reassemble on AuthVerifier
+                {
+                    alterContextResp.AuthVerifier = s.PeekBytes(s.BitPosition, alterContextResp.FragLength - s.BytePosition);
+                    AssociateFieldPosition(alterContextResp, "AuthVerifier", s, s.BitPosition, alterContextResp.FragLength * 8 - s.BitPosition);
+                }
+                else if (authLength > 0) // no need reassemble, decode using value parameter
+                {
+                    int authBeginPosition = s.BitPosition;
+                    authPadLength = alterContextResp.FragLength - alterContextResp.AuthLength - 8 - s.BytePosition;
+                    ValidationCheck(authPadLength <= 255, alterContextResp, DiagnosisLevel.Warning, MSRPCE_AUTHPADDING_LENGTH_TOO_LARGE);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[alterContextResp.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, alterContextResp, "RpcconnAlterContextResponseHdrT", ept);
+                        }
+                    }
+                    alterContextResp.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(alterContextResp, "AuthVerifier", s, authBeginPosition);
+                }
+                result = alterContextResp;
+            }
+        case PDUType.Response =>
+            if (BinaryDecoder<RpcconnResponseHdrT>(s) is response:RpcconnResponseHdrT)
+            {
+                if (authLength != 0)
+                {
+                    authPadLength = s.PeekByte((fragmentLength - authLength - 6) * 8);
+                    authVerifierLength = authPadLength + 8 + authLength;
+                }
+                int stubBeginPosition = s.BitPosition;
+                response.StubData = ((BinaryDecoder<Blob[(response.FragLength - s.BytePosition - authVerifierLength) as uint]>(s)) as Blob).Data;
+                AssociateFieldPosition(response, "StubData", s, stubBeginPosition);
+                if (authVerifierLength > 0)
+                {
+                    int authBeginPosition = s.BitPosition;
+                    var authVerifier = BinaryDecoder<AuthVerifierCoT[response.AuthLength, authPadLength, endian]>(s);
+                    if (authVerifier != nothing)
+                    { 
+                        AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                        if (av.AuthValue is b:binary)
+                        {
+                            av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, response, "RpcconnResponseHdrT", ept);
+                        }
+                    }
+                    response.AuthVerifier = authVerifier;
+                    AssociateFieldPosition(response, "AuthVerifier", s, authBeginPosition);
+                }
+                result = response;
+            }
+        case PDUType.Fault =>
+            if (BinaryDecoder<RpcconnFaultHdrT>(s) is fault:RpcconnFaultHdrT)
+            {
+                if (fault.Reserved2 != nothing)
+                {
+                    if (authLength != 0)
+                    {
+                        authPadLength = s.PeekByte((fragmentLength - authLength - 6) * 8);
+                        authVerifierLength = authPadLength + 8 + authLength;
+                    }
+                    ValidationCheck(fault.Reserved2 == $[00000000], fault, DiagnosisLevel.Error, "MSRPCE: The Reserved2 in message RpcconnFaultHdrT must be zero.");
+                    int stubBeginPosition = s.BitPosition;
+                    fault.StubData = (BinaryDecoder<Blob[(fault.FragLength - s.BytePosition - authVerifierLength) as uint]>(s) as Blob).Data;
+                    AssociateFieldPosition(fault, "StubData", s, stubBeginPosition);
+                    if (authVerifierLength > 0)
+                    {
+                        int authBeginPosition = s.BitPosition;
+                        var authVerifier = BinaryDecoder<AuthVerifierCoT[fault.AuthLength, authPadLength, endian]>(s);
+                        if (authVerifier != nothing)
+                        { 
+                            AuthVerifierCoT av = authVerifier as AuthVerifierCoT;
+                            if (av.AuthValue is b:binary)
+                            {
+                                av.AuthValue = DecodeAuthValue(b, av.AuthType, pduType, fault, "RpcconnFaultHdrT", ept);
+                            }
+                        }
+                        fault.AuthVerifier = authVerifier;
+                        AssociateFieldPosition(fault, "AuthVerifier", s, authBeginPosition);
+                    }
+                }
+                result = fault;
+            }
+        case PDUType.Shutdown =>
+            if (BinaryDecoder<RpcconnShutdownHdrT>(s) is shutdown:RpcconnShutdownHdrT)
+            {
+                result = shutdown;
+            }
+        case PDUType.BindNak =>
+            if (BinaryDecoder<RpcconnBindNakHdrT>(s) is bindNak:RpcconnBindNakHdrT)
+            {
+                result = bindNak;
+            }
+        default =>
+            result = nothing;
+    }
+    return result;
+}
+
+//----------------------------------------------------------
+// Reassembly Helper for connect-oriented messages
+const set<PDUType> PDUTypeNeedReassembled = 
+{
+    PDUType.Bind,
+    PDUType.BindAck,
+    PDUType.AlterContext,
+    PDUType.AlterContextResp,
+    PDUType.Auth3,
+    PDUType.Request,
+    PDUType.Response,
+    PDUType.Fault,
+};
+const ushort MaxUshortVal = 0xFFFF;
+
+type RpcconnReassemblyHelper : ReassemblyHelper<RpcconnCommonHdrT>
+{
+    map<long, array<RpcconnCommonHdrT>> msgCaches = {};
+    long curKey = -1;
+    Server strongTypedEPT = null; // Should assign the same instance with EPT in the base type.
+                       // It caches the strong-typed endpoint to avoid cost on casting.
+    RpcconnReassemblyHelper(MessageDirection direct, Server ept)
+    {
+        Direction = direct;
+        EPT = ept;
+        strongTypedEPT = ept;
+    }
+
+    override bool IsCompleteMessage(RpcconnCommonHdrT msg)
+    {
+        if ((msg.PTYPE in PDUTypeNeedReassembled) && 
+            (msg.PfcFlags & 0x03) != 0x03) // (msg.PfcFlags & RpcCoPfcFlags.PfcLastFrag) == RpcCoPfcFlags.PfcLastFrag && (msg.PfcFlags & RpcCoPfcFlags.PfcFirstFrag) == RpcCoPfcFlags.PfcFirstFrag
+        {
+            return IsTsProxySetupReceivePipeResponse(msg); // if it is TsProxySetupReceivePipeResponse, dispatch to server directly
+        }
+        else
+        {
+            return true;
+        }
+    }
+
+    override void Add(RpcconnCommonHdrT msg)
+    {
+        bool isFirst = (msg.PfcFlags & 0x01) == 0x01;
+
+        curKey = GetKey(msg);
+        bool containsKey = (curKey in msgCaches);
+
+        if (isFirst) // (msg.PfcFlags & RpcCoPfcFlags.PfcFirstFrag) == RpcCoPfcFlags.PfcFirstFrag)
+        {
+            if (containsKey)
+            {
+                ClearCacheByKey(curKey);
+            }
+            msgCaches[curKey] = [msg];
+        }
+        else if (containsKey && msgCaches[curKey].Count > 0)
+        {
+            msgCaches[curKey] += [msg];
+        }
+        else
+        {
+            DisplayTopLevelMessage(msg);
+        }
+    }
+
+    override void ClearExceptionally()
+    {
+        ClearCacheByKey(curKey);
+        msgCaches = msgCaches.Remove(curKey);
+    }
+
+    override bool IsAllFragmentsArrived(RpcconnCommonHdrT msg)
+    {
+        return (curKey in msgCaches) && (msg.PfcFlags & 0x02) > 0;
+    }
+
+    override array<RpcconnCommonHdrT> GetSorted(RpcconnCommonHdrT msg)
+    {
+        return msgCaches[curKey];
+    }
+
+    override optional RpcconnCommonHdrT GetMessageFromFragments(array<RpcconnCommonHdrT> msgs)
+    {
+        RpcconnCommonHdrT msg = null;
+        switch (msgs[0].PTYPE)
+        {
+            case PDUType.Bind =>
+                msg = ReassembleCoBind(msgs, strongTypedEPT);
+            case PDUType.BindAck =>
+                msg = ReassembleCoBindAck(msgs, strongTypedEPT);
+            case PDUType.AlterContext =>
+                msg = ReassembleCoAlterContext(msgs, strongTypedEPT);
+            case PDUType.AlterContextResp =>
+                msg = ReassembleCoAlterContextResponse(msgs, strongTypedEPT);
+            case PDUType.Auth3 =>
+                msg = ReassembleCoAuth3(msgs, strongTypedEPT);
+            case PDUType.Request =>
+                msg = ReassembleCoRequest(msgs, strongTypedEPT);
+            case PDUType.Response =>
+                msg = ReassembleCoResponse(msgs, strongTypedEPT);
+            case PDUType.Fault =>
+                msg = ReassembleCoFault(msgs, strongTypedEPT);
+            default =>;
+        }
+        return msg == null ? nothing : msg;
+    }
+
+    override void ClearAfterSuccess(RpcconnCommonHdrT msg)
+    {
+        msgCaches = msgCaches.Remove(curKey);
+    }
+
+    override void ClearInDestructor()
+    {
+        foreach (var pair in msgCaches)
+        {
+            ClearCacheByKey(pair.Key);
+        }
+        msgCaches = {};
+    }
+
+    override void DispatchMessage(RpcconnCommonHdrT msg)
+    {
+        if (Direction == MessageDirection.Accepts && msg.PTYPE in IssuesMsgTypeSet)
+        {
+            Direction = MessageDirection.Issues;
+        }
+        else if (Direction == MessageDirection.Issues && msg.PTYPE in AcceptsMsgTypeSet)
+        {
+            Direction = MessageDirection.Accepts;
+        }
+        // base.DispatchMessage(msg); cannot call base method. It might be a compiler bug
+        if (Direction is MessageDirection.Accepts)
+        {
+            dispatch EPT accepts (msg as any message);
+        }
+        else
+        {
+            dispatch EPT issues (msg as any message);
+        }
+    }
+
+    void ClearCacheByKey(long key)
+    {
+        if (key in msgCaches)
+        {
+            var cache = msgCaches[key];
+            RpcconnCommonHdrT msg;
+            if (cache.Count == 1)
+            {
+                msg = cache[0] as RpcconnCommonHdrT;
+            }
+            else
+            {
+                msg = new RpcconnIncompleteMessage{Payload = $[]};
+                foreach (var m in cache)
+                {
+                    msg.Origins += [m];
+                }
+                AssignRpcconnCommonHdrTFields(msg, cache[0], false);
+                // Change the Frags1 to the (first.Frags1 | last.Frags1)
+                msg.PfcFlags = (cache[0].PfcFlags | cache[cache.Count - 1].PfcFlags) as byte;
+                AssignCoFieldEncodingInfo(msg, (cache[0].SourceData as binary).Segment(0, 16));
+            }
+            ValidationCheck(false, msg, DiagnosisLevel.Warning, () => Format(MSPRCE_REASSEMBLE_FAILURE, EnumToString<PDUType>(msg.PTYPE)));
+            DisplayTopLevelMessage(msg);
+        }
+    }
+
+    static long GetKey(RpcconnCommonHdrT msg)
+    {
+        return ((msg.PTYPE as long) << 32) + msg.CallId;
+    }
+    
+    bool IsTsProxySetupReceivePipeResponse(RpcconnCommonHdrT msg) // check if it is IsTsProxySetupReceivePipeResponse
+    {
+        bool result = false;
+        PContextIdT pContId;
+        if (msg is resMsg:RpcconnResponseHdrT)
+        {
+            pContId = resMsg.PContId;
+        }
+        else
+        {
+            return false;
+        }
+        if (pContId in strongTypedEPT.NegotiatedPresentationContexts)
+        {
+            result = (strongTypedEPT.NegotiatedPresentationContexts[pContId].AbstractSyntax == TSGUInterface);
+        }
+        else if (pContId in strongTypedEPT.NonegotiatedPresentationContexts)
+        {
+            result = (strongTypedEPT.NonegotiatedPresentationContexts[pContId].AbstractSyntax == TSGUInterface);
+        }
+        return result && (msg.CallId in strongTypedEPT.OpnumMap) && strongTypedEPT.OpnumMap[msg.CallId] == 8;
+    }
+}
+
+void AssignRpcconnCommonHdrTFields(RpcconnCommonHdrT coRpcMsgReassembled, RpcconnCommonHdrT coRpcMsg, bool keepFragLength)
+{
+    coRpcMsgReassembled.RpcVers = 5;
+    coRpcMsgReassembled.PTYPE = coRpcMsg.PTYPE;
+    coRpcMsgReassembled.PfcFlags = (coRpcMsg.PfcFlags | 0x03) as byte; // Set RpcCoPfcFlags.PfcFirstFrag and RpcCoPfcFlags.PfcLastFrag as 1
+    coRpcMsgReassembled.PackedDrep = coRpcMsg.PackedDrep;
+    // For Bind, BindAck, AlterContext, AlterContextResp, No other flags or fields will change while reassembling the authentication data. Auth3 ? currently keep consistent with Bind.
+    // For Request and Response, the reassembled FragLength should be assigned according to the actual fragments, instead of assigning 'coRpcMsg.FragLength' here; Fault? currently keep consistent with Response.
+    coRpcMsgReassembled.FragLength = keepFragLength ? coRpcMsg.FragLength : 0;
+    coRpcMsgReassembled.AuthLength = coRpcMsg.AuthLength;
+    coRpcMsgReassembled.CallId = coRpcMsg.CallId;
+}
+
+void AssignCoFieldEncodingInfo(RpcconnCommonHdrT coMsg, binary sourceData)
+{
+    coMsg.SourceData = sourceData;
+    coMsg.AssignFieldEncodingInfo("RpcVers", 0, 8);
+    coMsg.AssignFieldEncodingInfo("RpcVersMinor", 8, 8);
+    coMsg.AssignFieldEncodingInfo("PTYPE", 16, 8);
+    coMsg.AssignFieldEncodingInfo("PfcFlags", 24, 8);
+    coMsg.AssignFieldEncodingInfo("PackedDrep", 32, 32);
+    coMsg.AssignFieldEncodingInfo("FragLength", 64, 16);
+    coMsg.AssignFieldEncodingInfo("AuthLength", 80, 16);
+    coMsg.AssignFieldEncodingInfo("CallId", 96, 32);
+}
+
+// Reassembly for connection-oriented Bind, including Nested Bind RPC
+RpcconnBindHdrT ReassembleCoBind(array<RpcconnCommonHdrT> coBindArray4Reassembly, Server ept)
+{
+    var bind = coBindArray4Reassembly[0] as RpcconnBindHdrT;
+    RpcconnBindHdrT bindReassembled = new RpcconnBindHdrT {};
+    AssignRpcconnCommonHdrTFields(bindReassembled, bind, true);
+    bindReassembled.MaxXmitFrag = bind.MaxXmitFrag;
+    bindReassembled.MaxRecvFrag = bind.MaxRecvFrag;
+    bindReassembled.AssocGroupId = bind.AssocGroupId;
+    bindReassembled.PContextElem = bind.PContextElem;
+    binary authBinary = $[];
+    binary sourceData = $[];
+    byte byteOrder = bindReassembled.PackedDrep.IntegerRepresentation;
+    Endian endian = byteOrder == 0x10 ? Endian.Little : Endian.Big;
+    foreach (RpcconnCommonHdrT commonFrag in coBindArray4Reassembly)
+    {
+        RpcconnBindHdrT frag = commonFrag as RpcconnBindHdrT;
+        authBinary += (frag.AuthVerifier as binary);
+        bindReassembled.Origins += [frag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (frag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (frag.AuthVerifier as binary);
+        }
+    }
+    byte authPadLength = (authBinary.Count - 8 - bindReassembled.AuthLength) as byte;
+    bindReassembled.AuthVerifier = BinaryDecoder<AuthVerifierCoT[bindReassembled.AuthLength, authPadLength, endian]>(authBinary as stream);
+    if (bindReassembled.AuthVerifier != nothing)
+    { 
+        AuthVerifierCoT av = bindReassembled.AuthVerifier as AuthVerifierCoT;
+        if (av.AuthValue is b:binary)
+        {
+            av.AuthValue = DecodeAuthValue(b, av.AuthType, PDUType.Bind, bindReassembled, "RpcconnBindHdrT", ept);
+        }
+    }
+    AssignCoFieldEncodingInfo(bindReassembled, sourceData);
+    bindReassembled.AssignFieldEncodingInfo("MaxXmitFrag", 128, 16);
+    bindReassembled.AssignFieldEncodingInfo("MaxRecvFrag", 144, 16);
+    bindReassembled.AssignFieldEncodingInfo("AssocGroupId", 160, 32);
+    bindReassembled.AssignFieldEncodingInfo("PContextElem", 192, (bindReassembled.FragLength - 24 - authBinary.Count) * 8);
+    bindReassembled.AssignFieldEncodingInfo("AuthVerifier", (bindReassembled.FragLength - authBinary.Count) * 8, authBinary.Count * 8);
+    return bindReassembled;
+}
+
+// Reassembly for connection-oriented BindAck, including Nested BindAck RPC
+RpcconnBindAckHdrT ReassembleCoBindAck(array<RpcconnCommonHdrT> coBindAckArray4Reassembly, Server ept)
+{
+    var bindAck = coBindAckArray4Reassembly[0] as RpcconnBindAckHdrT;
+    RpcconnBindAckHdrT bindAckReassembled = new RpcconnBindAckHdrT {};
+    AssignRpcconnCommonHdrTFields(bindAckReassembled, bindAck, true);
+    bindAckReassembled.MaxXmitFrag = bindAck.MaxXmitFrag;
+    bindAckReassembled.MaxRecvFrag = bindAck.MaxRecvFrag;
+    bindAckReassembled.AssocGroupId = bindAck.AssocGroupId;
+    bindAckReassembled.SecAddr = bindAck.SecAddr;
+    bindAckReassembled.Pad2 = bindAck.Pad2;
+    bindAckReassembled.PResultList = bindAck.PResultList;
+    binary authBinary = $[];
+    binary sourceData = $[];    
+    Endian endian = bindAckReassembled.PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.LittleEndian ? Endian.Little : Endian.Big;
+    foreach (RpcconnCommonHdrT commonFrag in coBindAckArray4Reassembly)
+    {
+        RpcconnBindAckHdrT frag = commonFrag as RpcconnBindAckHdrT;
+        authBinary += (frag.AuthVerifier as binary);
+        bindAckReassembled.Origins += [frag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (frag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (frag.AuthVerifier as binary);
+        }
+    }
+    byte authPadLength = (authBinary.Count - 8 - bindAckReassembled.AuthLength) as byte;
+    bindAckReassembled.AuthVerifier = BinaryDecoder<AuthVerifierCoT[bindAckReassembled.AuthLength, authPadLength, endian]>(authBinary as stream); // DecodeAuthVerifier(authBinary[bindAckReassembled.FragLength - bindAckReassembled.AuthLength - 6], bindAckReassembled.AuthLength, authBinary);
+    if (bindAckReassembled.AuthVerifier != nothing)
+    { 
+        AuthVerifierCoT av = bindAckReassembled.AuthVerifier as AuthVerifierCoT;
+        if (av.AuthValue is b:binary)
+        {
+            av.AuthValue = DecodeAuthValue(b, av.AuthType, PDUType.BindAck, bindAckReassembled, "RpcconnBindAckHdrT", ept);
+        }
+    }
+    AssignCoFieldEncodingInfo(bindAckReassembled, sourceData);
+    bindAckReassembled.AssignFieldEncodingInfo("MaxXmitFrag", 128, 16);
+    bindAckReassembled.AssignFieldEncodingInfo("MaxRecvFrag", 144, 16);
+    bindAckReassembled.AssignFieldEncodingInfo("AssocGroupId", 160, 32);
+    bindAckReassembled.AssignFieldEncodingInfo("SecAddr", 192, (bindAckReassembled.FragLength - 24 - authBinary.Count - ((4 - (bindAckReassembled.SecAddr.Length + 26) % 4) % 4)) * 8);
+    bindAckReassembled.AssignFieldEncodingInfo("Pad2", (bindAckReassembled.FragLength - authBinary.Count - ((4 - (bindAckReassembled.SecAddr.Length + 26) % 4) % 4)) * 8, ((4 - (bindAckReassembled.SecAddr.Length + 26) % 4) % 4) * 8);
+    bindAckReassembled.AssignFieldEncodingInfo("AuthVerifier", (bindAckReassembled.FragLength - authBinary.Count) * 8, authBinary.Count * 8);
+    return bindAckReassembled;
+}
+
+// Reassembly for connection-oriented AlterContext, including Nested AlterContext RPC
+RpcconnAlterContextHdrT ReassembleCoAlterContext(array<RpcconnCommonHdrT> coAlterContextArray4Reassembly, Server ept)
+{
+    var alterContext = coAlterContextArray4Reassembly[0] as RpcconnAlterContextHdrT;
+    RpcconnAlterContextHdrT alterContextReassembled = new RpcconnAlterContextHdrT {};
+    AssignRpcconnCommonHdrTFields(alterContextReassembled, alterContext, true);
+    alterContextReassembled.MaxXmitFrag = alterContext.MaxXmitFrag;
+    alterContextReassembled.MaxRecvFrag = alterContext.MaxRecvFrag;
+    alterContextReassembled.AssocGroupId = alterContext.AssocGroupId;
+    alterContextReassembled.PContextElem = alterContext.PContextElem;
+    binary authBinary = $[];
+    binary sourceData = $[];
+    Endian endian = alterContextReassembled.PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.LittleEndian ? Endian.Little : Endian.Big;
+    foreach (RpcconnCommonHdrT commonFrag in coAlterContextArray4Reassembly)
+    {
+        var frag = commonFrag as RpcconnAlterContextHdrT;
+        authBinary += (frag.AuthVerifier as binary);
+        alterContextReassembled.Origins += [frag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (frag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (frag.AuthVerifier as binary);
+        }
+    }
+    byte authPadLength = (authBinary.Count - 8 - alterContextReassembled.AuthLength) as byte;
+    alterContextReassembled.AuthVerifier = BinaryDecoder<AuthVerifierCoT[alterContextReassembled.AuthLength, authPadLength, endian]>(authBinary as stream); // DecodeAuthVerifier(authBinary[alterContextReassembled.FragLength - alterContextReassembled.AuthLength - 6], alterContextReassembled.AuthLength, authBinary);
+    if (alterContextReassembled.AuthVerifier != nothing)
+    { 
+        AuthVerifierCoT av = alterContextReassembled.AuthVerifier as AuthVerifierCoT;
+        if (av.AuthValue is b:binary)
+        {
+            av.AuthValue = DecodeAuthValue(b, av.AuthType, PDUType.AlterContext, alterContextReassembled, "RpcconnAlterContextHdrT", ept);
+        }
+    }
+    AssignCoFieldEncodingInfo(alterContextReassembled, sourceData);
+    alterContextReassembled.AssignFieldEncodingInfo("MaxXmitFrag", 128, 16);
+    alterContextReassembled.AssignFieldEncodingInfo("MaxRecvFrag", 144, 16);
+    alterContextReassembled.AssignFieldEncodingInfo("AssocGroupId", 160, 32);
+    alterContextReassembled.AssignFieldEncodingInfo("PContextElem", 192, (alterContextReassembled.FragLength - 24 - authBinary.Count) * 8);
+    alterContextReassembled.AssignFieldEncodingInfo("AuthVerifier", (alterContextReassembled.FragLength - authBinary.Count) * 8, authBinary.Count * 8);
+
+    return alterContextReassembled;
+}
+
+// Reassembly for connection-oriented Auth3, including Nested Auth3 RPC
+RpcconnRpcAuth3HdrT ReassembleCoAuth3(array<RpcconnCommonHdrT> coAuth3Array4Reassembly, Server ept)
+{
+    var auth3 = coAuth3Array4Reassembly[0] as RpcconnRpcAuth3HdrT;
+    RpcconnRpcAuth3HdrT auth3Reassembled = new RpcconnRpcAuth3HdrT {};
+    AssignRpcconnCommonHdrTFields(auth3Reassembled, auth3, true);
+    auth3Reassembled.Pad = auth3.Pad;
+    auth3Reassembled.SecTrailer = auth3.SecTrailer;
+    binary authBinary = $[];
+    binary sourceData = $[];
+    byte byteOrder = auth3Reassembled.PackedDrep.IntegerRepresentation;
+    foreach (RpcconnCommonHdrT commonFrag in coAuth3Array4Reassembly)
+    {
+        var frag = commonFrag as RpcconnRpcAuth3HdrT;
+        authBinary += ((frag as RpcconnRpcAuth3HdrT).AuthenticationTokens as binary);
+        auth3Reassembled.Origins += [frag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (frag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (frag.AuthenticationTokens as binary);
+        }
+    }
+    auth3Reassembled.AuthenticationTokens = DecodeAuthValue(authBinary, (auth3.SecTrailer as SecTrailer).AuthType, PDUType.Auth3, auth3, "RpcconnRpcAuth3HdrT", ept);
+    AssignCoFieldEncodingInfo(auth3Reassembled, sourceData);
+    auth3Reassembled.AssignFieldEncodingInfo("Pad", 128, 32);
+    auth3Reassembled.AssignFieldEncodingInfo("SecTrailer", 160, (auth3Reassembled.FragLength - 20 - authBinary.Count) * 8);
+    auth3Reassembled.AssignFieldEncodingInfo("AssocGroupId", (auth3Reassembled.FragLength - authBinary.Count) * 8, authBinary.Count * 8);
+
+    return auth3Reassembled;
+}
+
+// Reassembly for connection-oriented AlterContextResponse, including Nested AlterContextResponse RPC
+RpcconnAlterContextResponseHdrT ReassembleCoAlterContextResponse(array<RpcconnCommonHdrT> coAlterContextResponseArray4Reassembly, Server ept)
+{
+    var alterContextResp = coAlterContextResponseArray4Reassembly[0] as RpcconnAlterContextResponseHdrT;
+    RpcconnAlterContextResponseHdrT alterContextRespReassembled = new RpcconnAlterContextResponseHdrT {};
+    AssignRpcconnCommonHdrTFields(alterContextRespReassembled, alterContextResp, true);
+    alterContextRespReassembled.MaxXmitFrag = alterContextResp.MaxXmitFrag;
+    alterContextRespReassembled.MaxRecvFrag = alterContextResp.MaxRecvFrag;
+    alterContextRespReassembled.AssocGroupId = alterContextResp.AssocGroupId;
+    alterContextRespReassembled.SecAddr = alterContextResp.SecAddr;
+    alterContextRespReassembled.Pad2 = alterContextResp.Pad2;
+    alterContextRespReassembled.PResultList = alterContextResp.PResultList;
+    binary authBinary = $[];
+    binary sourceData = $[];
+    Endian endian = alterContextRespReassembled.PackedDrep.IntegerRepresentation == IntergerFloatingPointByteOrder.LittleEndian ? Endian.Little : Endian.Big;
+    foreach (RpcconnCommonHdrT commonFrag in coAlterContextResponseArray4Reassembly)
+    {
+        var frag = commonFrag as RpcconnAlterContextResponseHdrT;
+        authBinary += ((frag as RpcconnAlterContextResponseHdrT).AuthVerifier as binary);
+        alterContextRespReassembled.Origins += [frag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (frag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (frag.AuthVerifier as binary);
+        }
+    }
+    byte authPadLength = (authBinary.Count - 8 - alterContextRespReassembled.AuthLength) as byte;
+    alterContextRespReassembled.AuthVerifier = BinaryDecoder<AuthVerifierCoT[alterContextRespReassembled.AuthLength, authPadLength, endian]>(authBinary as stream); // DecodeAuthVerifier(authBinary[alterContextRespReassembled.FragLength - alterContextRespReassembled.AuthLength - 6], alterContextRespReassembled.AuthLength, authBinary);
+    if (alterContextRespReassembled.AuthVerifier != nothing)
+    { 
+        AuthVerifierCoT av = alterContextRespReassembled.AuthVerifier as AuthVerifierCoT;
+        if (av.AuthValue is b:binary)
+        {
+            av.AuthValue = DecodeAuthValue(b, av.AuthType, PDUType.AlterContextResp, alterContextRespReassembled, "RpcconnAlterContextResponseHdrT", ept);
+        }
+    }
+    AssignCoFieldEncodingInfo(alterContextRespReassembled, sourceData);
+    alterContextRespReassembled.AssignFieldEncodingInfo("MaxXmitFrag", 128, 16);
+    alterContextRespReassembled.AssignFieldEncodingInfo("MaxRecvFrag", 144, 16);
+    alterContextRespReassembled.AssignFieldEncodingInfo("AssocGroupId", 160, 32);
+    alterContextRespReassembled.AssignFieldEncodingInfo("SecAddr", 192, (alterContextRespReassembled.FragLength - 24 - authBinary.Count - ((4 - (alterContextRespReassembled.SecAddr.Length + 26) % 4) % 4)) * 8);
+    alterContextRespReassembled.AssignFieldEncodingInfo("Pad2", (alterContextRespReassembled.FragLength - authBinary.Count - ((4 - (alterContextRespReassembled.SecAddr.Length + 26) % 4) % 4)) * 8, ((4 - (alterContextRespReassembled.SecAddr.Length + 26) % 4) % 4) * 8);
+    alterContextRespReassembled.AssignFieldEncodingInfo("AuthVerifier", (alterContextRespReassembled.FragLength - authBinary.Count) * 8, authBinary.Count * 8);
+
+    return alterContextRespReassembled;
+}
+
+// Reassembly for connection-oriented Request, including Nested Request RPC
+RpcconnRequestHdrT ReassembleCoRequest(array<RpcconnCommonHdrT> coRequestArray4Reassembly, Server ept)
+{
+    var request = coRequestArray4Reassembly[0] as RpcconnRequestHdrT;
+    RpcconnRequestHdrT requestReassembled = new RpcconnRequestHdrT {};
+    AssignRpcconnCommonHdrTFields(requestReassembled, request, false);
+    requestReassembled.AllocHint = request.AllocHint;
+    requestReassembled.PContId = request.PContId;
+    requestReassembled.Opnum = request.Opnum;
+    requestReassembled.Object = request.Object;
+    requestReassembled.StubData = $[];
+    requestReassembled.AuthVerifier = request.AuthVerifier;
+    // requestReassembled#PContextUuid = request#PContextUuid == nothing ? "" : request#PContextUuid;
+    int headerLength = request.Object == nothing ? 24 : 40; // remember the request header length.
+    binary sourceData = $[];
+    long fragLength = headerLength;
+    foreach (RpcconnCommonHdrT commonFrag in coRequestArray4Reassembly)
+    {
+        RpcconnRequestHdrT requestFrag = commonFrag as RpcconnRequestHdrT;
+        fragLength += requestFrag.FragLength - headerLength;
+        requestReassembled.StubData += requestFrag.StubData;
+        requestReassembled.Origins += [requestFrag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (requestFrag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += requestFrag.StubData;
+        }
+    }
+    requestReassembled.FragLength = fragLength as ushort;
+    if (fragLength > MaxUshortVal)
+    {
+        requestReassembled.FragLength = MaxUshortVal;
+        ValidationCheck(false, requestReassembled, DiagnosisLevel.Warning, () => Format(MSPRCE_FRAGLENGTH_IS_TOO_LARGE, fragLength));
+    }
+
+    AssignCoFieldEncodingInfo(requestReassembled, sourceData);
+    requestReassembled.AssignFieldEncodingInfo("AllocHint", 128, 32);
+    requestReassembled.AssignFieldEncodingInfo("PContId", 160, 16);
+    requestReassembled.AssignFieldEncodingInfo("Opnum", 176, 16);
+    if (requestReassembled.Object != nothing)
+    {
+        requestReassembled.AssignFieldEncodingInfo("Object", 192, 128);
+        requestReassembled.AssignFieldEncodingInfo("StubData", 320, requestReassembled.StubData.Count * 8);
+    }
+    else
+    {
+        requestReassembled.AssignFieldEncodingInfo("StubData", 192, requestReassembled.StubData.Count * 8);
+    }
+    if (requestReassembled.AuthLength > 0)
+    {
+        requestReassembled.AssignFieldEncodingInfo("AuthVerifier", (requestReassembled.FragLength - requestReassembled.AuthLength - (requestReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength - 8) * 8, (requestReassembled.AuthLength + (requestReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength + 8) * 8);
+    }
+    return requestReassembled;
+}
+
+// Reassembly for connection-oriented Response, including Nested Response RPC
+RpcconnResponseHdrT ReassembleCoResponse(array<RpcconnCommonHdrT> coResponseArray4Reassembly, Server ept)
+{
+    var response = coResponseArray4Reassembly[0] as RpcconnResponseHdrT;
+    RpcconnResponseHdrT responseReassembled = new RpcconnResponseHdrT {};
+    AssignRpcconnCommonHdrTFields(responseReassembled, response, false);
+    responseReassembled.AllocHint = response.AllocHint;
+    responseReassembled.PContId = response.PContId;
+    responseReassembled.CancelCount = response.CancelCount;
+    responseReassembled.Reserved = response.Reserved;
+    responseReassembled.StubData = $[];
+    responseReassembled.AuthVerifier = response.AuthVerifier;
+    long fragLength = 24;
+    binary sourceData = $[];
+    foreach (RpcconnCommonHdrT commonFrag in coResponseArray4Reassembly)
+    {
+        RpcconnResponseHdrT responseFrag = commonFrag as RpcconnResponseHdrT;
+        fragLength += responseFrag.FragLength - 24; // 24 is the response header length.
+        responseReassembled.StubData += responseFrag.StubData;
+        responseReassembled.Origins += [responseFrag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (responseFrag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += responseFrag.StubData;
+        }
+    }
+    responseReassembled.FragLength = fragLength as ushort;
+    if (fragLength > MaxUshortVal)
+    {
+        responseReassembled.FragLength = MaxUshortVal;
+        ValidationCheck(false, responseReassembled, DiagnosisLevel.Warning, () => Format(MSPRCE_FRAGLENGTH_IS_TOO_LARGE, fragLength));
+    }
+    AssignCoFieldEncodingInfo(responseReassembled, sourceData);
+    responseReassembled.AssignFieldEncodingInfo("AllocHint", 128, 32);
+    responseReassembled.AssignFieldEncodingInfo("PContId", 160, 16);
+    responseReassembled.AssignFieldEncodingInfo("CancelCount", 176, 8);
+    responseReassembled.AssignFieldEncodingInfo("Reserved", 184, 8);
+    responseReassembled.AssignFieldEncodingInfo("StubData", 192, responseReassembled.StubData.Count * 8);
+    if (responseReassembled.AuthLength > 0)
+    {
+        responseReassembled.AssignFieldEncodingInfo("AuthVerifier", (responseReassembled.FragLength - responseReassembled.AuthLength - (responseReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength - 8) * 8, (responseReassembled.AuthLength + (responseReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength + 8) * 8);
+    }
+    return responseReassembled;
+}
+
+// Reassembly for connection-oriented Fault, including Nested Fault RPC
+RpcconnFaultHdrT ReassembleCoFault(array<RpcconnCommonHdrT> coFaultArray4Reassembly, Server ept)
+{
+    var fault = coFaultArray4Reassembly[0] as RpcconnFaultHdrT;
+    RpcconnFaultHdrT faultReassembled = new RpcconnFaultHdrT {};
+    AssignRpcconnCommonHdrTFields(faultReassembled, fault, false);
+    faultReassembled.AllocHint = fault.AllocHint;
+    faultReassembled.PContId = fault.PContId;
+    faultReassembled.CancelCount = fault.CancelCount;
+    faultReassembled.Reserved = fault.Reserved;
+    faultReassembled.Status = fault.Status;
+    faultReassembled.Reserved2 = fault.Reserved2;
+    faultReassembled.AuthVerifier = fault.AuthVerifier;
+    binary stubData = $[];
+    binary sourceData = $[];
+    foreach (RpcconnCommonHdrT commonFrag in coFaultArray4Reassembly)
+    {
+        RpcconnFaultHdrT faultFrag = commonFrag as RpcconnFaultHdrT;
+        faultReassembled.FragLength = (faultReassembled.FragLength + faultFrag.FragLength - 32) as ushort; // 32 is the fault header length;
+        stubData += (faultFrag.StubData as binary);
+        faultReassembled.Origins += [faultFrag];
+        if (sourceData.Count == 0)
+        {
+            sourceData += (faultFrag.SourceData as binary);
+        }
+        else
+        {
+            sourceData += (faultFrag.StubData as binary);
+        }
+    }
+    faultReassembled.StubData = stubData;
+    faultReassembled.FragLength = (faultReassembled.FragLength + 32) as ushort;
+
+    AssignCoFieldEncodingInfo(faultReassembled, sourceData);
+    faultReassembled.AssignFieldEncodingInfo("AllocHint", 128, 32);
+    faultReassembled.AssignFieldEncodingInfo("PContId", 160, 16);
+    faultReassembled.AssignFieldEncodingInfo("CancelCount", 176, 8);
+    faultReassembled.AssignFieldEncodingInfo("Reserved", 184, 8);
+    faultReassembled.AssignFieldEncodingInfo("Status", 192, 32);
+    int startIndex = 192 + 32;
+    if (faultReassembled.Reserved2 != nothing)
+    {
+        faultReassembled.AssignFieldEncodingInfo("Status", startIndex, 32);
+        startIndex += 32;
+    }
+    faultReassembled.AssignFieldEncodingInfo("StubData", startIndex, stubData.Count * 8);
+    if (faultReassembled.AuthLength > 0)
+    {
+        faultReassembled.AssignFieldEncodingInfo("AuthVerifier", (faultReassembled.FragLength - faultReassembled.AuthLength - (faultReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength - 8) * 8, (faultReassembled.AuthLength + (faultReassembled.AuthVerifier as AuthVerifierCoT).AuthPadLength + 8) * 8);
+    }
+
+    return faultReassembled;
+}
+
+type RpcclReassemblyCache
+{
+    int LastFragNumber;
+    array<any message> Msgs;
+    map<ushort, DcRpcClPktHdrT> CachedFrag;
+
+    RpcclReassemblyCache()
+    {
+        LastFragNumber = -1;
+        Msgs = [];
+        CachedFrag = {};
+    }
+}
+
+// Reassembly Helper for connect-less messages
+const int ClHeaderLength = 80;
+type RpcclReassemblyHelper : ReassemblyHelper<DcRpcClPktHdrT>
+{
+    map<string, RpcclReassemblyCache> msgCaches = {};
+    string curKey = "";
+
+    RpcclReassemblyHelper(MessageDirection direct, Server ept)
+    {
+        Direction = direct;
+        EPT = ept;
+    }
+
+    override bool IsCompleteMessage(DcRpcClPktHdrT msg)
+    {
+        return msg.PType != PDUType.Request && msg.PType != PDUType.Response && msg.PType != PDUType.Fack ||
+            msg.PType != PDUType.Fack && (msg.Flags1 & RpcClPktHdrFlag1.Frag) != RpcClPktHdrFlag1.Frag ||
+            msg.PType == PDUType.Fack && !(GetKey(msg) in msgCaches);
+    }
+
+    override void Add(DcRpcClPktHdrT msg)
+    {
+        curKey = GetKey(msg);
+        if (!(curKey in msgCaches))
+        {
+            msgCaches[curKey] = new RpcclReassemblyCache{};
+        }
+
+        var cache = msgCaches[curKey];
+        cache.Msgs += [msg];
+        if (msg.PType != PDUType.Fack)
+        {
+            if ((msg.Flags1 & RpcClPktHdrFlag1.Lastfrag) == RpcClPktHdrFlag1.Lastfrag)
+            {
+                cache.LastFragNumber = msg.Fragnum;
+            }
+
+            if (msg.Fragnum in cache.CachedFrag)
+            {
+                msg#Retransmission = true;
+            }
+            else
+            {
+                cache.CachedFrag[msg.Fragnum] = msg;
+            }
+        }
+    }
+
+    override void ClearExceptionally()
+    {
+        ClearCacheByKey(curKey);
+        msgCaches = msgCaches.Remove(curKey);
+    }
+
+    override bool IsAllFragmentsArrived(DcRpcClPktHdrT msg)
+    {
+        var cache = msgCaches[curKey];
+        return (cache.LastFragNumber + 1) == cache.CachedFrag.Count;
+    }
+
+    override array<DcRpcClPktHdrT> GetSorted(DcRpcClPktHdrT msg)
+    {
+        return msgCaches[curKey].CachedFrag.Values.Sort();
+    }
+
+    override optional DcRpcClPktHdrT GetMessageFromFragments(array<DcRpcClPktHdrT> msgs)
+    {
+        binary sourceData = $[];
+        if (msgs.Count > 1)
+        {
+            msgs[0]#FirstFrag = true;
+            msgs[msgs.Count - 1]#LastFrag = true;
+        }
+        foreach (var msg in msgs)
+        {
+            if (sourceData.Count == 0)
+            {
+                sourceData += (msg.SourceData as binary).Segment(0, (ClHeaderLength + msg.Len));
+            }
+            else
+            {
+                sourceData += (msg.SourceData as binary).Segment(ClHeaderLength, msg.Len);
+            }
+        }
+
+        DcRpcClPktHdrT clMsg;
+        if (Direction == MessageDirection.Accepts)
+        {
+            DcRpcClRequest requestReassembled = new DcRpcClRequest {};
+            requestReassembled.Origins = msgCaches[curKey].Msgs;
+            AssignClReassembledValue(requestReassembled, msgs[0]);
+            int bodyLength = sourceData.Count - ClHeaderLength;
+            requestReassembled.Len = (bodyLength > 65528 ? 0 : bodyLength) as ushort;
+            requestReassembled.Body = sourceData.Segment(ClHeaderLength);
+            AssignClFieldEncodingInfo(requestReassembled, sourceData);
+            requestReassembled.AssignFieldEncodingInfo("Body", 80 * 8, bodyLength * 8);
+            clMsg = requestReassembled;
+        }
+        else
+        {
+            DcRpcClResponse responseReassembled = new DcRpcClResponse {};
+            responseReassembled.Origins = msgCaches[curKey].Msgs;
+            AssignClReassembledValue(responseReassembled, msgs[0]);
+            int bodyLength = sourceData.Count - ClHeaderLength;
+            responseReassembled.Len = (bodyLength > 65528 ? 0 : bodyLength) as ushort;
+            responseReassembled.Body = sourceData.Segment(ClHeaderLength);
+            AssignClFieldEncodingInfo(responseReassembled, sourceData);
+            responseReassembled.AssignFieldEncodingInfo("Body", 80 * 8, bodyLength * 8);
+            clMsg = responseReassembled;
+        }
+        return clMsg;
+    }
+
+    override void ClearAfterSuccess(DcRpcClPktHdrT msg)
+    {
+        msgCaches = msgCaches.Remove(curKey);
+    }
+
+    override void ClearInDestructor()
+    {
+        foreach (var pair in msgCaches)
+        {
+            ClearCacheByKey(pair.Key);
+        }
+
+        msgCaches = {};
+    }
+
+    void ClearCacheByKey(string key)
+    {
+        if (key in msgCaches)
+        {
+            var cache = msgCaches[key];
+            DcRpcClPktHdrT msg;
+            var referedMsg = cache.Msgs[0] as DcRpcClPktHdrT;
+            if (cache.Msgs.Count == 1)
+            {
+                msg = referedMsg;
+            }
+            else
+            {
+                msg = new DcRpcClIncompleteMessage{Payload = $[]};
+                msg.Origins = cache.Msgs;
+                AssignClReassembledValue(msg, referedMsg);
+                // Change the Flags1 to the (first.Flags1 | last.Flags1)
+                msg.Flags1 = (referedMsg.Flags1 | (cache.Msgs[cache.Msgs.Count - 1] as DcRpcClPktHdrT).Flags1) as byte;
+                AssignClFieldEncodingInfo(msg, (referedMsg.SourceData as binary).Segment(0, ClHeaderLength));
+            }
+            ValidationCheck(false, msg, DiagnosisLevel.Warning, () => Format(MSPRCE_REASSEMBLE_FAILURE, EnumToString<PDUType>(msg.PType)));
+            DisplayTopLevelMessage(msg);
+        }
+    }
+
+    static string GetKey(DcRpcClPktHdrT msg)
+    {
+        return UuidToText(msg.ActId) + msg.Seqnum.ToString();
+    }
+}
+
+void AssignClReassembledValue(DcRpcClPktHdrT clRpcReassembled, DcRpcClPktHdrT clRpcMsg)
+{
+    clRpcReassembled.RpcVers = clRpcMsg.RpcVers;
+    clRpcReassembled.PType = clRpcMsg.PType;
+    clRpcReassembled.Flags1 = (clRpcMsg.Flags1 & 0xF9) as byte; // Set RpcClPktHdrFlag1.Frag and RpcClPktHdrFlag1.Lastfrag as 0
+    clRpcReassembled.Flags2 = clRpcMsg.Flags2;
+    clRpcReassembled.Drep = clRpcMsg.Drep;
+    clRpcReassembled.SerialHi = 0;
+    clRpcReassembled.Object = clRpcMsg.Object;
+    clRpcReassembled.IfId = clRpcMsg.IfId;
+    clRpcReassembled.ActId = clRpcMsg.ActId;
+    clRpcReassembled.ServerBoot = clRpcMsg.ServerBoot;
+    clRpcReassembled.IfVers = clRpcMsg.IfVers;
+    clRpcReassembled.Seqnum = clRpcMsg.Seqnum;
+    clRpcReassembled.Opnum = clRpcMsg.Opnum;
+    clRpcReassembled.Ihint = clRpcMsg.Ihint;
+    clRpcReassembled.Ahint = clRpcMsg.Ahint;
+    clRpcReassembled.Len = 0; // Length of 'Body' field
+    clRpcReassembled.Fragnum = 0;
+    clRpcReassembled.AuthProto = clRpcMsg.AuthProto;
+    clRpcReassembled.SerialLo = 0;
+}
+
+void AssignClFieldEncodingInfo(DcRpcClPktHdrT clMsg, binary sourceData)
+{
+    clMsg.SourceData = sourceData;
+    clMsg.AssignFieldEncodingInfo("RpcVers", 0, 8);
+    clMsg.AssignFieldEncodingInfo("PType", 8, 8);
+    clMsg.AssignFieldEncodingInfo("Flags1", 16, 8);
+    clMsg.AssignFieldEncodingInfo("Flags2", 24, 8);
+    clMsg.AssignFieldEncodingInfo("Drep", 32, 24);
+    clMsg.AssignFieldEncodingInfo("SerialHi", 56, 8);
+    clMsg.AssignFieldEncodingInfo("Object", 64, 128);
+    clMsg.AssignFieldEncodingInfo("IfId", 192, 128);
+    clMsg.AssignFieldEncodingInfo("ActId", 320, 128);
+    clMsg.AssignFieldEncodingInfo("ServerBoot", 56 * 8, 32);
+    clMsg.AssignFieldEncodingInfo("IfVers", 60 * 8, 32);
+    clMsg.AssignFieldEncodingInfo("Seqnum", 64 * 8, 32);
+    clMsg.AssignFieldEncodingInfo("Opnum", 68 * 8, 16);
+    clMsg.AssignFieldEncodingInfo("Ihint", 70 * 8, 16);
+    clMsg.AssignFieldEncodingInfo("Ahint", 72 * 8, 16);
+    clMsg.AssignFieldEncodingInfo("Len", 74 * 8, 16);
+    clMsg.AssignFieldEncodingInfo("Fragnum", 76 * 8, 16);
+    clMsg.AssignFieldEncodingInfo("AuthProto", 78 * 8, 8);
+    clMsg.AssignFieldEncodingInfo("SerialLo", 79 * 8, 8);
+}
+
+uint get PayloadLength(this RpcconnCommonHdrT s)
+{
+    return GetTCPPayloadsLength(s);
+}
+
+string PfcFlagsToSummaryWithComma(RpcCoPfcFlags pfcFlags)
+{
+    if ((pfcFlags & RpcCoPfcFlags.PfcFirstFrag) > 0 && !((pfcFlags & RpcCoPfcFlags.PfcLastFrag) > 0))
+    {
+        return ", PfcFirstFrag";
+    }
+    else if (!((pfcFlags & RpcCoPfcFlags.PfcFirstFrag) > 0) && (pfcFlags & RpcCoPfcFlags.PfcLastFrag) > 0)
+    {
+        return ", PfcLastFrag";
+    }
+    else
+    {
+        return "";
+    }
+}

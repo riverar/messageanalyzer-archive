@@ -1,0 +1,290 @@
+protocol OAPXBC with
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "OAuth 2.0 Protocol Extensions for Broker Clients",
+    ShortName = "OAPXBC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-OAPXBC", Version = "6.0", Date = "09/15/2017", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "381536", Date = "10/11/2016"},
+    ]
+};
+
+using OAuth2;
+using HTTP;
+using JWT;
+using OAPX;
+using X509;
+
+autostart actor OAPXBCExtendingOAuth2(OAuth2.AuthorizationServer server) follows OAPXExtendingOAuth2
+{
+    RequestType requestType;
+
+    observe server accepts tokenReq:OAuth2.AccessTokenRequest
+    {
+        if (DecodeOAPXBCRequest(ref tokenReq, ref requestType) is tokenParams:ParameterExtension)
+        {
+            array<ParameterExtension> extensions = (tokenReq.parameterExtensions == nothing) ? [] : tokenReq.parameterExtensions as array<ParameterExtension>;
+            extensions += [tokenParams];
+            tokenReq.parameterExtensions = extensions;
+        }
+    }
+
+    observe server issues tokenRes:OAuth2.AccessTokenResponse
+    {
+        if (DecodeOAPXBCResponse(ref tokenRes, requestType) is tokenParams:ParameterExtension)
+        {
+            array<ParameterExtension> extensions = (tokenRes.parameterExtensions == nothing) ? [] : tokenRes.parameterExtensions as array<ParameterExtension>;
+            extensions += [tokenParams];
+            tokenRes.parameterExtensions = extensions;
+        }
+    }
+
+    observe server accepts tokenReq:OAuth2.AuthorizationRequest
+    {
+        if (DecodeOAPXBCAuthorizationRequest(ref tokenReq, ref requestType) is tokenParams:ParameterExtension)
+        {
+            array<ParameterExtension> extensions = (tokenReq.parameterExtensions == nothing) ? [] : tokenReq.parameterExtensions as array<ParameterExtension>;
+            extensions += [tokenParams];
+            tokenReq.parameterExtensions = extensions;
+        }
+    }
+}
+
+optional ParameterExtension DecodeOAPXBCRequest(ref OAuth2.AccessTokenRequest tokenReq, ref RequestType requestType)
+{
+    optional ParameterExtension parameterExtension = nothing;
+    if (tokenReq.otherParameters is paras:map<string, string>)
+    {
+        if (tokenReq.grant_type is grantType:string)
+        {
+            if (grantType == "srv_challenge")
+            {
+                requestType = RequestType.ObtainNonceRequest;
+            }
+            else if (grantType == "urn:ietf:params:oauth:grant-type:jwt-bearer" && AssignField(ref paras, "request") is requestStr:string)
+            {
+                array<string> parts = requestStr.Split(['.']);
+                if (URLBase64StringToBinary(parts[0]) is bin:binary)
+                {
+                    if (DecodeJWS<JWS_Header, ObtainPrimaryRefreshTokenRequest_JWT_Claims>(requestStr) is jws1:JWS && jws1.Payload is ObtainPrimaryRefreshTokenRequest_JWT_Claims)
+                    {
+                        requestType = RequestType.ObtainPrimaryRefreshTokenRequest;
+                        var refreshReq = new OAPXBCObtainPrimaryRefreshTokenRequestParameters{};
+                        refreshReq.request = jws1;
+                        parameterExtension = refreshReq;
+                        tokenReq.otherParameters = paras;
+                    }
+                    else if (DecodeJWS<ObtainAccessTokenRequest_JWS_Header, ObtainAccessTokenRequest_JWT_Claims>(requestStr) is jws2:JWS && jws2.Header is ObtainAccessTokenRequest_JWS_Header && 
+                        jws2.Payload is ObtainAccessTokenRequest_JWT_Claims)
+                    {
+                        requestType = RequestType.ObtainAccessTokenRequest;
+                        var accessTokenReq = new OAPXBCObtainAccessTokenRequestParameters{};
+                        accessTokenReq.request =  jws2;
+                        parameterExtension = accessTokenReq;
+                        tokenReq.otherParameters = paras;
+                    }
+                }
+            }
+        }
+    }
+    return parameterExtension;
+}
+
+optional ParameterExtension DecodeOAPXBCResponse(ref OAuth2.AccessTokenResponse tokenRes, RequestType requestType)
+{
+    optional ParameterExtension parameterExtension = nothing;
+    if ((tokenRes.Origins)[0] is httpRes:HttpContract.Response && httpRes.Payload is httpPayload:binary)
+    {
+        if (requestType == RequestType.ObtainNonceRequest && JsonDecoder<OAPXBCObtainNonceResponseParameters>(httpPayload) is res1:OAPXBCObtainNonceResponseParameters)
+        {
+            parameterExtension = res1;
+        }
+        else if (requestType == RequestType.ObtainPrimaryRefreshTokenRequest && JsonDecoder<OAPXBCObtainPrimaryRefreshTokenResponseParameters>(httpPayload) is res2:OAPXBCObtainPrimaryRefreshTokenResponseParameters)
+        {
+            parameterExtension = res2;
+        }
+        else if (requestType == RequestType.ObtainAccessTokenRequest)
+        {
+            var res3= new OAPXBCObtainAccessTokenResponseParameters();
+            res3.response = DecodeJWE<ObtainAccessTokenResponse_JWE_Header>(ASCIIText(httpPayload) as string);
+            parameterExtension = res3;
+        }
+        else if (requestType == RequestType.ObtainUserAuthenticationCertificateRequest && 
+            JsonDecoder<OAPXBCObtainUserAuthenticationCertificateResponseParameters>(httpPayload) is res4:OAPXBCObtainUserAuthenticationCertificateResponseParameters)
+        {
+            parameterExtension = res4;
+        }
+    }
+    return parameterExtension;
+}
+
+optional ParameterExtension DecodeOAPXBCAuthorizationRequest(ref OAuth2.AuthorizationRequest tokenReq, ref RequestType requestType)
+{
+    optional ParameterExtension parameterExtension = nothing;
+    if (tokenReq.otherParameters is paras:map<string, string>)
+    {
+        if (AssignField(ref paras, "request") is requestStr:string)
+        {
+            array<string> parts = requestStr.Split(['.']);
+            if (URLBase64StringToBinary(parts[0]) is bin:binary)
+            {
+                if (DecodeJWS<GetAuthenticationRequest_JWE_Header, GetAuthenticationRequest_JWT_Claims>(requestStr) is 
+                        jws3:JWS && jws3.Header is GetAuthenticationRequest_JWE_Header && jws3.Payload is GetAuthenticationRequest_JWT_Claims)
+                {
+                    requestType = RequestType.AuthorizationGetRequest;
+                    parameterExtension = OAPX.DecodeOAPXAuthorizationRequestParameters(ref tokenReq);
+                    tokenReq.otherParameters = paras;
+                }
+            }
+        }
+    }
+    return parameterExtension;
+}
+
+pattern RequestType = enum
+{
+    ObtainNonceRequest = 1,
+    ObtainPrimaryRefreshTokenRequest,
+    ObtainAccessTokenRequest,
+    ObtainUserAuthenticationCertificateRequest,
+    NoOAPXBC,
+    AuthorizationGetRequest,
+    ...
+};
+
+type OAPXBCObtainNonceResponseParameters:ParameterExtension
+{
+    string Nonce;
+}
+
+type OAPXBCObtainPrimaryRefreshTokenRequestParameters:ParameterExtension // urn:ietf:params:oauth:grant-type:jwt-bearer
+{
+    (JWS | string) request;
+}
+
+type OAPXBCObtainPrimaryRefreshTokenResponseParameters:ParameterExtension
+{
+    string refresh_token_expires_in;
+    (JWE | string) session_key_jwe with Encoding{Decoder = DecodeJWE<JWE_Header>, SourcePattern = TypeOf<string>()};
+    (JSONWebToken | string) id_token with Encoding{Decoder = DecodeJWT<JWS_Header, IDToken_JWT_Claims, JWE_Header>, SourcePattern = TypeOf<string>()};
+
+    override string ToString()
+    {
+        return "ObtainPrimaryRefreshTokenResponse";
+    }
+}
+
+type OAPXBCObtainAccessTokenRequestParameters:ParameterExtension // urn:ietf:params:oauth:grant-type:jwt-bearer
+{
+    (JWS | string) request;
+}
+
+type OAPXBCObtainAccessTokenResponseParameters:ParameterExtension
+{
+    (JWE | string) response;
+}
+
+type OAPXBCObtainUserAuthenticationCertificateRequestParameters:ParameterExtension // urn:ietf:params:oauth:grant-type:jwt-bearer
+{
+    (JWS | string) request;
+}
+
+type OAPXBCObtainUserAuthenticationCertificateResponseParameters:ParameterExtension
+{
+    (JWE | string) response;
+}
+
+// 3.2.5.1.2 POST (Request for Primary Refresh Token)
+// 3.2.5.1.2.1 Request Body
+type ObtainPrimaryRefreshTokenRequest_JWT_Claims:JWT_Claims
+{
+    string client_id;
+    string scope;
+    string request_nonce;
+    string grant_type;
+    // 3.2.5.1.2.1.1 Username Password Authentication, grant_type (REQUIRED): "password"
+    optional [|grant_type == "password"|] string username;
+    optional [|grant_type == "password"|] string password;
+    // 3.2.5.1.2.1.2 User JWT Authentication, grant_type (REQUIRED): "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    optional [|grant_type == "urn:ietf:params:oauth:grant-type:jwt-bearer"|] (JWS | string) assertion with Encoding{Decoder = DecodeJWS<UserJWTAuthenticationAssertion_JWS_Header, JWT_Claims>, SourcePattern = TypeOf<string>()};
+    // 3.2.5.1.2.1.3 Refresh Token Authentication, grant_type (REQUIRED): "refresh_token"
+    optional [|grant_type == "refresh_token"|] string refresh_token;
+}
+type UserJWTAuthenticationAssertion_JWS_Header:JWS_Header
+{
+    string use;
+}
+
+// 3.2.5.1.3 POST (Exchange Primary Refresh Token for Access Token)
+// 3.2.5.1.3.1 Request Body
+type ObtainAccessTokenRequest_JWS_Header:JWS_Header
+{
+    string ctx;
+}
+type ObtainAccessTokenRequest_JWT_Claims:JWT_Claims
+{
+    string client_id;
+    string scope;
+    optional string resource;
+    string grant_type; // "refresh_token"
+    string refresh_token;
+}
+// 3.2.5.1.3.2 Response Body
+type ObtainAccessTokenResponse_JWE_Header:JWE_Header
+{
+    string ctx;
+}
+
+// 3.2.5.1.4 POST (Exchange Primary Refresh Token for User Authentication Certificate)
+// 3.2.5.1.4.1 Request Body
+type ObtainUserAuthenticationCertificateRequest_JWS_Header:JWS_Header
+{
+    string ctx;
+}
+type ObtainUserAuthenticationCertificateRequest_JWT_Claims:JWT_Claims
+{
+    string client_id;
+    string scope;
+    string resource; // "urn:microsoft:winhello:cert:prov:server"
+    string cert_token_use; // "winhello_cert"
+    string csr_type; // "http://schemas.microsoft.com/windows/pki/2009/01/enrollment#PKCS10"
+    string csr;
+    optional string pctx;
+    optional krctx krctx;
+    string grant_type; // "refresh_token"
+    string refresh_token;
+}
+// 3.2.5.1.4.2 Response Body
+type ObtainUserAuthenticationCertificateResponse_JWE_Header:JWE_Header
+{
+    string ctx;
+}
+
+type krctx
+{
+    string Data;
+    int Format where value == 1;
+    int Version where value == 1;
+}
+
+// 3.2.5.2.1.1 Request Body
+type GetAuthenticationRequest_JWE_Header:JWE_Header
+{
+    optional string ctx;
+}
+type GetAuthenticationRequest_JWT_Claims:JWT_Claims
+{
+    optional string grant_type;
+    optional string refresh_token;
+    string request_nonce;
+}

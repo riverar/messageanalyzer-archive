@@ -1,0 +1,1670 @@
+protocol KerberosV5 with
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.BER},
+Documentation
+{
+    ProtocolName = "The Kerberos Network Authentication Service (V5)",
+    ShortName = "KerberosV5",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 1510"},
+            new Reference{Name = "RFC 4120"},
+            new Reference{Name = "RFC 3961"},
+            new Reference{Name = "RFC 4556"},
+            new Reference{Name = "RFC 6113"},
+            new Reference{Name = "MS-SFU", Version = "14.0", Date = "08/08/2013", ProgramName = ProgramName.WSPP},
+            new Reference{Name = "MS-KILE", Version = "27.0", Date = "08/08/2013", ProgramName = ProgramName.WSPP}
+        ],
+    RevisionSummary =
+        [
+           new Revision{Class = RevisionClass.Major, Version = "379501", Date = "10/10/2015"}
+        ]
+};
+
+using Standard;
+using Technologies.ASN1;
+using IANA;
+using Utility;
+using UDP;
+using X509;
+using TCP;
+using MicrosoftCommonResources;
+using Diagnostics;
+using ERREF;
+
+endpoint Server
+    over TCP.Server | over UDP.Host
+    accepts KrbMessage issues KrbMessage
+    accepts KrbIncompleteMesage issues KrbIncompleteMesage
+    provides VirtualOperations;
+    
+client endpoint Client connected to Server;
+
+string MODULE_NAME = "KerberosV5";
+const set<byte> ApplicationTagNumber = {1, 10, 11, 12, 13, 14, 15, 20, 21, 22, 30};
+    
+autostart actor KerberosOverUdp(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where (d.DestinationPort == Port.Kerberos
+        && d.Payload.Count > 0
+        && ((d.Payload[0] & 0x1F) as byte) in ApplicationTagNumber)
+    {
+        switch (d.Payload)
+        {
+            case krbMsg:KrbMessage from BinaryDecoder<KrbMessage[false]> =>
+                dispatch (endpoint Server over host) accepts krbMsg;
+            default =>
+                ThrowDecodingException("KerberosV5", "KrbMessage");
+        }
+    }
+    process host accepts d:UDP.Datagram where (d.SourcePort == Port.Kerberos
+        && d.Payload.Count > 0
+        && ((d.Payload[0] & 0x1F) as byte) in ApplicationTagNumber)
+    {
+        switch (d.Payload)
+        {
+            case krbMsg:KrbMessage from BinaryDecoder<KrbMessage[false]> =>
+                dispatch (endpoint Server over host) issues krbMsg;
+            default =>
+                ThrowDecodingException("KerberosV5", "KrbMessage");
+        }
+    }
+}
+
+autostart actor KerberosOverTcp(TCP.Server server)
+{
+    TCPDecodingHelper helper = null;
+    
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.Kerberos
+    {
+        InitializeDecodingHelper();
+        helper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server issues s:TCP.Segment where s.SourcePort == Port.Kerberos
+    {
+        InitializeDecodingHelper();
+        helper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    void InitializeDecodingHelper()
+    {
+        if (helper == null)
+        {
+            helper = new TCPDecodingHelper();
+
+            helper.Initialize(null, null, 
+                MODULE_NAME, 
+                endpoint Server over server, 
+                IsKerberosMessage, 
+                IsCompleteKerberosMessage,
+                (stream s) => BinaryDecoder<KrbMessage[true]>(s) as optional any message,
+                (binary bin) => BinaryDecoder<KrbIncompleteMesage>(bin) as optional any message);
+        }
+    }
+    
+    ~endpoint(TCP.Server e)
+    {
+        if (helper != null)
+        {
+            helper.ClearInDestructor();
+        }
+    }
+}
+
+bool? IsKerberosMessage(binary bin)
+{
+    if (bin.Count < 4)
+    {
+        return null;
+    }
+
+    if (bin.Count == 4)
+    {
+        if (bin.Segment(0, 4) == $[00000000])
+        {
+            return true;
+        }
+        else
+        {
+            return null;
+        }
+    }
+
+    return ((bin[0] & 0x80) == 0 && ((bin[4] & 0x1F) as byte) in ApplicationTagNumber);
+}
+
+uint? IsCompleteKerberosMessage(binary bin)
+{
+    uint len = MakeDWord(bin[0], bin[1], bin[2], bin[3]) + 4;
+    return bin.Count >= len ? 0 : len;
+}
+
+pattern TicketPattern = TicketType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 1, TagClass = Asn1TagClass.Application};
+pattern KrbASReqPattern = KdcReq with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 10, TagClass = Asn1TagClass.Application};
+pattern KrbASRepPattern = KdcRep with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 11, TagClass = Asn1TagClass.Application};
+pattern KrbTgsReqPattern = KdcReq with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 12, TagClass = Asn1TagClass.Application};
+pattern KrbTgsRepPattern = KdcRep with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 13, TagClass = Asn1TagClass.Application};
+pattern KrbAPReqPattern = APReqType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 14, TagClass = Asn1TagClass.Application};
+pattern KrbAPRepPattern = APRepType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 15, TagClass = Asn1TagClass.Application};
+pattern KrbTGTReqPattern = TGTReqType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 16, TagClass = Asn1TagClass.Application};
+pattern KrbTGTRepPattern = TGTRepType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 17, TagClass = Asn1TagClass.Application};
+pattern KrbSafePattern = KrbSafeType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 20, TagClass = Asn1TagClass.Application};
+pattern KrbPrivPattern = KrbPrivType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 21, TagClass = Asn1TagClass.Application};
+pattern KrbCredPattern = KrbCredType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 22, TagClass = Asn1TagClass.Application};
+pattern KrbErrorPattern = KrbErrorType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 30, TagClass = Asn1TagClass.Application};
+
+pattern KrbMessageEncoding = KrbASReqPattern | KrbASRepPattern | KrbTgsReqPattern | KrbTgsRepPattern | KrbAPReqPattern
+        | KrbAPRepPattern | KrbSafePattern | KrbPrivPattern | KrbCredPattern | KrbErrorPattern | TicketPattern | KrbTGTReqPattern | KrbTGTRepPattern;
+
+// Should invoke BinaryDecoder to decode this message
+// HasLength denotes the existence of the Length field in KrbMessage.
+message KrbMessage[bool HasLength]
+{
+    optional [|HasLength|] MaxLength Length;
+    optional [|!HasLength || ((Length as MaxLength).Length > 0)|] KrbMessageEncoding Message with Encoding{Decoder = Asn1BerDecoder<KrbMessageEncoding>};
+    
+    override string ToString()
+    {
+        string summary = "";
+        
+        // [MS-KILE]: KILE will return a zero-length message whenever it receives a message that is either not well-formed or not supported.
+        if (Length is maxlen:MaxLength &&
+            maxlen.Length == 0)
+        {
+            return "Zero-length Message";
+        }
+        
+        switch (Message)
+        {
+            case TicketType =>
+                summary += "Ticket Message";
+            case kdcReq:KdcReq =>
+                if (kdcReq.MsgType == 10)
+                {
+                    summary += "KRB_AS_REQ, Cname: " + NameStringToText((kdcReq.ReqBody.Cname as PrincipalName).NameString as any) +
+                        ", Realm: " + kdcReq.ReqBody.Realm.ToString() +
+                        ", Sname: " + NameStringToText((kdcReq.ReqBody.Sname as PrincipalName).NameString as any);
+                }
+                else if (kdcReq.MsgType == 12)
+                {
+                    summary += "KRB_TGS_REQ, Realm: " + kdcReq.ReqBody.Realm.ToString() +
+                        ", Sname: " + NameStringToText((kdcReq.ReqBody.Sname as PrincipalName).NameString as any);
+                }
+            case kdcRep:KdcRep =>
+                if (kdcRep.MsgType == 11)
+                {
+                    summary += "KRB_AS_REP, Ticket {Realm: " + kdcRep.Ticket.Realm.ToString() +
+                        ", Sname: " + NameStringToText(kdcRep.Ticket.Sname.NameString as any) + "}";
+                }
+                else if (kdcRep.MsgType == 13)
+                {
+                    summary += "KRB_TGS_REP, Cname: " + NameStringToText(kdcRep.Cname.NameString as any) +
+                        ", Ticket {Realm: " + kdcRep.Ticket.Realm.ToString() +
+                        ", Sname: " + NameStringToText(kdcRep.Ticket.Sname.NameString as any) + "}";
+                }
+            case APReqType =>
+                summary += "KRB_AP_REQ";
+            case APRepType =>
+                summary += "KRB_AP_REP";
+            case TGTReqType =>
+                summary += "KRB_TGT_REP";
+            case TGTRepType =>
+                summary += "KRB_TGT_REP";
+            case KrbSafeType =>
+                summary += "KRB_SAFE (checksummed) application message";
+            case KrbPrivType =>
+                summary += "KRB_PRIV (encrypted) application message";
+            case KrbCredType =>
+                summary += "KRB_CRED (encrypted) message to forward credentials";
+            case KrbError:KrbErrorType =>
+                summary += ("KRB_ERROR, " + EnumToString(KrbError.ErrorCode, "KerberosV5.ErrorCode") + ": " + GetErrorStringByCode(KrbError.ErrorCode));
+                        if (KrbError.EData is krbMData:KerbErrorData)
+                        {
+                            if (krbMData.DataValue is dataValue:KERB_EXT_ERROR)
+                            {
+                                summary += ", status: " + dataValue.status.ToString();
+                            }
+                        }
+        }
+        return summary;
+    }
+}
+
+message KrbIncompleteMesage
+{
+    MaxLength Length;
+    binary Body;
+    
+    override string ToString()
+    {
+        return "Incomplete KerberosV5 message";
+    }
+}
+
+/************************** Types following are defined in RFC 4120 unless it has special comments. **************************/
+
+/* (RFC 4120)
+ * Each request (KRB_KDC_REQ) and response (KRB_KDC_REP or KRB_ERROR)
+ * sent over the TCP stream is preceded by the length of the request as
+ * 4 octets in network byte order
+ */
+type MaxLength // this type will be decoded by BinaryDecoder.
+{
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint Length with BinaryEncoding{Width = 31, Endian = Endian.Big};
+    
+    override string ToString()
+    {
+        return "Length: " + (Length as string);
+    }
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+pattern Int32 = Integer where value >= -2147483648 && value <= 2147483647;
+
+pattern UInt32 = Integer where value >= 0 && value <= 4294967295;
+
+pattern KerberosString = GeneralString with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+
+pattern Realm = KerberosString;
+
+pattern MicroSeconds = Integer with Asn1Encoding{LowerEndValue = 0, UpperEndValue = 999999};
+
+type PrincipalName
+{
+    Int32 NameType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                        DisplayInfo{ToText = NameTypeToText};
+    array<KerberosString> NameString with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit},
+                        DisplayInfo{ToText = NameStringToText};
+    
+    override string ToString()
+    {
+        return NameStringToText(NameString as any);
+    }
+}
+
+string NameTypeToText(any nameTypedata)
+{
+    Int32 nameType = nameTypedata as Int32;
+    switch (nameType)
+    {
+        case 0  => return "NT-UNKNOWN (0)";
+        case 1  => return "NT-PRINCIPAL (1)";
+        case 2  => return "NT-SRV-INST (2)";
+        case 3  => return "NT-SRV-HST (3)";
+        case 4  => return "NT-SRV-XHST (4)";
+        case 5  => return "NT-UID (5)";
+        case 6  => return "NT-X500-PRINCIPAL (6)";
+        case 7  => return "NT-SMTP-NAME (7)";
+        case 10 => return "NT-ENTERPRISE (10)";
+        default => return "Unknown Name Type(" + (nameType as string) + ")";
+    }
+}
+
+string NameStringToText(any nameStringdata)
+{
+    array<KerberosString> nameString = nameStringdata as array<KerberosString>;
+    if (nameString.Count > 0)
+    {
+        string name = nameString[0].ToString();
+        for (int i = 1; i < nameString.Count; i++)
+        {
+            name += "/" + nameString[i].ToString();
+        }
+        return name;
+    }
+    else
+    {
+        return "Name String is Null";
+    }
+}
+    
+pattern KerberosTime = GeneralizedTime;
+
+type HostAddress
+{
+    Int32 AddrType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                        DisplayInfo{ToText = AddrTypeToText};
+    ([|AddrType == 20|] NetBiosOctetString | OctetString) Address with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return Address.ToString();
+    }
+}
+
+string AddrTypeToText(any addrTypedata)
+{
+    Int32 addrType = addrTypedata as Int32;
+    switch (addrType)
+    {
+        case 2  => return "IPv4 Address (2)";
+        case 3  => return "Directional Address (3)";
+        case 5  => return "ChaosNet Address (5)";
+        case 6  => return "XNS Address (6)";
+        case 7  => return "ISO Address (7)";
+        case 12 => return "DECNET Phase IV Address (12)";
+        case 16 => return "AppleTalk DDP Address (16)";
+        case 20 => return "NetBios Address (20)";
+        case 24 => return "IPv6 Address (24)";
+        default => return "Unknown Address type(" + (addrType as string) + ")";
+    }
+}
+
+pattern NetBiosOctetString = OctetString with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+pattern HostAddresses = array<HostAddress>;
+
+// Since RFC 4120 use SEQUENCE OF SEQUENCE to define AuthorizationData, so add this type for definition of AuthorizationData.
+/*       Contents of ad-data             ad-type           Ref
+ *    DER encoding of AD-IF-RELEVANT        1           RFC 4120
+ *    DER encoding of AD-KDCIssued          4           RFC 4120
+ *    DER encoding of AD-AND-OR             5           RFC 4120
+ *    DER encoding of AD-MANDATORY-FOR-KDC  8           RFC 4120
+ */
+type AuthorizationDataMember
+{
+    Int32 ADType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    ([|ADType in {1, 4, 5, 8}|] ADDataType[ADType] |
+     OctetString) ADData with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        switch (ADType)
+        {
+            case 1  => return "AD-IF-RELEVANT";
+            case 4  => return "AD-KDCIssued";
+            case 5  => return "AD-AND-OR";
+            case 8  => return "AD-MANDATORY-FOR-KDC";
+            default => return "Unknown ADType(" + (ADType as string) + ")";
+        }
+    }
+}
+
+type ADDataType[Int32 AdType]
+{
+    ([|AdType == 1|] ADIfRelevant | [|AdType == 4|] ADKdcIssued | [|AdType == 5|] ADAndOR | [|AdType == 8|] ADMandatoryForKdc) ADData;
+}
+
+pattern AuthorizationData = array<AuthorizationDataMember>;
+
+pattern ADIfRelevant = AuthorizationData; // ADType is 1.
+
+type ADKdcIssued // ADType is 4.
+{
+    Checksum AdCheckSum with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional Realm IRealm with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName ISname with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    AuthorizationData Elements with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+}
+
+type ADAndOR // ADType is 5.
+{
+    Int32 ConditionCount with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    AuthorizationData Elements with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern ADMandatoryForKdc = AuthorizationData; // ADType is 8.
+
+pattern PAEncTimeStamp = EncryptedData;
+
+type PAEncTSEnc
+{
+    KerberosTime PaTimeStamp with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional MicroSeconds PauSec with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+type EtypeInfoEntry
+{
+    Int32 Etype with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                     DisplayInfo{ToText = EtypeToText};
+    optional OctetString Salt with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern EtypeInfo = array<EtypeInfoEntry>;
+
+type EtypeInfo2Entry
+{
+    Int32 Etype with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                     DisplayInfo{ToText = EtypeToText};
+    optional KerberosString Salt with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional OctetString S2kparams with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern EtypeInfo2 = array<EtypeInfo2Entry>;
+
+pattern KerberosFlags = BitString;
+
+pattern APOptions = flags uint
+{
+    reserved        = 0x80000000,
+    use_session_key = 0x40000000,
+    mutual_required = 0x20000000,
+    ...
+} with Encoding{Decoder = PatternDecoder<APOptions>, SourceConverter = ConvertArrayBoolToUint, SourcePattern = TypeOf<KerberosFlags>()};
+
+pattern TicketFlags = flags uint
+{
+    reserved                 = 0x80000000,
+    forwardable              = 0x40000000,
+    forwarded                = 0x20000000,
+    proxiable                = 0x10000000,
+    proxy                    = 0x08000000,
+    may_postdate             = 0x04000000,
+    postdated                = 0x02000000,
+    invalid                  = 0x01000000,
+    renewable                = 0x00800000,
+    initial                  = 0x00400000,
+    pre_authent              = 0x00200000,
+    hw_authent               = 0x00100000,
+    transited_policy_checked = 0x00080000,
+    ok_as_delegate           = 0x00040000,
+    ...
+} with Encoding{Decoder = PatternDecoder<TicketFlags>, SourceConverter = ConvertArrayBoolToUint, SourcePattern = TypeOf<KerberosFlags>()};
+
+pattern KdcOptions = flags uint
+{
+    reserved                  = 0x80000000,
+    forwardable               = 0x40000000,
+    forwarded                 = 0x20000000,
+    proxiable                 = 0x10000000,
+    proxy                     = 0x08000000,
+    allow_postdate            = 0x04000000,
+    postdated                 = 0x02000000,
+    unused7                   = 0x01000000,
+    renewable                 = 0x00800000,
+    unused9                   = 0x00400000,
+    unused10                  = 0x00200000,
+    hw_authent                = 0x00100000,
+    unused12                  = 0x00080000,
+    unused13                  = 0x00040000,
+    cname_in_addl_tkt         = 0x00020000, // [MS-SFU]
+    reserved_for_canonicalize = 0x00010000,
+    unused16                  = 0x00008000,
+    unused17                  = 0x00004000,
+    unused18                  = 0x00002000,
+    unused19                  = 0x00001000,
+    unused20                  = 0x00000800,
+    unused21                  = 0x00000400,
+    unused22                  = 0x00000200,
+    unused23                  = 0x00000100,
+    unused24                  = 0x00000080,
+    unused25                  = 0x00000040,
+    disable_transited_check   = 0x00000020,
+    renewable_ok              = 0x00000010,
+    enc_tkt_in_skey           = 0x00000008,
+    unused29                  = 0x00000004,
+    renew                     = 0x00000002,
+    validate                  = 0x00000001,
+    ...
+} with Encoding{Decoder = PatternDecoder<KdcOptions>, SourceConverter = ConvertArrayBoolToUint, SourcePattern = TypeOf<KerberosFlags>()};
+
+// Since RFC 4120 use SEQUENCE OF SEQUENCE to define LastReq, so add this type for definition of LastReq.
+type LastRequest
+{
+    Int32 LrType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    KerberosTime LrValue with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern LastReq = array<LastRequest>;
+
+type TicketType
+{
+    Int32 TktVno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit}; // default value is 5.
+    Realm Realm with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Sname with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    EncryptedData EncPart with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern Ticket = TicketType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 1, TagClass = Asn1TagClass.Application};
+
+type EncTicketPart
+{
+    TicketFlags TicketFlags with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    EncryptionKey Key with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    Realm Crealm with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Cname with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    TransitedEncoding Transited with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    KerberosTime AuthTime with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime StartTime with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    KerberosTime EndTime with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime ReNewTill with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit};
+    optional HostAddresses Caddr with Asn1Encoding {TagNumber = 9, Tagging = Asn1Tagging.Explicit};
+    optional AuthorizationData AuthorizationData with Asn1Encoding {TagNumber = 10, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 3, TagClass = Asn1TagClass.Application};
+
+type TransitedEncoding
+{
+    Int32 TyType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    OctetString Contents with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+type Authenticator
+{
+    Int32 AuthenticatorVno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit}; // default value is 5.
+    Realm Crealm with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Cname with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional Checksum CheckSum with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    Int32 Cusec with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    KerberosTime Ctime with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    optional EncryptionKey SubKey with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    optional UInt32 SeqNumber with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    optional AuthorizationData AuthorizationData with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 2, TagClass = Asn1TagClass.Application};
+
+pattern ASReq = KdcReq with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 10, TagClass = Asn1TagClass.Application};
+pattern TgsReq = KdcReq with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 12, TagClass = Asn1TagClass.Application};
+
+type KdcReq
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit}; // default value is 5.
+    MsgType MsgType with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional array<PAData[MsgType]> PAData with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    KdcReqBody ReqBody with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern MsgType = enum Int32
+{
+    Ticket         = 1,
+    KRB_AS_REQ     = 10,
+    KRB_AS_REP     = 11,
+    KRB_TGS_REQ    = 12,
+    KRB_TGS_REP    = 13,
+    KRB_AP_REQ     = 14,
+    KRB_AP_REP     = 15,
+    KRB_RESERVED16 = 16,
+    KRB_RESERVED17 = 17,
+    KRB_SAFE       = 20,
+    KRB_PRIV       = 21,
+    KRB_CRED       = 22,
+    KRB_ERROR      = 30,
+    ...
+};
+
+/* padata-type           Name                         Contents of padata-value                             Ref
+ *       1            pa-tgs-req                    DER encoding of AP-REQ                               RFC 4120
+ *       2            pa-enc-timestamp              DER encoding of PA-ENC-TIMESTAMP                     RFC 4120
+ *       3            pa-pw-salt                    salt (not ASN.1 encoded)                             RFC 4120
+ *       4            [reserved]                                                                         RFC 4120
+ *       5            PA-ENC-UNIX-TIME              (deprecated)                                         RFC 4120
+ *       6            PA-SANDIA-SECUREID                                                                 RFC 4120
+ *       7            PA-SESAME                                                                          RFC 4120
+ *       8            PA-OSF-DCE                                                                         RFC 4120
+ *       9            PA-CYBERSAFE-SECUREID                                                              RFC 4120
+ *       10           PA-AFS3-SALT                                                                       RFC 4120
+ *       11           pa-etype-info                 DER encoding of ETYPE-INFO                           RFC 4120
+ *       12           PA-SAM-CHALLENGE              (sam/otp)                                            RFC 4120
+ *       13           PA-SAM-RESPONSE               (sam/otp)                                            RFC 4120
+ *       14           PA-PK-AS-REQ_OLD              (pkinit)                                             RFC 4120
+ *       15           PA-PK-AS-REP_OLD              (pkinit)                                             RFC 4120
+ *       16           PA-PK-AS-REQ                  DER encoding of the type PA-PK-AS-REQ                RFC 4556
+ *       17           PA-PK-AS-REP                  DER encoding of the type PA-PK-AS-REP                RFC 4556
+ *       18           PA-PK-OCSP-RESPONSE           DER encoding of the type PKOcspData                  RFC 4557
+ *       19           pa-etype-info2                DER encoding of ETYPE-INFO2                          RFC 4120
+ *       20           PA-USE-SPECIFIED-KVNO                                                              RFC 4120
+ *       20           PA-SVR-REFERRAL-INFO                                                               Referrals-11
+ *       21           PA-SAM-REDIRECT               (sam/otp)                                            RFC 4120
+ *       22           PA-GET-FROM-TYPED-DATA        (embedded in typed data)                             RFC 4120
+ *       22           TD-PADATA                     (embeds padata)                                      RFC 4120
+ *       23           PA-SAM-ETYPE-INFO             (sam/otp)                                            RFC 4120
+ *       24           PA-ALT-PRINC                  (crawdad@fnal.gov)                                   RFC 4120
+ *       30           PA-SAM-CHALLENGE2             (kenh@pobox.com)                                     RFC 4120
+ *       31           PA-SAM-RESPONSE2              (kenh@pobox.com)                                     RFC 4120
+ *       41           PA-EXTRA-TGT                  Reserved extra TGT                                   RFC 4120
+ *       101          TD-PKINIT-CMS-CERTIFICATES    CertificateSet from CMS                              RFC 4120
+ *       102          TD-KRB-PRINCIPAL              PrincipalName                                        RFC 4120
+ *       103          TD-KRB-REALM                  Realm                                                RFC 4120
+ *       104          TD-TRUSTED-CERTIFIERS         TDTrustedCertifiers                                  RFC 4556
+ *       105          TD-INVALID-CERTIFICATES       TDInvalidCertificates                                RFC 4556
+ *       105          TD-CERTIFICATE-INDEX          from PKINIT                                          RFC 4120
+ *       106          TD-APP-DEFINED-ERROR          application specific                                 RFC 4120
+ *       107          TD-REQ-NONCE                  INTEGER                                              RFC 4120
+ *       108          TD-REQ-SEQ                    INTEGER                                              RFC 4120
+ *       109          TD-DH-PARAMETERS              TDDhParameters                                       RFC 4556
+ *       128          PA-PAC-REQUEST                KERB-PA-PAC-REQUEST                                  RFC 4120
+ *       129          PA-FOR-USER                   PA-FOR-USER                                          MS-SFU
+ *       130          PA-S4U-X509-USER              X509 Certifiate encoded per [RFC3280]                MS-SFU
+ *                                                  PA_S4U_X509_USER                                     MS-SFU
+ *       133          PA-FX-COOKIE                  PA-FX-COOKIE                                         RFC 6113
+ *       134          PA-AUTHENTICATION-SET         PA-AUTHENTICATION-SET                                RFC 6113
+ *       135          PA-AUTH-SET-SELECTED          PA-AUTH-SET-SELECTED                                 RFC 6113
+ *       136          PA-FX-FAST                    PA-FX-FAST-REQUEST                                   RFC 6113
+ *                                                  PA-FX-FAST-REPLY                                     RFC 6113
+ *       137          PA-FX-ERROR                   PA-FX-ERROR                                          RFC 6113
+ *       138          PA-ENCRYPTED-CHALLENGE        PA-ENCRYPTED-CHALLENGE                               RFC 6113
+ *       165          PA-SUPPORTED-ENCTYPES         PA-SUPPORTED-ENCTYPES                                MS-KILE
+ *       167          PA-PAC-OPTIONS                PA-PAC-OPTIONS                                       MS-KILE
+ */
+
+    // MS-KILE:  PA-PAC-REQUEST        (128)
+    //           PA-SUPPORTED-ENCTYPES (165)
+    //           PA-PAC-OPTIONS        (167)
+    // MS-SFU:   PA-FOR-USER           (129)
+    //           PA_S4U_X509_USER      (130)
+    // X509:     X509 Certificate      (130)
+    // RFC 6111: PA-FX-FAST-REQUEST    (136)
+    //           PA-FX-FAST-REPLY      (136)
+
+type PAData[Int32 MsgType]
+{
+    Int32 PADataType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit},
+                          DisplayInfo{ToText = PADataTypeToText};
+    (PADataValueType | SupportedEncryptionTypesBitFlags | OctetString) PadataValue 
+        with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit},
+            Encoding{Decoder = PadataValueDecoder, SourcePattern = TypeOf<binary>()};
+    
+    override string ToString()
+    {
+        return PADataTypeToText(PADataType as any);
+    }
+    
+    optional (PADataValueType | SupportedEncryptionTypesBitFlags | OctetString) PadataValueDecoder(binary bin)
+    {
+        if (bin.Count == 0) // PadataValue can be an empty binary in certain case (i.e. KRB_ERROR message)
+            return $[];
+        
+        optional (PADataValueType| SupportedEncryptionTypesBitFlags | OctetString) res = nothing;
+        switch (PADataType as int)
+        {
+            case 165 => res = BinaryDecoder<SupportedEncryptionTypesBitFlags>(bin);
+            case (1 | 2 | 11 | 16 | 17 | 19 | 102 | 103 | 104 | 107 | 108 | 128 | 129 | 130 | 136 | 167) =>
+                res = Asn1BerDecoder<PADataValueType[MsgType, PADataType]>(bin);
+            default => res = bin;
+        }
+        if (res == nothing)
+        {
+            ValidationCheck(false, null, DiagnosisLevel.Warning,
+                () => Format(KERBEROSV5_DECODING_PADATAVALUE_FAILED, PADataValueTypeToText(MsgType, PADataType), PADataTypeToText(PADataType)));
+            return bin;
+        }
+        
+        return res;
+    }
+}
+
+string PADataTypeToText(any paDataTypeInfo)
+{
+    Int32 paDataType = paDataTypeInfo as Int32;
+    switch (paDataType)
+    {
+        case 1  => return "PA-TGS-REQ (1)";
+        case 2  => return "PA-ENC-TIMESTAMP (2)";
+        case 3  => return "PA-PW-SALT (3)";
+        case 4  => return "[reserved] (4)";
+        case 5  => return "PA-ENC-UNIX-TIME (5)";
+        case 6  => return "PA-SANDIA-SECUREID (6)";
+        case 7  => return "PA-SESAME (7)";
+        case 8  => return "PA-OSF-DCE (8)";
+        case 9  => return "PA-CYBERSAFE-SECUREID (9)";
+        case 10 => return "PA-AFS3-SALT (10)";
+        case 11 => return "PA-ETYPE-INFO (11)";
+        case 12 => return "PA-SAM-CHALLENGE (12)";
+        case 13 => return "PA-SAM-RESPONSE (13)";
+        case 14 => return "PA-PK-AS-REQ_OLD (14)";
+        case 15 => return "PA-PK-AS-REP_OLD/ PA_PK_AS_REQ_WINDOWS_OLD/ PA_PK_AS_REP_WINDOWS_OLD (15)";
+        case 16 => return "PA-PK-AS-REQ (16)";
+        case 17 => return "PA-PK-AS-REP (17)";
+        case 18 => return "PA-PK-OCSP-RESPONSE (18)";
+        case 19 => return "PA-ETYPE-INFO2 (19)";
+        case 20 => return "PA-USE-SPECIFIED-KVNO/ PA-SVR-REFERRAL-INFO (20)";
+        case 21 => return "PA-SAM-REDIRECT (21)";
+        case 22 => return "PA-GET-FROM-TYPED-DATA/TD-PADATA (22)";
+        case 23 => return "PA-SAM-ETYPE-INFO (23)";
+        case 24 => return "PA-ALT-PRINC (24)";
+        case 30 => return "PA-SAM-CHALLENGE2 (30)";
+        case 31 => return "PA-SAM-RESPONSE2 (31)";
+        case 41 => return "PA-EXTRA-TGT (41)";
+        case 101 => return "TD-PKINIT-CMS-CERTIFICATES (101)";
+        case 102 => return "TD-KRB-PRINCIPAL (102)";
+        case 103 => return "TD-KRB-REALM (103)";
+        case 104 => return "TD-TRUSTED-CERTIFIERS (104)";
+        case 105 => return "TD-CERTIFICATE-INDEX/ TD-INVALID-CERTIFICATES (105)";
+        case 106 => return "TD-APP-DEFINED-ERROR (106)";
+        case 107 => return "TD-REQ-NONCE (107)";
+        case 108 => return "TD-REQ-SEQ (108)";
+        case 109 => return "TD-DH-PARAMETERS (109)";
+        case 128 => return "PA-PAC-REQUEST (128)";
+        case 129 => return "PA-FOR-USER (129)";
+        case 130 => return "PA-S4U-X509-USER (130)";
+        case 132 => return "KRB5_PADATA_AS_CHECKSUM (132)";
+        case 133 => return "PA-FX-COOKIE (133)";
+        case 134 => return "PA-AUTHENTICATION-SET (134)";
+        case 135 => return "PA-AUTH-SET-SELECTED (135)";
+        case 136 => return "PA-FX-FAST (136)";
+        case 137 => return "PA-FX-ERROR (137)";
+        case 138 => return "PA-ENCRYPTED-CHALLENGE (138)";
+        case 165 => return "PA-SUPPORTED-ENCTYPES (165)";
+        case 167 => return "PA-PAC-OPTIONS (167)";
+        default => return "Unknown Padata type (" + (paDataType as string) + ")";
+    }
+}
+
+type PADataValueType[Int32 MsgType, Int32 PaDataType]
+{
+    optional ([|PaDataType == 1|] APReq                                                                 |
+              [|PaDataType == 2|] PAEncTimeStamp                                                        |
+              [|PaDataType == 11|] EtypeInfo                                                            |
+              [|PaDataType == 19|] EtypeInfo2                                                           |
+              [|PaDataType == 16|] PaPkAsReq                                                            |
+              [|PaDataType == 17|] PaPkAsRep                                                            |
+              [|PaDataType == 102|] PrincipalName                                                       |
+              [|PaDataType == 103|] Realm                                                               |
+              [|PaDataType == 104|] TDTrustedCertifiers                                                 |
+              [|PaDataType == 107 || PaDataType == 108|] Integer                                        |
+              [|PaDataType == 128|] KerbPaPacRequest                                                    |
+              [|PaDataType == 129 && (MsgType == 12 || MsgType == 13)|] PAForUserEn                     |
+              [|PaDataType == 130 && (MsgType == 10 || MsgType == 11)|] Certificate                     |
+              [|PaDataType == 130 && (MsgType == 12 || MsgType == 13)|] PAS4UX509User                   |
+              [|PaDataType == 136 && (MsgType == 10 || MsgType == 12)|] PaFxFastRequest                 |
+              [|PaDataType == 136 && (MsgType == 11 || MsgType == 13 || MsgType == 30)|] PaFxFastReply  |
+              [|PaDataType == 167|] PaPacOptions) PADataValue;
+              
+    override string ToString()
+    {
+        return PADataValueTypeToText(MsgType, PaDataType);
+    }
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+string PADataValueTypeToText(Int32 msgType, Int32 paDataTypeInfo)
+{
+    switch (paDataTypeInfo)
+    {
+        case 1  => return "AP-REQ";
+        case 2  => return "PA-ENC-TIMESTAMP";
+        case 11 => return "ETYPE-INFO";
+        case 16 => return "PA-PK-AS-REQ";
+        case 17 => return "PA-PK-AS-REP";
+        case 19 => return "ETYPE-INFO2";
+        case 102 => return "PrincipalName";
+        case 103 => return "Realm";
+        case 104 => return "TD-TRUSTED-CERTIFIERS";
+        case 107 => return "INTEGER";
+        case 108 => return "INTEGER";
+        case 128 => return "KERB-PA-PAC-REQUEST";
+        case 129 => return "PA-FOR-USER-ENC";
+        case 130 => 
+            if (msgType == 10 || msgType == 11)
+            {
+                return "X509 Certificate";
+            }
+            else
+            {
+                return "PA-S4U-X509-USER";
+            }
+        case 136 => 
+            if (msgType == 10 || msgType == 12)
+            {
+                return "PA-FX-FAST-REQUEST";
+            }
+            else
+            {
+                return "PA-FX-FAST-REPLY";
+            }
+        case 165 => return "PA-SUPPORTED-ENCTYPES";
+        case 167 => return "PA-PAC-OPTIONS";
+        default => return "Unknown Padata Value with Type (" + (paDataTypeInfo as string) + ")";
+    }
+}
+
+/********************************************** Use type to define temporarily **********************************************/
+
+type KdcReqBody
+{
+    KdcOptions KdcOptions with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName Cname with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit}; // Used only in AS-REQ
+    Realm Realm with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName Sname with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime Form with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    KerberosTime Till with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime Rtime with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    UInt32 Nonce with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    array<Int32> Etype with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit},
+                            DisplayInfo{ToText = EtypeArrayToText};
+    optional HostAddresses Addresses with Asn1Encoding{TagNumber = 9, Tagging = Asn1Tagging.Explicit};
+    optional EncryptedData EncAuthorizationData with Asn1Encoding{TagNumber = 10, Tagging = Asn1Tagging.Explicit};
+    optional array<Ticket> AdditionalTickets with Asn1Encoding{TagNumber = 11, Tagging = Asn1Tagging.Explicit};
+    
+    static string EtypeArrayToText(any etype)
+    {
+        array<Int32> eTypeArr = etype as array<Int32>;
+        string eTypeInfo = "(";
+        foreach (Int32 eType in eTypeArr)
+        {
+            eTypeInfo += " " + EtypeToText(eType) + " ";
+        }
+        if (eTypeInfo != "(")
+        {
+            eTypeInfo += ")";
+            return eTypeInfo;
+        }
+        else
+        {
+            return "";
+        }
+    }
+}
+
+// pattern Int32Etype = Int32 with DisplayInfo{ToText = EtypeToText};
+
+string EtypeToText(any eTypeinfo)
+{
+    Int32 eType = eTypeinfo as Int32;
+    switch (eType)
+    {
+        case 1 => return "des-cbc-crc (1)";
+        case 2 => return "des-cbc-md4 (2)";
+        case 3 => return "des-cbc-md5 (3)";
+        case 4 => return "[reserved] (4)";
+        case 5 => return "des3-cbc-md5 (5)";
+        case 6 => return "[reserved] (6)";
+        case 7 => return "des3-cbc-sha1 (7)";
+        case 9 => return "dsaWithSHA1-CmsOID (9)";
+        case 10 => return "md5WithRSAEncryption-CmsOID (10)";
+        case 11 => return "sha1WithRSAEncryption-CmsOID (11)";
+        case 12 => return "rc2CBC-EnvOID (12)";
+        case 13 => return "rsaEncryption-EnvOID (13)";
+        case 14 => return "rsaES-OAEP-ENV-OID (14)";
+        case 15 => return "des-ede3-cbc-Env-OID (15)";
+        case 16 => return "des3-cbc-sha1-kd (16)";
+        case 17 => return "aes128-cts-hmac-sha1-96 (17)";
+        case 18 => return "aes256-cts-hmac-sha1-96 (18)";
+        case 0x17 => return "rc4-hmac (23)";
+        case 0x18 => return "rc4-hmac-exp (24)";
+        case 0x41 => return "subkey-keymaterial (65)";
+        case 128 => return "old rc4 md4 (128)";
+        case 129 => return "old rc4 plain (129)";
+        case 130 => return "old rc4 LM (130)";
+        case 131 => return "old rc4 sha (131)";
+        case 132 => return "old_des_plain (132)";
+        case 0xffffff80 => return "rc4 md4 (-128)";
+        case 0xffffff7f => return "rc4 plain2 (-129)";
+        case 0xffffff7e => return "rc4 lm (-130)";
+        case 0xffffff7d => return "rc4 sha (-131)";
+        case 0xffffff7c => return "des plain (-132)";
+        case 0xffffff7b => return "rc4 hmac old (-133)";
+        case 0xffffff7a => return "rc4 plain old (-134)";
+        case 0xffffff79 => return "rc4 hmac old exp (-135)";
+        case 0xffffff78 => return "rc4 plain old exp (-136)";
+        case 0xffffff74 => return "rc4 plain (-140)";
+        case 0xffffff73 => return"rc4 plain exp (-141)";
+        default=> return "Unknown Encryption Type(" + (eType as string) + ")";
+    }
+}
+
+pattern ASRep = KdcRep with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 11, TagClass = Asn1TagClass.Application};
+pattern TgsRep = KdcRep with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 13, TagClass = Asn1TagClass.Application};
+
+type KdcRep
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional array<PAData[MsgType]> PAData with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    Realm Crealm with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Cname with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    Ticket Ticket with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    EncryptedData EncPart with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern EncASRepPart = EncKdcRepPart with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 25, TagClass = Asn1TagClass.Application};
+pattern EncTgsRepPart = EncKdcRepPart with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 26, TagClass = Asn1TagClass.Application};
+
+type EncKdcRepPart
+{
+    EncryptionKey Key with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    LastReq LastReq with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    UInt32 Nonce with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime KeyExpiration with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    TicketFlags TicketFlags with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    KerberosTime AuthTime with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime StartTime with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    KerberosTime EndTime with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime RenewTill with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit};
+    Realm Srealm with Asn1Encoding{TagNumber = 9, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Sname with Asn1Encoding{TagNumber = 10, Tagging = Asn1Tagging.Explicit};
+    optional HostAddresses Caddr with Asn1Encoding{TagNumber = 11, Tagging = Asn1Tagging.Explicit};
+}
+
+type APReqType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    APOptions APOptions with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    Ticket Ticket with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    EncryptedData Authenticator with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern APReq = APReqType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 14, TagClass = Asn1TagClass.Application};
+
+type APRepType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    EncryptedData EncPart with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern APRep = APRepType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 15, TagClass = Asn1TagClass.Application};
+
+// draft-swift-win2k-krb-user2user-03
+type TGTReqType
+{    
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional PrincipalName ServerName with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional Realm Realm with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+};
+
+pattern TGTReq  = TGTReqType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 16, TagClass = Asn1TagClass.Application};
+
+type TGTRepType
+{    
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    Ticket Ticket with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+};
+
+pattern TGTRep = TGTRepType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 17, TagClass = Asn1TagClass.Application};
+
+type EncAPRepPart
+{
+    KerberosTime Ctime with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MicroSeconds Cusec with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional EncryptionKey SubKey with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional UInt32 SeqNumber with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 27, TagClass = Asn1TagClass.Application};
+
+type KrbSafeType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    KrbSafeBody SafeBody with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    Checksum CheckSum with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern KrbSafe = KrbSafeType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 20, TagClass = Asn1TagClass.Application};
+
+type KrbSafeBody
+{
+    OctetString UserData with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime TimeStamp with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional MicroSeconds Usec with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional UInt32 SeqNumber with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    HostAddress SAddress with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    optional HostAddress RAddress with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+}
+
+type KrbPrivType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    EncryptedData EncPart with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern KrbPriv = KrbPrivType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 21, TagClass = Asn1TagClass.Application};
+
+type EncKrbPrivPart
+{
+    OctetString UserData with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime TimeStamp with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional MicroSeconds Usec with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional UInt32 SeqNumber with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    HostAddress SAddress with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    optional HostAddress RAddress with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 28, TagClass = Asn1TagClass.Application};
+
+type KrbCredType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    array<Ticket> Tickets with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    EncryptedData EncPart with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern KrbCred = KrbCredType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 22, TagClass = Asn1TagClass.Application};
+
+type EncKrbCredPart
+{
+    array<KrbCredInfo> TicketInfo with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional UInt32 Nonce with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime TimeStamp with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional MicroSeconds Usec with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    optional HostAddress SAddress with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    optional HostAddress RAddress with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 29, TagClass = Asn1TagClass.Application};
+
+type KrbCredInfo
+{
+    EncryptionKey Key with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional Realm Prealm with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName Pname with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional TicketFlags TicketFlags with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime AuthTime with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime StartTime with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime EndTime with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime RenewTill with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    optional Realm Srealm with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName Sname with Asn1Encoding{TagNumber = 9, Tagging = Asn1Tagging.Explicit};
+    optional HostAddresses Caddr with Asn1Encoding{TagNumber = 10, Tagging = Asn1Tagging.Explicit};
+}
+
+type KrbErrorType
+{
+    Int32 Pvno with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    MsgType MsgType with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional KerberosTime Ctime with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional Int32 Cusec with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    KerberosTime Stime with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit};
+    MicroSeconds Susec with Asn1Encoding{TagNumber = 5, Tagging = Asn1Tagging.Explicit};
+    ErrorCode ErrorCode with Asn1Encoding{TagNumber = 6, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional Realm Crealm with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName Cname with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit};
+    Realm Realm with Asn1Encoding{TagNumber = 9, Tagging = Asn1Tagging.Explicit};
+    PrincipalName Sname with Asn1Encoding{TagNumber = 10, Tagging = Asn1Tagging.Explicit};
+    optional KerberosString EText with Asn1Encoding{TagNumber = 11, Tagging = Asn1Tagging.Explicit};
+    optional EDataType EData 
+        with Asn1Encoding{TagNumber = 12, Tagging = Asn1Tagging.Explicit},
+            Encoding{Decoder = EDataDecoder, SourcePattern = TypeOf<OctetString>()};
+
+    optional EDataType EDataDecoder(any input)
+    {
+        if (input is bin:binary &&
+            bin != null)
+        {
+            switch (ErrorCode)
+            {
+                case ErrorCode.KDC_ERR_PREAUTH_REQUIRED  =>
+                    return Asn1BerDecoder<MethodData[MsgType]>(bin);
+                default =>
+                    if (bin.Count > 0 && bin[0] == 0x30)
+                    {
+                        return Asn1BerDecoder<KerbErrorData>(bin);
+                    }
+                    else
+                    {
+                        return bin;
+                    }
+            }
+        }
+
+        return input;
+    }
+
+    override string ToString()
+    {
+        return EnumToString(MsgType, "KerberosV5.MsgType");
+    }
+}
+
+pattern EDataType = MethodData | KerbErrorData | binary;
+
+pattern KrbError = KrbErrorType with Asn1Encoding{Tagging = Asn1Tagging.Explicit, TagNumber = 30, TagClass = Asn1TagClass.Application};
+
+type MethodData[Int32 MsgType]
+{
+    array<PAData[MsgType]> MethodData;
+} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+// Since RFC 4120 use SEQUENCE OF SEQUENCE to define TypedData, so add this type for definition of TypedData.
+type TypedDataMember
+{
+    Int32 DataType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional OctetString DataValue with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern TypedData = array<TypedDataMember>;
+
+type EncryptedData
+{
+    Int32 Etype with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                     DisplayInfo{ToText = EtypeToText};
+    optional Int32 Kvno with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit}; // [MS-KILE]: KILE key version numbers (as defined in [RFC4120] section 5.2.9) are signed 32-bit integers.
+    OctetString Cipher with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+}
+
+type EncryptionKey
+{
+    Int32 KeyType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    OctetString KeyValue with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+type Checksum
+{
+    Int32 CheckSumType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                            DisplayInfo{ToText = CheckSumTypeToText};
+    OctetString CheckSum with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+string CheckSumTypeToText(any checkSumTypedata)
+{
+    Int32 checkSumType = checkSumTypedata as Int32;
+    switch (checkSumType)
+    {
+        case 1 => return "CRC32 (1)";
+        case 2 => return "rsa-md4 (2)";
+        case 3 => return "rsa-md4-des (3)";
+        case 4 => return "des-mac (4)";
+        case 5 => return "des-mac-k (5)";
+        case 6 => return "rsa-md4-des-k (6)";
+        case 7 => return "rsa-md5 (7)";
+        case 8 => return "rsa-md5-des (8)";
+        case 9 => return "rsa-md5-des3 (9)";
+        case 10 => return "sha1 (unkeyed) (10)";
+        case 12 => return "hmac-sha1-des3-kd (12)";
+        case 13 => return "hmac-sha1-des3 (13)";
+        case 14 => return "sha1 (unkeyed) (14)";
+        case 15 => return "hmac-sha1-96-aes128 (15)";
+        case 16 => return "hmac-sha1-96-aes256 (16)";
+        case 0x8003 => return "[reserved] (0x8003)";
+        default => return "Unknown CheckSum Type (" + (checkSumType as string) + ")";
+    }
+}
+
+pattern ErrorCode = enum Int32
+{
+    KDC_ERR_NONE                                = 0,
+    KDC_ERR_NAME_EXP                            = 1,
+    KDC_ERR_SERVICE_EXP                         = 2,
+    KDC_ERR_BAD_PVNO                            = 3,
+    KDC_ERR_C_OLD_MAST_KVNO                     = 4,
+    KDC_ERR_S_OLD_MAST_KVNO                     = 5,
+    KDC_ERR_C_PRINCIPAL_UNKNOWN                 = 6,
+    KDC_ERR_S_PRINCIPAL_UNKNOWN                 = 7,
+    KDC_ERR_PRINCIPAL_NOT_UNIQUE                = 8,
+    KDC_ERR_NULL_KEY                            = 9,
+    KDC_ERR_CANNOT_POSTDATE                     = 10,
+    KDC_ERR_NEVER_VALID                         = 11,
+    KDC_ERR_POLICY                              = 12,
+    KDC_ERR_BADOPTION                           = 13,
+    KDC_ERR_ETYPE_NOSUPP                        = 14,
+    KDC_ERR_SUMTYPE_NOSUPP                      = 15,
+    KDC_ERR_PADATA_TYPE_NOSUPP                  = 16,
+    KDC_ERR_TRTYPE_NOSUPP                       = 17,
+    KDC_ERR_CLIENT_REVOKED                      = 18,
+    KDC_ERR_SERVICE_REVOKED                     = 19,
+    KDC_ERR_TGT_REVOKED                         = 20,
+    KDC_ERR_CLIENT_NOTYET                       = 21,
+    KDC_ERR_SERVICE_NOTYET                      = 22,
+    KDC_ERR_KEY_EXPIRED                         = 23,
+    KDC_ERR_PREAUTH_FAILED                      = 24,
+    KDC_ERR_PREAUTH_REQUIRED                    = 25,
+    KDC_ERR_SERVER_NOMATCH                      = 26,
+    KDC_ERR_MUST_USE_USER2USER                  = 27,
+    KDC_ERR_PATH_NOT_ACCEPTED                   = 28,
+    KDC_ERR_SVC_UNAVAILABLE                     = 29,
+    KRB_AP_ERR_BAD_INTEGRITY                    = 31,
+    KRB_AP_ERR_TKT_EXPIRED                      = 32,
+    KRB_AP_ERR_TKT_NYV                          = 33,
+    KRB_AP_ERR_REPEAT                           = 34,
+    KRB_AP_ERR_NOT_US                           = 35,
+    KRB_AP_ERR_BADMATCH                         = 36,
+    KRB_AP_ERR_SKEW                             = 37,
+    KRB_AP_ERR_BADADDR                          = 38,
+    KRB_AP_ERR_BADVERSION                       = 39,
+    KRB_AP_ERR_MSG_TYPE                         = 40,
+    KRB_AP_ERR_MODIFIED                         = 41,
+    KRB_AP_ERR_BADORDER                         = 42,
+    KRB_AP_ERR_BADKEYVER                        = 44,
+    KRB_AP_ERR_NOKEY                            = 45,
+    KRB_AP_ERR_MUT_FAIL                         = 46,
+    KRB_AP_ERR_BADDIRECTION                     = 47,
+    KRB_AP_ERR_METHOD                           = 48,
+    KRB_AP_ERR_BADSEQ                           = 49,
+    KRB_AP_ERR_INAPP_CKSUM                      = 50,
+    KRB_AP_PATH_NOT_ACCEPTED                    = 51,
+    KRB_ERR_RESPONSE_TOO_BIG                    = 52,
+    KRB_ERR_GENERIC                             = 60,
+    KRB_ERR_FIELD_TOOLONG                       = 61,
+    KDC_ERROR_CLIENT_NOT_TRUSTED                = 62,
+    KDC_ERROR_KDC_NOT_TRUSTED                   = 63,
+    KDC_ERROR_INVALID_SIG                       = 64,
+    KDC_ERR_KEY_TOO_WEAK                        = 65,
+    KDC_ERR_CERTIFICATE_MISMATCH                = 66,
+    KRB_AP_ERR_NO_TGT                           = 67,
+    KDC_ERR_WRONG_REALM                         = 68,
+    KRB_AP_ERR_USER_TO_USER_REQUIRED            = 69,
+    KDC_ERR_CANT_VERIFY_CERTIFICATE             = 70,
+    KDC_ERR_INVALID_CERTIFICATE                 = 71,
+    KDC_ERR_REVOKED_CERTIFICATE                 = 72,
+    KDC_ERR_REVOCATION_STATUS_UNKNOWN           = 73,
+    KDC_ERR_REVOCATION_STATUS_UNAVAILABLE       = 74,
+    KDC_ERR_CLIENT_NAME_MISMATCH                = 75,
+    KDC_ERR_KDC_NAME_MISMATCH                   = 76,
+    KDC_ERR_INCONSISTENT_KEY_PURPOSE            = 77,
+    KDC_ERR_DIGEST_IN_CERT_NOT_ACCEPTED         = 78,
+    KDC_ERR_PA_CHECKSUM_MUST_BE_INCLUDED        = 79,
+    KDC_ERR_DIGEST_IN_SIGNED_DATA_NOT_ACCEPTED  = 80,
+    KDC_ERR_PUBLIC_KEY_ENCRYPTION_NOT_SUPPORTED = 81,
+    ...
+};
+
+string GetErrorStringByCode(Int32 errorCode)
+{
+    switch (errorCode)
+    {
+        case 0  => return "No error";
+        case 1  => return "Client's entry in database has expired";
+        case 2  => return "Server's entry in database has expired";
+        case 3  => return "Requested protocol version number not supported";
+        case 4  => return "Client's key encrypted in old master key";
+        case 5  => return "Server's key encrypted in old master key";
+        case 6  => return "Client not found in Kerberos database";
+        case 7  => return "Server not found in Kerberos database";
+        case 8  => return "Multiple principal entries in database";
+        case 9  => return "The client or server has a null key";
+        case 10 => return "Ticket not eligible for postdating";
+        case 11 => return "Requested start time is later than end time";
+        case 12 => return "KDC policy rejects request";
+        case 13 => return "KDC cannot accommodate requested option";
+        case 14 => return "KDC has no support for encryption type";
+        case 15 => return "KDC has no support for checksum type";
+        case 16 => return "KDC has no support for padata type";
+        case 17 => return "KDC has no support for transited type";
+        case 18 => return "Clients credentials have been revoked";
+        case 19 => return "Credentials for server have been revoked";
+        case 20 => return "TGT has been revoked";
+        case 21 => return "Client not yet valid - try again later";
+        case 22 => return "Server not yet valid - try again later";
+        case 23 => return "Password has expired - change password to reset";
+        case 24 => return "Pre-authentication information was invalid";
+        case 25 => return "Additional pre-authentication required*";
+        case 31 => return "Integrity check on decrypted field failed";
+        case 32 => return "Ticket expired";
+        case 33 => return "Ticket not yet valid";
+        case 34 => return "Request is a replay";
+        case 35 => return "The ticket isn't for us";
+        case 36 => return "Ticket and authenticator don't match";
+        case 37 => return "Clock skew too great";
+        case 38 => return "Incorrect net address";
+        case 39 => return "Protocol version mismatch";
+        case 40 => return "Invalid msg type";
+        case 41 => return "Message stream modified";
+        case 42 => return "Message out of order";
+        case 44 => return "Specified version of key is not available";
+        case 45 => return "Service key not available";
+        case 46 => return "Mutual authentication failed";
+        case 47 => return "Incorrect message direction";
+        case 48 => return "Alternative authentication method required*";
+        case 49 => return "Incorrect sequence number in message";
+        case 50 => return "Inappropriate type of checksum in message";
+        case 60 => return "Generic error (description in e-text)";
+        case 61 => return "Field is too long for this implementation";
+        // Following are defined in RFC 4120
+        case 51 => return "Policy rejects transited path";
+        case 52 => return "Response too big for UDP; retry with TCP";
+        case 62 => return "KDC Err Client Not Trusted";                     // defined in RFC 4556
+        case 63 => return "Reserved for PKINIT";
+        case 64 => return "KDC Err Invalid Sig";                            // defined in RFC 4556
+        case 65 => return "KDC Err Dh Key Parameters Not Accepted";         // defined in RFC 4556
+        case 66 => return "Reserved for PKINIT";
+        case 67 => return "No TGT available to validate USER-TO-USER";
+        case 68 => return "Reserved for future use";
+        case 69 => return "Ticket must be for USER-TO-USER";
+        case 70 => return "KDC Err Cant Verify Certificate";                // defined in RFC 4556
+        case 71 => return "KDC Err Invalid Certificate";                    // defined in RFC 4556
+        case 72 => return "KDC Err Revoked Certificate";                    // defined in RFC 4556
+        case 73 => return "KDC Err Revocation Status Unknown";              // defined in RFC 4556
+        case 74 => return "Reserved for PKINIT";
+        case 75 => return "KDC Err Client Name Mismatch";                   // defined in RFC 4556
+        case 76 => return "Reserved for PKINIT";
+        case 77 => return "KDC Err Inconsistent Key Purpose";               // defined in RFC 4556
+        case 78 => return "KDC Err Digest In Cert Not Accepted";            // defined in RFC 4556
+        case 79 => return "KDC Err Pa Checksum Must Be Included";           // defined in RFC 4556
+        case 80 => return "KDC Err Digest In Signed Data Not Accepted";     // defined in RFC 4556
+        case 81 => return "KDC Err Public Key Encryption Not Supported";    // defined in RFC 4556
+        default => return ("Unknown Error Code (" + (errorCode as string) + ")");
+    }
+}
+
+type OctetStringOrOtherTypes<T> // Add this type to decode types from OctetString type.
+{
+    T ResultType;
+}
+
+/************************** Types following are defined in RFC 4556 unless it has special comments. **************************/
+type PaPkAsReq // 16
+{
+    OctetString SignedAuthPack with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+    optional array <ExternalPrincipalIdentifier> TrustedCertifiers with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional OctetString KdcPkId with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Implicit};
+} with Asn1Encoding{IsExtensible = true};
+
+pattern DHNonce = OctetString;
+
+type ExternalPrincipalIdentifier
+{
+    optional OctetString SubjectName with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+    optional OctetString IssuerAndSerialNumber with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+    optional OctetString SubjectKeyIdentifier with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Implicit};
+} with Asn1Encoding{IsExtensible = true};
+
+type AuthPack
+{
+    PKAuthenticator PKAuthenticator with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional SubjectPublicKeyInfo ClientPublicValue with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional array<AlgorithmIdentifier> SupportedCMSTypes with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional DHNonce ClientDHNonce with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{IsExtensible = true};
+
+type PKAuthenticator
+{
+    Int32 Cusec with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit, LowerEndValue = 0, UpperEndValue = 999999};
+    KerberosTime Ctime with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    UInt32 Nonce with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional OctetString PaChecksum with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{IsExtensible = true};
+
+pattern TDTrustedCertifiers = array<ExternalPrincipalIdentifier>;
+
+pattern TDInvalidCertificates = array<ExternalPrincipalIdentifier>;
+
+type Krb5PrincipalName
+{
+    Realm Realm with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    PrincipalName PrincipalName with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+pattern ADInitialVerifiedCas = array <ExternalPrincipalIdentifier>;
+
+// PaPkAsRep is a Choice type, See RFC 4556 to get more details.
+pattern PaPkAsRep = PaPkAsRepPattern with Asn1Encoding{IsExtensible = true};
+pattern PaPkAsRepPattern = DhInfo | EncKeyPack;                                                     // Add this type for definition of PaPkAsRep.
+pattern DhInfo = DHRepInfo with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};        // Add this type for definition of PaPkAsRep.
+pattern EncKeyPack = OctetString with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Implicit};  // Add this type for definition of PaPkAsRep.
+
+type DHRepInfo
+{
+    OctetString DHSignedData with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+    optional DHNonce ServerDHNonce with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{IsExtensible = true};
+
+type KdcDHKeyInfo
+{
+    BitString SubjectPublicKey with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    UInt32 Nonce with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional KerberosTime DHKeyExpiration with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{IsExtensible = true};
+
+type ReplyKeyPack
+{
+    EncryptionKey ReplyKey with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    Checksum ASChecksum with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+} with Asn1Encoding{IsExtensible = true};
+
+pattern TDDHParameters = array <AlgorithmIdentifier>;
+
+//************************MS-SFU***************************/
+//http://msdn.microsoft.com/en-us/library/cc246071(v=PROT.13).aspx
+type PAForUserEn
+{
+    PrincipalName UserName with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    Realm UserRealm with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    Checksum Cksum with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    KerberosString AuthPackage with Asn1Encoding{ TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+}
+
+type PAS4UX509User
+{
+    S4UUserID UserID with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    Checksum Checksum with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+}
+
+type S4UUserID 
+{
+    Integer Nonce with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional PrincipalName CName with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    Realm CRealm with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional X509CertificateOrType SubjectCertificate with Asn1Encoding{TagNumber = 3, Tagging = Asn1Tagging.Explicit};
+    optional S4UUserID_Options Options with Asn1Encoding{TagNumber = 4, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+} with Asn1Encoding{IsExtensible = true};
+
+pattern S4UUserID_Options = flags uint
+{
+    check_logon_hour_restrictions        = 0x40000000,
+    KERB_S4U_OPTIONS_use_reply_key_usage = 0x20000000,
+    ...
+};
+
+type X509CertificateOrType
+{
+    optional Certificate Certificate;
+}
+
+//************************MS-KILE***************************/
+
+type KerbPaPacRequest
+{
+    Boolean IncludePac with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+}
+
+// (Padata 165) [MS-KILE] 2.2.6   Supported Encryption Types Bit Flags
+// It contains a 32-bit unsigned integer in little-endian format that contains a combination of the following flags.
+pattern SupportedEncryptionTypesBitFlags = flags uint
+{
+    DES_CBC_CRC                       = 0x00000001,
+    DES_CBC_MD5                       = 0x00000002,
+    RC4_HMAC                          = 0x00000004,
+    AES128_CTS_HMAC_SHA1_96           = 0x00000008,
+    AES256_CTS_HMAC_SHA1_96           = 0x00000010,
+    FAST_supported                    = 0x00010000,
+    Compound_identity_supported       = 0x00020000,
+    Claims_supported                  = 0x00040000,
+    Resource_SID_compression_disabled = 0x00080000,
+    ...
+};
+
+type PaPacOptions
+{
+    PaPacOptions_Flags PaPacOptions;
+    override string ToString()
+    {
+        return EnumToString<PaPacOptions_Flags>(PaPacOptions);
+    }
+} with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+
+pattern PaPacOptions_Flags = flags uint
+{
+    Claims                                   = 0x80000000,
+    $"Branch Aware"                          = 0x40000000,
+    $"Forward to Full DC"                    = 0x20000000,
+    $"resource-based constrained delegation" = 0x10000000, // [MS-SFU]
+    ...
+} with Encoding{Decoder = PatternDecoder<PaPacOptions_Flags>, SourceConverter = ConvertArrayBoolToUint, SourcePattern = TypeOf<KerberosFlags>()};
+
+//************************RFC 6113***************************/
+
+// PaData 136 Fx-Fast-Request
+
+pattern ArmoredDataReq = KrbFastArmoredReq with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+
+pattern PaFxFastRequest = ArmoredDataReq;
+
+type KrbFastArmoredReq
+{
+    optional KrbFastArmor Armor with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    Checksum ReqChecksum with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    EncryptedData EncFastReq with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit};
+    optional binary ExtensionData with Encoding{Ignore = true};
+}
+
+type KrbFastArmor
+{
+    Int32 ArmorType with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit},
+                        DisplayInfo{ToText = ArmorTypeToText};
+    OctetString ArmorValue with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit};
+    optional binary ExtensionData with Encoding{Ignore = true};
+}
+
+string ArmorTypeToText(any armorTypedata)
+{
+    Int32 armorType = armorTypedata as Int32;
+    switch (armorType)
+    {
+        case 1 => return "FX_FAST_ARMOR_AP_REQUEST (1)";
+        default => return "Unknown ArmorType (" + (armorType as string) + ")";
+    }
+}
+
+// PaData 136 Fx-Fast-Response
+
+pattern ArmoredDataRep = KrbFastArmoredRep with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+
+pattern PaFxFastReply = ArmoredDataRep;
+
+type KrbFastArmoredRep
+{
+    EncryptedData EncFastRep with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional binary ExtensionData with Encoding{Ignore = true};
+}
+
+optional uint ConvertArrayBoolToUint(array<bool> input)
+{
+    int bitToConvert = 32;
+    uint result = 0;
+    for (int i = 0; i < bitToConvert; i++)
+    {
+        result += (((input[i] as int) as uint) << (bitToConvert - i - 1));
+    }
+    return result;
+}
+
+contract VirtualOperations
+{
+    issues virtual operation KrbAs
+    {
+        in PrincipalName Cname = reqBody.Cname as PrincipalName;
+        in Realm Realm = reqBody.Realm;
+        in PrincipalName Sname = reqBody.Sname as PrincipalName;
+
+        override string ToString()
+        {
+            return "KRB_AS, Cname: " + Cname.ToString() + ", Realm: " + Realm.ToString() + ", Sname: " + Sname.ToString();
+        }
+    }
+    = 
+    accepts KrbMessage{Message is KdcReq{MsgType == 10, ReqBody is var reqBody}}
+    issues  KrbMessage{Message is KdcRep{MsgType == 11}};
+
+    issues virtual operation KrbAsError
+    {
+        in PrincipalName Cname = reqBody.Cname as PrincipalName;
+        in Realm Realm = reqBody.Realm;
+        in PrincipalName Sname = reqBody.Sname as PrincipalName;
+        out ErrorCode ErrorCode = errorCode;
+
+        override string ToString()
+        {
+            return "KRB_AS_ERROR, " + EnumToString<ErrorCode>(ErrorCode) + ": " + GetErrorStringByCode(ErrorCode) +
+                ", Cname: " + Cname.ToString() + ", Realm: " + Realm.ToString() + ", Sname: " + Sname.ToString();
+        }
+    }
+    = 
+    accepts KrbMessage{Message is KdcReq{MsgType == 10, ReqBody is var reqBody}}
+    issues  KrbMessage{Message is KrbError{ErrorCode is var errorCode}};
+
+    issues virtual operation KrbTgs
+    {
+        out PrincipalName Cname = cname;
+        in Realm Realm = reqBody.Realm;
+        in PrincipalName Sname = reqBody.Sname as PrincipalName;
+
+        override string ToString()
+        {
+            return "KRB_TGS, Cname: " + Cname.ToString() + ", Realm: " + Realm.ToString() + ", Sname: " + Sname.ToString();
+        }
+    }
+    = 
+    accepts KrbMessage{Message is KdcReq{MsgType == 12, ReqBody is var reqBody}}
+    issues  KrbMessage{Message is KdcRep{MsgType == 13, Cname is var cname}};
+
+    issues virtual operation KrbTgsError
+    {
+        out optional PrincipalName Cname = cname;
+        in Realm Realm = reqBody.Realm;
+        in PrincipalName Sname = reqBody.Sname as PrincipalName;
+        out ErrorCode ErrorCode = errorCode;
+
+        override string ToString()
+        {
+            return "KRB_TGS_ERROR, " + EnumToString<ErrorCode>(ErrorCode) + ": " + GetErrorStringByCode(ErrorCode) +
+                ", Cname: " + Cname.ToString() + ", Realm: " + Realm.ToString() + ", Sname: " + Sname.ToString();
+        }
+    }
+    = 
+    accepts KrbMessage{Message is KdcReq{MsgType == 12, ReqBody is var reqBody}}
+    issues  KrbMessage{Message is KrbError{Cname is var cname, ErrorCode is var errorCode}};
+}
+
+type KerbErrorData
+{
+    KerbErrorData_DataType Datatype with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit, Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+    optional (KERB_EXT_ERROR | binary) DataValue with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit},
+        Encoding{Decoder = DataValueDecoder, SourcePattern = TypeOf<OctetString>()};
+
+    optional (KERB_EXT_ERROR | binary) DataValueDecoder(any input)
+    {
+        if (input is bin:binary &&
+            bin != null)
+        {
+            switch (Datatype)
+            {
+                case KerbErrorData_DataType.KERB_ERR_TYPE_EXTENDED =>
+                    return BinaryDecoder<KERB_EXT_ERROR>(bin);
+                default =>
+                    return bin;
+            }
+        }
+        
+        return $[];
+    }
+}
+
+pattern KerbErrorData_DataType = enum Integer
+{
+    KERB_AP_ERR_TYPE_SKEW_RECOVERY = 2,
+    KERB_ERR_TYPE_EXTENDED         = 3,
+    ...
+};
+
+type KERB_EXT_ERROR
+{
+    NTSTATUS status;
+    uint reserved where ValidationCheckValue(value == 0, null, false, ReferenceType.Type, "KerberosV5", "reserved", "KERB_EXT_ERROR", 0, value);
+    uint $"flags" where ValidationCheckValue(value == 0x00000001, null, false, ReferenceType.Type, "KerberosV5", "flags", "KERB_EXT_ERROR", 0x00000001, value);
+}

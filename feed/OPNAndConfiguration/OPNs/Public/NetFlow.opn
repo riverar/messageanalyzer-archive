@@ -1,0 +1,2215 @@
+protocol NetFlow with
+    BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    DocumentName = "NetFlow",
+    ProtocolName = "Cisco Systems NetFlow Services Export",
+    ProtocolType = "block",
+    ShortName    = "NetFlow",
+    Description  = ""
+},
+OPNAuthoring
+{
+    Copyright  = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "NetFlow Export Datagram Format", Link = "http://www.cisco.com/c/en/us/td/docs/net_mgmt/netflow_collection_engine/3-6/user/guide/format.html"},
+            new Reference{Name = "RFC 3954"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382123", Date = "10/14/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+using TCP;
+using Diagnostics;
+using InfrastructureResources;
+using IGMP;
+using Configurations;
+using PublicResources;
+
+endpoint Collector[uint SourceID]
+    over UDP.Host
+    // Support parsing NetFlow v5 and v9
+    accepts PacketV5 accepts PacketV9;
+
+const set<ushort> NetFlowPortPorts = {2055, 9555 , 9995, 9025, 9026};
+const set<binary> NetFlowVersions = {$[0005], $[0009]};
+
+autostart actor NetFlowOverUDP(UDP.Host host)
+{
+    // Store template for V9.
+    // Declare as reference type so that Value Parameter could update back if it changes inside.
+    V9TemplateContainer v9TemplateContainer = new V9TemplateContainer();
+    // Helper to decode data message which are captured before observe corresponding templates.
+    DataMsgDecoderHelper decoderHelper = new DataMsgDecoderHelper();
+    // Port configuration 
+    NetFlowAndIPFIXConfiguration config = GetConfigurableValue<NetFlowAndIPFIXConfiguration>();
+
+    process host accepts d:UDP.Datagram where (d.DestinationPort in NetFlowPortPorts || d.DestinationPort in config.Ports) && 
+        d.Payload.Count > 2 && d.Payload.Segment(0, 2) is version:binary && version in NetFlowVersions // version 5 and 9
+    {
+        switch (version)
+        {
+            case $[0005] =>
+                switch (d.Payload)
+                {
+                    case msg:PacketV5 from BinaryDecoder<PacketV5> =>
+                        dispatch endpoint Collector[0] over host accepts msg;
+                    default =>
+                        ThrowDecodingException("NetFlow", "PacketV5");
+                }
+            case $[0009] =>
+                NetFlowV9DecodeAndDispatch(d, d.Payload, v9TemplateContainer, decoderHelper, host);
+            default =>;
+                // do nothing
+        }
+    }
+    ~endpoint(UDP.Host host)
+    {
+        if (decoderHelper != null)
+        {
+            decoderHelper.ClearInDestructor();
+            decoderHelper = null;
+        }
+        v9TemplateContainer = null;
+    }
+}
+
+////////////////////////////
+// NetFlow v5
+// http://www.cisco.com/c/en/us/td/docs/net_mgmt/netflow_collection_engine/3-6/user/guide/format.html
+// Table B-3 Version 5 Header Format
+message PacketV5
+{
+    ushort version;
+    ushort count where ValidationCheckValueInRange(value >= 1 && value <= 30, this, true, ReferenceType.Message, "NetFlow", "Count", "PacketV5", 1, 30, value);
+    uint SysUptime with DisplayInfo{ToText = (any obj) => (((obj as uint) as float) / 1000).ToString() + " second"};
+    TimeStamp8 unix_secs;
+    uint flow_sequence;
+    byte engine_type;
+    byte engine_id;
+    SamplingInfo sampling_interval;
+    array<FlowRecord> FlowRecords with BinaryEncoding{MaxLength = count};
+    
+    override string ToString()
+    {
+        return "Version: " + version.ToString() + ", Flow Count: " + count.ToString();
+    }
+}
+
+type SamplingInfo
+{
+    byte SamplingMode with BinaryEncoding{Width = 2};
+    ushort SamplingInterval with BinaryEncoding{Width = 14};
+
+    override string ToString()
+    {
+        return "SamplingMode: " + SamplingMode.ToString() + 
+            "SamplingInterval: " + SamplingInterval.ToString();
+    }
+}
+
+// Table B-4 Version 5 Flow Record Format 
+type FlowRecord 
+{
+    IPv4Address srcaddr;
+    IPv4Address dstaddr;
+    IPv4Address nexthop;
+    ushort input;
+    ushort output;
+    uint dPkts;
+    uint dOctets;
+    uint First;
+    uint Last;
+    IANA.Port srcport;
+    IANA.Port dstport;
+    binary pad1 with BinaryEncoding{Length = 1};
+    TCP.Flags tcp_flags;
+    byte prot;
+    byte tos;
+    ushort src_as;
+    ushort dst_as;
+    byte src_mask;
+    byte dst_mask;
+    binary pad2 with BinaryEncoding{Length = 2};
+}
+
+////////////////////////////
+// NetFlow v9
+// RFC 3954
+
+/*
+     +--------+-------------------------------------------+
+     |        | +----------+ +---------+ +----------+     |
+     | Packet | | Template | | Data    | | Options  |     |
+     | Header | | FlowSet  | | FlowSet | | Template | ... |
+     |        | |          | |         | | FlowSet  |     |
+     |        | +----------+ +---------+ +----------+     |
+     +--------+-------------------------------------------+
+*/
+message PacketV9
+{
+    ushort Version;
+    ushort Count;
+    uint sysUpTime with DisplayInfo{ToText = (any obj) => (((obj as uint) as float) / 1000).ToString() + " second"};
+    TimeStamp4 UNIXSecs;
+    uint SequenceNumber;
+    uint SourceID;
+
+    array<TemplateFlowSet |  // FlowSet ID = 0   
+        OptionsTemplateFlowSet |  // FlowSet ID = 1
+        DataFlowSet> FlowSets with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        string summary = "Version: " + Version.ToString() + ", SourceID: " + SourceID.ToString();
+        foreach (var flow in FlowSets)
+        {
+            if (flow is t:TemplateFlowSet)
+            {
+                summary += ", [Data Template: " + t.GetAllTemplateId() + "]";
+            }
+            else if (flow is ot:OptionsTemplateFlowSet)
+            {
+                summary += ", [Option Template: " + ot.GetAllTemplateId() + "]";
+            }
+            else if (flow is data:DataFlowSet)
+            {
+                summary += ", [Data: " + data.FlowSetID.ToString() + "]";
+            }
+        }
+        return summary;
+    }
+}
+
+// 5.2.  Template FlowSet Format
+type TemplateFlowSet
+{
+    ushort FlowSetID;
+    ushort Length;
+    optional [|Length > 4|] array<TemplateFlowSetRecord> Templates 
+        with BinaryEncoding{WidthForComposedType = ((Length - 4) * 8) as int}
+        with DisplayInfo{ToText = (any obj) => "Template Id: " + GetAllTemplateId()};
+
+    override string ToString()
+    {
+        string summary = "Data Template";
+        if (GetAllTemplateId() is ids:string && ids.Count > 0)
+        {
+            summary += ": [" + ids.ToString() + "]";
+        }
+        return summary;
+    }
+
+    string GetAllTemplateId()
+    {
+        string ret = "";
+        if (Templates is ts:array<TemplateFlowSetRecord> && ts != null && ts.Count > 0)
+        {
+            foreach (TemplateFlowSetRecord r in ts)
+            {
+                ret += ", " + r.TemplateID.ToString();
+            }
+            ret = ret.Segment(2);
+        }
+        return ret;
+    }
+}
+
+type TemplateFlowSetRecord
+{
+    ushort TemplateID;
+    ushort Count;
+    array<TemplateFieldInfo> FieldsInfo with BinaryEncoding{Length = Count as uint};
+
+    override string ToString()
+    {
+        return "TemplateID: " + TemplateID.ToString() + ", Count: " + Count.ToString();
+    }
+}
+
+type TemplateFieldInfo
+{
+    FieldTypeEnum Type;
+    ushort Length;
+
+    override string ToString()
+    {
+        return "Type: " + EnumToString<FieldTypeEnum>(Type, true) + ", Length : " + Length.ToString();
+    }
+}
+
+// 6.1.  Options Template FlowSet Format
+type OptionsTemplateFlowSet
+{
+    ushort FlowSetID;
+    ushort Length;
+    optional [|Length > 4|] array<OptionTemplateFlowSetRecord> Templates 
+        with BinaryEncoding{WidthForComposedType = ((Length - 4) * 8) as int}
+        with DisplayInfo{ToText = (any obj) => "Template Id: " + GetAllTemplateId()};
+
+    override string ToString()
+    {
+        string summary = "Option Template";
+        if (GetAllTemplateId() is ids:string && ids.Count > 0)
+        {
+            summary += ": [" + ids.ToString() + "]";
+        }
+        return summary;
+    }
+
+    string GetAllTemplateId()
+    {
+        string ret = "";
+        if (Templates is ts:array<OptionTemplateFlowSetRecord> && ts != null && ts.Count > 0)
+        {
+            foreach (OptionTemplateFlowSetRecord r in ts)
+            {
+                ret += ", " + r.TemplateID.ToString();
+            }
+            ret = ret.Segment(2);
+        }
+        return ret;
+    }
+}
+
+type OptionTemplateFlowSetRecord
+{
+    ushort TemplateID;
+    ushort OptionScopeLength;
+    ushort OptionLength;
+    array<OptionScopeFieldInfo> OptionScopeFields with BinaryEncoding{WidthForComposedType = (OptionScopeLength * 8) as int};
+    array<OptionFieldInfo> OptionFields with BinaryEncoding{WidthForComposedType = (OptionLength * 8) as int};
+
+    override string ToString()
+    {
+        return "Option Template, ID: " + TemplateID.ToString() + 
+            ", Scope Count: " + OptionScopeFields.Count.ToString() + 
+            ", Data Count: " + OptionFields.Count.ToString();
+    }
+}
+
+type OptionScopeFieldInfo
+{
+    ScopeFieldTypeEnum Type 
+        where ValidationCheckEnumValueTooManyItems(InRange<ScopeFieldTypeEnum>(value), null, true, ReferenceType.Type, "NetFlow", "FieldType", "PacketV9", "OptionScopeField", "RFC 3954");
+    ushort Length;
+
+    override string ToString()
+    {
+        return "Type: " + EnumToString<ScopeFieldTypeEnum>(Type, true) + ", Length: " + Length.ToString();
+    }
+}
+
+type OptionFieldInfo
+{
+    FieldTypeEnum Type;
+    ushort Length;
+
+    override string ToString()
+    {
+        return "Type: " + EnumToString<FieldTypeEnum>(Type, true) + ", Length: " + Length.ToString();
+    }
+}
+
+type ScopeFieldData[ushort Type, ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "ScopeField, Type: " + EnumToStringInSummary<ScopeFieldTypeEnum>(Type) + 
+            ", Data: " + BinaryToDecString(data);
+    }
+}
+
+pattern ScopeFieldTypeEnum = enum ushort
+{
+    System          = 1,
+    Interface       = 2,
+    LineCard        = 3,
+    NetFlowCache    = 4,
+    Template        = 5,
+    ...
+};
+
+/* 5.3.  Data FlowSet Format
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   FlowSet ID = Template ID    |          Length               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 1 - Field Value 1    |   Record 1 - Field Value 2    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 1 - Field Value 3    |             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 2 - Field Value 1    |   Record 2 - Field Value 2    |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 2 - Field Value 3    |             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 3 - Field Value 1    |             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |              ...              |            Padding            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+ * 6.2.  Options Data Record Format
+    0                   1                   2                   3
+    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |    FlowSet ID = Template ID   |          Length               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 1 - Scope 1 Value    |Record 1 - Option Field 1 Value|
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |Record 1 - Option Field 2 Value|             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 2 - Scope 1 Value    |Record 2 - Option Field 1 Value|
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |Record 2 - Option Field 2 Value|             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |   Record 3 - Scope 1 Value    |Record 3 - Option Field 1 Value|
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |Record 3 - Option Field 2 Value|             ...               |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |              ...              |            Padding            |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+*/
+type DataFlowSet[TemplateElement Template]
+{
+    ushort FlowSetID where ValidationCheckGreaterThan(value > 255, null, true, ReferenceType.Type, "NetFlow", "FlowSetID", "DataFlowSet", 255, value);
+    ushort Length; // The length of this FlowSet
+    (array<array<any> | OptionDataFlowRecord> | binary) Records
+        with Encoding{Decoder = DataFieldDecoder, SourcePattern = TypeOf<binary>()}
+        with BinaryEncoding{Length = Length - 4};
+
+    optional (array<array<any> | OptionDataFlowRecord> | binary) DataFieldDecoder(binary bin)
+    {
+        if (Template == null)
+        {
+            return bin;
+        }
+        return DecodeDataSetRecords(bin, Template);
+    }
+
+    override string ToString()
+    {
+        return "Data, FlowSetID: " + FlowSetID.ToString();
+    }
+}
+
+///////////////////////////////////////////////////
+// Decoding Utilities
+
+void NetFlowV9DecodeAndDispatch(any message origin, stream s, V9TemplateContainer v9TemplateContainer, DataMsgDecoderHelper decoderHelper, UDP.Host host)
+{
+    var m = BinaryDecoder<PacketV9>(s);
+    if (m == nothing) 
+        ThrowDecodingException("NetFlow", "PacketV9");
+    PacketV9 msg = m as PacketV9;
+    int prePos = s.BytePosition;
+    // start decoding FlowSets
+    array<TemplateFlowSet | OptionsTemplateFlowSet |DataFlowSet> decodedResult = [];
+    bool stopping = false;
+    set<ushort> misingTemplateId = {};
+    while (s.RemainingByteLength > 2 && !stopping)
+    {
+        ushort flowsetID = s.PeekUShort(s.BitPosition, Endian.Big);
+        switch (flowsetID)
+        {
+            case 0 => // TemplateFlowSet
+                switch (s)
+                {
+                    case templateFlowSet:TemplateFlowSet from BinaryDecoder<TemplateFlowSet> =>
+                        decodedResult += [templateFlowSet];
+                        // insert to template container.
+                        if (templateFlowSet.Templates is records:array<TemplateFlowSetRecord> && records != null && records.Count > 0)
+                        {
+                            foreach (var r in records)
+                            {
+                                if (r.Count > 0)
+                                {
+                                    // Save template
+                                    TemplateElement ele1 = new TemplateElement{Kind = TemplateKind.TemplateFlowSet, Content = r.FieldsInfo};
+                                    long id = ((msg.SourceID as long) << 16) + r.TemplateID;
+                                    v9TemplateContainer.Templates[id] = ele1;
+
+                                    // Try to decode cached Data message which is lacking of Template
+                                    decoderHelper.TryDecodeAndDispatchWhenObserveNewTemplate(r.TemplateID, v9TemplateContainer, endpoint Collector[msg.SourceID] over host);
+                                }
+                            }
+                        }
+                    default => 
+                        break;
+                }
+            case 1 => // OptionsTemplateFlowSet
+                switch (s)
+                {
+                    case optionsTemplateFlowSet:OptionsTemplateFlowSet from BinaryDecoder<OptionsTemplateFlowSet> =>
+                        decodedResult += [optionsTemplateFlowSet];
+                        // insert to template container.
+                        if (optionsTemplateFlowSet.Templates is records2:array<OptionTemplateFlowSetRecord> && records2 != null && records2.Count > 0)
+                        {
+                            foreach (var rec in records2)
+                            {
+                                // Save template
+                                OptionTemplateElement optionEle = new OptionTemplateElement
+                                {
+                                    OptionScopeFields = rec.OptionScopeFields, 
+                                    OptionFields = rec.OptionFields
+                                };
+                                TemplateElement ele2 = new TemplateElement{Kind = TemplateKind.OptionsTemplateFlowSet, Content = optionEle};
+                                long id = ((msg.SourceID as long) << 16) + rec.TemplateID;
+                                v9TemplateContainer.Templates[id] = ele2;
+
+                                // Try to decode cached Data message which is lacking of Template
+                                decoderHelper.TryDecodeAndDispatchWhenObserveNewTemplate(rec.TemplateID, v9TemplateContainer, endpoint Collector[msg.SourceID] over host);
+                            }
+                        }
+                    default => 
+                        break;
+                }
+            case ushort where value >= 256 => // Data flow
+                // retrieve template
+                long id = ((msg.SourceID as long) << 16) + flowsetID;
+                TemplateElement template = null;
+                if (v9TemplateContainer.Templates.Keys[id]) // template exists.
+                {
+                    template = v9TemplateContainer.Templates[id];
+                }
+                else
+                {
+                    // ValidationCheck(false, null, Format(UTILITY_STR_EXCEPTION_MESSAGE_WITH_REASON, "IPFIX", "DataRecord", "associated template(id: " + setID.ToString() + ") is missing"));
+                    template = null;
+                    misingTemplateId[flowsetID] = true;
+                }
+                // decoding
+                if (BinaryDecoder<DataFlowSet[template]>(s) is dataSet:DataFlowSet)
+                {
+                    decodedResult += [dataSet];
+                }
+                else
+                {
+                    stopping = true;
+                    break;
+                }
+            default =>
+                ValidationCheck(false, null, Format(PublicResources.NetFlow_UnexpectedFlowSetID, flowsetID));
+                stopping = true;
+                break;
+        }
+    }
+    msg.FlowSets = decodedResult;
+    msg.AssignFieldEncodingInfo("FlowSets", prePos, s.BitPosition);
+    msg.Origins = [origin];
+    
+    if (misingTemplateId.Count > 0)
+    {
+        // this is Data message and lack of template, cache it.
+        decoderHelper.AddNewDataMessage(msg, ref misingTemplateId);
+    }
+    else
+    {
+        dispatch endpoint Collector[msg.SourceID] over host accepts msg;
+    }
+}
+
+// Templates are transmitted in an interval on the wire. 
+// NetFlow v9 data messages prior to first Template transmission cannot decode successfully until the templates transmit later.
+// Below helper cache data messages are maintain the dependencies to Template.
+type DataMsgDecoderHelper
+{
+    // Key - Sequence number, Value: PacketV9 message
+    // Store PacketV9 messages containing data set whose templates has not captured yet.
+    map<uint, PacketV9> Msgs = {};
+    // Key -- Sequence number.
+    // Value -- Template IDs which are absent for decoding IPFIX message which is identified by Sequence Number.
+    map<uint, set<ushort>> SequenceNumToTemplates = {};
+    // Key -- Template ID
+    // Value -- a set of Sequence Number for IPFIX message which depends to the Template.
+    map<ushort, set<uint>> TemplateIDToSequenceNumbers = {};
+
+    void TryDecodeAndDispatchWhenObserveNewTemplate(ushort templateId, V9TemplateContainer v9TemplateContainer, Collector node)
+    {
+        if (templateId in TemplateIDToSequenceNumbers.Keys)
+        {
+            set<uint> seqs = TemplateIDToSequenceNumbers[templateId];
+            // remove key from TemplateIDToSequenceNumbers map
+            TemplateIDToSequenceNumbers = TemplateIDToSequenceNumbers.Remove(templateId);
+
+            foreach (uint seq in seqs)
+            {
+                if (seq in SequenceNumToTemplates.Keys)
+                {
+                    SequenceNumToTemplates[seq][templateId] = false;
+                    // All dependent templates has been captured. so it's time to decode data message.
+                    if (SequenceNumToTemplates[seq].Count == 0)
+                    {
+                        // Remove key from SequenceNumToTemplates map
+                        SequenceNumToTemplates = SequenceNumToTemplates.Remove(seq);
+                        // Decoding data message based on template.
+                        if (seq in Msgs.Keys)
+                        {
+                            PacketV9 msg = Msgs[seq];
+                            Msgs = Msgs.Remove(seq);
+                            DecodeDataSet(ref msg, v9TemplateContainer);
+                            dispatch node accepts msg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add new Data message which is lacking of templates.
+    void AddNewDataMessage(PacketV9 msg, ref set<ushort> templateIds)
+    {
+        uint seq = msg.SequenceNumber;
+        Msgs[seq] = msg;
+        SequenceNumToTemplates[seq] = templateIds;
+
+        foreach (ushort templateId in templateIds)
+        {
+            if (!(templateId in TemplateIDToSequenceNumbers.Keys))
+            {
+                TemplateIDToSequenceNumbers[templateId] = {};
+            }
+            TemplateIDToSequenceNumbers[templateId][seq] = true;
+        }
+    }
+
+    internal void DecodeDataSet(ref PacketV9 msg, V9TemplateContainer v9TemplateContainer)
+    {
+        foreach (var s in msg.FlowSets)
+        {
+            if (s is dataSet:DataFlowSet && dataSet.Records is bin:binary)
+            {
+                long id = ((msg.SourceID as long) << 16) + dataSet.FlowSetID;
+                if (id in v9TemplateContainer.Templates.Keys)
+                {
+                    // decode Data Set Records
+                    dataSet.Records = DecodeDataSetRecords(bin, v9TemplateContainer.Templates[id]);
+                }
+            }
+        }
+    }
+
+    void ClearInDestructor()
+    {
+        SequenceNumToTemplates = null;
+        TemplateIDToSequenceNumbers = null;
+        foreach (PacketV9 m in Msgs.Values)
+        {
+            ValidationCheck(false, m, Format(UTILITY_STR_EXCEPTION_MESSAGE_WITH_REASON, "NetFlow", "DataRecord", "associated templates is missing"));
+            DisplayTopLevelMessage(m);
+        }
+    }
+}
+
+///////////////////////////////
+// Template management
+type V9TemplateContainer
+{
+    // Key: Source ID + Template ID 
+    // Value: Template or Option Template
+    map<long, TemplateElement> Templates = {};
+}
+
+pattern TemplateKind = enum byte
+{
+    TemplateFlowSet, 
+    OptionsTemplateFlowSet,
+    ...
+};
+
+type TemplateElement
+{
+    TemplateKind Kind;
+    (array<TemplateFieldInfo> | OptionTemplateElement) Content;
+}
+
+type OptionTemplateElement
+{
+    array<OptionScopeFieldInfo> OptionScopeFields;
+    array<OptionFieldInfo> OptionFields;
+}
+
+// Decode DataSet Records based on input template
+(array<array<any> | OptionDataFlowRecord> | binary) DecodeDataSetRecords(binary bin, TemplateElement template)
+{
+    stream s = bin;
+    array<array<any> | OptionDataFlowRecord> decodedResult = [];
+    if (template.Kind == TemplateKind.TemplateFlowSet)
+    {
+        array<TemplateFieldInfo> dataFlowTemp = template.Content as array<TemplateFieldInfo>;
+        while (s.RemainingByteLength > 0)
+        {
+            if (DecodeSingleDataFlowRecordBasedTemplate(s, dataFlowTemp) is ret:array<any>)
+            {
+                decodedResult += [ret];
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+    else if (template.Kind == TemplateKind.OptionsTemplateFlowSet)
+    {
+        OptionTemplateElement optionTemp = template.Content as OptionTemplateElement;
+        while (s.RemainingByteLength > 0)
+        {
+            if (DecodeSingleOptionDataFlowRecordBasedTemplate(s, optionTemp) is ret:OptionDataFlowRecord)
+            {
+                decodedResult += [ret];
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        ValidationCheck(false, null, Format(UTILITY_STR_EXCEPTION_MESSAGE_WITH_REASON, "NetFlow", "DataFlowSet", "associated template mismatches"));
+        return bin;
+    }
+    return decodedResult;
+}
+
+////////////////////////////
+// types
+type TimeStamp4
+{
+    uint UNIXSecs;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddSeconds(UNIXSecs as double).ToString() + "  UTC";
+    }
+}
+
+type TimeStamp8
+{
+    uint UNIXSecs; // Current count of seconds since 0000 UTC 1970
+    uint UNIXNSecs; // Residual nanoseconds since 0000 UTC 1970
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddSeconds(UNIXSecs as double).ToString() + "." + UNIXNSecs.ToString() + "  UTC";
+    }
+}
+
+// https://tools.ietf.org/html/rfc3954#section-8, Field Type Definitions
+// type: 1
+type IN_BYTES[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "IN_BYTES: " + BinaryToDecString(data);
+    }
+}
+
+// type: 2
+type IN_PKTS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "IN_PKTS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 3
+type FLOWS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "FLOWS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 4
+type PROTOCOL
+{
+    ProtocolType data;
+
+    override string ToString()
+    {
+        return "PROTOCOL: " + EnumToStringInSummary<ProtocolType>(data);
+    }
+}
+
+// type: 5
+type SRC_TOS
+{
+    byte data;
+
+    override string ToString()
+    {
+        return "SRC_TOS: " + data.ToString();
+    }
+}
+
+// type: 6
+type TCP_FLAGS
+{
+    TCP.Flags data;
+    override string ToString()
+    {
+        return "TCP_FLAGS: " + data.ToString();
+    }
+}
+
+// type: 7
+type L4_SRC_PORT
+{
+    IANA.Port data;
+    
+    override string ToString()
+    {
+        return "L4_SRC_PORT: " + IANA.PortToServiceNameForAlias(data as ushort);
+    }
+}
+
+// type: 8
+type IPV4_SRC_ADDR 
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "IPV4_SRC_ADDR: " + data.ToString();
+    }
+}
+
+// type: 9
+type SRC_MASK
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "SRC_MASK: " + data.ToString();
+    }
+}
+
+// type: 10
+type INPUT_SNMP[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "INPUT_SNMP: " + BinaryToDecString(data);
+    }
+}
+
+// type: 11
+type L4_DST_PORT
+{
+    IANA.Port data;
+    
+    override string ToString()
+    {
+        return "L4_DST_PORT: " + IANA.PortToServiceNameForAlias(data as ushort);
+    }
+}
+
+// type: 12
+type IPV4_DST_ADDR
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "IPV4_DST_ADDR: " + data.ToString();
+    }
+}
+
+// type: 13
+type DST_MASK
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "DST_MASK: " + data.ToString();
+    }
+}
+
+// type: 14
+type OUTPUT_SNMP[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "OUTPUT_SNMP: " + BinaryToDecString(data);
+    }
+}
+
+// type: 15
+type IPV4_NEXT_HOP
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "IPV4_NEXT_HOP: " + data.ToString();
+    }
+}
+
+// type: 16
+type SRC_AS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "SRC_AS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 17
+type DST_AS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "DST_AS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 18
+type BGP_IPV4_NEXT_HOP
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "BGP_IPV4_NEXT_HOP: " + data.ToString();
+    }
+}
+
+// type: 19
+type MUL_DST_PKTS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "MUL_DST_PKTS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 20
+type MUL_DST_BYTES[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "MUL_DST_BYTES: " + BinaryToDecString(data);
+    }
+}
+
+// type: 21
+type LAST_SWITCHED
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "LAST_SWITCHED: " + data.ToString();
+    }
+}
+
+// type: 22
+type FIRST_SWITCHED
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "FIRST_SWITCHED: " + data.ToString();
+    }
+}
+
+// type: 23
+type OUT_BYTES[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "OUT_BYTES: " + BinaryToDecString(data);
+    }
+}
+
+// type: 24
+type OUT_PKTS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "OUT_PKTS: " + BinaryToDecString(data);
+    }
+}
+
+// type: 27
+type IPV6_SRC_ADDR
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "IPV6_SRC_ADDR: " + data.ToString();
+    }
+}
+
+// type: 28
+type IPV6_DST_ADDR
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "IPV6_DST_ADDR: " + data.ToString();
+    }
+}
+
+// type: 29
+type IPV6_SRC_MASK
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "IPV6_SRC_MASK: " + data.ToString();
+    }
+}
+
+// type: 30
+type IPV6_DST_MASK
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "IPV6_DST_MASK: " + data.ToString();
+    }
+}
+
+// type: 31
+type IPV6_FLOW_LABEL
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "IPV6_FLOW_LABEL: " + data.ToString();
+    }
+}
+
+// type: 32
+type ICMP_TYPE
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "ICMP_TYPE: " + data.ToString();
+    }
+}
+
+// type: 33
+type MUL_IGMP_TYPE
+{
+    IGMP.MessageType data;
+    
+    override string ToString()
+    {
+        return "MUL_IGMP_TYPE: " + EnumToStringInSummary<IGMP.MessageType>(data);
+    }
+}
+
+// type: 34
+type SAMPLING_INTERVAL
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "SAMPLING_INTERVAL: " + data.ToString();
+    }
+}
+
+// type: 35
+type SAMPLING_ALGORITHM
+{
+    SAMPLING_ALGORITHMEnum data;
+    
+    override string ToString()
+    {
+        return "SAMPLING_ALGORITHM: " + EnumToStringInSummary<SAMPLING_ALGORITHMEnum>(data);
+    }
+}
+
+// type: 36
+type FLOW_ACTIVE_TIMEOUT
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "FLOW_ACTIVE_TIMEOUT: " + data.ToString();
+    }
+}
+
+// type: 37
+type FLOW_INACTIVE_TIMEOUT
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "FLOW_INACTIVE_TIMEOUT: " + data.ToString();
+    }
+}
+
+// type: 38
+type ENGINE_TYPE
+{
+    ENGINE_TYPE_enum data;
+    
+    override string ToString()
+    {
+        return "ENGINE_TYPE: " + EnumToStringInSummary<ENGINE_TYPE_enum>(data);
+    }
+}
+
+pattern ENGINE_TYPE_enum = enum byte
+{
+    RP              = 0,
+    VIP_Linecard    = 1,
+    ...
+};
+
+// type: 39
+type ENGINE_ID
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "ENGINE_ID: " + data.ToString();
+    }
+}
+
+// type: 40
+type TOTAL_BYTES_EXP[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "TOTAL_BYTES_EXP: " + BinaryToDecString(data);
+    }
+}
+
+// type: 41
+type TOTAL_PKTS_EXP[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "TOTAL_PKTS_EXP: " + BinaryToDecString(data);
+    }
+}
+
+// type: 42
+type TOTAL_FLOWS_EXP[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    
+    override string ToString()
+    {
+        return "TOTAL_FLOWS_EXP: " + BinaryToDecString(data);
+    }
+}
+
+// type: 44
+type IPV4_SRC_PREFIX
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "IPV4_SRC_PREFIX: " + data.ToString();
+    }
+}
+
+// type: 45
+type IPV4_DST_PREFIX
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "IPV4_DST_PREFIX: " + data.ToString();
+    }
+}
+
+// type: 46
+type MPLS_TOP_LABEL_TYPE
+{
+    mplsTopLabelType data;
+    
+    override string ToString()
+    {
+        return "MPLS_TOP_LABEL_TYPE: " + EnumToStringInSummary<mplsTopLabelType>(data);
+    }
+}
+
+pattern mplsTopLabelType = enum byte
+{
+    TE_MIDPT    = 0x01,
+    Pseudowire  = 0x02,
+    VPN         = 0x03,
+    BGP         = 0x04,
+    LDP         = 0x05,
+    ...
+};
+
+// type: 47
+type MPLS_TOP_LABEL_IP_ADDR
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "MPLS_TOP_LABEL_IP_ADDR: " + data.ToString();
+    }
+}
+
+// type: 48
+type FLOW_SAMPLER_ID
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "FLOW_SAMPLER_ID: " + data.ToString();
+    }
+}
+
+// type: 49
+type FLOW_SAMPLER_MODE
+{
+    FLOW_SAMPLER_MODE_enum data;
+    
+    override string ToString()
+    {
+        return "FLOW_SAMPLER_MODE: " + EnumToStringInSummary<FLOW_SAMPLER_MODE_enum>(data);
+    }
+}
+
+pattern FLOW_SAMPLER_MODE_enum = enum byte
+{
+    RandomSampling = 0x02,
+    ...
+};
+
+// type: 50
+type FLOW_SAMPLER_RANDOM_INTERVAL
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "FLOW_SAMPLER_RANDOM_INTERVAL: " + data.ToString();
+    }
+}
+
+// type : 52
+type MIN_TTL
+{
+    byte data;
+
+    override string ToString()
+    {
+        return "MIN_TTL: " + data.ToString();
+    }
+}
+
+// type 53
+type MAX_TTL
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "MAX_TTL: " + data.ToString();
+    }
+}
+
+// type 54
+type IPV4_IDENT
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "IPV4_IDENT: " + data.ToString();
+    }
+}
+
+// type: 55
+type DST_TOS
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "DST_TOS: " + data.ToString();
+    }
+}
+
+// type: 56
+type IN_SRC_MAC
+{
+    MacAddress data;
+    
+    override string ToString()
+    {
+        return "IN_SRC_MAC: " + data.ToString();
+    }
+}
+
+// type: 57
+type OUT_DST_MAC
+{
+    MacAddress data;
+    
+    override string ToString()
+    {
+        return "OUT_DST_MAC: " + data.ToString();
+    }
+}
+
+// type: 58
+type SRC_VLAN
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "SRC_VLAN: " + data.ToString();
+    }
+}
+
+// type: 59
+type DST_VLAN
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "DST_VLAN: " + data.ToString();
+    }
+}
+
+// type: 60
+type IP_PROTOCOL_VERSION
+{
+    IP_PROTOCOL_VERSIONEnum data;
+    
+    override string ToString()
+    {
+        return "IP_PROTOCOL_VERSION: " + EnumToStringInSummary<IP_PROTOCOL_VERSIONEnum>(data);
+    }
+}
+
+// type: 61
+type DIRECTION
+{
+    DIRECTIONEnum data;
+    
+    override string ToString()
+    {
+        return "DIRECTION: " + EnumToStringInSummary<DIRECTIONEnum>(data);
+    }
+}
+
+// type: 62
+type IPV6_NEXT_HOP
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "IPV6_NEXT_HOP: " + data.ToString();
+    }
+}
+
+// type: 63
+type BPG_IPV6_NEXT_HOP
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "BPG_IPV6_NEXT_HOP: " + data.ToString();
+    }
+}
+
+// type: 64
+type IPV6_OPTION_HEADERS
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "IPV6_OPTION_HEADERS: " + data.ToString();
+    }
+}
+
+// type: 70
+type MPLS_LABEL_1
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_1" + data.ToString();
+    }
+}
+
+type mplsLabelStackSectionData
+{
+    uint  MPLS_label with BinaryEncoding{Width = 20};
+    byte Exp with BinaryEncoding{Width = 3};
+    bool S with BinaryEncoding{Width = 1};
+
+    override string ToString()
+    {
+        return "MPLS_label: " + MPLS_label.ToString() + 
+            "Exp: " + Exp.ToString() + 
+            "S: " + S.ToString();
+    }
+}
+
+// type: 71
+type MPLS_LABEL_2
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_2" + data.ToString();
+    }
+}
+
+// type: 72
+type MPLS_LABEL_3
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_3" + data.ToString();
+    }
+}
+
+// type: 73
+type MPLS_LABEL_4
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_4" + data.ToString();
+    }
+}
+
+// type: 74
+type MPLS_LABEL_5
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_5" + data.ToString();
+    }
+}
+
+// type: 75
+type MPLS_LABEL_6
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_6" + data.ToString();
+    }
+}
+
+// type: 76
+type MPLS_LABEL_7
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_7" + data.ToString();
+    }
+}
+
+// type: 77
+type MPLS_LABEL_8
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_8" + data.ToString();
+    }
+}
+
+// type: 78
+type MPLS_LABEL_9
+{
+    mplsLabelStackSectionData data;
+    
+    override string ToString()
+    {
+        return "MPLS_LABEL_9" + data.ToString();
+    }
+}
+
+// type: 79
+type MPLS_LABEL_10
+{
+    mplsLabelStackSectionData data;
+
+    override string ToString()
+    {
+        return "MPLS_LABEL_10" + data.ToString();
+    }
+}
+
+// more type declaration on http://www.cisco.com/en/US/technologies/tk648/tk362/technologies_white_paper09186a00800a3db9.html
+// type: 80
+type IN_DST_MAC
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "IN_DST_MAC" + data.ToString();
+    }
+}
+
+// type: 81
+type OUT_SRC_MAC
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "OUT_SRC_MAC: " + data.ToString();
+    }
+}
+
+// The data may contains '\0' char, so change to string terminator to \r\n.  
+// type: 82
+type IF_NAME[ushort Len]
+{
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len, TextTerminator = "\r\n"};
+    override string ToString()
+    {
+        return "IF_NAME: " + data;
+    }
+}
+
+// type: 83
+type IF_DESC[ushort Len]
+{
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len, TextTerminator = "\r\n"};
+    override string ToString()
+    {
+        return "IF_DESC: " + data;
+    }
+}
+
+// type: 84
+type SAMPLER_NAME[ushort Len]
+{
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+    override string ToString()
+    {
+        return "SAMPLER_NAME: " + data;
+    }
+}
+
+// type: 85
+type IN_PERMANENT_BYTES[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "IN_PERMANENT_BYTES" + BinaryToDecString(data);
+    }
+}
+
+// type: 86
+type IN_PERMANENT_PKTS[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "IN_PERMANENT_PKTS" + BinaryToDecString(data);
+    }
+}
+
+// type: 88
+type FRAGMENT_OFFSET
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "FRAGMENT_OFFSET: " + data.ToString();
+    }
+}
+
+// type: 89
+type FORWARDING_STATUS
+{
+    StatusEnum Status with BinaryEncoding{Width = 2};
+    ([|Status == StatusEnum.Unknown|] UnknownReasonCodeEnum | [|Status == StatusEnum.Forwarded|] ForwardedReasonCodeEnum | 
+    [|Status == StatusEnum.Dropped|] DroppedReasonCodeEnum | [|Status == StatusEnum.Consumed|] ConsumedReasonCodeEnum) ReasonCode with BinaryEncoding{Width = 6};
+    
+    override string ToString()
+    {
+        return "FORWARDING_STATUS: Status: " + EnumToStringInSummary<StatusEnum>(Status);
+    }
+}
+
+pattern StatusEnum = enum byte
+{
+    Unknown = 0b00,
+    Forwarded = 0b01,
+    Dropped = 0b10,
+    Consumed = 0b11,
+    ...
+};
+
+pattern UnknownReasonCodeEnum = enum byte
+{
+    Unknown                 = 0,
+    ...
+};
+
+pattern ForwardedReasonCodeEnum = enum byte
+{
+    Unknown         = 0,
+    Fragmented      = 1,
+    NotFragmented   = 2,
+    ...
+};
+
+pattern DroppedReasonCodeEnum = enum byte
+{
+    Unknown                 = 0,
+    ACLDeny                 = 1,
+    ACLDrop                 = 2,
+    Unroutable              = 3,
+    Adjacency               = 4,
+    FragmentationAndDFSet   = 5,
+    BadHeaderChecksum       = 6,
+    BadTotalLength          = 7,
+    BadHeaderLength         = 8,
+    BadTTL                  = 9,
+    Policer                 = 10,
+    WRED                    = 11,
+    RPF                     = 12,
+    ForUs                   = 13,
+    BadOutputInterface      = 14,
+    Hardware                = 15,
+    ...
+};
+
+pattern ConsumedReasonCodeEnum = enum byte
+{
+    Unknown                         = 0,
+    TerminatePuntAdjacency          = 1,
+    TerminateIncompleteAdjacency    = 2,
+    TerminateForus                  = 3,
+    ...
+};
+
+// type: 90
+type MPLS_PAL_RD
+{
+    binary data with BinaryEncoding{Length = 8};
+    
+    override string ToString()
+    {
+        return "MPLS_PAL_RD: " + BinaryToDecString(data);
+    }
+}
+
+// type: 91
+type MPLS_PREFIX_LEN
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "MPLS_PREFIX_LEN: " + data.ToString();
+    }
+}
+
+// type: 92
+type SRC_TRAFFIC_INDEX
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "SRC_TRAFFIC_INDEX: " + data.ToString();
+    }
+}
+
+// 93
+type DST_TRAFFIC_INDEX
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "DST_TRAFFIC_INDEX: " + data.ToString();
+    }
+}
+
+// 94
+type APPLICATION_DESCRIPTION[ushort Len]
+{
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+    override string ToString()
+    {
+        return "APPLICATION_DESCRIPTION: " + data;
+    }
+}
+
+// 95
+type APPLICATION_TAG[ushort Len]
+{
+    byte EngineID;
+    binary classification with BinaryEncoding{Length = Len / 8 + 1};
+    
+    override string ToString()
+    {
+        return "APPLICATION_TAG: " + EngineID.ToString();
+    }
+}
+
+// 96
+type APPLICATION_NAME[ushort Len]
+{
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Len};
+    
+    override string ToString()
+    {
+        return "APPLICATION_NAME: " + data;
+    }
+}
+
+// 98
+type postipDiffServCodePoint
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "postipDiffServCodePoint: " + data.ToString();
+    }
+}
+
+// 99
+type replication_factor
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "replication_factor: " + data.ToString();
+    }
+}
+
+// 100
+type DEPRECATED[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "DEPRECATED: " + BinaryToDecString(data);
+    }
+}
+
+// 102
+type layer2packetSectionOffset[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "layer2packetSectionOffset: " + BinaryToDecString(data);
+    }
+}
+
+// 103
+type layer2packetSectionSize[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "layer2packetSectionSize: " + BinaryToDecString(data);
+    }
+}
+
+// 104
+type layer2packetSectionData[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "layer2packetSectionData: " + BinaryToDecString(data);
+    }
+}
+
+pattern FieldTypeEnum = enum ushort
+{
+    IN_BYTES                        = 1,
+    IN_PKTS                         = 2,
+    FLOWS                           = 3,
+    PROTOCOL                        = 4,
+    SRC_TOS                         = 5,
+    TCP_FLAGS                       = 6,
+    L4_SRC_PORT                     = 7,
+    IPV4_SRC_ADDR                   = 8,
+    SRC_MASK                        = 9,
+    INPUT_SNMP                      = 10,
+    L4_DST_PORT                     = 11,
+    IPV4_DST_ADDR                   = 12,
+    DST_MASK                        = 13,
+    OUTPUT_SNMP                     = 14,
+    IPV4_NEXT_HOP                   = 15,
+    SRC_AS                          = 16,
+    DST_AS                          = 17,
+    BGP_IPV4_NEXT_HOP               = 18,
+    MUL_DST_PKTS                    = 19,
+    MUL_DST_BYTES                   = 20,
+    LAST_SWITCHED                   = 21,
+    FIRST_SWITCHED                  = 22,
+    OUT_BYTES                       = 23,
+    OUT_PKTS                        = 24,
+    IPV6_SRC_ADDR                   = 27,
+    IPV6_DST_ADDR                   = 28,
+    IPV6_SRC_MASK                   = 29,
+    IPV6_DST_MASK                   = 30,
+    IPV6_FLOW_LABEL                 = 31,
+    ICMP_TYPE                       = 32,
+    MUL_IGMP_TYPE                   = 33,
+    SAMPLING_INTERVAL               = 34,
+    SAMPLING_ALGORITHM              = 35,
+    FLOW_ACTIVE_TIMEOUT             = 36,
+    FLOW_INACTIVE_TIMEOUT           = 37,
+    ENGINE_TYPE                     = 38,
+    ENGINE_ID                       = 39,
+    TOTAL_BYTES_EXP                 = 40,
+    TOTAL_PKTS_EXP                  = 41,
+    TOTAL_FLOWS_EXP                 = 42,
+    IPV4_SRC_PREFIX                 = 44,
+    IPV4_DST_PREFIX                 = 45,
+    MPLS_TOP_LABEL_TYPE             = 46,
+    MPLS_TOP_LABEL_IP_ADDR          = 47,
+    FLOW_SAMPLER_ID                 = 48,
+    FLOW_SAMPLER_MODE               = 49,
+    FLOW_SAMPLER_RANDOM_INTERVAL    = 50,
+    MIN_TTL                         = 52,
+    MAX_TTL                         = 53,
+    IPV4_IDENT                      = 54,
+    DST_TOS                         = 55,
+    IN_SRC_MAC                      = 56,
+    OUT_DST_MAC                     = 57,
+    SRC_VLAN                        = 58,
+    DST_VLAN                        = 59,
+    IP_PROTOCOL_VERSION             = 60,
+    DIRECTION                       = 61,
+    IPV6_NEXT_HOP                   = 62,
+    BPG_IPV6_NEXT_HOP               = 63,
+    IPV6_OPTION_HEADERS             = 64,
+    MPLS_LABEL_1                    = 70,
+    MPLS_LABEL_2                    = 71,
+    MPLS_LABEL_3                    = 72,
+    MPLS_LABEL_4                    = 73,
+    MPLS_LABEL_5                    = 74,
+    MPLS_LABEL_6                    = 75,
+    MPLS_LABEL_7                    = 76,
+    MPLS_LABEL_8                    = 77,
+    MPLS_LABEL_9                    = 78,
+    MPLS_LABEL_10                   = 79,
+    IN_DST_MAC                      = 80,
+    OUT_SRC_MAC                     = 81,
+    IF_NAME                         = 82,
+    IF_DESC                         = 83,
+    SAMPLER_NAME                    = 84,
+    IN_PERMANENT_BYTES              = 85,
+    IN_PERMANENT_PKTS               = 86,
+    FRAGMENT_OFFSET                 = 88,
+    FORWARDING_STATUS               = 89,
+    MPLS_PAL_RD                     = 90,
+    MPLS_PREFIX_LEN                 = 91,
+    SRC_TRAFFIC_INDEX               = 92,
+    DST_TRAFFIC_INDEX               = 93,
+    APPLICATION_DESCRIPTION         = 94,
+    APPLICATION_TAG                 = 95,
+    APPLICATION_NAME                = 96,
+    postipDiffServCodePoint         = 98,
+    replication_factor              = 99,
+    DEPRECATED                      = 100,
+    layer2packetSectionOffset       = 101,
+    layer2packetSectionSize         = 102,
+    layer2packetSectionData         = 103,
+    ...
+};
+
+pattern SAMPLING_ALGORITHMEnum = enum byte
+{
+    deterministicsampling = 0x01,
+    randomsampling        = 0x02,
+    ...
+};
+
+pattern IP_PROTOCOL_VERSIONEnum = enum byte
+{
+    IPv4 = 4,
+    IPv6 = 6,
+    ...
+};
+
+pattern DIRECTIONEnum = enum byte
+{
+    ingressflow = 0,
+    egressflow  = 1,
+    ...
+};
+
+// Decode single Data Flow record based on template
+optional array<any> DecodeSingleDataFlowRecordBasedTemplate(stream s, array<TemplateFieldInfo> template)
+{
+    array<any> decodedResult = [];
+    foreach (TemplateFieldInfo f in template)
+    {
+        optional any ret = DecodePrimitiveType(s, f.Type, f.Length);
+        if (ret == nothing)
+        {
+            return nothing;
+        }
+        else
+        {
+            decodedResult += [ret as any];
+        }
+    }
+    return decodedResult;
+}
+
+type OptionDataFlowRecord
+{
+    optional array<any> ScopeFields = [];
+    optional array<any> OptionFields = [];
+
+    override string ToString()
+    {
+        string summary = "";
+        if (ScopeFields != nothing) summary += ScopeFields.ToString();
+        if (OptionFields != nothing) summary += OptionFields.ToString();
+        return summary;
+    }
+}
+
+// Decode single Option Data Flow record based on template
+optional OptionDataFlowRecord DecodeSingleOptionDataFlowRecordBasedTemplate(stream s, OptionTemplateElement template)
+{
+    array<any> scopeFields = [];
+    array<any> optionFields = [];
+    foreach (OptionScopeFieldInfo scopeFieldInfo in template.OptionScopeFields)
+    {
+        if (BinaryDecoder<ScopeFieldData[scopeFieldInfo.Type, scopeFieldInfo.Length]>(s) is scope:ScopeFieldData)
+        {
+            scopeFields += [scope];
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+    
+    foreach (OptionFieldInfo optionFieldInfo in template.OptionFields)
+    {
+        optional any ret = DecodePrimitiveType(s, optionFieldInfo.Type, optionFieldInfo.Length);
+        if (ret == nothing)
+        {
+            return nothing;
+        }
+        else
+        {
+            optionFields += [ret as any];
+        }
+    }
+    return new OptionDataFlowRecord
+        {
+            ScopeFields = scopeFields.Count > 0 ? scopeFields : nothing,
+            OptionFields = optionFields.Count > 0 ? optionFields : nothing,
+        };
+}
+
+optional any DecodePrimitiveType(stream s, ushort id, ushort length)
+{
+    switch (id)
+    {
+        case 1 =>
+            return BinaryDecoder<IN_BYTES[length]>(s);
+        case 2 =>
+            return BinaryDecoder<IN_PKTS[length]>(s);
+        case 3 =>
+            return BinaryDecoder<FLOWS>(s);
+        case 4 =>
+            return BinaryDecoder<PROTOCOL>(s);
+        case 5 =>
+            return BinaryDecoder<SRC_TOS>(s);
+        case 6 =>
+            return BinaryDecoder<TCP_FLAGS>(s);
+        case 7 =>
+            return BinaryDecoder<L4_SRC_PORT>(s);
+        case 8 =>
+            return BinaryDecoder<IPV4_SRC_ADDR>(s);
+        case 9 =>
+            return BinaryDecoder<SRC_MASK>(s);
+        case 10 =>
+            return BinaryDecoder<INPUT_SNMP[length]>(s);
+        case 11 =>
+            return BinaryDecoder<L4_DST_PORT>(s);
+        case 12 =>
+            return BinaryDecoder<IPV4_DST_ADDR>(s);
+        case 13 =>
+            return BinaryDecoder<DST_MASK>(s);
+        case 14 =>
+            return BinaryDecoder<OUTPUT_SNMP[length]>(s);
+        case 15 =>
+            return BinaryDecoder<IPV4_NEXT_HOP>(s);
+        case 16 =>
+            return BinaryDecoder<SRC_AS[length]>(s);
+        case 17 =>
+            return BinaryDecoder<DST_AS[length]>(s);
+        case 18 =>
+            return BinaryDecoder<BGP_IPV4_NEXT_HOP>(s);
+        case 19 =>
+            return BinaryDecoder<MUL_DST_PKTS[length]>(s);
+        case 20 =>
+            return BinaryDecoder<MUL_DST_BYTES[length]>(s);
+        case 21 =>
+            return BinaryDecoder<LAST_SWITCHED>(s);
+        case 22 =>
+            return BinaryDecoder<FIRST_SWITCHED>(s);
+        case 23 =>
+            return BinaryDecoder<OUT_BYTES[length]>(s);
+        case 24 =>
+            return BinaryDecoder<OUT_PKTS[length]>(s);
+        case 27 =>
+            return BinaryDecoder<IPV6_SRC_ADDR>(s);
+        case 28 =>
+            return BinaryDecoder<IPV6_DST_ADDR>(s);
+        case 29 =>
+            return BinaryDecoder<IPV6_SRC_MASK>(s);
+        case 30 =>
+            return BinaryDecoder<IPV6_DST_MASK>(s);
+        case 31 =>
+            return BinaryDecoder<IPV6_FLOW_LABEL>(s);
+        case 32 =>
+            return BinaryDecoder<ICMP_TYPE>(s);
+        case 33 =>
+            return BinaryDecoder<MUL_IGMP_TYPE>(s);
+        case 34 =>
+            return BinaryDecoder<SAMPLING_INTERVAL>(s);
+        case 35 =>
+            return BinaryDecoder<SAMPLING_ALGORITHM>(s);
+        case 36 =>
+            return BinaryDecoder<FLOW_ACTIVE_TIMEOUT>(s);
+        case 37 =>
+            return BinaryDecoder<FLOW_INACTIVE_TIMEOUT>(s);
+        case 38 =>
+            return BinaryDecoder<ENGINE_TYPE>(s);
+        case 39 =>
+            return BinaryDecoder<ENGINE_ID>(s);
+        case 40 =>
+            return BinaryDecoder<TOTAL_BYTES_EXP[length]>(s);
+        case 41 =>
+            return BinaryDecoder<TOTAL_PKTS_EXP[length]>(s);
+        case 42 =>
+            return BinaryDecoder<TOTAL_FLOWS_EXP[length]>(s);
+        case 44 =>
+            return BinaryDecoder<IPV4_SRC_PREFIX>(s);
+        case 45 =>
+            return BinaryDecoder<IPV4_DST_PREFIX>(s);
+        case 46 =>
+            return BinaryDecoder<MPLS_TOP_LABEL_TYPE>(s);
+        case 47 =>
+            return BinaryDecoder<MPLS_TOP_LABEL_IP_ADDR>(s);
+        case 48 =>
+            return BinaryDecoder<FLOW_SAMPLER_ID>(s);
+        case 49 =>
+            return BinaryDecoder<FLOW_SAMPLER_MODE>(s);
+        case 50 =>
+            return BinaryDecoder<FLOW_SAMPLER_RANDOM_INTERVAL>(s);
+        case 52 =>
+            return BinaryDecoder<MIN_TTL>(s);
+        case 53 =>
+            return BinaryDecoder<MAX_TTL>(s);
+        case 54 =>
+            return BinaryDecoder<IPV4_IDENT>(s);
+        case 55 =>
+            return BinaryDecoder<DST_TOS>(s);
+        case 56 =>
+            return BinaryDecoder<IN_SRC_MAC>(s);
+        case 57 =>
+            return BinaryDecoder<OUT_DST_MAC>(s);
+        case 58 =>
+            return BinaryDecoder<SRC_VLAN>(s);
+        case 59 =>
+            return BinaryDecoder<DST_VLAN>(s);
+        case 60 =>
+            return BinaryDecoder<IP_PROTOCOL_VERSION>(s);
+        case 61 =>
+            return BinaryDecoder<DIRECTION>(s);
+        case 62 =>
+            return BinaryDecoder<IPV6_NEXT_HOP>(s);
+        case 63 =>
+            return BinaryDecoder<BPG_IPV6_NEXT_HOP>(s);
+        case 64 =>
+            return BinaryDecoder<IPV6_OPTION_HEADERS>(s);
+        case 70 =>
+            return BinaryDecoder<MPLS_LABEL_1>(s);
+        case 71 =>
+            return BinaryDecoder<MPLS_LABEL_2>(s);
+        case 72 =>
+            return BinaryDecoder<MPLS_LABEL_3>(s);
+        case 73 =>
+            return BinaryDecoder<MPLS_LABEL_4>(s);
+        case 74 =>
+            return BinaryDecoder<MPLS_LABEL_5>(s);
+        case 75 =>
+            return BinaryDecoder<MPLS_LABEL_6>(s);
+        case 76 =>
+            return BinaryDecoder<MPLS_LABEL_7>(s);
+        case 77 =>
+            return BinaryDecoder<MPLS_LABEL_8>(s);
+        case 78 =>
+            return BinaryDecoder<MPLS_LABEL_9>(s);
+        case 79 =>
+            return BinaryDecoder<MPLS_LABEL_10>(s);
+        case 80 => 
+            return BinaryDecoder<IN_DST_MAC>(s);
+        case 81 => 
+            return BinaryDecoder<OUT_SRC_MAC>(s);
+        case 82 => 
+            return BinaryDecoder<IF_NAME[length]>(s);
+        case 83 => 
+            return BinaryDecoder<IF_DESC[length]>(s);
+        case 84 => 
+            return BinaryDecoder<SAMPLER_NAME[length]>(s);
+        case 85 => 
+            return BinaryDecoder<IN_PERMANENT_BYTES[length]>(s);
+        case 86 => 
+            return BinaryDecoder<IN_PERMANENT_PKTS[length]>(s);
+        case 88 => 
+            return BinaryDecoder<FRAGMENT_OFFSET>(s);
+        case 89 => 
+            return BinaryDecoder<FORWARDING_STATUS>(s);
+        case 90 => 
+            return BinaryDecoder<MPLS_PAL_RD>(s);
+        case 91 => 
+            return BinaryDecoder<MPLS_PREFIX_LEN>(s);
+        case 92 => 
+            return BinaryDecoder<SRC_TRAFFIC_INDEX>(s);
+        case 93 => 
+            return BinaryDecoder<DST_TRAFFIC_INDEX>(s);
+        case 94 => 
+            return BinaryDecoder<APPLICATION_DESCRIPTION[length]>(s);
+        case 95 => 
+            return BinaryDecoder<APPLICATION_TAG[length]>(s);
+        case 96 => 
+            return BinaryDecoder<APPLICATION_NAME[length]>(s);
+        case 98 => 
+            return BinaryDecoder<postipDiffServCodePoint>(s);
+        case 99 => 
+            return BinaryDecoder<replication_factor>(s);
+        case 100 => 
+            return BinaryDecoder<DEPRECATED>(s);
+        case 101 => 
+            return BinaryDecoder<layer2packetSectionOffset[length]>(s);
+        case 102 => 
+            return BinaryDecoder<layer2packetSectionSize[length]>(s);
+        case 103 => 
+            return BinaryDecoder<layer2packetSectionData[length]>(s);
+        default =>
+            return BinaryDecoder<UnknownType[id, length]>(s);
+    }
+}
+
+type UnknownType[ushort TypeId, ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+
+    override string ToString()
+    {
+        return "Unknown Type: " + TypeId.ToString();
+    }
+}
+
+// Binary to Decimal
+string BinaryToDecString(any obj)
+{
+    binary bin = obj as binary;
+    switch (bin.Count)
+    {
+        case 1 =>
+            return bin[0].ToString();
+        case 2 =>
+            return (((bin[0] as ushort) << 8) + bin[1]).ToString();
+        case 4 =>
+            return (BinaryPrimitiveTypeDecoder<uint>(bin, Endian.Big) as uint).ToString();
+        case 8 =>
+            return (BinaryPrimitiveTypeDecoder<ulong>(bin, Endian.Big) as ulong).ToString();
+        default =>
+            return bin.ToString();
+    }
+}

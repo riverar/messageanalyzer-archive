@@ -1,0 +1,171 @@
+protocol MAIL with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Remote Mailslot Protocol",
+    ShortName = "MAIL"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-CIFS", Version = "21.0", Date = "01/31/2013", ProgramName = ProgramName.WSPP},
+            new Reference{Name = "NETBEUI", Version = "1.3.0", Link = "http://publibz.boulder.ibm.com/cgi-bin/bookmgr_OS390/BOOKS/BK8P7001/CCONTENTS"}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "371783", Date = "12/04/2014"}
+        ]
+};
+
+using NBTDS;
+using Standard;
+using SMBTransport;
+using Utility;
+using MicrosoftCommonResources;
+using InfrastructureResources;
+using Diagnostics;
+using NBF;
+
+string MAIL_MODULE = "MAIL";
+
+endpoint Server 
+    over NBTDS.Server | over NBF.Node
+    accepts MailslotWriteMessage;
+
+autostart actor MailOverNbtds(NBTDS.Server nbtdsServer)
+{
+    // accept ComTransactionRequest with Subcommand == 0x0001 and SetupCount == 0x03
+    process nbtdsServer accepts p:NBTDS.Packet 
+        where p.UserData != nothing && (p.UserData is binary) && IsMailTraffic(p.UserData as binary)
+    {
+        var server = endpoint Server over nbtdsServer;
+        DecodeMailslotWriteMessage(p.UserData as binary, Dispatcher, server);
+    }
+
+    // issue ComTransactionRequest with Subcommand == 0x0001 and SetupCount == 0x03
+    process nbtdsServer issues p:NBTDS.Packet 
+        where p.UserData != nothing && p.UserData is binary && IsMailTraffic(p.UserData as binary)
+    {
+        var server = endpoint Server over nbtdsServer;
+        DecodeMailslotWriteMessage(p.UserData as binary, Dispatcher, server);
+    }
+    
+
+}
+
+autostart actor MailOverNbf(NBF.Node node)
+{
+    process node accepts d:NBF.Datagram where d.Payload != nothing && d.Payload is binary && IsMailTraffic(d.Payload as binary)
+    {
+        var server = endpoint Server over node;
+        DecodeMailslotWriteMessage(d.Payload as binary, Dispatcher, server);
+    }
+    
+    process node accepts d:NBF.DatagramBroadcast where d.Payload != nothing && d.Payload is binary && IsMailTraffic(d.Payload as binary)
+    {
+        var server = endpoint Server over node;
+        DecodeMailslotWriteMessage(d.Payload as binary, Dispatcher, server);
+    }
+    
+    process node accepts d:NBF.DataOnlyLast where d.UserData != nothing && d.UserData is binary && IsMailTraffic(d.UserData as binary)
+    {
+        var server = endpoint Server over node;
+        DecodeMailslotWriteMessage(d.UserData as binary, Dispatcher, server);
+    }
+}
+
+void Dispatcher(MailslotWriteMessage m, Server server)
+{
+    dispatch server accepts m;
+}
+
+// ComTransactionRequest(0x25) with Subcommand == 0x0001 and SetupCount == 0x03
+bool IsMailTraffic(binary bin)
+{
+    return bin.Count > 63 && bin.Segment(0, 5) is $[FF534D4225] &&
+        bin.Segment(59, 1) is $[03] && bin.Segment(61, 2) is $[0100];
+}
+
+void DecodeMailslotWriteMessage(binary payload, void(MailslotWriteMessage, Server) dispatcher, Server server)
+{
+    optional MailslotWriteMessage msg = BinaryDecoder<MailslotWriteMessage>(payload);
+    if (msg != nothing)
+    {
+        MailslotWriteMessage m = msg as MailslotWriteMessage;
+        ValidateMailslotWriteMessage (m);
+        dispatcher(m, server);
+    }
+    else
+    {
+        ThrowDecodingException ("MAIL", "MailslotWriteMessage");
+    }  
+}
+
+string AddWindowsBehavior(string originalString, string windowsValue)
+{
+    return Format(originalString + " " + MAIL_STR_WINDOWS_BEHAVIOR, windowsValue);
+}
+
+void ValidateMailslotWriteMessage(MailslotWriteMessage msg)
+{
+    ValidationCheckValue(msg.Header.Command == 0x25, msg, true, ReferenceType.Type, MAIL_MODULE, "Command", "SMBHeader", 0x25, msg.Header.Command);
+    ValidationCheckValue(msg.WordCount == 0x11, msg, true, ReferenceType.Type, MAIL_MODULE, "WordCount", "MailslotWriteMessage", 0x11, msg.WordCount);
+    ValidationCheckZero(msg.TotalParameterCount == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "TotalParameterCount", "MailslotWriteMessage", msg.TotalParameterCount);
+    array<any> descParams = [MAIL_MODULE, "MaxParameterCount", ReferenceType.Type, "MailslotWriteMessage", INFRASTRUCTURE_STR_SHOULD, INFRASTRUCTURE_STR_ZERO, "2"];
+    string maxPC = Format(INFRASTRUCTURE_STR_CHECK_VALUE, descParams);
+    if (msg.MaxParameterCount == 0x0002)
+    {
+        ValidationCheck(false, msg, AddWindowsBehavior(maxPC, "2"));
+    }
+    else
+    {
+        ValidationCheck(msg.MaxParameterCount == 0x0000, msg, maxPC);
+    }
+    ValidationCheckZero(msg.MaxDataCount == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "MaxDataCount", "MailslotWriteMessage", msg.MaxDataCount);
+    ValidationCheckZero(msg.MaxSetupCount == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "MaxSetupCount", "MailslotWriteMessage", msg.MaxSetupCount);
+    ValidationCheckReservedZero(msg.Reserved1 == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "Reserved1", "MailslotWriteMessage", msg.Reserved1);
+    ValidationCheckReservedZero(msg.Reserved2 == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "Reserved2", "MailslotWriteMessage", msg.Reserved2);
+    ValidationCheckZero(msg.ParameterCount == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "ParameterCount", "MailslotWriteMessage", msg.ParameterCount);
+    ValidationCheckValueSame(msg.DataCount == msg.TotalDataCount, msg, true, ReferenceType.Type, MAIL_MODULE, "DataCount", "MailslotWriteMessage", ReferenceType.Type, "TotalDataCount", "MailslotWriteMessage", msg.DataCount);
+    ValidationCheckValue(msg.SetupCount == 0x03, msg, true, ReferenceType.Type, MAIL_MODULE, "SetupCount", "MailslotWriteMessage", 3, msg.SetupCount);
+    ValidationCheckReservedZero(msg.Reserved3 == 0x0000, msg, true, ReferenceType.Type, MAIL_MODULE, "Reserved3", "MailslotWriteMessage", msg.Reserved3);
+    ValidationCheckValue(msg.MailSlotOpcode == 0x0001, msg, true, ReferenceType.Type, MAIL_MODULE, "MailSlotOpcode", "MailslotWriteMessage", 1, msg.MailSlotOpcode);
+    ValidationCheckValueInRange(msg.Priority >= 0x0000 && msg.Priority <= 0x0009, msg, true, ReferenceType.Type, MAIL_MODULE, "Priority", "MailslotWriteMessage", 0, 9, msg.Priority);
+    ValidationCheckValueInRange(msg.Class == 0x0001 || msg.Class == 0x0002, msg, true, ReferenceType.Type, MAIL_MODULE, "Class", "MailslotWriteMessage", 1, 2, msg.Class);
+}
+
+message MailslotWriteMessage
+{
+    SMBTransport.SmbHeader Header;
+    byte WordCount;
+    ushort TotalParameterCount;
+    ushort TotalDataCount;
+    ushort MaxParameterCount;
+    ushort MaxDataCount;
+    byte MaxSetupCount;
+    byte Reserved1;
+    ushort Flags;
+    uint Timeout;
+    ushort Reserved2;
+    ushort ParameterCount;
+    ushort ParameterOffset;
+    ushort DataCount;
+    ushort DataOffset;
+    byte SetupCount;
+    byte Reserved3;
+    ushort MailSlotOpcode;
+    ushort Priority;
+    ushort Class; 
+    ushort ByteCount;
+    string MailslotName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    // Padding length = DataOffset - sizeof Header - sizeof ByteCount - sizeof WordCount - WordCount * 2("words" means "ushort") - sizeof MailslotName("Count" does not include null-terminator) 
+    binary Padding with BinaryEncoding{Length = (DataOffset - 32 - 2 - 1 - WordCount * 2 - (MailslotName.Count + 1))};
+    binary Databytes with BinaryEncoding{Length = DataCount};
+    
+    override string ToString()
+    {
+        return "Mail slot Write, Mailslot:" + MailslotName + ", MailSlotOpcode:" + MailSlotOpcode.ToString() + ", Class:" + Class.ToString() + ", DataCount:" + DataCount.ToString(); 
+    }
+}

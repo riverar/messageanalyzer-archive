@@ -1,0 +1,342 @@
+protocol MSEUMR with
+Documentation
+{
+    ProtocolName = "Routing to Exchange Unified Messaging Extensions",
+    ShortName = "MS-EUMR",
+    DocumentName = "MS-EUMR",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-EUMR", Version = "7.3"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision {Class=RevisionClass.Major, Version="1.0.0", Date="05/19/2015"},
+        ]
+};
+
+using Diagnostics;
+using Utility;
+using Standard;
+using SIP;
+using SDP;
+using SkypeforBusinessShared;
+
+endpoint Server 
+	over SIP.Server | over SDP.Server
+	accepts RequestMessage issues ResponseMessage;
+	
+client endpoint Client connected to Server;
+
+autostart actor ActorOverSIP(SIP.Server node)
+{		
+    process node accepts sipMsg:SIP.Request
+    {  
+		RequestMessage msg;
+
+		switch (GetEumrReqMessageType(sipMsg))
+		{				
+			case ("UserEventNotificationMessage") =>
+			{
+				msg = new UserEventNotificationMessage(sipMsg);				
+			}				
+			case("EdgeServerINVITEMessage") =>
+			{
+				msg = new EdgeServerInviteMessage(sipMsg);				
+			}
+			default =>
+			{
+				reject;
+			}
+		}
+		dispatch (endpoint Server over node) accepts msg;	
+    }
+}
+
+autostart actor ActorOverSDP(SDP.Server node)
+{	
+    process node accepts sdpMsg:SDP.SessionDescription where (IsEumrSdpReq(sdpMsg))
+    {       	
+		SDPRequestMessage msg = new SDPRequestMessage(sdpMsg);
+		dispatch (endpoint Server over node) accepts msg;		
+    }	
+
+	process node issues sdpMsg:SDP.SessionDescription where (IsEumrSdpRsp(sdpMsg))
+    {  
+		SDPResponseMessage msg = new SDPResponseMessage(sdpMsg);
+		dispatch (endpoint Server over node) issues msg;				
+	}	
+}
+
+string GetEumrReqMessageType(SIP.Request sipMsg)
+{		
+	if ((sipMsg.Method == "INFO") && (TryGetHeaderValue("Content-Type", sipMsg.Headers) == "application/ms-rtc-usernotification+xml")) 
+	{
+		return "UserEventNotificationMessage";	
+	}
+
+	if ((sipMsg.Method == "INVITE") && ContainsHeaders(["Ms-Mras-Address"], sipMsg.Headers))
+	{		
+		return "EdgeServerINVITEMessage";
+	}
+	return null;
+}
+
+bool IsEumrSdpReq(SDP.SessionDescription sdpMsg)
+{	
+	if (sdpMsg.MediaDescriptions == null)
+	{
+		return false;
+	}	
+
+	array<any message> tempMsgs = sdpMsg.Origins;
+
+	if (tempMsgs == null || tempMsgs.Count != 1)
+	{
+		return false;
+	}
+
+	SIP.Request sipReq = null;
+
+	if (tempMsgs[0] is SIP.Request)
+	{
+		sipReq = tempMsgs[0] as SIP.Request;
+	}
+	
+	if ((sipReq == null) || (sipReq.Method != "INVITE"))
+	{	
+		return false;
+	} 
+	else if (TryGetHeaderValue("From", sipReq.Headers) == "<sip:A410AA79-D874-4e56-9B46-709BDD0EB850>")
+	{
+		return (ContainsSdpMD(sdpMsg, "application 9 SIP *") && ContainsSdpAtts(sdpMsg, ["sendonly", "accept-types:application/ms-rtc-usernotification+xml"]));	
+	}
+	return false;	
+}
+
+bool IsEumrSdpRsp(SDP.SessionDescription sdpMsg)
+{	
+	if (sdpMsg.MediaDescriptions == null)
+	{
+		return false;
+	}
+	else
+	{	
+		array<any message> tempMsgs = sdpMsg.Origins;
+
+		if (tempMsgs == null || tempMsgs.Count != 1)
+		{
+			return false;
+		}
+
+		SIP.Response sipRsp = null;
+
+		if (tempMsgs[0] is SIP.Response)
+		{
+			sipRsp = tempMsgs[0] as SIP.Response;
+		}		
+	
+		if (sipRsp == null)
+		{	
+			return false;
+		}
+
+		string cSeq = TryGetHeaderValue("CSeq", sipRsp.Headers);
+
+		if (cSeq != "INVITE")
+		{	
+			return false;
+		} 
+		else
+		{	
+			return (ContainsSdpMD(sdpMsg, "application 9 SIP *") && ContainsSdpAtts(sdpMsg, ["recvonly", "accept-types:application/ms-rtc-usernotification+xml", "ms-rtc-accept-eventtemplates:RtcDefault"]));	
+		}
+		return false;
+	}	
+}
+
+message RequestMessage : SipRequestMessage
+{	
+	RequestMessage(SIP.Request sipReqMsg)
+	{
+		InitializeSIPReq(sipReqMsg, ["From", "To", "Content-Type"], this);
+	}
+	
+	override string ToString()
+	{ 
+		return "Request";
+	}
+}
+
+message UserEventNotificationMessage : RequestMessage
+{		
+	UserEventNotificationMessage(SIP.Request sipReqMsg)
+	{
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Call-ID"]);
+	}
+	
+	override string ToString()
+	{
+		if (this.Body == nothing || this.Body == null)
+		{
+			return "Unknown Event Notification";
+		}
+
+		xml tempBody = this.Body as xml;
+
+		if (tempBody == null)
+		{
+			return "Unknown Event Notification";
+		}
+		else 
+		{
+			array<xml> eventTypeXmls = tempBody select xpath{//UserNotification/Event/@type};
+
+			if (eventTypeXmls == null || eventTypeXmls.Count == 0)
+			{
+				return "Invalid Event Notification Message: Missing type Attribute for Event Element in Message Body";
+			}
+			else if (eventTypeXmls.Count > 1)
+			{
+				return "Invalid Event Notification Message: More Than One type Attribute for Event Element in Message Body";
+			}
+			else
+			{	
+				string eventType = eventTypeXmls[0].Value as string;
+				
+				if (eventType == null)
+				{
+					return "Invalid Event Notification Message: Value of type Attribute for Event Element Is Not String";
+				}
+				else
+				{
+					switch (eventType)
+					{
+						case ("missed")	=> 
+						{
+							return "Missed Call Event Notification";
+						}
+						case ("answered") => 
+						{
+							return "Call Answered Event Notification";
+						}
+						case ("forbidden") => 
+						{
+							return "Call Forbidden Event Notification";
+						}
+						default	=> 
+						{
+							return "Unknown Type Event Notification";
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+message EdgeServerInviteMessage : RequestMessage
+{
+	EdgeServerInviteMessage(SIP.Request sipReqMsg)
+	{	
+		base.RequestMessage(sipReqMsg);
+		this.Headers += GetHeaders(sipReqMsg.Headers, ["Ms-Mras-Address"]);
+	}
+	
+	override string ToString()
+	{
+		return "A/V Edge Server INVITE Message";
+	}
+}
+
+message SDPRequestMessage : RequestMessage
+{	
+	array<MediaDescriptionType> MediaDescriptions;
+
+	SDPRequestMessage(SDP.SessionDescription sdpMsg)
+	{	
+		array<any message> tempMsgs = sdpMsg.Origins;
+		SIP.Request sipReqMsg = null;
+
+		if ((tempMsgs.Count == 1) && (tempMsgs[0] is SIP.Request))
+		{
+			sipReqMsg = tempMsgs[0] as SIP.Request;
+		}
+		
+		if (sipReqMsg == null)
+		{
+			ThrowDecodingException("MSEUMR", "The origin of this SDP message is not a SIP Request message.", null);
+		}
+		else
+		{
+			base.RequestMessage(sipReqMsg);
+			this.Headers += GetHeaders(sipReqMsg.Headers, ["Supported"]);
+			this.MediaDescriptions = sdpMsg.MediaDescriptions as array<MediaDescriptionType>;
+		}
+	}
+		
+	override string ToString()
+	{
+		return "Notification INVITE Request";
+	}
+}
+
+message ResponseMessage : SipResponseMessage
+{
+	ResponseMessage(SIP.Response sipRspMsg)
+	{
+		InitializeSIPRsp(sipRspMsg, ["From", "To", "CSeq"], this);
+	}
+
+	override string ToString()
+	{	
+		return Format("{0} {1}", this.StatusCode, this.ReasonPhrase);
+	}	
+}
+	
+message SDPResponseMessage : ResponseMessage
+{
+	array<MediaDescriptionType> MediaDescriptions;
+
+	SDPResponseMessage(SDP.SessionDescription sdpMsg)
+	{	
+		array<any message> tempMsgs = sdpMsg.Origins;
+		SIP.Response sipRspMsg = null;
+
+		if ((tempMsgs.Count == 1) && (tempMsgs[0] is SIP.Response))
+		{
+			sipRspMsg = tempMsgs[0] as SIP.Response;
+		}
+		
+		if (sipRspMsg == null)
+		{
+			ThrowDecodingException("MSEUMR", "The origin of this SDP message is not a SIP Response message.", null);
+		}
+		else
+		{		
+			base.ResponseMessage(sipRspMsg);
+			this.Headers += GetHeaders(sipRspMsg.Headers, ["Supported"]);
+			this.MediaDescriptions = sdpMsg.MediaDescriptions as array<MediaDescriptionType>;
+		}
+	}
+	
+	override string ToString()
+	{
+		string commonSummary = null;
+
+		if ((this.StatusCode == 0) && (this.ReasonPhrase == null))
+		{	
+			commonSummary = "";
+		}
+		else
+		{
+			commonSummary = Format(", {0} {1}", this.StatusCode, this.ReasonPhrase);
+		}
+		return "Notification INVITE Response" + commonSummary;
+	}
+}

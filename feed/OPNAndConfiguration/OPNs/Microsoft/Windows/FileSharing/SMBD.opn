@@ -1,0 +1,214 @@
+protocol SMBD with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "SMB2 Remote Direct Memory Access (RDMA) Transport Protocol",
+    ShortName = "SMBD",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-SMBD", Version = "4.0", Date = "08/08/2013", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "356548", Date = "11/16/2013"}
+        ]
+};
+
+using EtwEvent;
+using Utility;
+using RDMAP;
+using ERREF;
+
+public const guid SmbdProviderId = {db66ea65-b7bb-4ca9-8748-334cb5c32400};
+
+endpoint Server 
+    over EtwEvent.Node | over RDMAP.Server
+    provides MessageContract consumes MessageContract;
+
+client endpoint Client connected to Server;
+
+autostart actor SmbdOverRdmap(RDMAP.Server node)
+{
+    MessageContract.DataTransfer data;
+
+    //The first 4 bytes of SMBD is MinVersion and MaxVersion, which values must be 0x0100.
+    process node issues msg:RDMAP.Msg where msg.ULPPayload != nothing && (msg.ULPPayload as binary).Count > 20 && (msg.ULPPayload as binary).Segment(0,4) == $[01000100]
+    {
+        switch (msg.ULPPayload as binary)
+        {
+            case m:MessageContract.NegotiateRequest from BinaryDecoder<MessageContract.NegotiateRequest> =>
+                dispatch (endpoint Server over node) issues m;
+            case m:MessageContract.NegotiateResponse from BinaryDecoder<MessageContract.NegotiateResponse> =>
+                dispatch (endpoint Server over node) issues m;
+            case m:MessageContract.DataTransfer from BinaryDecoder<MessageContract.DataTransfer> =>
+                if (ReassembleData(ref data, m))
+                {
+                    dispatch (endpoint Server over node) issues data;
+                    data = null;
+                }
+            default =>
+                ThrowDecodingException("SMBD");
+        }
+    }
+
+    process node accepts msg:RDMAP.Msg where msg.ULPPayload != nothing && (msg.ULPPayload as binary).Count > 20 && (msg.ULPPayload as binary).Segment(0,4) == $[01000100]
+    {
+        switch (msg.ULPPayload as binary)
+        {
+            case m:MessageContract.NegotiateRequest from BinaryDecoder<MessageContract.NegotiateRequest> =>
+                dispatch (endpoint Server over node) accepts m;
+            case m:MessageContract.NegotiateResponse from BinaryDecoder<MessageContract.NegotiateResponse> =>
+                dispatch (endpoint Server over node) accepts m;
+            case m:MessageContract.DataTransfer from BinaryDecoder<MessageContract.DataTransfer> =>
+                if (ReassembleData(ref data, m))
+                {
+                    dispatch (endpoint Server over node) accepts data;
+                    data = null;
+                }
+            default =>
+                ThrowDecodingException("SMBD");
+        }
+    }
+}
+
+contract MessageContract
+{
+    accepts NegotiateRequest
+    {
+        VersionType MinVersion;
+        VersionType MaxVersion;
+        ushort Reserved;
+        ushort CreditsRequested;
+        uint PreferredSendSize;
+        uint MaxReceiveSize;
+        uint MaxFragmentedSize;
+        
+        invariant Reserved == 0;
+        override string ToString()
+        {
+            return "NegotiateRequest, MinVersion: " + MinVersion.ToString() + ", MaxVersion: " + MaxVersion.ToString();
+        }
+    }
+    
+    issues NegotiateResponse
+    {
+        VersionType MinVersion;
+        VersionType MaxVersion;
+        VersionType NegotiatedVersion;
+        ushort Reserved;
+        ushort CreditsRequested;
+        ushort CreditsGranted;
+        uint Status;
+        uint MaxReadWriteSize;
+        uint PreferredSendSize;
+        uint MaxReceiveSize;
+        uint MaxFragmentedSize;
+        
+        invariant Reserved == 0;
+        
+        override string ToString()
+        {
+            string summary = "NegotiateResponse, Status: ";
+            if (Status == 0)
+            {
+                summary += "Success, NegotiatedVersion: " + NegotiatedVersion.ToString() + ", CreditsGranted: " + CreditsGranted.ToString();
+            }
+            else
+            {
+                summary += NtStatusValuesToText(Status);
+            }
+            return summary;
+        }
+    }
+    
+    accepts DataTransfer
+    {
+        ushort CreditsRequested;
+        ushort CreditsGranted;
+        (TransferFlags | 0) Flags;
+        ushort Reserved;
+        uint RemainingDataLength;
+        uint DataOffset;
+        uint DataLength;
+        optional [|DataLength != 0|] uint Padding;
+        optional [|DataLength != 0|] binary Buffer with BinaryEncoding{Length = DataLength};
+        
+        invariant Reserved == 0 && (Padding == nothing || Padding == 0);
+        
+        override string ToString()
+        {
+            string summary = "DataTransfer";
+            if (Flags is TransferFlags)
+            {
+                summary += ", Flags: RESPONSE_REQUESTED";
+            }
+            summary += ", DataLength: " + DataLength.ToString() + ", DataOffset: " + DataOffset.ToString() + ", RemainingDataLength: " + RemainingDataLength.ToString() + ", CreditsGranted: " + CreditsGranted.ToString();
+            return summary;
+        }
+    }
+}
+
+pattern VersionType = enum ushort
+{
+    Version1 = 0x0100
+};
+
+pattern TransferFlags = enum ushort
+{
+    SMB_DIRECT_RESPONSE_REQUESTED = 1
+};
+
+type BufferDescriptorV1
+{
+    ulong Offset;
+    uint Token;
+    uint Length;
+}
+
+bool ReassembleData(ref MessageContract.DataTransfer data, MessageContract.DataTransfer m)
+{
+    if (m.RemainingDataLength != 0)
+    {
+        if (data == null)
+        {
+            data = new MessageContract.DataTransfer{};
+            data.CreditsRequested = m.CreditsRequested;
+            data.CreditsGranted = m.CreditsGranted;
+            data.Flags = m.Flags;
+            data.Reserved = m.Reserved;
+            data.RemainingDataLength = m.RemainingDataLength;
+            data.DataOffset = m.DataOffset;
+            data.DataLength = m.DataLength;
+            data.Padding = m.Padding;
+            data.Buffer = (data.Buffer as binary) + (m.Buffer as binary);
+        }
+        else
+        {
+            data.DataLength += m.DataLength;
+            data.Buffer = (data.Buffer as binary) + (m.Buffer as binary);
+        }
+
+        return false;
+    }
+    else
+    {
+        if (data == null)
+        {
+            data = m;
+        }
+        else
+        {
+            data.DataLength += m.DataLength;
+            data.Buffer = (data.Buffer as binary) + (m.Buffer as binary);
+        }
+
+        return true;
+    }
+
+    return false;
+}

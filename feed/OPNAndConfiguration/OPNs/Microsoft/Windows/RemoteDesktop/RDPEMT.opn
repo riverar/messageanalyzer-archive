@@ -1,0 +1,214 @@
+protocol RDPEMT with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: Multitransport Extension",
+    ShortName = "RDPEMT",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "MS-RDPEMT", Version = "6.0", Date = "05/15/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="380827", Date="09/22/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using ERREF;
+using RDPEUDP;
+using DecodingUtility;
+using Diagnostics;
+
+endpoint Server over RDPEUDP.Server 
+    accepts RDP_TUNNEL_CREATEREQUEST issues RDP_TUNNEL_CREATERESPONSE
+    accepts RDP_TUNNEL_DATA issues RDP_TUNNEL_DATA;
+    
+autostart actor RDPEMTOverRDPEUDP(RDPEUDP.Server server)
+{
+    RDPEMT.Server EPT;
+    RDPEMTDecodingCache RequestCache = null;
+    RDPEMTDecodingCache ResponseCache = null;
+    
+    process server accepts d:RDPEUDP.ACKDatagram where RequestCache != null && RequestCache.BufferCount() > 0 
+        || d.Payload is bin:binary && IsRDPEMTMessage(bin) == true
+    {
+        if (RequestCache == null)
+        {
+            EPT = endpoint RDPEMT.Server over server;
+            RequestCache = new RDPEMTDecodingCache();
+            RequestCache.InitializeRDPEMTCache(EPT, MessageDirection.Accepts);
+        }
+        
+        RequestCache.AddACKDatagram(d);
+        RequestCache.TryDecodeAndDispatchMessage();
+    }
+    
+    process server issues d:RDPEUDP.ACKDatagram where ResponseCache != null && ResponseCache.BufferCount() > 0 
+        || d.Payload is bin:binary && IsRDPEMTMessage(bin) == true
+    {
+        if (ResponseCache == null)
+        {
+            EPT = endpoint RDPEMT.Server over server;
+            ResponseCache = new RDPEMTDecodingCache();
+            ResponseCache.InitializeRDPEMTCache(EPT, MessageDirection.Issues);
+        }
+        
+        ResponseCache.AddACKDatagram(d);
+        ResponseCache.TryDecodeAndDispatchMessage();
+    }
+}
+    
+message RDP_TUNNEL_CREATEREQUEST
+{
+    RDP_TUNNEL_HEADER TunnelHeader where TunnelHeader.Action == RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_CREATEREQUEST;
+    uint RequestID;
+    uint Reserved where ValidationCheckReservedZero(value == 0, this, true, ReferenceType.Type, "RDPEMT", "Reserved", "RDP_TUNNEL_CREATEREQUEST", value);
+    binary SecurityCookie with BinaryEncoding{Length = 16},DisplayInfo{ToText = (any input) => "0x" + BinaryToText(input as binary)};
+    
+    override string ToString()
+    {
+        return "RDP_TUNNEL_CREATEREQUEST, RequestID: " + RequestID.ToString() + ", SecurityCookie: 0x" + BinaryToText(SecurityCookie);
+    }
+}
+
+message RDP_TUNNEL_CREATERESPONSE
+{
+    RDP_TUNNEL_HEADER TunnelHeader where TunnelHeader.Action == RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_CREATERESPONSE;
+    uint HrResponse with DisplayInfo{ToText = (any input) => HResultValuesToText(input as uint)};
+    
+    override string ToString()
+    {
+        return "RDP_TUNNEL_CREATERESPONSE, HrResponse: " + HResultValuesToText(HrResponse);
+    }
+}
+
+message RDP_TUNNEL_DATA
+{
+    RDP_TUNNEL_HEADER TunnelHeader where TunnelHeader.Action == RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_DATA;
+    binary HigherLayerData with BinaryEncoding{Length = TunnelHeader.PayloadLength};
+    
+    override string ToString()
+    {
+        return "RDP_TUNNEL_DATA, PayloadLength: " + TunnelHeader.PayloadLength.ToString();
+    }
+}
+
+type RDP_TUNNEL_HEADER
+{
+    uint Flags where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "RDPEMT", "Flags", "RDP_TUNNEL_HEADER", value)
+        with BinaryEncoding{Width = 4};
+    RDP_TUNNEL_HEADER_Action Action;
+    ushort PayloadLength;
+    byte HeaderLength;
+    optional [|HeaderLength > 4|] array<RDP_TUNNEL_SUBHEADER> SubHeaders with BinaryEncoding{WidthForComposedType = (HeaderLength - 4) * 8};
+}
+
+pattern RDP_TUNNEL_HEADER_Action = enum byte
+{
+    RDPTUNNEL_ACTION_CREATEREQUEST = 0x0,
+    RDPTUNNEL_ACTION_CREATERESPONSE = 0x1,
+    RDPTUNNEL_ACTION_DATA = 0x2,
+    ...
+} with BinaryEncoding{Width = 4};
+
+type RDP_TUNNEL_SUBHEADER
+{
+    byte SubHeaderLength where ValidationCheckGreaterThanOrEqualTo(value >= 2, null, true, ReferenceType.Type, "RDPEMT", "SubHeaderLength", "RDP_TUNNEL_SUBHEADER", 2, value);
+    RDP_TUNNEL_SUBHEADER_SubHeaderType SubHeaderType;
+    optional [|SubHeaderLength - 2 > 0|] binary SubHeaderData with BinaryEncoding{Length = SubHeaderLength - 2};
+
+    override string ToString()
+    {
+        return "RDP_TUNNEL_SUBHEADER, " + EnumToString<RDP_TUNNEL_SUBHEADER_SubHeaderType>(SubHeaderType);
+    }
+}
+
+pattern RDP_TUNNEL_SUBHEADER_SubHeaderType = enum byte
+{
+    TYPE_ID_AUTODETECT_REQUEST = 0x00,
+    TYPE_ID_AUTODETECT_RESPONSE = 0x01,
+    ...
+};
+
+bool? IsRDPEMTMessage(binary bin)
+{
+    if (bin.Count < 4)
+    {
+        return null;
+    }
+    else
+    {
+        return InRange<RDP_TUNNEL_HEADER_Action>(GetMessageType(bin[0])) && (bin[0] & 0xF0) == 0;
+    }
+}
+
+RDP_TUNNEL_HEADER_Action GetMessageType(byte input)
+{
+    return (input & 0x0F) as RDP_TUNNEL_HEADER_Action;
+}
+
+optional any message DecodeRDPEMTMessage(stream s)
+{
+    if (s.RemainingByteLength < 1)
+    {
+        return nothing;
+    }
+    
+    optional any message res;
+    switch (GetMessageType(s.CurrentByte))
+    {
+        case RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_CREATEREQUEST =>
+            res = BinaryDecoder<RDP_TUNNEL_CREATEREQUEST>(s);
+        case RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_CREATERESPONSE =>
+            res = BinaryDecoder<RDP_TUNNEL_CREATERESPONSE>(s);
+        case RDP_TUNNEL_HEADER_Action.RDPTUNNEL_ACTION_DATA =>
+            res = BinaryDecoder<RDP_TUNNEL_DATA>(s);
+        default => res = nothing;
+    }
+    return res;
+}
+
+type RDPEMTDecodingCache : StreamDecodingCache
+{
+    void InitializeRDPEMTCache(any endpoint ept, MessageDirection direction)
+    {
+        base.Initialize("RDPEMT", ept, direction, IsRDPEMTMessage, IsDataSufficient,
+            DecodeRDPEMTMessage, (binary bin) => nothing);
+    }
+    
+    void AddACKDatagram(RDPEUDP.ACKDatagram datagram)
+    {
+        if (datagram.Payload is bin:binary)
+        {
+            Buffer += bin;
+            Origins += [datagram];
+        }
+    }
+}
+
+uint? IsDataSufficient(binary bin)
+{
+    if (bin.Count < 4)
+    {
+        return null;
+    }
+    else
+    {
+        var temp = MakeWord(bin[2], bin[1]) + bin[3] as uint;
+        return (temp <= bin.Count) ? 0 : temp;
+    }
+}
+
+// Transform binary to hexadecimal as string to show hex in UI.
+// E.g., Input: $[0102030F], Output: "0102030F"
+string BinaryToText(binary bin)
+{
+    return (bin as array<byte>).Accumulate<byte, string>((byte val, string text) => text + Format("{0:X2}", val));
+}

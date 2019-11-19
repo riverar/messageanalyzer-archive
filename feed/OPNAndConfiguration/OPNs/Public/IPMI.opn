@@ -1,0 +1,1050 @@
+﻿protocol IPMI with 
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Intelligent Platform Management Interface",
+    ShortName = "IPMI",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+    new Reference{Name = "IPMI 2.0", Version = "2.0", Link = "http://www.intel.com/content/www/us/en/servers/ipmi/second-gen-interface-spec-v2.html"},
+    new Reference{Name = "DCMI", Version = "1.0", Link = "http://www.intel.com/content/www/us/en/data-center/dcmi/dcmi-specification-download.html"}
+    ],
+    RevisionSummary =
+    [
+    new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="03/26/2013"}
+    ]
+};
+
+using Standard;
+using DTYP;
+using Utility;
+using PublicResources;
+using RMCP;
+
+string IPMI_MODULE = "IPMI";
+string IPMI_UNKNOWN_COMMAND = "Unknown command";
+
+endpoint Console[binary address] issues LANRequest accepts LANResponse issues OpenSessionRequest accepts OpenSessionResponse issues RAKPMessage1 accepts RAKPMessage2 issues RAKPMessage3 accepts RAKPMessage4;
+
+client endpoint Client connected to IpmiOnLAN;
+
+int GetAuthCodeLength(IntegrityAlgorithm alg)
+{
+    int authcodeLen = 0;
+    switch (alg)
+    {
+        case IntegrityAlgorithm.HMAC_SHA1_96 =>
+        authcodeLen = 12;
+        case IntegrityAlgorithm.HMAC_MD5_128 =>
+        authcodeLen = 16;
+        case IntegrityAlgorithm.MD5_128 =>
+        authcodeLen = 16;
+        case IntegrityAlgorithm.HMAC_SHA256_128 =>
+        authcodeLen = 16;
+    }
+    return authcodeLen;
+}
+
+int GetConfHeaderLength(ConfidentialityAlgorithm alg)
+{
+    int result = 0;
+    switch (alg)
+    {
+        case ConfidentialityAlgorithm.AES_CBC_128 =>      
+        result = 16;
+        case ConfidentialityAlgorithm.xRC4_128 =>
+        result = 20;
+        case ConfidentialityAlgorithm.xRC4_40 =>
+        result = 20;
+    }
+    return result;
+}
+
+// only observe unencrypted messages
+endpoint IpmiOnLAN over RMCP.Console accepts IPMI20 accepts IPMI15
+{
+    binary DeviceIP = $[];
+    
+    IPMI20SessionState session = new IPMI20SessionState();
+    
+    process this accepts i:IPMI20 where (i.PayloadType.Encryption == PayloadEncryption.Unencrypted)
+    {
+        binary data = i.Payload as binary;        
+        switch(i.PayloadType.PayloadType)
+        {
+            case PayloadTypeEnum.RMCPPlusOpenSessionRequest =>
+                OpenSessionRequest osreq = BinaryDecoder<OpenSessionRequest>(data) as OpenSessionRequest;
+                dispatch endpoint Console[DeviceIP] issues osreq; 
+            case PayloadTypeEnum.RMCPPlusOpenSessionResponse =>
+                OpenSessionResponse osres = BinaryDecoder<OpenSessionResponse>(data) as OpenSessionResponse;
+                dispatch endpoint Console[DeviceIP] accepts osres;
+            case PayloadTypeEnum.RAKPMessage1 =>
+                RAKPMessage1 rakp1 = BinaryDecoder<RAKPMessage1>(data) as RAKPMessage1;
+                dispatch endpoint Console[DeviceIP] issues rakp1; 
+            case PayloadTypeEnum.RAKPMessage2 =>
+                RAKPMessage2 rakp2 = BinaryDecoder<RAKPMessage2>(data) as RAKPMessage2;
+                dispatch endpoint Console[DeviceIP] accepts rakp2;
+            case PayloadTypeEnum.RAKPMessage3 =>
+                RAKPMessage3 rakp3 = BinaryDecoder<RAKPMessage3>(data) as RAKPMessage3;
+                dispatch endpoint Console[DeviceIP] issues rakp3; 
+            case PayloadTypeEnum.RAKPMessage4 =>
+                RAKPMessage4 rakp4 = BinaryDecoder<RAKPMessage4>(data) as RAKPMessage4;
+                dispatch endpoint Console[DeviceIP] accepts rakp4;
+            case PayloadTypeEnum.IPMIMessage =>
+                {
+                    // check network function code to determine request/response
+                    NetFnLUN fn = BinaryDecoder<NetFnLUN>(data.Segment(1, 1)) as NetFnLUN;
+                    // it's response when FN is odd
+                    if ((fn.NetworkFunctionCode & 0x4) != 0x4)
+                    {
+                        LANRequest p = BinaryDecoder<LANRequest>(data) as LANRequest;
+                        dispatch endpoint Console[DeviceIP] issues p;
+                    }
+                    else
+                    {
+                        LANResponse p = BinaryDecoder<LANResponse>(data) as LANResponse;
+                        dispatch endpoint Console[DeviceIP] accepts p;
+                    } 
+                }  
+        }
+    }
+}
+
+// calculate integrity length and then decode into IPMI20 message
+IPMI20 DecodeIPMI20(stream data, ConfidentialityAlgorithm conf, IntegrityAlgorithm integ, bool knownSession)
+{
+    IPMI20 msg = BinaryDecoder<IPMI20[conf, knownSession]>(data) as IPMI20;
+    int offset = data.BytePosition;
+    if (msg.PayloadType.Authentication == 0 || !knownSession)
+    {
+        // process unauthenticated message
+        msg.Payload = BinaryDecoder<binary>(data);
+        Utility.AssociateFieldPosition(msg, "Payload", data, offset * 8);
+        return msg;
+    }
+    else if (knownSession)
+    {
+        // process authenticated message
+        bool isOEM = msg.PayloadType.PayloadType == 2;
+        int authCodeLen = GetAuthCodeLength(integ);
+        int padLen = data.PeekBytes((data.ByteLength - authCodeLen - 2) * 8, 1)[0];
+        int payloadLen = data.ByteLength - padLen - 2 - authCodeLen - GetConfHeaderLength(conf) - (isOEM == true ? 18 : 12);
+    
+        msg.Payload = (BinaryDecoder<Blob[payloadLen as uint]>(data) as Blob).Data;
+        Utility.AssociateFieldPosition(msg, "Payload", data, offset * 8);
+        offset += payloadLen;
+        msg.IntegrityPAD = (BinaryDecoder<Blob[padLen as uint]>(data) as Blob).Data;
+        Utility.AssociateFieldPosition(msg, "IntegrityPAD", data, offset * 8);
+        offset +=padLen;
+        msg.PadLength = BinaryDecoder<byte>(data);
+        Utility.AssociateFieldPosition(msg, "PadLength", data, offset * 8);
+        offset++;
+        msg.NextHeader = BinaryDecoder<byte>(data);
+        Utility.AssociateFieldPosition(msg, "NextHeader", data, offset * 8);
+        offset++;      
+        msg.AuthCode = (BinaryDecoder<Blob[authCodeLen as uint]>(data) as Blob).Data;
+        Utility.AssociateFieldPosition(msg, "AuthCode", data, offset * 8);
+        offset += authCodeLen;
+    }
+    if (offset != data.ByteLength)
+    {
+        ThrowDecodingException("IPMI", "IPMI 2.0 message");
+    }
+    return msg; 
+}
+
+
+type IPMI20SessionState
+{
+    uint ConsoleSessionID;
+    uint DeviceSessionID;
+    uint ConsoleSeq;
+    uint DeviceSeq;
+    IntegrityAlgorithm Integrity;
+    ConfidentialityAlgorithm Conf;
+    map<uint, any> LANMessages = {};   
+} 
+    
+// Listen to RMCP console, decode message and dispatch
+autostart actor IpmiOverRmcp(RMCP.Console console)
+{
+    ConfidentialityAlgorithm conf = ConfidentialityAlgorithm.none;
+    
+    IntegrityAlgorithm integ = IntegrityAlgorithm.none;
+    
+    bool hasOpenSessionResponse = false;
+    
+    // Process IPMI 2.0
+    process console accepts c:RMCP.RMCPMessage where (c.ClassOfMessage.MessageClass == MessageClass.IPMI && (c.RMCPData as binary)[0] == 0x6)
+    {
+        binary data = c.RMCPData as binary;
+        int sessionIDOffset = 2;
+        IPMI20 msg = null;
+        uint sid = BinaryDecoder<uint>(data.Segment(sessionIDOffset, 4)) as uint;
+        if (sid != 0)
+        {
+            msg = DecodeIPMI20(data as stream, conf, integ, hasOpenSessionResponse); 
+        }
+        else
+        {
+            // session ID == 0 is out-of-session, includes message in session activation and get capability... etc.
+            msg = DecodeIPMI20(data as stream, 0, 0, false);
+        } 
+        if (msg.PayloadType.PayloadType == PayloadTypeEnum.RMCPPlusOpenSessionResponse)
+        {
+            data = msg.Payload as binary;
+            /* Check 2nd byte, which is status code,  when it's 0, it means a new session is successfully opened, 
+               save the integrity algorithm (offset 24) and confidentiality algorithm (offset 32)
+            */
+            if (data[1] == 0)
+            {
+                integ = data[24];
+                conf = data[32];
+                hasOpenSessionResponse = true;
+            }
+        } 
+        dispatch (endpoint IpmiOnLAN over console) accepts msg;
+    }
+}
+
+message IPMI15[bool request]
+{
+    AuthType AuthType;
+    uint SessionSequenceNumber;
+    uint SessionID;
+    optional [|AuthType.AuthType != AuthenticationType.none|]binary AuthCode with BinaryEncoding{Length = 16};
+    byte PayloadLength;
+    binary Payload;
+
+    override string ToString()
+    {
+        return "SessionID:" + SessionID.ToString() + ", SessionSeq:" + SessionSequenceNumber.ToString() + ", " + (AuthType.AuthType != 0 ? IPMI_STR_ENCRYPTED : "");
+    }
+};
+
+message IPMI20[ConfidentialityAlgorithm alg, bool knownSession]
+{
+    AuthType AuthType;
+    PayloadType PayloadType;
+    optional [| PayloadType.PayloadType == 2|] uint OEMIANA;
+    optional [| PayloadType.PayloadType == 2|] ushort OEMPayloadID;
+    uint SessionID;
+    uint SessionSequenceNumber;
+    ushort PayloadLength;
+    optional [|PayloadType.Encryption == PayloadEncryption.Encrypted && knownSession|] ([|alg == ConfidentialityAlgorithm.AES_CBC_128|] AESCBC128ConfHeader |
+                 [|alg == ConfidentialityAlgorithm.xRC4_128 || alg == ConfidentialityAlgorithm.xRC4_40|] XRC4ConfHeader) ConfidentialityHeader;
+    optional binary Payload with Encoding{Ignore = true};
+    optional binary IntegrityPAD with Encoding{Ignore = true};
+    optional byte PadLength with Encoding{Ignore = true};
+    optional byte NextHeader with Encoding{Ignore = true};
+    optional binary AuthCode with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return "IPMI 2.0, PayloadType:" + PayloadTypeEnumToString(PayloadType.PayloadType) + ", SessionID:" + SessionID.ToString() + ", SessionSeq:" + SessionSequenceNumber.ToString() + ", " + (PayloadType.Encryption == PayloadEncryption.Encrypted ? IPMI_STR_ENCRYPTED : "");
+    }
+};
+
+type AESCBC128ConfHeader
+{
+    binary IV with BinaryEncoding{Length = 16};
+}
+
+type XRC4ConfHeader
+{
+    binary DataOffset with BinaryEncoding{Length = 4};
+    binary IV with BinaryEncoding{Length = 16};
+}
+
+type NetFnLUN
+{
+    NetworkFunctionCode NetworkFunctionCode with BinaryEncoding{Width = 6};
+    byte LUN with BinaryEncoding{Width = 2};
+}
+
+type SeqLUN
+{
+    byte SequenceNumber with BinaryEncoding{Width = 6};
+    byte LUN with BinaryEncoding{Width = 2};
+}
+
+message LANRequest
+{
+    byte rsAddr;
+    NetFnLUN NetFnrsLUN;
+    byte checksum1;
+    byte rqAddr;
+    SeqLUN rqSeqLUN;
+    byte cmd;
+    optional ([|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.StorageRequest && cmd == 0x11|] ReadFRURequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.ChassisRequest && cmd == 0x2|] ChassisControlRequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.ChassisRequest && cmd == 0x9|] GetSystemBootOptionRequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.AppRequest && cmd == 0x3B|] SetSessionPrivilegeLevelRequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.AppRequest && cmd == 0x3C|] CloseSessionRequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.AppRequest && cmd == 0x59|] GetSysteInfoRequest | 
+    [|NetFnrsLUN.NetworkFunctionCode == NetworkFunctionCode.GroupExtRequest && cmd == 0x6|] GetAssetTagRequest) RequestData;
+    byte checksum2;
+    optional binary ConfidentialityTrailer;
+    
+    override string ToString()
+    {
+        return "LAN Request, Seq:" + rqSeqLUN.SequenceNumber.ToString() + ", " + RequestData.ToString();
+    }
+}
+
+message LANResponse
+{
+    byte rqAddr;
+    NetFnLUN NetFnrqLUN;
+    byte checksum1;
+    byte rsAddr;
+    SeqLUN rqSeqrsLUN;
+    byte cmd;
+    CompletionCode CompletionCode;
+    optional ([|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.StorageResponse && cmd == 0x11|] ReadFRUResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.ChassisResponse && cmd == 0x1|] GetChassisStatusResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.AppResponse && cmd == 0x1|] GetDeviceIDResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.ChassisResponse && cmd == 0x9|] GetSystemBootOptionResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.AppResponse && cmd == 0x3B|] SetSessionPrivilegeLevelResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.AppRequest && cmd == 0x59|] GetSysteInfoResponse | 
+    [|NetFnrqLUN.NetworkFunctionCode == NetworkFunctionCode.GroupExtResponse && cmd == 0x6|] GetAssetTagResponse) ResponseData;
+    byte checksum2;    
+    optional binary ConfidentialityTrailer;
+    
+    override string ToString()
+    {
+        return "LAN Response, Seq:" + rqSeqrsLUN.SequenceNumber.ToString() + ", " + ResponseData.ToString() + ", CompletionCode:"+ CompletionCode.ToString();
+    } 
+}
+
+message RAKPMessage1
+{
+    byte MessageTag;
+    ulong reserved1 with BinaryEncoding{Width = 24};
+    uint ManagedSystemSessionID;
+    binary RemoteConsoleRandomNumber with BinaryEncoding{Length = 16};
+    Role Role;
+    ushort reserved2;
+    byte UserNameLength;
+    optional [|UserNameLength>=1 && UserNameLength <=16|] string UserName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = UserNameLength};
+    
+    override string ToString()
+    {
+        return "RAKP Message 1, " + "ManagedSystemSessionID:" + ManagedSystemSessionID.ToString() + ", Role:" + Role.ToString();
+    }
+};
+
+message RAKPMessage2
+{
+    byte MessageTag;
+    RMCPPlusStatusCode StatusCode;
+    ushort reserved;
+    uint RemoteConsoleSessionID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] binary ManagedSystemRandomNumber with BinaryEncoding{Length = 16};
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] GUID ManagedSystemGUID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] binary KeyExchangeAuthenticationCode;
+
+    override string ToString()
+    {
+        return "RAKP Message 2, " + "RMCPPlusStatusCode:" + StatusCode.ToString() + ", RemoteConsoleSessionID:" + RemoteConsoleSessionID.ToString();
+    }
+};
+
+message RAKPMessage3
+{
+    byte MessageTag;
+    RMCPPlusStatusCode StatusCode;
+    ushort reserved;
+    uint ManagedSystemSessionID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] binary KeyExchangeAuthenticationCode;
+    
+    override string ToString()
+    {
+        return "RAKP Message 3, " + "RMCPPlusStatusCode:" + StatusCode.ToString() + ", ManagedSystemSessionID:" + ManagedSystemSessionID.ToString();
+    }
+};
+
+message RAKPMessage4
+{
+    byte MessageTag;
+    RMCPPlusStatusCode StatusCode;
+    ushort reserved;
+    uint MgmtConsoleSessionID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] binary IntegrityCheckValue;
+
+    override string ToString()
+    {
+        return "RAKP Message 4, " + "RMCPPlusStatusCode:" + StatusCode.ToString() + ", MgmtConsoleSessionID:" + MgmtConsoleSessionID.ToString();
+    }
+};
+
+type AuthType
+{
+    byte Reserved with BinaryEncoding{Width = 4};
+    AuthenticationType AuthType with BinaryEncoding{Width = 4};
+};
+
+message OpenSessionResponse
+{
+    byte MessageTag;
+    RMCPPlusStatusCode StatusCode;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] Role Role;
+    byte reserved;
+    uint RemoteConsoleSessionID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] uint ManagedSystemSessionID;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] AuthenticationPayload AuthenticationPayload;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] IntegrityPayload IntegrityPayload;
+    optional [|StatusCode == RMCPPlusStatusCode.NoError|] ConfidentialityPayload ConfidentialityPayload;
+    
+    override string ToString()
+    {
+        return "Open Session Response, StatusCode:" + StatusCode.ToString() + ", RemoteConsoleSessionID:" + RemoteConsoleSessionID.ToString();
+    }
+};
+
+pattern RMCPPlusStatusCode = enum byte
+{
+    NoError = 0,
+    InsufficientResouseToCreateSession = 1,
+    InvalidSessionID = 2,
+    InvalidPayloadType = 3,
+    InvalidAuthenticationAlgorithm = 4,
+    InvlaidIntegrityAlgorithm = 5,
+    NoMatchingAuthPayload = 6,
+    NoMatchingIntegrityPayload = 7,
+    InactiveSessionID = 8,
+    InvalidRole = 9,
+    UnauthorizedRoleOrPrivilegeLevel = 10,
+    InsufficiantResouseToCreateSessionAtRequestedLevel = 11,
+    InvalidNameLength = 12,
+    UnauthorizedName = 13,
+    UnauthroziedGUID = 14,
+    InvalidIntegrityCheckValue = 15,
+    InvalidConfidentialityAlgorithm = 16,
+    NoCipherSuiteMatchSecurityAlgorithm = 17,
+    IllegalOrUnrecParamter = 18,
+    ...
+};
+
+message OpenSessionRequest
+{
+    byte MessageTag;
+    Role Role;
+    ushort reserved;
+    uint RemoteConsoleSessionID;
+    AuthenticationPayload AuthenticationPayload;
+    IntegrityPayload IntegrityPayload;
+    ConfidentialityPayload ConfidentialityPayload;
+    
+    override string ToString()
+    {
+        return "Open Session Request, RemoteConsoleSessionID:" + RemoteConsoleSessionID.ToString() + ", Role:" + Role.ToString();
+    }
+};
+
+type ConfidentialityPayload
+{
+    byte PayloadType;
+    ushort reserved1;
+    byte PayloadLength;
+    byte ConfidentialityReserved with BinaryEncoding{Width = 2};
+    ConfidentialityAlgorithm ConfidentialityAlgorithm with BinaryEncoding{Width = 6};
+    ulong reserved2 with BinaryEncoding{Width = 24};
+};
+
+pattern ConfidentialityAlgorithm  = enum byte
+{
+    none = 0,
+    AES_CBC_128 = 1,
+    xRC4_128 = 2,
+    xRC4_40 = 3,
+    ...
+};
+
+type IntegrityPayload
+{
+    byte PayloadType;
+    ushort reserved1;
+    byte PayloadLength;
+    byte IntegrityReserved with BinaryEncoding{Width = 2};
+    IntegrityAlgorithm IntegrityAlgorithm with BinaryEncoding{Width = 6};
+    ulong reserved2 with BinaryEncoding{Width = 24};
+};
+
+pattern IntegrityAlgorithm  = enum byte
+{
+    none = 0,
+    HMAC_SHA1_96 = 1,
+    HMAC_MD5_128 = 2,
+    MD5_128 = 3,
+    HMAC_SHA256_128 = 4,
+    ...
+};
+
+type AuthenticationPayload
+{
+    byte PayloadType;
+    ushort reserved1;
+    byte PayloadLength;
+    byte AuthenticationReserved with BinaryEncoding{Width = 2};
+    AuthenticationAlgorithm AuthenticationAlgorithm with BinaryEncoding{Width = 6};
+    ulong reserved2 with BinaryEncoding{Width = 24};
+};
+
+pattern AuthenticationAlgorithm  = enum byte
+{
+    RAKP_none = 0,
+    RAKP_HMAC_SHA1 = 1,
+    RAKP_HMAC_MD5 = 2,
+    RAKP_HMAC_SHA256 = 3,
+    ...
+};
+
+type Role
+{
+    byte Reserved with BinaryEncoding{Width = 4};
+    PrivilegeLevel Role with BinaryEncoding{Width = 4};
+};
+
+type PayloadType
+{
+    PayloadEncryption Encryption with BinaryEncoding{Width = 1};
+    PayloadAuth Authentication with BinaryEncoding{Width = 1};
+    PayloadTypeEnum PayloadType with BinaryEncoding{Width = 6};
+};
+
+pattern PayloadTypeEnum = enum byte
+{
+    IPMIMessage = 0,
+    SOL = 1,
+    OEMExplicit = 2,
+    RMCPPlusOpenSessionRequest = 16,
+    RMCPPlusOpenSessionResponse = 17,
+    RAKPMessage1 = 18,
+    RAKPMessage2 = 19,
+    RAKPMessage3 = 20,
+    RAKPMessage4 = 21,
+    ...
+} with BinaryEncoding{Width = 6};
+
+string PayloadTypeEnumToString(PayloadTypeEnum t)
+{
+    switch(t)
+    {
+        case PayloadTypeEnum.IPMIMessage =>
+        return "IPMI Message";
+        case PayloadTypeEnum.SOL =>
+        return "SOL";
+        case PayloadTypeEnum.OEMExplicit =>
+        return "OEM Explicit";
+        case PayloadTypeEnum.RMCPPlusOpenSessionRequest =>
+        return "RMCP+ Open Session Request";
+        case PayloadTypeEnum.RMCPPlusOpenSessionResponse =>
+        return "RMCP+ Open Session Response";
+        case PayloadTypeEnum.RAKPMessage1 =>
+        return "RAKP Message 1";
+        case PayloadTypeEnum.RAKPMessage2 =>
+        return "RAKP Message 2";
+        case PayloadTypeEnum.RAKPMessage3 =>
+        return "RAKP Message 3";
+        case PayloadTypeEnum.RAKPMessage4 => 
+        return "RAKP Message 4";   
+        default=>
+        return "Unknown";
+    }
+};
+
+pattern PayloadEncryption = enum byte
+{
+    Unencrypted = 0,
+    Encrypted = 1
+};
+
+pattern PrivilegeLevel = enum byte
+{
+    HighestLevelMatching = 0,
+    CALLBACK = 1,
+    USER = 2,
+    OPERATOR = 3,
+    ADMINISTRATOR = 4,
+    OEMProprietary = 5
+};
+
+pattern PayloadAuth = enum byte
+{
+    Unauthenticated = 0,
+    Authenticated = 1
+};
+
+pattern AuthenticationType = enum byte
+{
+    none = 0x00,
+       MD2 = 0x01,
+       MD5 = 0x02,
+       StraightPassword = 0x04,
+       OEM = 0x05,
+       RmcpPlus = 0x06,
+       ...
+};
+
+pattern CompletionCode = enum byte
+{
+    Success = 0x0,
+    NodeBusy = 0xC0,
+    InvalidCommand = 0xC1,
+    InvalidCommandForLUN = 0xC2,
+    Timeout = 0xC3,
+    OutOfSpace = 0xC4,
+    ReservationCanceled = 0xC5,
+    RequestTruncated = 0xC6,
+    InvalidRequestLength = 0xC7,
+    RequestDataLengthExceeded = 0xC8,
+    ParamterOutOfRange = 0xC9,
+    CannotReturnData = 0xCA,
+    RequestedObjectNotPresented = 0xCB,
+    RequestDataFieldInvalid = 0xCC,
+    CommandIllegal = 0xCD,
+    ResponseNotProvided = 0xCE,
+    DuplicatedRequest = 0xCF,
+    SDRInUpdate = 0xD0,
+    DeviceInFirmwareUpdate = 0xD1,
+    InitInProgress = 0xD2,
+    UnavaiableDestination = 0xD3,
+    InsufficiantPrivilegeLevel = 0xD4,
+    NotSupported = 0xD5,
+    SubFuncDisabledOrNotAvaiable = 0xD6,
+    UnspecifiedError = 0xFF,
+    ...
+};
+
+pattern NetworkFunctionCode = enum byte
+{
+    ChassisRequest = 0,
+    ChassisResponse = 1,
+    BridgeRequest = 2,
+    BridgeResponse = 3,
+    SensorEventRequest = 4,
+    SensorEventesponse = 5,
+    AppRequest = 6,
+    AppResponse = 7,
+    FirwareRequest = 8,
+    FirwareResponse = 9,
+    StorageRequest = 10,
+    StorageResponse = 11,
+    TransportRequest = 12,
+    TransportResponse = 13,
+    GroupExtRequest = 0x2C,
+    GroupExtResponse = 0x2D,
+    OEMGroupRequest = 0x2E,
+    OEMGroupResponse = 0x2F,
+    ControllerSpecificRequest = 0x2E,
+    ControllerSpecificResponse = 0x2F,
+    ...
+};
+
+string GetCommandMsgName(NetworkFunctionCode fn, byte cmd)
+{
+    string ret = "";
+    ushort combine = (fn * 0x100 + cmd) as ushort;
+    if(combine in CommandNameMap)
+    {
+        ret += CommandNameMap[combine];
+    }
+    else
+    {
+        ret = IPMI_UNKNOWN_COMMAND;
+    }
+    if (fn << 7 == 0)
+    {
+        ret += " Request";
+    }
+    else
+    {
+        ret += " Response";
+    }
+    return ret;
+};
+
+const map<ushort, string> CommandNameMap = 
+{
+    0x1 -> "Get Chassis Status",
+    0x2 -> "Chassis Control",
+    0x8 -> "Set System Boot Options",
+    0x9 -> "Get System Boot Options",
+    0x601 -> "Get Device ID",
+    0x63B -> "Set Session Privilege Level",
+    0x63C -> "Close Session",
+    0x659 -> "Get System info",
+    0x1011 -> "Read FRU Data",
+    0x2C06 -> "Get Asset Tag"
+};
+
+type ReadFRURequest
+{
+    byte DeviceID;
+    byte LS;
+    byte MS;
+    byte Count;    
+};
+
+type ReadFRUResponse
+{
+    byte Count; 
+    binary Data with BinaryEncoding{Length = Count};
+};
+
+type CloseSessionRequest
+{
+    uint SessionID;
+    optional [|SessionID == 0|] byte Handle;
+};
+
+type SetSessionPrivilegeLevelRequest
+{
+    Role RequestedLevel;
+};
+
+type SetSessionPrivilegeLevelResponse
+{
+    Role NewLevel;
+};
+
+type GetAssetTagRequest
+{
+    byte Offset;
+    byte ToRead where ValidationCheckValueInRange(value <= 16, null, true, ReferenceType.Type, IPMI_MODULE, "ToRead", "GetAssetTagRequest", 0, 16, value);
+};
+
+type GetAssetTagResponse
+{
+    byte Identifier where ValidationCheckValue(value == 0xDC, null, true, ReferenceType.Type, IPMI_MODULE, "Identifier", "GetAssetTagResponse", 0xDC, value);
+    byte Length;
+    binary AssetTag with BinaryEncoding{Length = Length};
+};
+
+type GetDeviceIDResponse
+{
+    byte DeviceID;
+    DeviceRevision DeviceRevision;
+    FirewareRevision FirewareRevision1;
+    byte FirewareMinorRevision;
+    BCDFormat IPMIVersion;
+    AdditionalDeviceSupportFlags AdditionalDeviceSupport;
+    uint ManufacturerID with BinaryEncoding{Width = 24};
+    ushort ProductID;
+    optional uint AuxiliaryFirewareRevInfo;
+};
+
+type DeviceRevision
+{
+    DeviceRevisionProvides Provide with BinaryEncoding{Width = 1};
+    byte reserved with BinaryEncoding{Width = 3};
+    byte Revision with BinaryEncoding{Width = 4}; 
+};
+
+pattern AdditionalDeviceSupportFlags = flags byte
+{
+    Sensor = 1,
+    SDR = 0x2,
+    SEL = 0x4,
+    FRU = 0x8,
+    IPMBEventReceiver = 0x10,
+    IPMBEventGenerator = 0x20,
+    Bridge = 0x40,
+    Chassis = 0x80
+};
+
+type BCDFormat
+{
+    byte Minor with BinaryEncoding{Width = 4};
+    byte Major with BinaryEncoding{Width = 4};
+    
+
+    override string ToString()
+    {
+        return Major.ToString() + "." + Minor.ToString();
+    }
+}
+
+type FirewareRevision
+{
+    FirewareRevisionEnum Avaiable with BinaryEncoding{Width = 1};
+    byte FirewareMajorRevision with BinaryEncoding{Width = 7}; 
+};
+
+type GetChassisStatusResponse
+{
+    CurrentPowerState CurrentPowerState;
+    LastPowerEvent LastPowerEvent;
+    ChassisState ChassisState;
+    FrontPannelButtonCapAndStatusFlags FrontPannelButtonCapAndStatus;    
+};
+
+pattern FrontPannelButtonCapAndStatusFlags = flags byte
+{
+    StandbyDisableAllow = 1,
+    DiagDisableAllow = 2,
+    ResetDisableAllow = 4,
+    PowerDisableAllow = 8,
+    StandbyDisabled = 16,
+    DiagDisabled = 32,
+    ResetDisabled = 64,
+    PowerDisable = 128,
+};
+
+type ChassisState
+{
+    byte reserved with BinaryEncoding{Width = 1};
+    ChassisIdentifyCmdSupport ChassisIdentifyCmdSupport with BinaryEncoding{Width = 1};
+    ChassisIdentityState ChassisIdentityState with BinaryEncoding{Width = 2};
+    byte FanFaultDetected with BinaryEncoding{Width = 1};
+    byte DriveFault with BinaryEncoding{Width = 1};
+    byte FronPannelLockout with BinaryEncoding{Width = 1};
+    byte ChassisIntrusion with BinaryEncoding{Width = 1};
+};
+
+pattern ChassisIdentityState = enum byte
+{
+    Off = 0,
+    TempOn = 1,
+    IndefiniteOn = 2,
+    reserved = 3
+};
+
+pattern ChassisIdentifyCmdSupport = enum byte
+{
+    Unspecified = 0,
+    Supported = 1,
+};
+
+type CurrentPowerState
+{
+    byte reserved with BinaryEncoding{Width = 1};
+    PowerRestorePolicy PowerRestorePolicy with BinaryEncoding{Width = 2};
+    byte PowerControlFault with BinaryEncoding{Width = 1};
+    byte PowerFault with BinaryEncoding{Width = 1};
+    byte Interlock with BinaryEncoding{Width = 1};
+    byte PowerOverload with BinaryEncoding{Width = 1};
+    byte PowerIsOn with BinaryEncoding{Width = 1};
+};
+
+type LastPowerEvent
+{
+    byte reserved with BinaryEncoding{Width = 3};
+    byte PowerOnViaIPMI with BinaryEncoding{Width = 1};
+    byte DownByPowerFault with BinaryEncoding{Width = 1};
+    byte DownByInterlock with BinaryEncoding{Width = 1};
+    byte DownByOverload with BinaryEncoding{Width = 1};
+    byte ACFailed with BinaryEncoding{Width = 1};
+};
+
+
+pattern PowerRestorePolicy = enum byte
+{
+    StaysPoweredOff = 0,
+    Restored = 1,
+    AlwaysPowersUp = 2,
+    Unknown = 3  
+};
+
+
+pattern DeviceRevisionProvides = enum byte
+{
+    NotProvideDeviceSDRs = 0,
+    ProvideDeviceSDRS = 1
+};
+
+pattern FirewareRevisionEnum = enum byte
+{
+    Normal = 0,
+    InProgress = 1
+};
+
+pattern ChassisControl = enum byte
+{
+    Down = 0,
+    Up = 1,
+    Cycle = 2,
+    HardReset = 3,
+    PulseDiagInterrupt = 4,
+    InitSoftShutdown = 5,
+    ...
+};
+
+type ChassisControlRequest
+{
+    byte reserved with BinaryEncoding{Width = 4};
+    ChassisControl ChassisControl with BinaryEncoding{Width = 4};
+};
+
+pattern ParameterValid = enum byte
+{
+    Unlock = 0,
+    Lock = 1
+};
+
+type SetSystemBootOptionRequest
+{
+    ParameterValid ParameterValid with BinaryEncoding{Width = 1};
+    byte selector with BinaryEncoding{Width = 7};
+    BootOption[selector] Data;
+};
+
+type GetSystemBootOptionRequest
+{
+    byte reserved with BinaryEncoding{Width = 1};
+    byte ParamSelector with BinaryEncoding{Width = 7}; 
+    byte SetSelector;
+    byte BlockSelector;
+};
+
+type BootOption[byte selector]
+{
+    optional [|selector == 5|] BootFlagsOption BootFlags;
+    optional [|BootFlags == nothing|] binary UnparsedBootOption;
+};
+
+type BootFlagsOption
+{
+    BootFlagsOptionData1 Data1;
+    BootFlagsOptionData2 Data2;
+    BootFlagsOptionData3 Data3;
+    BootFlagsOptionData4 Data4;
+    BootFlagsOptionData5 Data5;
+};
+
+type BootFlagsOptionData1
+{
+    byte IsValid with BinaryEncoding{Width = 1};
+    byte ApplyPersistent with BinaryEncoding{Width = 1};
+    BIOSBootType BIOSBootType with BinaryEncoding{Width = 1};
+    byte reserved with BinaryEncoding{Width = 5};
+};
+
+type BootFlagsOptionData2
+{
+    byte CMOSClear with BinaryEncoding{Width = 1};
+    byte Lo9ckKeyboard with BinaryEncoding{Width = 1};
+    BootDeviceSelector BootDeviceSelector with BinaryEncoding{Width = 4};
+    byte ScreenBlank with BinaryEncoding{Width = 1};
+    byte LockoutResetBtn with BinaryEncoding{Width = 1};
+};
+
+pattern FirmwareVerbosity = enum byte
+{
+    Default = 0,
+    Quiet = 1,
+    Verbose = 2,
+    Reserved = 3
+};
+
+pattern ConsolRedirectionControl = enum byte
+{
+    PerBIOSConfig = 0,
+    SuppressIfEnabled = 1,
+    RequestRedirection = 2,
+    Reserved = 3,
+};
+
+type BootFlagsOptionData3
+{
+    byte LockoutVIaPowerBtn with BinaryEncoding{Width = 1};
+    FirmwareVerbosity FirmwareVerbosity with BinaryEncoding{Width = 2};
+    byte ForceProgEventTraps with BinaryEncoding{Width = 1};
+    byte BypassPassword with BinaryEncoding{Width = 1};
+    byte LocoutSleepBtn with BinaryEncoding{Width = 1};
+    ConsolRedirectionControl ConsolRedirectionControl with BinaryEncoding{Width = 2};
+};
+
+type BootFlagsOptionData4
+{
+    byte LockoutVIaPowerBtn with BinaryEncoding{Width = 4};
+    byte BIOSSharedModeOverride with BinaryEncoding{Width = 1};
+    BIOSMuxControlOverride BIOSMuxControlOverride with BinaryEncoding{Width = 3};
+};
+
+pattern BIOSMuxControlOverride = enum byte
+{
+    Recommanded = 0,
+    ForceMuxToBMC = 1,
+    ForceMuxToSystem = 2,
+};
+
+type BootFlagsOptionData5
+{
+    byte reserved with BinaryEncoding{Width = 3};
+    BootDeviceSelector DeviceInstanceSelector with BinaryEncoding{Width = 5};
+};
+
+pattern BootDeviceSelector = enum byte
+{
+    NoChangeOverride= 0,
+    PXE = 1,
+    DefaultHardDrvie = 2,
+    DefaultHardDriveSafeMode = 3,
+    DefaultDiagPartition = 4,
+    DefaultCDDVD = 5,
+    BIOSSetup = 6,
+    RemoteFloppyOrPriRemovableMedia = 7,
+    PrimaryRemoteMedia = 8,
+    RemoteCDDVD = 9,
+    reserved1 = 10,
+    RemoteHardDrive = 11,
+    reserved2 = 12,
+    FloppyPrimRemovableMedia = 13,
+};
+
+pattern BIOSBootType = enum byte
+{
+    PCCompatible = 0,
+    EFI = 1,
+};
+
+type GetSystemBootOptionResponse
+{
+    byte reserved with BinaryEncoding{Width = 4};
+    byte version with BinaryEncoding{Width = 4};
+    ParameterValid ParameterValid with BinaryEncoding{Width = 1};
+    byte selector with BinaryEncoding{Width = 7};
+    BootOption[selector] Data;
+};
+
+type GetSysteInfoRequest
+{
+    GetParameterEnum GetParameter with BinaryEncoding{Width = 1};
+    byte reserved with BinaryEncoding{Width = 7};
+    byte selector;
+    byte SetSelector;
+    byte BlockSelector;
+};
+
+
+type SystemInfo[byte selector]
+{
+    optional [|selector == 1|] SystemFirmwareVersion SystemFirmwareVersion;
+    optional [|SystemFirmwareVersion == nothing|] binary UnparsedSystemInfo;
+};
+
+type SystemFirmwareVersion
+{
+    binary SetSelector with BinaryEncoding{Length = 16};
+    binary Name with BinaryEncoding{Length = 16};
+};
+
+pattern GetParameterEnum = enum byte
+{
+    GetParameter = 0,
+    GetRevisionOnly = 1
+};
+
+type GetSysteInfoResponse
+{
+    byte Revision;
+    optional binary Data;
+}
+;

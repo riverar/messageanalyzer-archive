@@ -1,0 +1,1113 @@
+protocol MSASPROV with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Exchange ActiveSync: Provisioning Protocol",
+    ShortName = "MS-ASPROV",
+    DocumentName = "MS-ASPROV",
+    ProtocolType = "Block",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2016 Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-ASPROV", Version = "16.0"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="14/09/2015"},
+        ]
+};
+
+using Diagnostics;
+using MSASHTTP;
+using MSASWBXML;
+using WBXML;
+
+annotation string ResponseMessage#HttpFault;
+pattern EASMessageBodyType = WBXML.DocumentType | xml | string | binary;
+syntax LiteralString = s:regex{[\x00-\x7F]+} => s;  
+
+endpoint Server over MSASHTTP.Server 
+                accepts RequestMessage 
+                issues ResponseMessage;
+                
+client endpoint Client connected to Server;
+
+autostart actor ActorOverASHttpServer(MSASHTTP.Server node)
+{
+   bool IsASPROV = false;
+   
+   process node accepts ashttpMsg:ASHTTPContract.Request where ashttpMsg.RequestLine.Method == "POST" && ashttpMsg#CmdName == "Provision"
+   {
+       IsASPROV = true;
+       string contentTypeTemp = ("Content-Type" in ashttpMsg.Headers == false) ? "" :  ashttpMsg.Headers["Content-Type"] as string;
+       
+       RequestMessage msg = new RequestMessage(
+            (ashttpMsg.Body as binary).Count > 0? ASPROVMessageDecoder(ashttpMsg.Body as binary, contentTypeTemp): ashttpMsg.Body as binary, 
+            ashttpMsg#CmdName as string,
+            contentTypeTemp);
+       dispatch (endpoint Server over node) accepts msg;
+   }
+
+   process node issues ashttpMsg:ASHTTPContract.Response where IsASPROV
+   {
+       ResponseMessage msg;
+       string contentTypeTemp = ("Content-Type" in ashttpMsg.Headers == false) ? "" :  ashttpMsg.Headers["Content-Type"] as string;
+
+       if (ashttpMsg.StatusLine.Status < 400)
+       {   
+            msg = new ResponseMessage(
+                    (ashttpMsg.Body as binary).Count > 0? ASPROVMessageDecoder(ashttpMsg.Body as binary, contentTypeTemp): ashttpMsg.Body as binary, 
+                    ashttpMsg#CmdName as string, 
+                    contentTypeTemp);
+       }
+       else
+       {
+           msg = new ResponseMessage(
+                ashttpMsg.Body as binary, 
+                ashttpMsg#CmdName as string, 
+                contentTypeTemp,
+                GenerateHttpFaultMessage(ashttpMsg.StatusLine.Status, ashttpMsg.StatusLine.Reason)
+                );
+       }
+      
+       dispatch (endpoint Server over node) issues msg;
+       IsASPROV = false;
+   }
+}
+
+message RequestMessage
+{
+    EASMessageBodyType Body;
+    string Command;
+    string ContentType;
+    
+    RequestMessage(EASMessageBodyType data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        IsValidEASPROVMessage(this.Body, false);
+    }
+    
+    RequestMessage(binary data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+    }
+    
+    override string ToString()
+    {
+        string ns = GetCmdNamespace(Command);
+        return (ns == "" ? (Command) : (ns + "." + Command))  + " Request";
+    }
+}
+
+
+message ResponseMessage
+{
+    EASMessageBodyType Body;
+    string Command;
+    string ContentType;
+    bool ContainsHttpFault;
+    
+    
+    ResponseMessage(EASMessageBodyType data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        IsValidEASPROVMessage(this.Body, true);
+        ContainsHttpFault = false;
+    }
+    
+    ResponseMessage(binary data, string command, string ashttpContentType)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        ContainsHttpFault = false;
+    }
+    
+    ResponseMessage(binary data, string command, string ashttpContentType, string httpFault)
+    {
+        this.Body = data;
+        this.Command = command;
+        this.ContentType = ashttpContentType;
+        ContainsHttpFault = true;
+        this#HttpFault = httpFault;
+    }
+    
+    override string ToString()
+    {
+        string ns = GetCmdNamespace(Command);
+        
+         if (!ContainsHttpFault)
+         {
+            return (ns == "" ? (Command) : (ns + "." + Command))  + " Response";
+         }
+         else 
+         {
+            return (ns == "" ? (Command) : (ns + "." + Command))  + " Response (" + (this#HttpFault as string) + ")";
+         }
+    }
+}
+
+
+void IsValidEASPROVMessage(EASMessageBodyType Body, bool isResponse)
+{
+    if (Body is WBXML.DocumentType)
+    {       
+        WBXML.DocumentType body = Body as WBXML.DocumentType;
+        if (body.DecodedXml != nothing)
+        {
+            xml decodedXMLResult = body.DecodedXml as xml;
+            IsValidMessage(decodedXMLResult, isResponse);
+        } 
+    }
+}
+
+
+string GenerateHttpFaultMessage(uint statusCode, string reason)
+{
+    return Format("{0} {1}", statusCode, reason);
+}
+
+WBXML.DocumentType DecodeASWBXml(stream s)
+{
+    var wbXmlDocument = BinaryDecoder<WBXML.DocumentType>(s) as WBXML.DocumentType;
+    MSASWBXML.Converter converter = new MSASWBXML.Converter();
+    wbXmlDocument.DecodedXml = converter.ConvertToXml(wbXmlDocument);
+    return wbXmlDocument;
+}
+
+EASMessageBodyType ASPROVMessageDecoder(binary bin, string ashttpContentType)
+{
+    switch (ashttpContentType)
+    {
+        case "text/html" =>
+            return LiteralString(bin) as string;
+        case "message/rfc822" => 
+            return LiteralString(bin) as string;   
+        case "text/xml" => 
+            return BuildXml(LiteralString(bin) as string);
+        case "application/vnd.ms-sync" =>
+            return DecodeASWBXml(bin);
+        case "application/vnd.ms-sync.wbxml" => 
+            return DecodeASWBXml(bin);
+        default => 
+            return bin;
+    }
+}
+
+void IsValidMessage(xml encodedXml, bool isResponse)
+{   
+    if (encodedXml != nothing || encodedXml != null)
+    {
+        string encodedXmlString = encodedXml.ToString();
+        string updatedEncodedXmlString = encodedXmlString.Replace("::","");
+        var updatedEncodedBody = updatedEncodedXmlString.ToXml();
+        
+        if (updatedEncodedBody != nothing)
+        { 
+            xml updatedEncodedXml = updatedEncodedBody as xml;
+            
+            var bodyContent = (updatedEncodedXml.Children).Filter(e => (e as xml).Kind == XmlKind.Element);
+            if (bodyContent.Count == 1)
+            {
+                updatedEncodedXml = bodyContent[0];
+            }
+            
+            var rootName = bodyContent[0].Name as XmlName;
+            
+            if (rootName != nothing && rootName.LocalName == "ProvisionProvision")
+            {   
+                if (isResponse) 
+                {           
+                    array<xml> allowBluetooth = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowBluetooth};
+                    if (allowBluetooth.Count > 0)
+                    {
+                        foreach (xml x in allowBluetooth)
+                        {
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value as string;
+                                ValidationCheck(InRange<AllowBluetooth>(xValue), null, () => Format("Invalid AllowBluetooth value: {0}; ", xValue));                                
+                            }
+                        }
+                    }
+
+                        array<xml> allowBrowser = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowBrowser};
+                        if (allowBrowser.Count > 0)
+                        {
+                            foreach (xml x in allowBrowser)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowBrowser>(xValue), null, () => Format("Invalid AllowBrowser value: {0}; ", xValue));    
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowCamera = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowCamera};
+                        if (allowCamera.Count > 0)
+                        {
+                            foreach (xml x in allowCamera)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowCamera>(xValue), null, () => Format("Invalid AllowCamera value: {0}; ", xValue));  
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowConsumerEmail = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowConsumerEmail};
+                        if (allowConsumerEmail.Count > 0)
+                        {
+                            foreach (xml x in allowConsumerEmail)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowConsumerEmail>(xValue), null, () => Format("Invalid AllowConsumerEmail value: {0}; ", xValue));    
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowDesktopSync = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowDesktopSync};
+                        if (allowDesktopSync.Count > 0)
+                        {
+                            foreach (xml x in allowDesktopSync)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowDesktopSync>(xValue), null, () => Format("Invalid AllowDesktopSync value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowHTMLEmail = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowHTMLEmail};
+                        if (allowHTMLEmail.Count > 0)
+                        {
+                            foreach (xml x in allowHTMLEmail)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowHTMLEmail>(xValue), null, () => Format("Invalid AllowHTMLEmail value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowInternetSharing = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowInternetSharing};
+                        if (allowInternetSharing.Count > 0)
+                        {
+                            foreach (xml x in allowInternetSharing)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowInternetSharing>(xValue), null, () => Format("Invalid AllowInternetSharing value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowIrDA = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowIrDA};
+                        if (allowIrDA.Count > 0)
+                        {
+                            foreach (xml x in allowIrDA)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowIrDA>(xValue), null, () => Format("Invalid AllowIrDA value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowPOPIMAPEmail = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowPOPIMAPEmail};
+                        if (allowPOPIMAPEmail.Count > 0)
+                        {
+                            foreach (xml x in allowPOPIMAPEmail)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowPOPIMAPEmail>(xValue), null, () => Format("Invalid AllowPOPIMAPEmail value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowRemoteDesktop = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowRemoteDesktop};
+                        if (allowRemoteDesktop.Count > 0)
+                        {
+                            foreach (xml x in allowRemoteDesktop)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowRemoteDesktop>(xValue), null, () => Format("Invalid AllowRemoteDesktop value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowSimpleDevicePassword = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowSimpleDevicePassword};
+                        if (allowSimpleDevicePassword.Count > 0)
+                        {
+                            foreach (xml x in allowSimpleDevicePassword)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowSimpleDevicePassword>(xValue), null, () => Format("Invalid AllowSimpleDevicePassword value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowSMIMEEncryptionAlgorithmNegotiation = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowSMIMEEncryptionAlgorithmNegotiation};
+                        if (allowSMIMEEncryptionAlgorithmNegotiation.Count > 0)
+                        {
+                            foreach (xml x in allowSMIMEEncryptionAlgorithmNegotiation)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowSMIMEEncryptionAlgorithmNegotiation>(xValue), null, () => Format("Invalid AllowSMIMEEncryptionAlgorithmNegotiation value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowSMIMESoftCerts = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowSMIMESoftCerts};
+                        if (allowSMIMESoftCerts.Count > 0)
+                        {
+                            foreach (xml x in allowSMIMESoftCerts)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowSMIMESoftCerts>(xValue), null, () => Format("Invalid AllowSMIMESoftCerts value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowStorageCard = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowStorageCard};
+                        if (allowStorageCard.Count > 0)
+                        {
+                            foreach (xml x in allowStorageCard)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowStorageCard>(xValue), null, () => Format("Invalid AllowStorageCard value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowTextMessaging = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowTextMessaging};
+                        if (allowTextMessaging.Count > 0)
+                        {
+                            foreach (xml x in allowTextMessaging)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowTextMessaging>(xValue), null, () => Format("Invalid AllowTextMessaging value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowUnsignedApplications = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowUnsignedApplications};
+                        if (allowUnsignedApplications.Count > 0)
+                        {
+                            foreach (xml x in allowUnsignedApplications)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowUnsignedApplications>(xValue), null, () => Format("Invalid AllowUnsignedApplications value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowUnsignedInstallationPackages = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowUnsignedInstallationPackages};
+                        if (allowUnsignedInstallationPackages.Count > 0)
+                        {
+                            foreach (xml x in allowUnsignedInstallationPackages)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowUnsignedInstallationPackages>(xValue), null, () => Format("Invalid AllowUnsignedInstallationPackages value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> allowWiFi = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAllowWiFi};
+                        if (allowWiFi.Count > 0)
+                        {
+                            foreach (xml x in allowWiFi)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AllowWifi>(xValue), null, () => Format("Invalid AllowWifi value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> alphanumericDevicePasswordRequired = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAlphanumericDevicePasswordRequired};
+                        if (alphanumericDevicePasswordRequired.Count > 0)
+                        {
+                            foreach (xml x in alphanumericDevicePasswordRequired)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AlphanumericDevicePasswordRequired>(xValue), null, () => Format("Invalid AlphanumericDevicePasswordRequired value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> attachmentsEnabled = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionAttachmentsEnabled};
+                        if (attachmentsEnabled.Count > 0)
+                        {
+                            foreach (xml x in attachmentsEnabled)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<AttachmentsEnabled>(xValue), null, () => Format("Invalid AttachmentsEnabled value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> devicePasswordEnabled = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionDevicePasswordEnabled};
+                        if (devicePasswordEnabled.Count > 0)
+                        {
+                            foreach (xml x in devicePasswordEnabled)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<DevicePasswordEnabled>(xValue), null, () => Format("Invalid DevicePasswordEnabled value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        
+                        array<xml> devicePasswordExpiration = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionDevicePasswordExpiration};
+                        if (devicePasswordExpiration.Count > 0)
+                        {
+                            foreach (xml x in devicePasswordExpiration)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value.ToString();
+                                    if (xValue != "nothing")
+                                    {
+                                        ValidationCheck((xValue as uint) >= 0, null, () => Format("Invalid DevicePasswordExpiration value: {0}; ", xValue));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        
+                        array<xml> devicePasswordHistory = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionDevicePasswordHistory};
+                        if (devicePasswordHistory.Count > 0)
+                        {
+                            foreach (xml x in devicePasswordHistory)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value.ToString();
+                                    if (xValue != "nothing")
+                                    { 
+                                        ValidationCheck((xValue as uint) >= 0, null, () => Format("Invalid DevicePasswordHistory value: {0}; ", xValue));           
+                                    }
+                                }
+                            }
+                        }
+
+                        array<xml> maxEmailBodyTruncationSize = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionMaxEmailBodyTruncationSize};
+                        if (maxEmailBodyTruncationSize.Count > 0)
+                        {
+                            foreach (xml x in maxEmailBodyTruncationSize)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value.ToString();
+                                    if (xValue != "nothing")
+                                    {
+                                        int temp = xValue as int;
+                                        ValidationCheck((temp == -1 || temp >= 0), null, () => Format("Invalid MaxEmailBodyTruncationSize value: {0}; ", xValue));
+                                    }
+                                }
+                            }
+                        }
+
+                        array<xml> maxEmailHTMLBodyTruncationSize = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionMaxEmailHTMLBodyTruncationSize};
+                        if (maxEmailHTMLBodyTruncationSize.Count > 0)
+                        {
+                            foreach (xml x in maxEmailHTMLBodyTruncationSize)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value.ToString();
+                                    if (xValue != "nothing")
+                                    {
+                                        int temp = xValue as int;
+                                        ValidationCheck((temp == -1 || temp >= 0), null, () => Format("Invalid MaxEmailHTMLBodyTruncationSize value: {0}; ", xValue));
+                                    }
+                                }
+                            }
+                        }               
+                        
+                        array<xml> maxCalendarAgeFilter = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionMaxCalendarAgeFilter};
+                        if (maxCalendarAgeFilter.Count > 0)
+                        {
+                            foreach (xml x in maxCalendarAgeFilter)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<MaxCalendarAgeFilter>(xValue), null, () => Format("Invalid MaxCalendarAgeFilter value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> maxEmailAgeFilter = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionMaxEmailAgeFilter};
+                        if (maxEmailAgeFilter.Count > 0)
+                        {
+                            foreach (xml x in maxEmailAgeFilter)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<MaxEmailAgeFilter>(xValue), null, () => Format("Invalid MaxEmailAgeFilter value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> passwordRecoveryEnabled = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionPasswordRecoveryEnabled};
+                        if (passwordRecoveryEnabled.Count > 0)
+                        {
+                            foreach (xml x in passwordRecoveryEnabled)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<PasswordRecoveryEnabled>(xValue), null, () => Format("Invalid PasswordRecoveryEnabled value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> requireDeviceEncryption = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireDeviceEncryption};
+                        if (requireDeviceEncryption.Count > 0)
+                        {
+                            foreach (xml x in requireDeviceEncryption)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireDeviceEncryption>(xValue), null, () => Format("Invalid RequireDeviceEncryption value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                                
+                        array<xml> requireEncryptedSMIMEMessages = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireEncryptedSMIMEMessages};
+                        if (requireEncryptedSMIMEMessages.Count > 0)
+                        {
+                            foreach (xml x in requireEncryptedSMIMEMessages)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireEncryptedSMIMEMessages>(xValue), null, () => Format("Invalid RequireEncryptedSMIMEMessages value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> requireEncryptionSMIMEAlgorithm = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireEncryptionSMIMEAlgorithm};
+                        if (requireEncryptionSMIMEAlgorithm.Count > 0)
+                        {
+                            foreach (xml x in requireEncryptionSMIMEAlgorithm)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireEncryptionSMIMEAlgorithm>(xValue), null, () => Format("Invalid RequireEncryptionSMIMEAlgorithm value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> requireManualSyncWhenRoaming = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireManualSyncWhenRoaming};
+                        if (requireManualSyncWhenRoaming.Count > 0)
+                        {
+                            foreach (xml x in requireManualSyncWhenRoaming)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireManualSyncWhenRoaming>(xValue), null, () => Format("Invalid RequireManualSyncWhenRoaming value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> requireSignedSMIMEAlgorithm = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireSignedSMIMEAlgorithm};
+                        if (requireSignedSMIMEAlgorithm.Count > 0)
+                        {
+                            foreach (xml x in requireSignedSMIMEAlgorithm)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireSignedSMIMEAlgorithm>(xValue), null, () => Format("Invalid RequireSignedSMIMEAlgorithm value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> requireStorageCardEncryption = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireStorageCardEncryption};
+                        if (requireStorageCardEncryption.Count > 0)
+                        {
+                            foreach (xml x in requireStorageCardEncryption)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireStorageCardEncryption>(xValue), null, () => Format("Invalid RequireStorageCardEncryption value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        
+                        array<xml> requireSignedSMIMEMessages = updatedEncodedXml select xpath{//ProvisionEASProvisionDoc/ProvisionRequireSignedSMIMEMessages};
+                        if (requireSignedSMIMEMessages.Count > 0)
+                        {
+                            foreach (xml x in requireSignedSMIMEMessages)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<RequireSignedSMIMEMessages>(xValue), null, () => Format("Invalid RequireSignedSMIMEMessages value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> statusPolicyResponse = updatedEncodedXml select xpath{//ProvisionPolicy/ProvisionStatus};
+                        if (statusPolicyResponse.Count > 0)
+                        {
+                            foreach (xml x in statusPolicyResponse)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck(InRange<StatusPolicyResponse>(xValue), null, () => Format("Invalid Status Policy Response value: {0}; ", xValue));
+                                }
+                            }
+                        }
+                        
+                        array<xml> statusProvisionResponse = updatedEncodedXml select xpath{/ProvisionStatus};
+                        if (statusProvisionResponse.Count > 0)
+                        {
+                            foreach (xml x in statusProvisionResponse)
+                            {
+                                if (x.Value != nothing || x.Value != null)
+                                {
+                                    string xValue = x.Value as string;
+                                    ValidationCheck((InRange<StatusProvisionResponse>(xValue) || InRange<Status>(xValue)), null, () => Format("Invalid Status Provision Response value: {0}; ", xValue));
+                                }
+                            }
+                        }               
+                    
+                }
+                else
+                {       
+                    array<xml> statusPolicyRequest = updatedEncodedXml select xpath{//ProvisionPolicy/ProvisionStatus};
+                    if (statusPolicyRequest.Count > 0)
+                    {
+                        foreach (xml x in statusPolicyRequest)
+                        {
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value as string;
+                                ValidationCheck(InRange<StatusPolicyRequest>(xValue), null, () => Format("Invalid Status Policy Request value: {0}; ", xValue));
+                            }
+                        }
+                    }
+                    
+                    array<xml> statusRemoteWipeRequest = updatedEncodedXml select xpath{/ProvisionRemoteWipe/ProvisionStatus};
+                    if (statusRemoteWipeRequest.Count > 0)
+                    {
+                        foreach (xml x in statusRemoteWipeRequest)
+                        {
+                            if (x.Value != nothing || x.Value != null)
+                            {
+                                string xValue = x.Value as string;
+                                ValidationCheck(InRange<StatusRemoteWipeRequest>(xValue), null, () => Format("Invalid Status RemoteWipe Request value: {0}; ", xValue));
+                            }
+                        }
+                    }
+                    
+                }
+            }
+        }
+    }   
+}
+
+// 2.2.2.1  AllowBluetooth
+pattern AllowBluetooth = enum string
+{
+    DisableBluetooth = "0",
+    DisableBluetoothAllowConfiguration  = "1",
+    AllowBluetooth = "2"
+};
+
+// 2.2.2.2  AllowBrowser
+pattern AllowBrowser = enum string
+{
+    DoNotAllow = "0",
+    Allow = "1"
+};
+
+// 2.2.2.3  AllowCamera
+pattern AllowCamera = enum string
+{
+    CameraIsNotAllowed = "0",
+    CameraIsAllowed = "1"
+};
+
+// 2.2.2.4  AllowConsumerEmail
+pattern AllowConsumerEmail = enum string
+{
+    DoNotAllowConsumerEmaild = "0",
+    DoAllowConsumerEmaild = "1"
+};
+
+// 2.2.2.5  AllowDesktopSync
+pattern AllowDesktopSync = enum string
+{
+    DoNotAllowDesktopActiveSync = "0",
+    AllowDesktopActiveSync = "1"
+};
+
+// 2.2.2.6  AllowHTMLEmail
+pattern AllowHTMLEmail = enum string
+{
+    HTMLFormattedEmailNotAllowed = "0",
+    HTMLFormattedEmailAllowed = "1"
+};
+
+// 2.2.2.7  AllowInternetSharing 
+pattern AllowInternetSharing = enum string
+{
+    NotAllowTheInternetSharing = "0",
+    AllowTheInternetSharing = "1"
+};
+
+// 2.2.2.8  AllowIrDA 
+pattern AllowIrDA = enum string
+{
+    DisableIrDA = "0",
+    AllowTheIrDA = "1"
+};
+
+// 2.2.2.9  AllowPOPIMAPEmail
+pattern AllowPOPIMAPEmail = enum string
+{
+    POPIMAPEmailAccessNotAllowed = "0",
+    POPIMAPEmailAccessAllowed = "1"
+};
+
+// 2.2.2.10 AllowRemoteDesktop
+pattern AllowRemoteDesktop = enum string
+{
+    NotAllowUseRemoteDesktop = "0",
+    AllowUseRemoteDesktop = "1"
+};
+
+// 2.2.2.11 AllowSimpleDevicePassword
+pattern AllowSimpleDevicePassword = enum string
+{
+    SimplePasswordsNotAllowed = "0",
+    SimplePasswordsAllowed = "1"
+};
+
+// 2.2.2.12 AllowSMIMEEncryptionAlgorithmNegotiation
+pattern AllowSMIMEEncryptionAlgorithmNegotiation = enum string
+{
+    DoNotNegotiate = "0",
+    NegotiateStrongAlgorithm = "1",
+    NegotiateAnyAlgorithm = "2"
+};
+
+// 2.2.2.13 AllowSMIMESoftCerts
+pattern AllowSMIMESoftCerts = enum string
+{
+    SoftCertificatesNotAllowed = "0",
+    SoftCertificatesAllowed = "1"
+};
+
+// 2.2.2.14 AllowStorageCard
+pattern AllowStorageCard = enum string
+{
+    SDCardUseNotAllowed = "0",
+    SDCardUseAllowed = "1"
+};
+
+// 2.2.2.15 AllowTextMessaging
+pattern AllowTextMessaging = enum string
+{
+    SMSOrTextMessagingNotAllowed = "0",
+    SMSOrTextMessagingAllowed = "1"
+};
+
+// 2.2.2.16 AllowUnsignedApplications
+pattern AllowUnsignedApplications = enum string
+{
+    UnsignedApplicationsNotAllowed  = "0",
+    UnsignedApplicationsAllowed = "1"
+};
+
+// 2.2.2.17 AllowUnsignedInstallationPackages
+pattern AllowUnsignedInstallationPackages = enum string
+{
+    UnsignedCabinetFilesNotAllowed  = "0",
+    UnsignedCabinetFilesAllowed = "1"
+};
+
+// 2.2.2.18 AllowWifi
+pattern AllowWifi = enum string
+{
+    WiFiConnectionsNotAllowed  = "0",
+    WiFiConnectionsAllowed = "1"
+};
+
+// 2.2.2.19 AlphanumericDevicePasswordRequired
+pattern AlphanumericDevicePasswordRequired = enum string
+{
+    AlphanumericDevicePasswordNotRequired  = "0",
+    AlphanumericDevicePasswordRequired = "1"
+};
+
+// 2.2.2.22 AttachmentsEnabled
+pattern AttachmentsEnabled = enum string
+{
+    AttachmentsNotAllowed = "0",
+    AttachmentsAllowed = "1"
+};
+
+// 2.2.2.24 DevicePasswordEnabled
+pattern DevicePasswordEnabled = enum string
+{
+    DevicePasswordNotRequired = "0",
+    DevicePasswordRequired = "1"
+};
+
+// 2.2.2.25 DevicePasswordExpiration >= 0
+
+// 2.2.2.26 DevicePasswordHistory >= 0
+
+// 2.2.2.30 MaxCalendarAgeFilter
+pattern MaxCalendarAgeFilter = enum string
+{
+    AllDays = "0",
+    TwoWeeks = "4",
+    OneMonth = "5",
+    ThreeMonths = "6",
+    SixMonths = "7"
+};
+
+// 2.2.2.32 MaxEmailAgeFilter
+pattern MaxEmailAgeFilter = enum string
+{
+    SyncAll = "0",
+    OneDay = "1",
+    ThreeDays = "2",
+    OneWeek = "3",
+    TwoWeeks = "4",
+    OneMonth = "5"
+};
+
+
+// 2.2.2.38 PasswordRecoveryEnabled
+pattern PasswordRecoveryEnabled = enum string
+{
+    PasswordRecoveryNotEnabled  = "0",
+    PasswordRecoveryEnabled = "1"
+};
+
+// 2.2.2.45 RequireDeviceEncryption
+pattern RequireDeviceEncryption = enum string
+{
+    EncryptionNotRequired  = "0",
+    EncryptionRequired = "1"
+};
+
+// 2.2.2.46 RequireEncryptedSMIMEMessages
+pattern RequireEncryptedSMIMEMessages = enum string
+{
+    EncryptedEmailMessagesNotRequired  = "0",
+    EncryptedEmailMessagesRequired = "1"
+};
+
+// 2.2.2.47 RequireEncryptionSMIMEAlgorithm
+pattern RequireEncryptionSMIMEAlgorithm = enum string
+{
+    TripleDESAlgorithm = "0",
+    DESAlgorithm = "1",
+    RC2128bit = "2",
+    RC264bit = "3",
+    RC240bit = "4"
+};
+
+// 2.2.2.48 RequireManualSyncWhenRoaming
+pattern RequireManualSyncWhenRoaming = enum string
+{
+    NotRequireManualSync  = "0",
+    RequireManualSync = "1"
+};
+
+// 2.2.2.49 RequireSignedSMIMEAlgorithm
+pattern RequireSignedSMIMEAlgorithm = enum string
+{
+    UseSHA1  = "0",
+    UseMD5 = "1"
+};
+
+// 2.2.2.50 RequireSignedSMIMEMessages
+pattern RequireSignedSMIMEMessages = enum string
+{
+    SignedSMIMEMessagesNotRequired  = "0",
+    SignedSMIMEMessagesRequired = "1"
+};
+
+// 2.2.2.51 RequireStorageCardEncryption
+pattern RequireStorageCardEncryption = enum string
+{
+    EncryptionDeviceStorageCardNotRequired  = "0",
+    EncryptionDeviceStorageCardRequired = "1"
+};
+
+// 2.2.2.53.1   Status (Policy)
+pattern StatusPolicyResponse = enum string
+{
+    Success = "1",
+    NoPolicyForClient = "2",
+    UnknownPolicyTypeValue = "3",
+    PolicyDataOnServerCorrupted = "4",
+    ClientAcknowledgingWrongPolicyKey = "5"
+};
+
+// 2.2.2.53.1   Status (Policy)
+pattern StatusPolicyRequest = enum string
+{
+    Success = "1",
+    PartialSuccess = "2",
+    ClientNotApplyPolicy = "3",
+    ClientClaimsBeenProvisioned = "4"
+};
+
+// 2.2.2.53.2   Status (Provision)
+pattern StatusProvisionResponse = enum string
+{
+    Success = "1",
+    ProtocolError = "2",
+    GeneralServerError = "3"
+};
+
+// 2.2.2.53.3   Status (RemoteWipe)
+pattern StatusRemoteWipeRequest = enum string
+{
+    RemoteWipeOperationSuccessful = "1",
+    RemoteWipeOperationFailed = "2"
+};
+
+pattern Status = enum string
+{
+
+    InvalidContent = "101",
+    InvalidWBXML = "102",
+    InvalidXML = "103",
+    InvalidDateTime = "104",
+    InvalidCombinationOfIDs = "105",
+    InvalidIDs = "106",
+    InvalidMIME = "107",
+    DeviceIdMissingOrInvalid = "108",
+    DeviceTypeMissingOrInvalid ="109",
+    ServerError = "110",
+    ServerErrorRetryLater = "111",
+    ActiveDirectoryAccessDenied = "112",
+    MailboxQuotaExceeded = "113",
+    MailboxServerOffline = "114",
+    SendQuotaExceeded = "115",
+    MessageRecipientUnresolved = "116",
+    MessageReplyNotAllowed = "117",
+    MessagePreviouslySent = "118",
+    MessageHasNoRecipient = "119",
+    MailSubmissionFailed = "120",
+    MessageReplyFailed = "121",
+    AttachmentIsTooLarge = "122",
+    UserHasNoMailbox = "123",
+    UserCannotBeAnonymous = "124",
+    UserPrincipalCouldNotBeFound = "125",
+    UserDisabledForSync = "126",
+    UserOnNewMailboxCannotSync = "127",
+    UserOnLegacyMailboxCannotSync = "128",
+    DeviceIsBlockedForThisUser = "129",
+    AccessDenied = "130",
+    AccountDisabled = "131",
+    SyncStateNotFound = "132",
+    SyncStateLocked = "133",
+    SyncStateCorrupt = "134",
+    SyncStateAlreadyExists = "135",
+    SyncStateVersionInvalid = "136",
+    CommandNotSupported = "137",
+    VersionNotSupported = "138",
+    DeviceNotFullyProvisionable = "139",
+    RemoteWipeRequested = "140",
+    LegacyDeviceOnStrictPolicy = "141",
+    DeviceNotProvisioned = "142",
+    PolicyRefresh = "143",
+    InvalidPolicyKey = "144",
+    ExternallyManagedDevicesNotAllowed = "145",
+    NoRecurrenceInCalendar = "146",
+    UnexpectedItemClass = "147",
+    RemoteServerHasNoSSL = "148",
+    InvalidStoredRequest = "149",
+    ItemNotFound = "150",
+    TooManyFolders = "151",
+    NoFoldersFound = "152",
+    ItemsLostAfterMove = "153",
+    FailureInMoveOperation = "154",
+    MoveCommandDisallowedForNonPersistentMoveAction = "155",
+    MoveCommandInvalidDestinationFolder = "156",
+    AvailabilityTooManyRecipients = "160",
+    AvailabilityDLLimitReached = "161",
+    AvailabilityTransientFailure = "162",
+    AvailabilityFailure = "163",
+    BodyPartPreferenceTypeNotSupported = "164",
+    DeviceInformationRequired = "165",
+    InvalidAccountId = "166",
+    AccountSendDisabled = "167",
+    IRM_FeatureDisabled = "168",
+    IRM_TransientError = "169",
+    IRM_PermanentError = "170",
+    IRM_InvalidTemplateID = "171",
+    IRM_OperationNotPermitted = "172",
+    NoPicture = "173",
+    PictureTooLarge = "174",
+    PictureLimitReached = "175",
+    BodyPart_ConversationTooLarge = "176",
+    MaximumDevicesReached = "177",
+    InvalidMimeBodyCombination = "178",
+    InvalidSmartForwardParameters = "179",
+    InvalidRecipients = "183",
+    OneOrMoreExceptionsFailed = "184"
+};

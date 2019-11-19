@@ -1,0 +1,815 @@
+﻿protocol NBF with
+BinaryEncodingDefaults{Endian = Endian.Little, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "NetBIOS Frames Protocol",
+    ShortName = "NBF",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "NetBIOS, NetBEUI, NBF, NBT, NBIPX, SMB, CIFS Networking", Link= "http://timothydevans.me.uk/nbf2cifs/nbf2cifs.pdf"},
+            new Reference{Name = "RFC 1001"},
+            new Reference{Name = "RFC 1002"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "1.0.0", Date = "5/16/2012"}
+        ]
+};
+
+using Standard;
+using LLC;
+using Utility;
+
+endpoint Node 
+    over ReassembleSessionFrames 
+    accepts AddGroupNameQuery
+    accepts AddNameQuery
+    accepts AddNameResponse
+    accepts NameInConflict
+    accepts NameQuery
+    accepts NameRecognised
+    accepts Datagram
+    accepts DatagramBroadcast
+    accepts StatusQuery
+    accepts StatusResponse
+    accepts TerminateTrace 
+    accepts TerminateLocalRemoteTrace
+    accepts SessionAlive
+    accepts SessionConfirm 
+    accepts SessionEnd
+    accepts SessionInitialize 
+    accepts DataAck
+    accepts DataFirstMiddle
+    accepts DataOnlyLast
+    accepts NoReceive 
+    accepts ReceiveOutstanding
+    accepts ReceiveContinue;
+
+// For NetBIOS, DSAP = 0xF0 (240) , SSAP = 0xF0
+autostart actor NBFOverLLC(LLC.Node node)
+{
+    process node accepts s:LLC.Segment where (s.InformationData != nothing) && (s.DSAPaddress * 2 + s.IG) == 0xF0 && (s.SSAPaddress * 2 + s.CR) == 0xF0 && (s.InformationData as InformationData).Payload.Count > 5
+    {
+        var infoData = s.InformationData as InformationData;
+        switch (infoData.Payload[4])
+        {
+            case NBFCommand.AddGroupName =>
+                DecodeNBF<AddGroupNameQuery>(node, infoData.Payload, "AddGroupNameQuery", AcceptDispatcher);
+            case NBFCommand.AddNameQuery =>
+                DecodeNBF<AddNameQuery>(node, infoData.Payload, "AddNameQuery", AcceptDispatcher);
+            case NBFCommand.AddNameResponse =>
+                DecodeNBF<AddNameResponse>(node, infoData.Payload, "AddNameResponse", AcceptDispatcher);
+            case NBFCommand.NameInConflict =>
+                DecodeNBF<NameInConflict>(node, infoData.Payload, "NameInConflict", AcceptDispatcher);
+            case NBFCommand.NameQuery =>
+                DecodeNBF<NameQuery>(node, infoData.Payload, "NameQuery", AcceptDispatcher);
+            case NBFCommand.NameRecognised =>
+                DecodeNBF<NameRecognised>(node, infoData.Payload, "NameRecognised", AcceptDispatcher);
+            case NBFCommand.Datagram =>
+                DecodeNBF<Datagram>(node, infoData.Payload, "Datagram", AcceptDispatcher);
+            case NBFCommand.DatagramBroadcast =>
+                DecodeNBF<DatagramBroadcast>(node, infoData.Payload, "DatagramBroadcast", AcceptDispatcher);
+            case NBFCommand.StatusQuery =>
+                DecodeNBF<StatusQuery>(node, infoData.Payload, "StatusQuery", AcceptDispatcher);
+            case NBFCommand.StatusResponse =>
+                DecodeNBF<StatusResponse>(node, infoData.Payload, "StatusResponse", AcceptDispatcher);
+            case NBFCommand.TerminateTrace =>
+                DecodeNBF<TerminateTrace>(node, infoData.Payload, "TerminateTrace", AcceptDispatcher);
+            case NBFCommand.TerminateTraceLocalAndRemote =>
+                DecodeNBF<TerminateLocalRemoteTrace>(node, infoData.Payload, "TerminateLocalRemoteTrace", AcceptDispatcher);
+            case NBFCommand.SessionAlive =>
+                DecodeNBF<SessionAlive>(node, infoData.Payload, "SessionAlive", AcceptDispatcher);
+            case NBFCommand.SessionConfirm =>
+                DecodeNBF<SessionConfirm>(node, infoData.Payload, "SessionConfirm", AcceptDispatcher);
+            case NBFCommand.SessionEnd =>
+                DecodeNBF<SessionEnd>(node, infoData.Payload, "SessionEnd", AcceptDispatcher);
+            case NBFCommand.SessionInitialize =>
+                DecodeNBF<SessionInitialize>(node, infoData.Payload, "SessionInitialize", AcceptDispatcher);
+            case NBFCommand.DataAck =>
+                DecodeNBF<DataAck>(node, infoData.Payload, "DataAck", AcceptDispatcher);
+            case NBFCommand.DataFirstMiddle =>
+                DecodeNBF<DataFirstMiddle>(node, infoData.Payload, "DataFirstMiddle", AcceptDispatcher);
+            case NBFCommand.DataOnlyLast =>
+                DecodeNBF<DataOnlyLast>(node, infoData.Payload, "DataOnlyLast", AcceptDispatcher);
+            case NBFCommand.NoReceive =>
+                DecodeNBF<NoReceive>(node, infoData.Payload, "NoReceive", AcceptDispatcher);
+            case NBFCommand.ReceiveOutstanding =>
+                DecodeNBF<ReceiveOutstanding>(node, infoData.Payload, "ReceiveOutstanding", AcceptDispatcher);
+            case NBFCommand.ReceiveContinue =>
+                DecodeNBF<ReceiveContinue>(node, infoData.Payload, "ReceiveContinue", AcceptDispatcher);
+            default =>
+                ThrowDecodingException("NBF");
+        }
+    }
+}
+
+void AcceptDispatcher(LLC.Node node, NBFCommonHeader nbf)
+{
+    dispatch (endpoint NBF.ReassembleSessionFrames over node) accepts nbf;
+}
+
+void DecodeNBF<T>(LLC.Node node, binary payload, string msgStr, void(LLC.Node, T) dispatcher)
+{
+    var nbf = BinaryDecoder<T>(payload);
+    if (nbf == nothing)
+    {
+        ThrowDecodingException("NBF", msgStr);
+    }
+    dispatcher(node, nbf as T);
+}
+
+// SessionService is connection oriented, so 
+endpoint ReassembleSessionFrames over LLC.Node accepts DataFirstMiddle accepts DataOnlyLast accepts NBFCommonHeader
+{
+    // The reassembly group has the same ResponseCorrelator
+    // <RspCor, DataFirstMiddle|DataOnlyLast>
+    map<ushort, array<NBFCommonHeader>> DataNeedReassemble = {};
+    
+    process this accepts nbf:NBFCommonHeader where !(nbf is DataOnlyLast || nbf is DataFirstMiddle)
+    {
+        dispatch (endpoint NBF.Node over this) accepts nbf;
+    }
+    
+    process this accepts firstMiddle:DataFirstMiddle
+    {
+        if (!(firstMiddle.RspCor in DataNeedReassemble))
+        {
+            if (CheckSMBData(firstMiddle, firstMiddle.UserData as binary))
+            {
+                DataNeedReassemble[firstMiddle.RspCor] = [firstMiddle];
+            }
+            else
+            {
+                dispatch (endpoint NBF.Node over this) accepts firstMiddle;
+            }
+        }
+        else
+        {
+            DataNeedReassemble[firstMiddle.RspCor] += [firstMiddle];
+        }
+    }
+    
+    process this accepts onlyLast:DataOnlyLast
+    {
+        if (onlyLast.UserData != nothing && CheckSMBData(onlyLast, onlyLast.UserData as binary) || !(onlyLast.RspCor in DataNeedReassemble))
+        {
+            dispatch (endpoint Node over this) accepts onlyLast;
+        }
+        else
+        {
+            DataNeedReassemble[onlyLast.RspCor] += [onlyLast];
+            if (DataNeedReassemble[onlyLast.RspCor][0] is DataFirstMiddle && CheckSMBData(DataNeedReassemble[onlyLast.RspCor][0], (DataNeedReassemble[onlyLast.RspCor][0] as DataFirstMiddle).UserData))
+            {
+                DataOnlyLast reassembledDataOnlyLast = new DataOnlyLast{};
+                reassembledDataOnlyLast#IsReassembled = true;
+                reassembledDataOnlyLast.Length = onlyLast.Length;
+                reassembledDataOnlyLast.Deliminator = onlyLast.Deliminator;
+                reassembledDataOnlyLast.Command = onlyLast.Command;
+                reassembledDataOnlyLast.Data1 = onlyLast.Data1;
+                reassembledDataOnlyLast.Data2 = onlyLast.Data2;
+                reassembledDataOnlyLast.XmitCor = onlyLast.XmitCor;
+                reassembledDataOnlyLast.RspCor = onlyLast.RspCor;
+                reassembledDataOnlyLast.DestinationNum = onlyLast.DestinationNum;
+                reassembledDataOnlyLast.SourceNum = onlyLast.SourceNum;
+                binary sourceData = $[];
+                foreach (NBFCommonHeader dataFrame in DataNeedReassemble[onlyLast.RspCor])
+                {
+                    if (dataFrame is DataFirstMiddle)
+                    {
+                        if (sourceData.Count == 0)
+                        {
+                            sourceData += (dataFrame.SourceData as binary);
+                        }
+                        else
+                        {
+                            sourceData += (dataFrame as DataFirstMiddle).UserData as binary;
+                        }
+                    }
+                    else if (dataFrame is DataOnlyLast)
+                    {
+                        sourceData += (dataFrame as DataOnlyLast).UserData as binary;
+                    }
+                    reassembledDataOnlyLast.Origins += [dataFrame];
+                }
+                reassembledDataOnlyLast.UserData = sourceData.Segment(14);
+                reassembledDataOnlyLast.SourceData = sourceData;
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("Length", 0, 16);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("Deliminator", 16, 16);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("Command", 32, 8);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("Data1", 40, 8);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("Data2", 48, 16);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("XmitCor", 64, 16);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("RspCor", 80, 16);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("DestinationNum", 96, 8);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("SourceNum", 104, 8);
+                reassembledDataOnlyLast.AssignFieldEncodingInfo("UserData", 112, (sourceData.Count - 14) * 8);
+                DataNeedReassemble = DataNeedReassemble.Remove(onlyLast.RspCor);
+                dispatch (endpoint NBF.Node over this) accepts reassembledDataOnlyLast;
+            }
+        }
+    }
+}
+
+autostart actor ReassembleActor(ReassembleSessionFrames reassembleNode)
+{
+    ~endpoint(ReassembleSessionFrames reassembleNode)
+    {
+        if (reassembleNode.DataNeedReassemble.Count > 0)
+        {
+            foreach (ushort key in reassembleNode.DataNeedReassemble.Keys)
+            {
+                foreach (NBFCommonHeader nbf in reassembleNode.DataNeedReassemble[key])
+                {
+                    DisplayTopLevelMessage(nbf);
+                }
+            }
+        }
+        reassembleNode.DataNeedReassemble = {};
+    }
+}
+
+bool CheckSMBData(any message m, optional binary payload)
+{
+    if (payload != nothing && (payload as binary).Count > 0)
+    {
+        binary tpayload = payload as binary;
+        bool isSMBData = tpayload[0] == 0xFF && tpayload[1] == 0x53 && tpayload[2] == 0x4D && tpayload[3] == 0x42;
+        if (isSMBData && m is DataFirstMiddle)
+        {
+            ValidationCheck(tpayload[6] == 0x01 && tpayload[7] == 0x00, m, "Data2 should be set to 0x0001 if it is the first DATA FIRST MIDDLE frame.");
+        }
+        return isSMBData;
+    }
+    return false;
+}
+
+message NBFCommonHeader
+{
+    ushort Length;
+    ushort Deliminator where value == 0xEFFF;
+    NBFCommand Command;
+}
+
+message AddGroupNameQuery : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 5};
+    ushort RspCor;
+    binary DestinationName with BinaryEncoding{Length = 16};
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.AddGroupName;
+    
+    override string ToString()
+    {
+        return "AddGroupNameQuery, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message AddNameQuery : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 5};
+    ushort RspCor;
+    binary DestinationName with BinaryEncoding{Length = 16};
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.AddNameQuery;
+    
+    override string ToString()
+    {
+        return "AddNameQuery, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message AddNameResponse : NBFCommonHeader
+{
+    byte Data1 where value == 0 || value == 1;
+    ushort Data2 where value == 0 || value == 1;
+    ushort XmitCor;
+    binary Reserved with BinaryEncoding{Length = 2};
+    NetBIOSName DestinationName;
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.AddNameResponse;
+    invariant DestinationName == SourceName;
+
+    override string ToString()
+    {
+        return "AddNameResponse, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message NameInConflict : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 7};
+    NetBIOSName DestinationName;
+    NetBIOSName1 SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.NameInConflict;
+
+    override string ToString()
+    {
+        return "NameInConflict, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString() + ", NodeAddress: " + (SourceName.Segment(0, 6) as string);
+    }
+}
+
+message NameQuery : NBFCommonHeader
+{
+    byte Data1; // Reserved
+    ushort Data2;// where value & 0x00FE == 0;
+    binary Reserved with BinaryEncoding{Length = 2};
+    ushort RspCor;
+    NetBIOSName DestinationName;
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.NameQuery;
+
+    override string ToString()
+    {
+        return "NameQuery, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message NameRecognised : NBFCommonHeader
+{
+    byte Data1; // Reserved
+    ushort Data2;
+    ushort XmitCor;
+    ushort RspCor;
+    NetBIOSName DestinationName;
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.NameRecognised;
+
+    override string ToString()
+    {
+        return "NameRecognised, " + "Command: " + NBFCommandToString(Command) + ", SourceName: "+ SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message Datagram : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 7};
+    NetBIOSName DestinationName;
+    NetBIOSName SourceName;
+    optional binary Payload;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.Datagram;
+
+    override string ToString()
+    {
+        return "Datagram, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString();
+    }
+}
+
+message DatagramBroadcast : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 23};
+    NetBIOSName SourceName;
+    optional binary Payload;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.DatagramBroadcast;
+
+    override string ToString()
+    {
+        return "DatagramBroadcast, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString();
+    }
+}
+
+message StatusQuery : NBFCommonHeader
+{
+    byte Data1; // 0x0 indicates a 1.x or 2.0 type request, 0x01 indicates a NetBIOS 2.1 request and values greater than 1 indicate a NetBIOS 2.1 request.
+    ushort Data2; // The two bytes of the "DATA2" field are used to indicate the length of the user’s status buffer.
+    binary Reserved with BinaryEncoding{Length = 2};
+    ushort RspCor;
+    NetBIOSName DestinationName;
+    NetBIOSName1 SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.StatusQuery;
+
+    override string ToString()
+    {
+        return "StatusQuery, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString() + ", SenderAddress: " + (SourceName.Segment(0, 6) as string);
+    }
+}
+
+message StatusResponse : NBFCommonHeader
+{
+    byte Data1; // 0x0 indicates a 1.x or 2.0 type response, and values greater than 0x0 indicate a NetBIOS 2.1 response.
+    ushort Data2; // bbbbbbbb
+                  // xybbbbbb
+                  // the first bit x is set to 1 if the length of the status data exceeds the frame size; 
+                  // the second bit y is set to 1 if the length exceeds the size of the user’s buffer; the remaining 14 bits
+                  // indicate the length of the status data sent.
+    ushort XmitCor;
+    binary Reserved with BinaryEncoding{Length = 2};
+    NetBIOSName1 DestinationName;
+    NetBIOSName SourceName;
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.StatusResponse;
+
+    override string ToString()
+    {
+        return "StatusResponse, " + "Command: " + NBFCommandToString(Command) + ", SourceName: " + SourceName.ToString() + ", DestinationName: " + DestinationName.ToString() + ", ReceiverAddress: " + (DestinationName.Segment(0, 6) as string);
+    }
+}
+
+message TerminateTrace : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 39};
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.TerminateTrace;
+}
+
+message TerminateLocalRemoteTrace : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 39};
+    
+    invariant Length == 0x002C;
+    invariant Command == NBFCommand.TerminateTraceLocalAndRemote;
+}
+
+message SessionAlive : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 9};
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.SessionAlive;
+}
+
+message SessionConfirm : NBFCommonHeader
+{
+    byte Data1 where (value & 0x7E) == 0; // the first bit "y" is set to 0 for versions of
+                                        // NetBIOS prior to version 2.20 and to 1 for higher versions. After 6 bits always set to
+                                        // 0, the last bit "x" is set to 0 for NetBIOS version 1.xx and set to 1 for version 2.00 or
+                                        // above (In practice this will now always be set to 1).
+    ushort Data2; // The two bytes of the "DATA2" field are used to indicate the length of the user’s receive buffer
+    ushort XmitCor;
+    ushort RspCor;
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.SessionConfirm;
+
+    override string ToString()
+    {
+        return "SessionConfirm, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+message SessionEnd : NBFCommonHeader
+{
+    byte Data1 where value == 0 || value == 1;
+    ushort Data2;
+    ushort XmitCor;
+    ushort RspCor;
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.SessionEnd;
+
+    override string ToString()
+    {
+        return "SessionEnd, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+message SessionInitialize : NBFCommonHeader
+{
+    byte Data1 where (value & 0x70) == 0; // The "DATA1" octet is an 8 bit binary string; the first bit "z" is set to 0 for versions of
+                                        // NetBIOS prior to version 2.20 and to 1 for higher versions (In practice this will now always be set to 1). 
+                                        // Three reserved bits "rrr", always set to 0 are followed by 3 bits
+                                        // "xxx" used to indicate the largest frame value as seen by the MAC layer; the last bit
+                                        // "z" is set to 0 for NetBIOS version 1.xx and set to 1 for version 2.00 or above.
+    ushort Data2;
+    ushort XmitCor;
+    ushort RspCor; // Reserved in Table, but not reserved in Text discription.
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.SessionInitialize;
+
+    override string ToString()
+    {
+        return "SessionInitialize, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+message DataAck : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 3};
+    ushort XmitCor;
+    ushort RspCor;
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.DataAck;
+
+    override string ToString()
+    {
+        return "DataAck, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+// The "DATA FIRST MIDDLE" frame (0x15) is used to transmit user messages across a session.
+message DataFirstMiddle : NBFCommonHeader
+{
+    byte Data1 where (value & 0xF0) == 0;  // The "DATA1" octet is an 8 bit binary string; the first four bits are reserved; the fifth
+                                        // bit "x" is set to 1 if an acknowledgment is included; this is followed by a reserved
+                                        // bit; the seventh bit "y" is set to 0 for versions of NetBIOS prior to version 2.20 and
+                                        // set to 1 for later versions (In practice this will now always be set to 1); the last bit
+                                        // "z" is set to 0 if a RECEIVE CONTINUE was not requested, otherwise it is set to 1.
+    ushort Data2; // The next two octets are for DATA2 and is a re-synchronization indicator set to 0001
+                  // if it is the first DATA FIRST MIDDLE frame.
+    ushort XmitCor;
+    ushort RspCor;
+    byte DestinationNum;
+    byte SourceNum;
+    optional binary UserData;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.DataFirstMiddle;
+
+    override string ToString()
+    {
+        return "DataFirstMiddle, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+annotation bool DataOnlyLast#IsReassembled;
+// The "DATA ONLY LAST" frame (0x16) is used to transmit user messages across a session and is either the only frame or the last.
+message DataOnlyLast : NBFCommonHeader
+{
+    byte Data1 where (value & 0xF1) == 0;  // The "DATA1" octet is an 8 bit binary string; the first four bits are reserved; the fifth
+                                        // bit "x" is set to 1 if an acknowledgment is included; this is followed by the sixth
+                                        // "y" bit which indicates that an "acknowledge with data allowed" is permitted; the
+                                        // seventh bit "z" is a "no.ack" indicator and the final bit is reserved.
+    ushort Data2; // The next two octets are for DATA2 and is a re-synchronization indicator set to 0001 if this frame
+                  // is send following receipt of a RECEIVE OUTSTANDING.
+    ushort XmitCor;
+    ushort RspCor;
+    byte DestinationNum;
+    byte SourceNum;
+    optional binary UserData;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.DataOnlyLast;
+
+    override string ToString()
+    {
+        string summary = "DataOnlyLast, ";
+        if (this#IsReassembled == nothing || !(this#IsReassembled as bool))
+        {
+            summary = "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+        }
+        else
+        {
+            summary = "Reassembled, Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+        }
+        return summary;
+    }
+}
+
+// The "NO RECEIVE" frame (0x1A) is transmitted in response to a "DATA ONLY LAST" frame or a "DATA FIRST MIDDLE" frame.
+message NoReceive : NBFCommonHeader
+{
+    byte Data1 where (value & 0xFD) == 0;  // The "DATA1" octet is an 8 bit binary string; the first six bits are reserved; the seventh
+                                        // bit "x" is set to 0 for versions of NetBIOS prior to 2.20, otherwise it is set to 1 (In
+                                        // practice this will now always be set to 1); the eighth bit is reserved.
+    ushort Data2; // The next two bytes are for DATA2 and gives the number of data bytes accepted.
+    binary Reserved with BinaryEncoding{Length = 4};
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.NoReceive;
+
+    override string ToString()
+    {
+        return "NoReceive, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+// The "RECEIVE OUTSTANDING" frame (0x1B) is transmitted in response to a "NO RECEIVE" frame.
+message ReceiveOutstanding : NBFCommonHeader
+{
+    byte Data1 where value == 0; // The "DATA1" octet is reserved.
+    ushort Data2; // gives the number of data bytes accepted.
+    binary Reserved with BinaryEncoding{Length = 4};
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.ReceiveOutstanding;
+
+    override string ToString()
+    {
+        return "ReceiveOutstanding, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+// The "RECEIVE CONTINUE" frame (0x1C) is transmitted in response to a "DATA ONLY LAST" frame which had the RECEIVE CONTINUE bit set.
+message ReceiveContinue : NBFCommonHeader
+{
+    binary Reserved with BinaryEncoding{Length = 3};
+    ushort XmitCor;
+    ushort RspCor where value == 0; // Reserved
+    byte DestinationNum;
+    byte SourceNum;
+    
+    invariant Length == 0x000E;
+    invariant Command == NBFCommand.ReceiveContinue;
+
+    override string ToString()
+    {
+        return "ReceiveContinue, " + "Command: " + NBFCommandToString(Command) + ", RSN: " + Utility.DecToHexFormat(2, DestinationNum as uint) + ", LSN: " + Utility.DecToHexFormat(2, SourceNum as uint);
+    }
+}
+
+pattern NBFCommand = enum byte
+{
+    AddNameQuery                    = 0x01,
+    AddGroupName                    = 0x00,
+    AddNameResponse                 = 0x0D,
+    NameInConflict                  = 0x02,
+    StatusQuery                     = 0x03,
+    TerminateTrace                  = 0x07,
+    Datagram                        = 0x08,
+    DatagramBroadcast               = 0x09,
+    NameQuery                       = 0x0A,
+    NameRecognised                  = 0x0E,
+    StatusResponse                  = 0x0F,
+    TerminateTraceLocalAndRemote    = 0x13,
+    DataAck                         = 0x14,
+    DataFirstMiddle                 = 0x15,
+    DataOnlyLast                    = 0x16,
+    SessionConfirm                  = 0x17,
+    SessionEnd                      = 0x18,
+    SessionInitialize               = 0x19,
+    NoReceive                       = 0x1A,
+    ReceiveOutstanding              = 0x1B,
+    ReceiveContinue                 = 0x1C,
+    SessionAlive                    = 0x1F,
+};
+
+//# nbf2cifs.pdf page 13~14
+string NBFCommandToString(NBFCommand command)
+{
+    switch(command)
+    {
+        case 0x01 => return "Add Name Query";
+        case 0x00 => return "Add Group Name";
+        case 0x0D => return "Add Name Response";
+        case 0x02 => return "Name In Conflict";
+        case 0x03 => return "Status Query";
+        case 0x07 => return "Terminate Trace";
+        case 0x08 => return "Datagram";
+        case 0x09 => return "Datagram Broadcast";
+        case 0x0A => return "Name Query";
+        case 0x0E => return "Name Recognised";
+        case 0x0F => return "Status Response";
+        case 0x13 => return "Terminate Trace";
+        case 0x14 => return "Data Ack";
+        case 0x15 => return "Data First Middle";
+        case 0x16 => return "Data Only Last";
+        case 0x17 => return "Session Confirm";
+        case 0x18 => return "Session End";
+        case 0x19 => return "Session Initialize";
+        case 0x1A => return "No Receive";
+        case 0x1B => return "Receive Outstanding";
+        case 0x1C => return "Receive Continue";
+        case 0x1F => return "Session Alive";
+        default => return "Unhandled NBF Command";
+    }
+}
+
+pattern NetBIOSName1 = binary where value.Count == 16 && value.Segment(0, 10) == $[00000000000000000000] with BinaryEncoding{Length = 16};
+
+type NetBIOSName
+{
+    binary Name with BinaryEncoding{Length = 15}; 
+    ServiceIdentification Suffix where ValidationCheck(InRange<ServiceIdentification>(value), null, "NBF: The Suffix field in type NetBIOSName is an undefined value. Please refer to http://support.microsoft.com/default.aspx?scid=kb;en-us;Q163409");
+
+    string ParseBiosName()
+    {
+        string nameStr = "";
+        foreach(byte cur in (Name as array<byte>))
+        {
+            if (cur >= 0x20 && cur <= 0x7E)
+            {
+                nameStr += NetBIOSNamePaser([cur] as binary) as string;
+            }
+            else
+            {
+                nameStr += "<" + Utility.DecToHexFormat(2, cur).Segment(2) + ">";
+            }
+        }
+        return nameStr;
+    }
+    
+    override string ToString()
+    {
+        return ParseBiosName() + "<" + Utility.DecToHexFormat(2, Suffix) + "> "+ NetBIOSSuffixesString(Suffix);
+    }
+}
+
+syntax decoder = TextDecoder;
+syntax NetBIOSNamePaser = s:regex{[\x20-\x7E]} => s with StreamEncoding{Encoding = TextEncoding.ASCII};
+
+// http://support.microsoft.com/default.aspx?scid=kb;en-us;Q163409
+string NetBIOSSuffixesString(byte suffix)
+{
+    switch (suffix)
+    {
+        case 0x00 => return "Workstation Service";
+        case 0x01 => return "Messenger Service/Master Browser";
+        case 0x02 => return "Workstation/Redirector";
+        case 0x03 => return "Messenger Service/Main name";
+        case 0x05 => return "Forwarded name";
+        case 0x06 => return "RAS Server Service";
+        case 0x1B => return "Domain Master Browser";
+        case 0x1C => return "Domain Controllers";
+        case 0x1D => return "Master Browser";
+        case 0x1E => return "Browser Service Elections";
+        case 0x1F => return "NetDDE Service";
+        case 0x20 => return "File Server Service";
+        case 0x21 => return "RAS Client Service";
+        case 0x22 => return "Microsoft Exchange Interchange(MSMail Connector)";
+        case 0x23 => return "Microsoft Exchange Store";
+        case 0x24 => return "Microsoft Exchange Directory";
+        case 0x2B => return "Lotus Notes Server Service";
+        case 0x2F => return "Lotus Notes";
+        case 0x30 => return "Modem Sharing Server Service";
+        case 0x31 => return "Modem Sharing Client Service";
+        case 0x33 => return "Lotus Notes";
+        case 0x42 => return "Mccaffee Anti-virus";
+        case 0x43 => return "SMS Clients Remote Control";
+        case 0x44 => return "SMS Administrators Remote Control Tool";
+        case 0x45 => return "SMS Clients Remote Chat";
+        case 0x46 => return "SMS Clients Remote Transfer";
+        case 0x4C => return "DEC Pathworks TCPIP service on Windows NT";
+        case 0x52 => return "DEC Pathworks TCPIP service on Windows NT";
+        case 0x6A => return "Microsoft Exchange IMC";
+        case 0x87 => return "Microsoft Exchange MTA";
+        case 0xBE => return "Network Monitor Agent";
+        case 0xBF => return "Network Monitor Application";
+        default   => return "Program Defined";
+    }
+}
+
+// http://support.microsoft.com/default.aspx?scid=kb;en-us;Q163409
+pattern ServiceIdentification = enum byte
+{
+    WorkstationService                          = 0x00,
+    MessengerServiceMasterBrowser               = 0x01,
+    WorkstationRedirector                       = 0x02,
+    MessengerServiceMainname                    = 0x03,
+    Forwardedname                               = 0x05,
+    RASServerService                            = 0x06,
+    DomainMasterBrowser                         = 0x1B,
+    DomainControllers                           = 0x1C,
+    MasterBrowser                               = 0x1D,
+    BrowserServiceElections                     = 0x1E,
+    NetDDEService                               = 0x1F,
+    FileServerService                           = 0x20,
+    RASClientService                            = 0x21,
+    MicrosoftExchangeInterchangeMSMailConnector = 0x22,
+    MicrosoftExchangeStore                      = 0x23,
+    MicrosoftExchangeDirectory                  = 0x24,
+    LotusNotesServerService                     = 0x2B,
+    LotusNotesIrisMulticast                     = 0x2F,
+    ModemSharingServerService                   = 0x30,
+    ModemSharingClientService                   = 0x31,
+    LotusNotesIrisNameServer                    = 0x33,
+    MccaffeeAntiVirus                           = 0x42,
+    SMSClientsRemoteControl                     = 0x43,
+    SMSAdministratorsRemoteControlTool          = 0x44,
+    SMSClientsRemoteChat                        = 0x45,
+    SMSClientsRemoteTransfer                    = 0x46,
+    DECPathworksTCPIPserviceonWindowsNT1        = 0x4C,
+    DECPathworksTCPIPserviceonWindowsNT2        = 0x52,
+    MicrosoftExchangeIMC                        = 0x6A,
+    MicrosoftExchangeMTA                        = 0x87,
+    NetworkMonitorAgent                         = 0xBE,
+    NetworkMonitorApplication                   = 0xBF,
+    ...
+};

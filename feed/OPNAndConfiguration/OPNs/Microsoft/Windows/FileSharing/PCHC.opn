@@ -1,0 +1,164 @@
+protocol PCHC with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Peer Content Caching and Retrieval: Hosted Cache Protocol",
+    ShortName = "PCHC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+             new Reference{Name = "MS-PCHC", Version = "4.0", Date = "01/31/2013", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "357145", Date = "12/20/2013"}
+        ]
+};
+
+using Standard;
+using HTTP;
+using PCCRC;
+using Utility;
+
+// -------------------------------------------
+// Endpoints
+
+endpoint Server over HTTP.Server accepts Request issues Response;
+
+// -------------------------------------------
+// Actors
+
+autostart actor PCHCOverHTTP(HTTP.Server server)
+{
+    process server accepts req:HttpContract.Request where req.Payload.Count > 0 && IsPCHC(req.Uri)
+    {
+        switch (req.Payload)
+        {
+            case rq:PCHC.Request from BinaryDecoder<PCHC.Request> =>
+                var pchc = endpoint PCHC.Server over server;
+                dispatch pchc accepts rq;
+            default =>
+                ThrowDecodingException("PCHC");
+        }
+    }
+    
+    process server issues res:HttpContract.Response where res.Payload.Count > 0 && IsPCHC(res#Uri)
+    {
+        switch (res.Payload)
+        {
+            case rs:PCHC.Response from BinaryDecoder<PCHC.Response> =>
+                var pchc = endpoint PCHC.Server over server;
+                dispatch pchc issues rs;
+            default =>
+                ThrowDecodingException("PCHC");
+        }
+    }
+    
+    bool IsPCHC(optional UriType uriType)
+    {
+        return (uriType is uri:UriType) && uri.AbsPath is absPath:string && 
+            (absPath.Contains("C574AC30-5794-4AEE-B1BB-6651C5315029") || absPath.Contains("0131501b-d67f-491b-9a40-c4bf27bcb4d4"));
+    }
+}
+
+// -------------------------------------------
+// Interface
+
+message Request
+{
+    MESSAGE_HEADER MessageHeader;
+    CONNECTION_INFORMATION ConnectionInformation;
+    ([|MessageHeader.Type == 1|] INITIAL_OFFER_MESSAGE               | 
+     [|MessageHeader.Type == 2|] SEGMENT_INFO_MESSAGE                | 
+     [|MessageHeader.Type == 3|] BATCHED_OFFER_MESSAGE) MessageBody;
+    
+    override string ToString()
+    {
+        string summary = "Request, Type: ";
+        switch (MessageHeader.Type)
+        {
+            case 1 => summary += "Initial Offer Message";
+            case 2 => summary += "Segment Info Message";
+            case 3 => summary += "Batched Offer Message";
+            default => summary += "Unknown (" + MessageHeader.Type.ToString() + ")";
+        }        
+        summary += ", Version: " + MessageHeader.Version.MajorVersion.ToString() + "." + MessageHeader.Version.MinorVersion.ToString();
+        return summary;
+    }
+}
+
+message Response
+{
+    TransportHeader TransportHeader;
+    byte ResponseCode;
+    
+    override string ToString()
+    {
+        string summary = "Response, ResponseCode: ";
+        switch (ResponseCode)
+        {
+            case 0 => summary += "OK, The server has sufficient information to retrieve content from the client.";
+            case 1 => summary += "INTERESTED, The server needs the range of block hashes from the client before it can retrieve content from the client.";
+            default => summary += "Unknown (" + DecToHexFormat(ResponseCode) + ")";
+        }        
+        return summary;
+    }
+}
+
+// -------------------------------------------
+// Data types
+
+type MESSAGE_HEADER
+{
+    PCHC.Version Version;
+    ushort Type;
+    uint Padding;
+}
+
+type Version
+{
+    byte MinorVersion where ValidationCheck(value == 0, null, "PCHC: The MinorVersion in type Version must be set to 0x00.");
+    byte MajorVersion where ValidationCheck(value == 1 || value == 2, null, "PCHC: The MajorVersion in type Version must be 0x01 or 0x02.");
+}
+
+type CONNECTION_INFORMATION
+{
+    ushort Port;
+    binary Padding with BinaryEncoding {Length = 6};
+}
+
+type INITIAL_OFFER_MESSAGE
+{
+    binary Hash;
+}
+
+type SEGMENT_INFO_MESSAGE
+{
+    binary ContentTag with BinaryEncoding {Length = 16};
+    // Future Reference:  should use both ContentInformationVersion10 and ContentInformationVersion20
+    ContentInformationVersion10 SegmentInformation where ValidationCheck(value.cSegments == 1, null, DiagnosisLevel.Error, "PCHC: The SegmentInformation.cSegments in type SEGMENT_INFO_MESSAGE must be set to 1.");
+}
+
+type SegmentDescriptor
+{
+    uint BlockSize;
+    uint SegmentSize;
+    ushort SizeOfContentTag where ValidationCheck(value == 16, null, DiagnosisLevel.Error, "PCHC: The SizeOfContentTag in type SegmentDescriptor must be set to 16 bytes.");
+    binary ContentTag with BinaryEncoding {Length = SizeOfContentTag };
+    byte HashAlgorithm where ValidationCheck(value == 1 || value == 4, null, DiagnosisLevel.Error, () => "PCHC: The HashAlgorithm in type SegmentDescriptor must be set to 0x01 or 0x04, not " + Utility.DecToHexFormat(value) + ".");
+    binary SegmentHoHoDk with BinaryEncoding {Length = 32};
+}
+
+type BATCHED_OFFER_MESSAGE
+{
+    array<SegmentDescriptor> SegmentDescriptor where ValidationCheck(value.Count <= 128, null, "PCHC: The BATCHED_OFFER_MESSAGE must not contain more than 128 SegmentDescriptors.");
+}
+
+type TransportHeader
+{
+    uint Size;
+}

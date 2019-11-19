@@ -1,0 +1,143 @@
+protocol JSONRPC with
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "JSON RPC",
+    ShortName = "JSONRPC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "JSON-RPC 1.0 Specifications", Link = "http://json-rpc.org/wiki/specification"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+
+const TreedataName TreedataNameOfMethod = new TreedataName{LocalName = "method"};
+const TreedataName TreedataNameOfId = new TreedataName{LocalName = "id"};
+const TreedataName TreedataNameOfResult = new TreedataName{LocalName = "result"};
+
+type JSONRPCOverTCPDecodingHelper : TCP.TCPDecodingHelper
+{
+    SessionContext sessionContext = null;
+
+    void InitializeJSONRPCOverTCPDecodingHelper(string protocolName, any endpoint ept, ref set<string> notificationMethodNames, (optional any message)(string, json) decodeJSONRPCRequestMessage, (optional any message)(any message, json) decodeJSONRPCResponseMessage)
+    {
+        sessionContext = new SessionContext();
+        sessionContext.NotificationMethodNames = notificationMethodNames;
+        JSONRPCOverTPDecodingCache acceptsCache = new JSONRPCOverTPDecodingCache();
+        acceptsCache.InitializeJSONRPCCache(protocolName, ept, MessageDirection.Accepts, sessionContext, decodeJSONRPCRequestMessage, decodeJSONRPCResponseMessage);
+        AcceptsCache = acceptsCache;
+
+        JSONRPCOverTPDecodingCache issuesCache = new JSONRPCOverTPDecodingCache();
+        issuesCache.InitializeJSONRPCCache(protocolName, ept, MessageDirection.Issues, sessionContext, decodeJSONRPCRequestMessage, decodeJSONRPCResponseMessage);
+        IssuesCache = issuesCache;
+    }
+}
+
+type SessionContext
+{
+    // request cache, the key is request's id
+    map<string, any message> RequestCache = {};
+    // Check whether message is a notification, if yes, don't add this message to requestCache
+    set<string> NotificationMethodNames;
+}
+
+type JSONRPCOverTPDecodingCache : TCP.TCPDecodingCache
+{
+    SessionContext sessionContext = null;
+    
+    any currentJson = null;
+    // Decode as upper layer request message
+    internal (optional any message)(string, json) DecodeJSONRPCRequestMessage;
+    // Decode as upper layer response message
+    internal (optional any message)(any message, json) DecodeJSONRPCResponseMessage;
+
+    void InitializeJSONRPCCache(string protocolName, any endpoint ept, MessageDirection direction, SessionContext context, (optional any message)(string, json) decodeJSONRPCRequestMessage, (optional any message)(any message, json) decodeJSONRPCResponseMessage)
+    {
+        assert context != null;
+        assert decodeJSONRPCRequestMessage != null;
+        assert decodeJSONRPCResponseMessage != null;
+        sessionContext = context;
+        DecodeJSONRPCRequestMessage = decodeJSONRPCRequestMessage;
+        DecodeJSONRPCResponseMessage = decodeJSONRPCResponseMessage;
+        base.Initialize(protocolName, ept, direction, IsJSONRPCMessage, IsSufficientForJSONRPCMsg, DecodeJSONRPCMessage, DecodeIncompleteJSONRPCMessage);
+    }
+
+    bool? IsJSONRPCMessage(binary data)
+    {
+        return (data.Count > 0) && (data[0] == 0x7B); // Json should start with "{"
+    }
+
+    uint? IsSufficientForJSONRPCMsg(binary data)
+    {
+        stream s = Buffer;
+        // BuildJson will consume the stream, cache the result to currentJson to improve performance
+        currentJson = BuildJson(s);
+        // Because BuildJson will consume the stream, we should move Buffer to the current position
+        if (currentJson != null)
+        {
+            if (s.BytePosition == s.ByteLength)
+            {
+                Buffer = $[];
+            }
+            else // Buffer has data
+            {
+                Buffer = s.PeekBytes(s.BitPosition);
+            }
+        }
+        if (currentJson == null)
+            return null;
+        else
+            return 0;
+    }
+
+    optional any message DecodeIncompleteJSONRPCMessage(binary bin)
+    {
+        return nothing;
+    }
+
+    optional any message DecodeJSONRPCMessage(stream s)
+    {
+        optional any message result = nothing;
+        if (currentJson is js:json)
+        {
+            if ((js.GetChild(TreedataNameOfMethod) is method:json) && (method.Value is methodString:string) && // request must contains "method"
+                (js.GetChild(TreedataNameOfId) is reqIdJson:json) && (reqIdJson.Value is reqId:string))
+            {
+                result = DecodeJSONRPCRequestMessage(methodString, js);
+                if ((result is resultMessage:any message) && !(methodString in sessionContext.NotificationMethodNames))
+                {
+                    sessionContext.RequestCache[reqId] = resultMessage;
+                }
+            }
+            else if ((js.GetChild(TreedataNameOfResult) is json || js.GetChild(new TreedataName{LocalName = "error"}) is json) && // response must contains "result" or "error"
+                     (js.GetChild(TreedataNameOfId) is resIdJson:json && resIdJson.Value is resId:string) &&
+                     (resId in sessionContext.RequestCache))
+            {
+                any message req = sessionContext.RequestCache[resId];
+                result = DecodeJSONRPCResponseMessage(req, js);
+                sessionContext.RequestCache = sessionContext.RequestCache.Remove(resId);
+            }
+        }
+        // If current Json value is invalid for JSON RPC and there is data for next JSON value in Buffer, we don't handle it
+        return result;
+    }
+
+    override void ClearInDestructor()
+    {
+        sessionContext = null;
+        base.ClearInDestructor();
+    }
+}

@@ -1,0 +1,6055 @@
+protocol IPFIX with
+    BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    DocumentName = "IPFIX",
+    ProtocolName = "IP Flow Information Export",
+    ProtocolType = "block",
+    ShortName    = "IPFIX",
+    Description  = ""
+},
+OPNAuthoring
+{
+    Copyright  = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 7011"},
+            new Reference{Name = "RFC 7012"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382123", Date = "10/14/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+using TCP;
+using Diagnostics;
+using InfrastructureResources;
+using IGMP;
+using Configurations;
+using PublicResources;
+
+/////////////////////////////////////
+// Endpoint and Actors
+endpoint Collector[uint ObservationDomainID]
+    over host:UDP.Host
+    accepts IPFIXMessage;
+
+const set<ushort> IPFIXPortPorts = {2055, 9555 , 9995, 9025, 9026};
+const binary IPFIXVersion = $[000A];
+
+autostart actor IPFIXOverUDP(UDP.Host host)
+{
+    // Store template for IPFIX.
+    // Declare as reference type so that Value Parameter could update back if it changes inside.
+    IpfixTemplateContainer ipfixTemplateContainer = new IpfixTemplateContainer();
+    // Helper to decode data message which are captured before observe corresponding templates.
+    DataMsgDecoderHelper decoderHelper = new DataMsgDecoderHelper();
+    // Port configuration 
+    NetFlowAndIPFIXConfiguration config = GetConfigurableValue<NetFlowAndIPFIXConfiguration>();
+
+    process host accepts d:UDP.Datagram where (d.DestinationPort in IPFIXPortPorts || d.DestinationPort in config.Ports) && 
+        d.Payload.Count > 2 && d.Payload.Segment(0, 2) == IPFIXVersion
+    {
+        IpfixDecodeAndDispatch(d, d.Payload, ipfixTemplateContainer, decoderHelper, host);
+    }
+
+    ~endpoint(UDP.Host host)
+    {
+        if (decoderHelper != null)
+        {
+            decoderHelper.ClearInDestructor();
+            decoderHelper = null;
+        }
+        ipfixTemplateContainer = null;
+    }
+}
+
+///////////////////////////////////
+// Messages and types
+
+/* IPFIX Message
+     +--------+--------------------------------------------------------+
+     |        | +----------+ +---------+     +-----------+ +---------+ |
+     |Message | | Template | | Data    |     | Options   | | Data    | |
+     | Header | | Set      | | Set     | ... | Template  | | Set     | |
+     |        | |          | |         |     | Set       | |         | |
+     |        | +----------+ +---------+     +-----------+ +---------+ |
+     +--------+--------------------------------------------------------+
+*/
+message IPFIXMessage
+{
+    ushort Version;
+    ushort Length;
+    TimeStamp4 ExportTime;
+    uint SequenceNumber;
+    uint ObservationDomainID;
+
+    array<TemplateSet | OptionsTemplateSet | DataSet> Sets with Encoding{Ignore = true}; // Manually decode
+    
+    override string ToString()
+    {
+        string summary = "Version: " + Version.ToString() + ", ObservationDomainID: " + ObservationDomainID.ToString();
+        foreach (var flow in Sets)
+        {
+            if (flow is t:TemplateSet)
+            {
+                summary += ", [Data Template: " + t.GetAllTemplateId() + "]";
+            }
+            else if (flow is ot:OptionsTemplateSet)
+            {
+                summary += ", [Option Template: " + ot.GetAllTemplateId() + "]";
+            }
+            else if (flow is data:DataSet)
+            {
+                summary += ", [Data: " + data.SetID.ToString() + "]";
+            }
+        }
+        return summary;
+    }
+}
+
+/*
+https://tools.ietf.org/html/rfc7011#section-3.3.1 
+Set Header Format:
+      0                   1                   2                   3
+      0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+     |          Set ID               |          Length               |
+     +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+Set Format:
+    +--------------------------------------------------+
+    | Set Header                                       |
+    +--------------------------------------------------+
+    | record                                           |
+    +--------------------------------------------------+
+    | record                                           |
+    +--------------------------------------------------+
+    ...
+    +--------------------------------------------------+
+    | record                                           |
+    +--------------------------------------------------+
+    | Padding (opt.)                                   |
+    +--------------------------------------------------+
+
+The record types can be either Template Records, Options Template Records, or Data Records.
+The record types MUST NOT be mixed within a Set.
+*/
+type TemplateSet
+{
+    ushort SetID;
+    ushort Length;
+    array<TemplateRecord> Records 
+        with BinaryEncoding{WidthForComposedType = (Length - 4) * 8}
+        with DisplayInfo{ToText = (any obj) => "Template Id: " + GetAllTemplateId()};
+
+    override string ToString()
+    {
+        string summary = "Data Template";
+        if (GetAllTemplateId() is ids:string && ids.Count > 0)
+        {
+            summary += ": [" + ids.ToString() + "]";
+        }
+        return summary;
+    }
+
+    string GetAllTemplateId()
+    {
+        string ids = "";
+        foreach (TemplateRecord r in Records)
+        {
+            ids += ", " + r.TemplateID.ToString();
+        }
+        return ids.Count > 2 ? ids.Segment(2) : "";
+    }
+}
+
+type OptionsTemplateSet
+{
+    ushort SetID;
+    ushort Length;
+    array<OptionsTemplateRecord> Records with BinaryEncoding{WidthForComposedType = (Length - 4) * 8};
+
+    override string ToString()
+    {
+        string summary = "Option Template";
+        if (GetAllTemplateId() is ids:string && ids.Count > 0)
+        {
+            summary += ": [" + ids.ToString() + "]";
+        }
+        return summary;
+    }
+
+    string GetAllTemplateId()
+    {
+        string ids = "";
+        foreach (OptionsTemplateRecord r in Records)
+        {
+            ids += ", " + r.TemplateID.ToString();
+        }
+        return ids.Count > 2 ? ids.Segment(2) : "";
+    }
+}
+
+type DataSet[TemplateElement Template]
+{
+    ushort SetID;
+    ushort Length;
+    (array<array<any> | OptionDataType> | binary) Records 
+        with Encoding{Decoder = DataSetDecoder, SourcePattern = TypeOf<binary>()}
+        with BinaryEncoding{Length = Length - 4};
+
+    override string ToString()
+    {
+        return "Data, SetID: " + SetID.ToString();
+    }
+
+    optional (array<array<any> | OptionDataType> | binary) DataSetDecoder(binary bin)
+    {
+        if (Template == null)
+        {
+            return bin;
+        }
+        return DecodeDataSetRecords(bin, Template);
+    }
+}
+
+// section-3.4.1
+type TemplateRecord
+{
+    ushort TemplateID;
+    ushort Count;
+    array<FieldInfo> FieldsInfo with BinaryEncoding{Length = Count};
+
+    override string ToString()
+    {
+        return "Data Template, ID: " + TemplateID.ToString() + ", Count: " + Count.ToString();
+    }
+}
+
+// section-3.4.2
+type OptionsTemplateRecord
+{
+    ushort TemplateID;
+    ushort FieldCount;
+    ushort ScopeFieldCount;
+
+    array<FieldInfo> ScopeFields with BinaryEncoding{Length = ScopeFieldCount};
+    array<FieldInfo> Fields with BinaryEncoding{Length = FieldCount - ScopeFieldCount};
+
+    override string ToString()
+    {
+        return "Option Template, ID: " + TemplateID.ToString() + 
+            ", Scope Count: " + ScopeFieldCount.ToString() + 
+            ", Data Count: " + FieldCount.ToString();
+    }
+}
+
+type OptionDataType
+{
+    optional array<any> ScopeFields = [];
+    optional array<any> OptionFields = [];
+
+    override string ToString()
+    {
+        string summary = "";
+        if (ScopeFields != nothing) summary += ScopeFields.ToString();
+        if (OptionFields != nothing) summary += OptionFields.ToString();
+        return summary;
+    }
+}
+
+// section-3.2
+type FieldInfo
+{
+    bool E with BinaryEncoding{Width = 1};
+    FieldTypeEnum Type with BinaryEncoding{Width = 15};
+    ushort Length;
+    optional [|E|] uint EnterpriseNumber;
+
+    override string ToString()
+    {
+        return "Type: " + EnumToString<FieldTypeEnum>(Type, true) + 
+            ", Length: " + Length.ToString() + 
+            (EnterpriseNumber == nothing ? "" : ", EnterpriseNumber: " + EnterpriseNumber.ToString());
+    }
+}
+
+///////////////////////////////////////////////////
+// Decoding Utilities
+
+// Entry for decoding function
+void IpfixDecodeAndDispatch(any message origin, stream s, IpfixTemplateContainer ipfixTemplateContainer, DataMsgDecoderHelper decoderHelper, UDP.Host host)
+{
+    var m = BinaryDecoder<IPFIXMessage>(s);
+    if (m == nothing) 
+        ThrowDecodingException("IPFIX");
+    IPFIXMessage msg = m as IPFIXMessage;
+    int prePos = s.BytePosition;
+    // start decoding FlowSets
+    array<TemplateSet | OptionsTemplateSet | DataSet> decodedResult = [];
+    bool stopping = false;
+    set<ushort> misingTemplateId = {};
+    while (s.RemainingByteLength > 2 && !stopping)
+    {
+        ushort setID = s.PeekUShort(s.BitPosition, Endian.Big);
+        switch (setID)
+        {
+            case 2 => // Data Template Set
+                switch (s)
+                {
+                    case templateSet:TemplateSet from BinaryDecoder<TemplateSet> =>
+                        decodedResult += [templateSet];
+                        // insert to template container.
+                        if (templateSet.Records is records:array<TemplateRecord> && records != null && records.Count > 0)
+                        {
+                            foreach (var r in records)
+                            {
+                                if (r.Count > 0)
+                                {
+                                    // Save template
+                                    TemplateElement ele1 = new TemplateElement{Kind = TemplateKind.DataTemplate, Content = r.FieldsInfo};
+                                    long id = ((msg.ObservationDomainID as long) << 16) + r.TemplateID;
+                                    ipfixTemplateContainer.Templates[id] = ele1;
+                                    
+                                    // Try to decode cached Data message which is lacking of Template
+                                    decoderHelper.TryDecodeAndDispatchWhenObserveNewTemplate(r.TemplateID, ipfixTemplateContainer, endpoint Collector[msg.ObservationDomainID] over host);
+                                }
+                            }
+                        }
+                    default => 
+                        break;
+                }
+            case 3 => // Options Template Set
+                switch (s)
+                {
+                    case optionTemplateSet:OptionsTemplateSet from BinaryDecoder<OptionsTemplateSet> =>
+                        decodedResult += [optionTemplateSet];
+                        // insert to template container.
+                        if (optionTemplateSet.Records is records2:array<OptionsTemplateRecord> && records2 != null && records2.Count > 0)
+                        {
+                            foreach (var rec in records2)
+                            {
+                                // Save template
+                                OptionTemplateElement optionEle = new OptionTemplateElement
+                                {
+                                    OptionScopeFields = rec.ScopeFields, 
+                                    OptionFields = rec.Fields
+                                };
+                                TemplateElement ele2 = new TemplateElement{Kind = TemplateKind.OptionsTemplate, Content = optionEle};
+                                long id = ((msg.ObservationDomainID as long) << 16) + rec.TemplateID;
+                                ipfixTemplateContainer.Templates[id] = ele2;
+
+                                // Try to decode cached Data message which is lacking of Template
+                                decoderHelper.TryDecodeAndDispatchWhenObserveNewTemplate(rec.TemplateID, ipfixTemplateContainer, endpoint Collector[msg.ObservationDomainID] over host);
+                            }
+                        }
+                    default => 
+                        break;
+                }
+            case ushort where value >= 256 => // Data set
+                // retrieve template
+                long id = ((msg.ObservationDomainID as long) << 16) + setID;
+                TemplateElement template = null;
+                if (ipfixTemplateContainer.Templates.Keys[id]) // template exists.
+                {
+                    template = ipfixTemplateContainer.Templates[id];
+                }
+                else
+                {
+                    template = null;
+                    misingTemplateId[setID] = true;
+                }
+                // decoding
+                if (BinaryDecoder<DataSet[template]>(s) is dataSet:DataSet)
+                {
+                    decodedResult += [dataSet];
+                }
+                else
+                {
+                    stopping = true;
+                    break;
+                }
+            default =>
+                ValidationCheck(false, null, Format(PublicResources.IPFIX_UnexpectedFlowSetID, setID));
+                stopping = true;
+                break;
+        }
+    }
+    msg.Sets = decodedResult;
+    msg.AssignFieldEncodingInfo("Sets", prePos, s.BitPosition);
+    msg.Origins = [origin];
+
+    if (misingTemplateId.Count > 0)
+    {
+        // this is Data message and lack of template, cache it.
+        decoderHelper.AddNewDataMessage(msg, ref misingTemplateId);
+    }
+    else
+    {
+        dispatch endpoint Collector[msg.ObservationDomainID] over host accepts msg;
+    }
+}
+
+// Decode DataSet Records based on input template
+(array<array<any> | OptionDataType> | binary) DecodeDataSetRecords(binary bin, TemplateElement template)
+{
+    stream s = bin;
+    array<array<any> | OptionDataType> decodedResult = [];
+    if (template.Kind == TemplateKind.DataTemplate)
+    {
+        array<FieldInfo> dataFlowTemp = template.Content as array<FieldInfo>;
+        while (s.RemainingByteLength > 0)
+        {
+            if (DecodeSingleDataFlowRecordBasedTemplate(s, dataFlowTemp) is ret:array<any>)
+            {
+                decodedResult += [ret];
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+    else if (template.Kind == TemplateKind.OptionsTemplate)
+    {
+        OptionTemplateElement optionTemp = template.Content as OptionTemplateElement;
+        while (s.RemainingByteLength > 0)
+        {
+            if (DecodeSingleOptionDataFlowRecordBasedTemplate(s, optionTemp) is ret:OptionDataType)
+            {
+                decodedResult += [ret];
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+    else
+    {
+        ValidationCheck(false, null, Format(UTILITY_STR_EXCEPTION_MESSAGE_WITH_REASON, "IPFIX", "DataSet", "associated template mismatches"));
+        return bin;
+    }
+    return decodedResult;
+}
+
+// Decode single Option Data Flow record based on template
+optional OptionDataType DecodeSingleOptionDataFlowRecordBasedTemplate(stream s, OptionTemplateElement template)
+{
+    array<any> scopeFields = [];
+    array<any> optionFields = [];
+    foreach (FieldInfo scopeFieldInfo in template.OptionScopeFields)
+    {
+        optional any ret2 = DecodePrimitiveType(s, scopeFieldInfo.Type, scopeFieldInfo.Length, scopeFieldInfo.EnterpriseNumber);
+        if (ret2 == nothing)
+        {
+            return nothing;
+        }
+        else
+        {
+            scopeFields += [ret2];
+        }
+    }
+    
+    foreach (FieldInfo optionFieldInfo in template.OptionFields)
+    {
+        optional any ret = DecodePrimitiveType(s, optionFieldInfo.Type, optionFieldInfo.Length, optionFieldInfo.EnterpriseNumber);
+        if (ret == nothing)
+        {
+            return nothing;
+        }
+        else
+        {
+            optionFields += [ret as any];
+        }
+    }
+    return new OptionDataType
+        {
+            ScopeFields = scopeFields.Count > 0 ? scopeFields : nothing,
+            OptionFields = optionFields.Count > 0 ? optionFields : nothing,
+        };
+}
+
+// Decode single Data Flow record based on template
+optional array<any> DecodeSingleDataFlowRecordBasedTemplate(stream s, array<FieldInfo> template)
+{
+    array<any> decodedResult = [];
+    foreach (FieldInfo f in template)
+    {
+        optional any ret = DecodePrimitiveType(s, f.Type, f.Length, f.EnterpriseNumber);
+        if (ret == nothing)
+        {
+            return nothing;
+        }
+        else
+        {
+            decodedResult += [ret as any];
+        }
+    }
+    return decodedResult;
+}
+
+// Templates are transmitted in an interval on the wire. 
+// IPFIX data messages prior to first Template transmission cannot decode successfully until the templates transmit later.
+// Below helper cache data messages are maintain the dependencies to Template.
+type DataMsgDecoderHelper
+{
+    // Key - Sequence number, Value: IPFIXMessage
+    // Store IPFIX messages containing data set whose templates has not captured yet.
+    map<uint, IPFIXMessage> Msgs = {};
+    // Key -- Sequence number.
+    // Value -- Template IDs which are absent for decoding IPFIX message which is identified by Sequence Number.
+    // Single data message may depend on multiple Template.
+    map<uint, set<ushort>> SequenceNumToTemplates = {};
+    // Key -- Template ID
+    // Value -- a set of Sequence Number for IPFIX message which depends to the Template.
+    map<ushort, set<uint>> TemplateIDToSequenceNumbers = {};
+
+    // Try to decode and dispatch data message if all templates which cached data message depends on exists.
+    void TryDecodeAndDispatchWhenObserveNewTemplate(ushort templateId, IpfixTemplateContainer ipfixTemplateContainer, Collector node)
+    {
+        if (templateId in TemplateIDToSequenceNumbers.Keys)
+        {
+            set<uint> seqs = TemplateIDToSequenceNumbers[templateId];
+            // remove key from TemplateIDToSequenceNumbers map
+            TemplateIDToSequenceNumbers = TemplateIDToSequenceNumbers.Remove(templateId);
+
+            foreach (uint seq in seqs)
+            {
+                if (seq in SequenceNumToTemplates.Keys)
+                {
+                    SequenceNumToTemplates[seq][templateId] = false;
+                    // All dependent templates has been captured. so it's time to decode data message.
+                    if (SequenceNumToTemplates[seq].Count == 0)
+                    {
+                        // Remove key from SequenceNumToTemplates map
+                        SequenceNumToTemplates = SequenceNumToTemplates.Remove(seq);
+                        // Decoding data message based on template.
+                        if (seq in Msgs.Keys)
+                        {
+                            IPFIXMessage msg = Msgs[seq];
+                            Msgs = Msgs.Remove(seq);
+                            DecodeDataSet(ref msg, ipfixTemplateContainer);
+                            dispatch node accepts msg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Add new Data message which is lacking of templates.
+    void AddNewDataMessage(IPFIXMessage msg, ref set<ushort> templateIds)
+    {
+        uint seq = msg.SequenceNumber;
+        Msgs[seq] = msg;
+        SequenceNumToTemplates[seq] = templateIds;
+
+        foreach (ushort templateId in templateIds)
+        {
+            if (!(templateId in TemplateIDToSequenceNumbers.Keys))
+            {
+                TemplateIDToSequenceNumbers[templateId] = {};
+            }
+            TemplateIDToSequenceNumbers[templateId][seq] = true;
+        }
+    }
+
+    internal void DecodeDataSet(ref IPFIXMessage msg, IpfixTemplateContainer ipfixTemplateContainer)
+    {
+        foreach (var s in msg.Sets)
+        {
+            if (s is dataSet:DataSet && dataSet.Records is bin:binary)
+            {
+                long id = ((msg.ObservationDomainID as long) << 16) + dataSet.SetID;
+                if (id in ipfixTemplateContainer.Templates.Keys)
+                {
+                    // decode Data Set Records
+                    dataSet.Records = DecodeDataSetRecords(bin, ipfixTemplateContainer.Templates[id]);
+                }
+            }
+        }
+    }
+
+    // Clear cached messages
+    void ClearInDestructor()
+    {
+        SequenceNumToTemplates = null;
+        TemplateIDToSequenceNumbers = null;
+        foreach (IPFIXMessage m in Msgs.Values)
+        {
+            ValidationCheck(false, m, Format(UTILITY_STR_EXCEPTION_MESSAGE_WITH_REASON, "IPFIX", "DataRecord", "associated templates is missing"));
+            DisplayTopLevelMessage(m);
+        }
+    }
+}
+
+// Template management
+type IpfixTemplateContainer
+{
+    // Collecting Processes SHOULD use the Transport Session and the
+    // Observation Domain ID field to separate different export streams
+    // originating from the same Exporter.
+    // Key: Source ID + Template ID 
+    // Value: Template or Option Template
+    map<long, TemplateElement> Templates = {};
+}
+
+pattern TemplateKind = enum byte
+{
+    DataTemplate, 
+    OptionsTemplate,
+    ...
+};
+
+type TemplateElement
+{
+    TemplateKind Kind;
+    (array<FieldInfo> | OptionTemplateElement) Content;
+}
+
+type OptionTemplateElement
+{
+    array<FieldInfo> OptionScopeFields;
+    array<FieldInfo> OptionFields;
+}
+
+///////////////////////////
+// Type declaration 
+type TimeStamp4
+{
+    uint UNIXSecs;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddSeconds(UNIXSecs as double).ToString() + "  UTC";
+    }
+}
+
+type dateTimeseconds
+{
+    ulong Seconds;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddSeconds(Seconds as double).ToString() + "  UTC";
+    }
+}
+
+type dateTimeMilliseconds
+{
+    ulong MilliSeconds;
+
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddMilliseconds(MilliSeconds as double).ToString() + "  UTC";
+    }
+}
+
+type dateTimeMicroseconds
+{
+    uint Microseconds;
+    
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddMilliseconds((Microseconds / 1000) as double).ToString() + "  UTC";
+    }
+}
+
+type dateTimeNanoseconds
+{
+    uint Nanoseconds;
+    
+    override string ToString()
+    {
+        return CreateDateTime(1970, 1, 1).AddMilliseconds((Nanoseconds / 1000000) as double).ToString() + "  UTC";
+    }
+}
+////////////////////////////////////////
+// Types: http://www.iana.org/assignments/ipfix/ipfix.xhtml
+// type: 1
+type octetDeltaCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "octetDeltaCount: " + data.ToString();
+    }
+}
+
+// type: 2
+type packetDeltaCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "packetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 3
+type deltaFlowCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "deltaFlowCount: " + data.ToString();
+    }
+}
+
+// type: 4
+type protocolIdentifier
+{
+    ProtocolType data;
+    override string ToString()
+    {
+        return "protocolIdentifier: " + EnumToStringInSummary<ProtocolType>(data);
+    }
+}
+
+// type: 5
+type ipClassOfService
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipClassOfService: " + data.ToString();
+    }
+}
+
+// type: 6
+type tcpControlBits[ushort Len]
+{
+    optional [|Len == 2|] byte Reserved;
+    TCP.Flags data;
+
+    override string ToString()
+    {
+        return "tcpControlBits: " + data.ToString();
+    }
+}
+
+// type: 7
+type sourceTransportPort
+{
+    IANA.Port data;
+    
+    override string ToString()
+    {
+        return "sourceTransportPort: " + IANA.PortToServiceName(data);
+    }
+}
+
+// type: 8
+type sourceIPv4Address
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "sourceIPv4Address: " + data.ToString();
+    }
+}
+
+// type: 9
+type sourceIPv4PrefixLength
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "sourceIPv4PrefixLength: " + data.ToString();
+    }
+}
+
+// type: 10
+type ingressInterface
+{
+    uint data;
+    override string ToString()
+    {
+        return "ingressInterface: " + data.ToString();
+    }
+}
+
+// type: 11
+type destinationTransportPort
+{
+    IANA.Port data;
+    
+    override string ToString()
+    {
+        return "destinationTransportPort: " + IANA.PortToServiceName(data);
+    }
+}
+
+// type: 12
+type destinationIPv4Address
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "destinationIPv4Address: " + data.ToString();
+    }
+}
+
+// type: 13
+type destinationIPv4PrefixLength
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "destinationIPv4PrefixLength: " + data.ToString();
+    }
+}
+
+// type: 14
+type egressInterface
+{
+    uint data;
+    override string ToString()
+    {
+        return "egressInterface: " + data.ToString();
+    }
+}
+
+// type: 15
+type ipNextHopIPv4Address
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "ipNextHopIPv4Address: " + data.ToString();
+    }
+}
+
+// type: 16
+type bgpSourceAsNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "bgpSourceAsNumber: " + data.ToString();
+    }
+}
+
+// type: 17
+type bgpDestinationAsNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "bgpDestinationAsNumber: " + data.ToString();
+    }
+}
+
+// type: 18
+type bgpNextHopIPv4Address
+{
+    IPv4Address data;
+    
+    override string ToString()
+    {
+        return "bgpNexthopIPv4Address: " + data.ToString();
+    }
+}
+
+// type: 19
+type postMCastPacketDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastPacketDeltaCount: " + data.ToString();
+    }
+}
+
+// type: 20
+type postMCastOctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastOctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type: 21
+type flowEndSysUpTime
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "flowEndSysUpTime: " + data.ToString();
+    }
+}
+
+// type: 22
+type flowStartSysUpTime
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "flowStartSysUpTime: " + data.ToString();
+    }
+}
+
+// type: 23
+type postOctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postOctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type: 24
+type postPacketDeltaCount
+{
+    ulong data;
+    
+    override string ToString()
+    {
+        return "postPacketDeltaCount: " + data.ToString();
+    }
+}
+
+// type: 25
+type minimumIpTotalLength
+{
+    ulong data;
+    
+    override string ToString()
+    {
+        return "minimumIpTotalLength: " + data.ToString();
+    }
+}
+
+// type: 26
+type maximumIpTotalLength
+{
+    ulong data;
+    
+    override string ToString()
+    {
+        return "maximumIpTotalLength: " + data.ToString();
+    }
+}
+
+// type: 27
+type sourceIPv6Address
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "sourceIPv6Address: " + data.ToString();
+    }
+}
+
+// type: 28
+type destinationIPv6Address
+{
+    IPv6Address data;
+    
+    override string ToString()
+    {
+        return "destinationIPv6Address: " + data.ToString();
+    }
+}
+
+// type: 29
+type sourceIPv6PrefixLength
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "sourceIPv6PrefixLength: " + data.ToString();
+    }
+}
+
+// type: 30
+type destinationIPv6PrefixLength
+{
+    byte data;
+    
+    override string ToString()
+    {
+        return "destinationIPv6PrefixLength: " + data.ToString();
+    }
+}
+
+// type: 31
+type flowLabelIPv6
+{
+    uint data;
+    
+    override string ToString()
+    {
+        return "flowLabelIPv6: " + data.ToString();
+    }
+}
+
+// type: 32
+type icmpTypeCodeIPv4
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "icmpTypeCodeIPv4: " + data.ToString();
+    }
+}
+
+// type: 33
+type igmpType
+{
+    IGMP.MessageType data;
+    
+    override string ToString()
+    {
+        return "igmpType: " + EnumToStringInSummary<IGMP.MessageType>(data);
+    }
+}
+
+// type 34
+type samplingInterval
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingInterval: " + data.ToString();
+    }
+}
+
+// type 35
+type samplingAlgorithm[ushort Len]
+{
+    optional [|Len > 1|] binary Pad with BinaryEncoding{Length = Len - 1};
+    samplingAlgorithmEnum data;
+    override string ToString()
+    {
+        return "samplingAlgorithm: " + EnumToStringInSummary<samplingAlgorithmEnum>(data);
+    }
+}
+
+pattern samplingAlgorithmEnum = enum byte
+{
+    Deterministic   = 1,
+    Random          = 2,
+    ...
+};
+
+// type: 36
+type flowActiveTimeout
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "flowActiveTimeout: " + data.ToString();
+    }
+}
+
+// type: 37
+type flowIdleTimeout
+{
+    ushort data;
+    
+    override string ToString()
+    {
+        return "flowIdleTimeout: " + data.ToString();
+    }
+}
+
+// type 38
+type engineType
+{
+    engineTypeEnum data;
+    override string ToString()
+    {
+        return "engineType: " + EnumToStringInSummary<engineTypeEnum>(data);
+    }
+}
+
+pattern engineTypeEnum = enum byte
+{
+    RP = 0,
+    VIP_LineCard = 1,
+    PFC_DFC = 2,
+    ...
+};
+
+// type 39
+type engineId
+{
+    byte data;
+    override string ToString()
+    {
+        return "engineId: " + data.ToString();
+    }
+}
+
+// type 40
+type exportedOctetTotalCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "exportedOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 41
+type exportedMessageTotalCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "exportedMessageTotalCount: " + data.ToString();
+    }
+}
+
+// type 42
+type exportedFlowRecordTotalCount[ushort Len]
+{
+    ulong data with BinaryEncoding{Width = Len * 8};
+    override string ToString()
+    {
+        return "exportedFlowRecordTotalCount: " + data.ToString();
+    }
+}
+
+// type 43
+type ipv4RouterSc
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "ipv4RouterSc: " + data.ToString();
+    }
+}
+
+// type 44
+type sourceIPv4Prefix
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "sourceIPv4Prefix: " + data.ToString();
+    }
+}
+
+// type 45
+type destinationIPv4Prefix
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "destinationIPv4Prefix: " + data.ToString();
+    }
+}
+
+// type 46
+type mplsTopLabelType
+{
+    byte data;
+    override string ToString()
+    {
+        return "mplsTopLabelType: " + data.ToString();
+    }
+}
+
+// type 47
+type mplsTopLabelIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "mplsTopLabelIPv4Address: " + data.ToString();
+    }
+}
+
+// type 48
+type samplerId
+{
+    byte data;
+    override string ToString()
+    {
+        return "samplerId: " + data.ToString();
+    }
+}
+
+// type 49
+type samplerMode
+{
+    byte data;
+    override string ToString()
+    {
+        return "samplerMode: " + data.ToString();
+    }
+}
+
+// type 50
+type samplerRandomInterval
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplerRandomInterval: " + data.ToString();
+    }
+}
+
+// type 51
+type classId
+{
+    byte data;
+    override string ToString()
+    {
+        return "classId: " + data.ToString();
+    }
+}
+
+// type 52
+type minimumTTL
+{
+    byte data;
+    override string ToString()
+    {
+        return "minimumTTL: " + data.ToString();
+    }
+}
+
+// type 53
+type maximumTTL
+{
+    byte data;
+    override string ToString()
+    {
+        return "maximumTTL: " + data.ToString();
+    }
+}
+
+// type 54
+type fragmentIdentification
+{
+    uint data;
+    override string ToString()
+    {
+        return "fragmentIdentification: " + data.ToString();
+    }
+}
+
+// type 55
+type postIpClassOfService
+{
+    byte data;
+    override string ToString()
+    {
+        return "postIpClassOfService: " + data.ToString();
+    }
+}
+
+// type 56
+type sourceMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "sourceMacAddress: " + data.ToString();
+    }
+}
+
+// type 57
+type postDestinationMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "postDestinationMacAddress: " + data.ToString();
+    }
+}
+
+// type 58
+type vlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "vlanId: " + data.ToString();
+    }
+}
+
+// type 59
+type postVlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "postVlanId: " + data.ToString();
+    }
+}
+
+// type 60
+type ipVersion
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipVersion: " + data.ToString();
+    }
+}
+
+// type 61
+type flowDirection
+{
+    flowDirectionEnum data;
+    override string ToString()
+    {
+        return "flowDirection: " + EnumToStringInSummary<flowDirectionEnum>(data);
+    }
+}
+
+pattern flowDirectionEnum = enum byte
+{
+    ingress = 0x00,
+    egress  = 0x01,
+    ...
+};
+
+// type 62
+type ipNextHopIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "ipNextHopIPv6Address: " + data.ToString();
+    }
+}
+
+// type 63
+type bgpNextHopIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "bgpNextHopIPv6Address: " + data.ToString();
+    }
+}
+
+// type 64
+type ipv6ExtensionHeaders
+{
+    uint data;
+    override string ToString()
+    {
+        return "ipv6ExtensionHeaders: " + data.ToString();
+    }
+}
+
+// type 70
+type mplsTopLabelStackSection
+{
+    uint Label with BinaryEncoding{Width = 20};
+    byte Exp with BinaryEncoding{Width = 3};
+    bool S with BinaryEncoding{Width = 1};
+    override string ToString()
+    {
+        return "mplsTopLabelStackSection: [Label: " + Label.ToString() + ", Exp: " + Exp.ToString() + ", S: " + S.ToString() + "]";
+    }
+}
+
+// type 71
+type mplsLabelStackSection2
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection2: " + BinaryToDecString(data);
+    }
+}
+
+// type 72
+type mplsLabelStackSection3
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection3: " + BinaryToDecString(data);
+    }
+}
+
+// type 73
+type mplsLabelStackSection4
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection4: " + BinaryToDecString(data);
+    }
+}
+
+// type 74
+type mplsLabelStackSection5
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection5: " + BinaryToDecString(data);
+    }
+}
+
+// type 75
+type mplsLabelStackSection6
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection6: " + BinaryToDecString(data);
+    }
+}
+
+// type 76
+type mplsLabelStackSection7
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection7: " + BinaryToDecString(data);
+    }
+}
+
+// type 77
+type mplsLabelStackSection8
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection8: " + BinaryToDecString(data);
+    }
+}
+
+// type 78
+type mplsLabelStackSection9
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection9: " + BinaryToDecString(data);
+    }
+}
+
+// type 79
+type mplsLabelStackSection10
+{
+    binary data with BinaryEncoding{Length = 3}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection10: " + BinaryToDecString(data);
+    }
+}
+
+// type 80
+type destinationMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "destinationMacAddress: " + data.ToString();
+    }
+}
+
+// type 81
+type postSourceMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "postSourceMacAddress: " + data.ToString();
+    }
+}
+
+// type 82
+type interfaceName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "interfaceName: " + data;
+    }
+}
+
+// type 83
+type interfaceDescription[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "interfaceDescription: " + data;
+    }
+}
+
+// type 84
+type samplerName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "samplerName: " + data;
+    }
+}
+
+// type 85
+type octetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "octetTotalCount: " + data.ToString();
+    }
+}
+
+// type 86
+type packetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "packetTotalCount: " + data.ToString();
+    }
+}
+
+// type 87
+type flagsAndSamplerId
+{
+    uint data;
+    override string ToString()
+    {
+        return "flagsAndSamplerId: " + data.ToString();
+    }
+}
+
+// type 88
+type fragmentOffset
+{
+    ushort data;
+    override string ToString()
+    {
+        return "fragmentOffset: " + data.ToString();
+    }
+}
+
+// type 89
+type forwardingStatus
+{
+    StatusEnum Status with BinaryEncoding{Width = 2};
+    ([|Status == StatusEnum.Forwarded|] ForwardedReason | 
+    [|Status == StatusEnum.Dropped|] DroppedReason |
+    [|Status == StatusEnum.Consumed|] ConsumedReason |
+    byte) ReasonCode with BinaryEncoding{Width = 6};
+
+    override string ToString()
+    {
+        return "forwardingStatus: [Status: " + Status.ToString() + "]";
+    }
+}
+
+pattern StatusEnum = enum byte
+{
+    Unknown     = 0b00,
+    Forwarded   = 0b01,
+    Dropped     = 0b10,
+    Consumed    = 0b11,
+    ...
+};
+
+pattern ForwardedReason = enum byte
+{
+    Unknown = 0,
+    Fragmented = 1,
+    NotFragmented = 2,
+    ...
+};
+
+pattern DroppedReason = enum byte
+{
+    Unknown                 = 0,
+    ACLDeny                 = 1,
+    ACLDrop                 = 2,
+    Unroutable              = 3,
+    Adjacency               = 4,
+    FragmentationAndDFset   = 5,
+    BadHeaderChecksum       = 6,
+    BadTotalLength          = 7,
+    BadHeaderLength         = 8,
+    BadTTL                  = 9,
+    Policer                 = 10,
+    WRED                    = 11,
+    RPF                     = 12,
+    ForUs                   = 13,
+    BadOutputInterface      = 14,
+    Hardware                = 15,
+    ...
+};
+
+pattern ConsumedReason = enum byte
+{
+    Unknown                 = 0,
+    PuntAdjacency           = 1,
+    IncompleteAdjacency     = 2,
+    ForUs                   = 3,
+    ...
+};
+
+// type 90
+type mplsVpnRouteDistinguisher[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsVpnRouteDistinguisher: " + BinaryToDecString(data);
+    }
+}
+
+// type 91
+type mplsTopLabelPrefixLength
+{
+    byte data;
+    override string ToString()
+    {
+        return "mplsTopLabelPrefixLength: " + data.ToString();
+    }
+}
+
+// type 92
+type srcTrafficIndex
+{
+    uint data;
+    override string ToString()
+    {
+        return "srcTrafficIndex: " + data.ToString();
+    }
+}
+
+// type 93
+type dstTrafficIndex
+{
+    uint data;
+    override string ToString()
+    {
+        return "dstTrafficIndex: " + data.ToString();
+    }
+}
+
+// type 94
+type applicationDescription[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "applicationDescription: " + data;
+    }
+}
+
+// type 95
+type applicationId[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "applicationId: " + BinaryToDecString(data);
+    }
+}
+
+// type 96
+type applicationName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "applicationName: " + data;
+    }
+}
+
+// type 98
+type postIpDiffServCodePoint
+{
+    byte data;
+    override string ToString()
+    {
+        return "postIpDiffServCodePoint: " + data.ToString();
+    }
+}
+
+// type 99
+type multicastReplicationFactor
+{
+    uint data;
+    override string ToString()
+    {
+        return "multicastReplicationFactor: " + data.ToString();
+    }
+}
+
+// type 100
+type className[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "className: " + data;
+    }
+}
+
+// type 101
+type classificationEngineId
+{
+    byte data;
+    override string ToString()
+    {
+        return "classificationEngineId: " + data.ToString();
+    }
+}
+
+// type 102
+type layer2packetSectionOffset
+{
+    ushort data;
+    override string ToString()
+    {
+        return "layer2packetSectionOffset: " + data.ToString();
+    }
+}
+
+// type 103
+type layer2packetSectionSize
+{
+    ushort data;
+    override string ToString()
+    {
+        return "layer2packetSectionSize: " + data.ToString();
+    }
+}
+
+// type 104
+type layer2packetSectionData[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "layer2packetSectionData: " + BinaryToDecString(data);
+    }
+}
+
+// type 128
+type bgpNextAdjacentAsNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "bgpNextAdjacentAsNumber: " + data.ToString();
+    }
+}
+
+// type 129
+type bgpPrevAdjacentAsNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "bgpPrevAdjacentAsNumber: " + data.ToString();
+    }
+}
+
+// type 130
+type exporterIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "exporterIPv4Address: " + data.ToString();
+    }
+}
+
+// type 131
+type exporterIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "exporterIPv6Address: " + data.ToString();
+    }
+}
+
+// type 132
+type droppedOctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedOctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 133
+type droppedPacketDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedPacketDeltaCount: " + data.ToString();
+    }
+}
+
+// type 134
+type droppedOctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 135
+type droppedPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 136
+type flowEndReason
+{
+    flowEndReasonEnum data;
+    override string ToString()
+    {
+        return "flowEndReason: " + EnumToStringInSummary<flowEndReasonEnum>(data);
+    }
+}
+
+pattern flowEndReasonEnum = enum byte
+{
+    $"idle timeout" = 0x01,
+    $"active timeout" = 0x02,
+    $"end of Flow detected" = 0x03,
+    $"forced end" = 0x04,
+    $"lack of resources" = 0x05,
+    ...
+};
+
+// type 137
+type commonPropertiesId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "commonPropertiesId: " + data.ToString();
+    }
+}
+
+// type 138
+type observationPointId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "observationPointId: " + data.ToString();
+    }
+}
+
+// type 139
+type icmpTypeCodeIPv6
+{
+    ushort data;
+    override string ToString()
+    {
+        return "icmpTypeCodeIPv6: " + data.ToString();
+    }
+}
+
+// type 140
+type mplsTopLabelIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "mplsTopLabelIPv6Address: " + data.ToString();
+    }
+}
+
+// type 141
+type lineCardId
+{
+    uint data;
+    override string ToString()
+    {
+        return "lineCardId: " + data.ToString();
+    }
+}
+
+// type 142
+type portId
+{
+    uint data;
+    override string ToString()
+    {
+        return "portId: " + data.ToString();
+    }
+}
+
+// type 143
+type meteringProcessId
+{
+    uint data;
+    override string ToString()
+    {
+        return "meteringProcessId: " + data.ToString();
+    }
+}
+
+// type 144
+type exportingProcessId
+{
+    uint data;
+    override string ToString()
+    {
+        return "exportingProcessId: " + data.ToString();
+    }
+}
+
+// type 145
+type templateId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "templateId: " + data.ToString();
+    }
+}
+
+// type 146
+type wlanChannelId
+{
+    byte data;
+    override string ToString()
+    {
+        return "wlanChannelId: " + data.ToString();
+    }
+}
+
+// type 147
+type wlanSSID[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "wlanSSID: " + data;
+    }
+}
+
+// type 148
+type flowId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowId: " + data.ToString();
+    }
+}
+
+// type 149
+type observationDomainId
+{
+    uint data;
+    override string ToString()
+    {
+        return "observationDomainId: " + data.ToString();
+    }
+}
+
+// type 150
+type flowStartSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "flowStartSeconds: " + data.ToString();
+    }
+}
+
+// type 151
+type flowEndSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "flowEndSeconds: " + data.ToString();
+    }
+}
+
+// type 152
+type flowStartMilliseconds
+{
+    IPFIX.dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "flowStartMilliseconds: " + data.ToString();
+    }
+}
+
+// type 153
+type flowEndMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "flowEndMilliseconds: " + data.ToString();
+    }
+}
+
+// type 154
+type flowStartMicroseconds
+{
+    dateTimeMicroseconds data;
+    override string ToString()
+    {
+        return "flowStartMicroseconds: " + data.ToString();
+    }
+}
+
+// type 155
+type flowEndMicroseconds
+{
+    dateTimeMicroseconds data;
+    override string ToString()
+    {
+        return "flowEndMicroseconds: " + data.ToString();
+    }
+}
+
+// type 156
+type flowStartNanoseconds
+{
+    dateTimeNanoseconds data;
+    override string ToString()
+    {
+        return "flowStartNanoseconds: " + data.ToString();
+    }
+}
+
+// type 157
+type flowEndNanoseconds
+{
+    dateTimeNanoseconds data;
+    override string ToString()
+    {
+        return "flowEndNanoseconds: " + data.ToString();
+    }
+}
+
+// type 158
+type flowStartDeltaMicroseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "flowStartDeltaMicroseconds: " + data.ToString();
+    }
+}
+
+// type 159
+type flowEndDeltaMicroseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "flowEndDeltaMicroseconds: " + data.ToString();
+    }
+}
+
+// type 160
+type systemInitTimeMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "systemInitTimeMilliseconds: " + data.ToString();
+    }
+}
+
+// type 161
+type flowDurationMilliseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "flowDurationMilliseconds: " + data.ToString();
+    }
+}
+
+// type 162
+type flowDurationMicroseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "flowDurationMicroseconds: " + data.ToString();
+    }
+}
+
+// type 163
+type observedFlowTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "observedFlowTotalCount: " + data.ToString();
+    }
+}
+
+// type 164
+type ignoredPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ignoredPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 165
+type ignoredOctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ignoredOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 166
+type notSentFlowTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "notSentFlowTotalCount: " + data.ToString();
+    }
+}
+
+// type 167
+type notSentPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "notSentPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 168
+type notSentOctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "notSentOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 169
+type destinationIPv6Prefix
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "destinationIPv6Prefix: " + data.ToString();
+    }
+}
+
+// type 170
+type sourceIPv6Prefix
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "sourceIPv6Prefix: " + data.ToString();
+    }
+}
+
+// type 171
+type postOctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 172
+type postPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 173
+type flowKeyIndicator
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowKeyIndicator: " + data.ToString();
+    }
+}
+
+// type 174
+type postMCastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 175
+type postMCastOctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastOctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 176
+type icmpTypeIPv4
+{
+    byte data;
+    override string ToString()
+    {
+        return "icmpTypeIPv4: " + data.ToString();
+    }
+}
+
+// type 177
+type icmpCodeIPv4
+{
+    byte data;
+    override string ToString()
+    {
+        return "icmpCodeIPv4: " + data.ToString();
+    }
+}
+
+// type 178
+type icmpTypeIPv6
+{
+    byte data;
+    override string ToString()
+    {
+        return "icmpTypeIPv6: " + data.ToString();
+    }
+}
+
+// type 179
+type icmpCodeIPv6
+{
+    byte data;
+    override string ToString()
+    {
+        return "icmpCodeIPv6: " + data.ToString();
+    }
+}
+
+// type 180
+type udpSourcePort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "udpSourcePort: " + data.ToString();
+    }
+}
+
+// type 181
+type udpDestinationPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "udpDestinationPort: " + data.ToString();
+    }
+}
+
+// type 182
+type tcpSourcePort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "tcpSourcePort: " + data.ToString();
+    }
+}
+
+// type 183
+type tcpDestinationPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "tcpDestinationPort: " + data.ToString();
+    }
+}
+
+// type 184
+type tcpSequenceNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "tcpSequenceNumber: " + data.ToString();
+    }
+}
+
+// type 185
+type tcpAcknowledgementNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "tcpAcknowledgementNumber: " + data.ToString();
+    }
+}
+
+// type 186
+type tcpWindowSize
+{
+    ushort data;
+    override string ToString()
+    {
+        return "tcpWindowSize: " + data.ToString();
+    }
+}
+
+// type 187
+type tcpUrgentPointer
+{
+    ushort data;
+    override string ToString()
+    {
+        return "tcpUrgentPointer: " + data.ToString();
+    }
+}
+
+// type 188
+type tcpHeaderLength
+{
+    byte data;
+    override string ToString()
+    {
+        return "tcpHeaderLength: " + data.ToString();
+    }
+}
+
+// type 189
+type ipHeaderLength
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipHeaderLength: " + data.ToString();
+    }
+}
+
+// type 190
+type totalLengthIPv4
+{
+    ushort data;
+    override string ToString()
+    {
+        return "totalLengthIPv4: " + data.ToString();
+    }
+}
+
+// type 191
+type payloadLengthIPv6
+{
+    ushort data;
+    override string ToString()
+    {
+        return "payloadLengthIPv6: " + data.ToString();
+    }
+}
+
+// type 192
+type ipTTL
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipTTL: " + data.ToString();
+    }
+}
+
+// type 193
+type nextHeaderIPv6
+{
+    byte data;
+    override string ToString()
+    {
+        return "nextHeaderIPv6: " + data.ToString();
+    }
+}
+
+// type 194
+type mplsPayloadLength
+{
+    uint data;
+    override string ToString()
+    {
+        return "mplsPayloadLength: " + data.ToString();
+    }
+}
+
+// type 195
+type ipDiffServCodePoint
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipDiffServCodePoint: " + data.ToString();
+    }
+}
+
+// type 196
+type ipPrecedence
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipPrecedence: " + data.ToString();
+    }
+}
+
+// type 197
+type fragmentFlags
+{
+    byte data;
+    override string ToString()
+    {
+        return "fragmentFlags: " + data.ToString();
+    }
+}
+
+// type 198
+type octetDeltaSumOfSquares
+{
+    ulong data;
+    override string ToString()
+    {
+        return "octetDeltaSumOfSquares: " + data.ToString();
+    }
+}
+
+// type 199
+type octetTotalSumOfSquares
+{
+    ulong data;
+    override string ToString()
+    {
+        return "octetTotalSumOfSquares: " + data.ToString();
+    }
+}
+
+// type 200
+type mplsTopLabelTTL
+{
+    byte data;
+    override string ToString()
+    {
+        return "mplsTopLabelTTL: " + data.ToString();
+    }
+}
+
+// type 201
+type mplsLabelStackLength
+{
+    uint data;
+    override string ToString()
+    {
+        return "mplsLabelStackLength: " + data.ToString();
+    }
+}
+
+// type 202
+type mplsLabelStackDepth
+{
+    uint data;
+    override string ToString()
+    {
+        return "mplsLabelStackDepth: " + data.ToString();
+    }
+}
+
+// type 203
+type mplsTopLabelExp
+{
+    byte data;
+    override string ToString()
+    {
+        return "mplsTopLabelExp: " + data.ToString();
+    }
+}
+
+// type 204
+type ipPayloadLength
+{
+    uint data;
+    override string ToString()
+    {
+        return "ipPayloadLength: " + data.ToString();
+    }
+}
+
+// type 205
+type udpMessageLength
+{
+    ushort data;
+    override string ToString()
+    {
+        return "udpMessageLength: " + data.ToString();
+    }
+}
+
+// type 206
+type isMulticast
+{
+    byte data;
+    override string ToString()
+    {
+        return "isMulticast: " + data.ToString();
+    }
+}
+
+// type 207
+type ipv4IHL
+{
+    byte data;
+    override string ToString()
+    {
+        return "ipv4IHL: " + data.ToString();
+    }
+}
+
+// type 208
+type ipv4Options
+{
+    uint data;
+    override string ToString()
+    {
+        return "ipv4Options: " + data.ToString();
+    }
+}
+
+// type 209
+type tcpOptions
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpOptions: " + data.ToString();
+    }
+}
+
+// type 210
+type paddingOctets[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "paddingOctets: " + BinaryToDecString(data);
+    }
+}
+
+// type 211
+type collectorIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "collectorIPv4Address: " + data.ToString();
+    }
+}
+
+// type 212
+type collectorIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "collectorIPv6Address: " + data.ToString();
+    }
+}
+
+// type 213
+type exportInterface
+{
+    uint data;
+    override string ToString()
+    {
+        return "exportInterface: " + data.ToString();
+    }
+}
+
+// type 214
+type exportProtocolVersion
+{
+    byte data;
+    override string ToString()
+    {
+        return "exportProtocolVersion: " + data.ToString();
+    }
+}
+
+// type 215
+type exportTransportProtocol
+{
+    byte data;
+    override string ToString()
+    {
+        return "exportTransportProtocol: " + data.ToString();
+    }
+}
+
+// type 216
+type collectorTransportPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "collectorTransportPort: " + data.ToString();
+    }
+}
+
+// type 217
+type exporterTransportPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "exporterTransportPort: " + data.ToString();
+    }
+}
+
+// type 218
+type tcpSynTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpSynTotalCount: " + data.ToString();
+    }
+}
+
+// type 219
+type tcpFinTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpFinTotalCount: " + data.ToString();
+    }
+}
+
+// type 220
+type tcpRstTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpRstTotalCount: " + data.ToString();
+    }
+}
+
+// type 221
+type tcpPshTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpPshTotalCount: " + data.ToString();
+    }
+}
+
+// type 222
+type tcpAckTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpAckTotalCount: " + data.ToString();
+    }
+}
+
+// type 223
+type tcpUrgTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "tcpUrgTotalCount: " + data.ToString();
+    }
+}
+
+// type 224
+type ipTotalLength
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ipTotalLength: " + data.ToString();
+    }
+}
+
+// type 225
+type postNATSourceIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "postNATSourceIPv4Address: " + data.ToString();
+    }
+}
+
+// type 226
+type postNATDestinationIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "postNATDestinationIPv4Address: " + data.ToString();
+    }
+}
+
+// type 227
+type postNAPTSourceTransportPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "postNAPTSourceTransportPort: " + data.ToString();
+    }
+}
+
+// type 228
+type postNAPTDestinationTransportPort
+{
+    ushort data;
+    override string ToString()
+    {
+        return "postNAPTDestinationTransportPort: " + data.ToString();
+    }
+}
+
+// type 229
+type natOriginatingAddressRealm
+{
+    byte data;
+    override string ToString()
+    {
+        return "natOriginatingAddressRealm: " + data.ToString();
+    }
+}
+
+// type 230
+type natEvent
+{
+    byte data;
+    override string ToString()
+    {
+        return "natEvent: " + data.ToString();
+    }
+}
+
+// type 231
+type initiatorOctets
+{
+    ulong data;
+    override string ToString()
+    {
+        return "initiatorOctets: " + data.ToString();
+    }
+}
+
+// type 232
+type responderOctets
+{
+    ulong data;
+    override string ToString()
+    {
+        return "responderOctets: " + data.ToString();
+    }
+}
+
+// type 233
+type firewallEvent
+{
+    byte data;
+    override string ToString()
+    {
+        return "firewallEvent: " + data.ToString();
+    }
+}
+
+// type 234
+type ingressVRFID
+{
+    uint data;
+    override string ToString()
+    {
+        return "ingressVRFID: " + data.ToString();
+    }
+}
+
+// type 235
+type egressVRFID
+{
+    uint data;
+    override string ToString()
+    {
+        return "egressVRFID: " + data.ToString();
+    }
+}
+
+// type 236
+type VRFname[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "VRFname: " + data;
+    }
+}
+
+// type 237
+type postMplsTopLabelExp
+{
+    byte data;
+    override string ToString()
+    {
+        return "postMplsTopLabelExp: " + data.ToString();
+    }
+}
+
+// type 238
+type tcpWindowScale
+{
+    ushort data;
+    override string ToString()
+    {
+        return "tcpWindowScale: " + data.ToString();
+    }
+}
+
+// type 239
+type biflowDirection
+{
+    byte data;
+    override string ToString()
+    {
+        return "biflowDirection: " + data.ToString();
+    }
+}
+
+// type 240
+type ethernetHeaderLength
+{
+    byte data;
+    override string ToString()
+    {
+        return "ethernetHeaderLength: " + data.ToString();
+    }
+}
+
+// type 241
+type ethernetPayloadLength
+{
+    ushort data;
+    override string ToString()
+    {
+        return "ethernetPayloadLength: " + data.ToString();
+    }
+}
+
+// type 242
+type ethernetTotalLength
+{
+    ushort data;
+    override string ToString()
+    {
+        return "ethernetTotalLength: " + data.ToString();
+    }
+}
+
+// type 243
+type dot1qVlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "dot1qVlanId: " + data.ToString();
+    }
+}
+
+// type 244
+type dot1qPriority
+{
+    byte data;
+    override string ToString()
+    {
+        return "dot1qPriority: " + data.ToString();
+    }
+}
+
+// type 245
+type dot1qCustomerVlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "dot1qCustomerVlanId: " + data.ToString();
+    }
+}
+
+// type 246
+type dot1qCustomerPriority
+{
+    byte data;
+    override string ToString()
+    {
+        return "dot1qCustomerPriority: " + data.ToString();
+    }
+}
+
+// type 247
+type metroEvcId[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "metroEvcId: " + data;
+    }
+}
+
+// type 248
+type metroEvcType
+{
+    byte data;
+    override string ToString()
+    {
+        return "metroEvcType: " + data.ToString();
+    }
+}
+
+// type 249
+type pseudoWireId
+{
+    uint data;
+    override string ToString()
+    {
+        return "pseudoWireId: " + data.ToString();
+    }
+}
+
+// type 250
+type pseudoWireType
+{
+    ushort data;
+    override string ToString()
+    {
+        return "pseudoWireType: " + data.ToString();
+    }
+}
+
+// type 251
+type pseudoWireControlWord
+{
+    uint data;
+    override string ToString()
+    {
+        return "pseudoWireControlWord: " + data.ToString();
+    }
+}
+
+// type 252
+type ingressPhysicalInterface
+{
+    uint data;
+    override string ToString()
+    {
+        return "ingressPhysicalInterface: " + data.ToString();
+    }
+}
+
+// type 253
+type egressPhysicalInterface
+{
+    uint data;
+    override string ToString()
+    {
+        return "egressPhysicalInterface: " + data.ToString();
+    }
+}
+
+// type 254
+type postDot1qVlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "postDot1qVlanId: " + data.ToString();
+    }
+}
+
+// type 255
+type postDot1qCustomerVlanId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "postDot1qCustomerVlanId: " + data.ToString();
+    }
+}
+
+// type 256
+type ethernetType
+{
+    ushort data;
+    override string ToString()
+    {
+        return "ethernetType: " + data.ToString();
+    }
+}
+
+// type 257
+type postIpPrecedence
+{
+    byte data;
+    override string ToString()
+    {
+        return "postIpPrecedence: " + data.ToString();
+    }
+}
+
+// type 258
+type collectionTimeMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "collectionTimeMilliseconds: " + data.ToString();
+    }
+}
+
+// type 259
+type exportSctpStreamId
+{
+    ushort data;
+    override string ToString()
+    {
+        return "exportSctpStreamId: " + data.ToString();
+    }
+}
+
+// type 260
+type maxExportSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "maxExportSeconds: " + data.ToString();
+    }
+}
+
+// type 261
+type maxFlowEndSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "maxFlowEndSeconds: " + data.ToString();
+    }
+}
+
+// type 262
+type messageMD5Checksum[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "messageMD5Checksum: " + BinaryToDecString(data);
+    }
+}
+
+// type 263
+type messageScope
+{
+    byte data;
+    override string ToString()
+    {
+        return "messageScope: " + data.ToString();
+    }
+}
+
+// type 264
+type minExportSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "minExportSeconds: " + data.ToString();
+    }
+}
+
+// type 265
+type minFlowStartSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "minFlowStartSeconds: " + data.ToString();
+    }
+}
+
+// type 266
+type opaqueOctets[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "opaqueOctets: " + BinaryToDecString(data);
+    }
+}
+
+// type 267
+type sessionScope
+{
+    byte data;
+    override string ToString()
+    {
+        return "sessionScope: " + data.ToString();
+    }
+}
+
+// type 268
+type maxFlowEndMicroseconds
+{
+    dateTimeMicroseconds data;
+    override string ToString()
+    {
+        return "maxFlowEndMicroseconds: " + data.ToString();
+    }
+}
+
+// type 269
+type maxFlowEndMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "maxFlowEndMilliseconds: " + data.ToString();
+    }
+}
+
+// type 270
+type maxFlowEndNanoseconds
+{
+    dateTimeNanoseconds data;
+    override string ToString()
+    {
+        return "maxFlowEndNanoseconds: " + data.ToString();
+    }
+}
+
+// type 271
+type minFlowStartMicroseconds
+{
+    dateTimeMicroseconds data;
+    override string ToString()
+    {
+        return "minFlowStartMicroseconds: " + data.ToString();
+    }
+}
+
+// type 272
+type minFlowStartMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "minFlowStartMilliseconds: " + data.ToString();
+    }
+}
+
+// type 273
+type minFlowStartNanoseconds
+{
+    dateTimeNanoseconds data;
+    override string ToString()
+    {
+        return "minFlowStartNanoseconds: " + data.ToString();
+    }
+}
+
+// type 274
+type collectorCertificate[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "collectorCertificate: " + BinaryToDecString(data);
+    }
+}
+
+// type 275
+type exporterCertificate[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "exporterCertificate: " + BinaryToDecString(data);
+    }
+}
+
+// type 276
+type dataRecordsReliability
+{
+    bool data;
+    override string ToString()
+    {
+        return "dataRecordsReliability: " + data.ToString();
+    }
+}
+
+// type 277
+type observationPointType
+{
+    byte data;
+    override string ToString()
+    {
+        return "observationPointType: " + data.ToString();
+    }
+}
+
+// type 278
+type newConnectionDeltaCount
+{
+    uint data;
+    override string ToString()
+    {
+        return "newConnectionDeltaCount: " + data.ToString();
+    }
+}
+
+// type 279
+type connectionSumDurationSeconds
+{
+    ulong data;
+    override string ToString()
+    {
+        return "connectionSumDurationSeconds: " + data.ToString();
+    }
+}
+
+// type 280
+type connectionTransactionId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "connectionTransactionId: " + data.ToString();
+    }
+}
+
+// type 281
+type postNATSourceIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "postNATSourceIPv6Address: " + data.ToString();
+    }
+}
+
+// type 282
+type postNATDestinationIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "postNATDestinationIPv6Address: " + data.ToString();
+    }
+}
+
+// type 283
+type natPoolId
+{
+    uint data;
+    override string ToString()
+    {
+        return "natPoolId: " + data.ToString();
+    }
+}
+
+// type 284
+type natPoolName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "natPoolName: " + data;
+    }
+}
+
+// type 285
+type anonymizationFlags
+{
+    ushort data;
+    override string ToString()
+    {
+        return "anonymizationFlags: " + data.ToString();
+    }
+}
+
+// type 286
+type anonymizationTechnique
+{
+    ushort data;
+    override string ToString()
+    {
+        return "anonymizationTechnique: " + data.ToString();
+    }
+}
+
+// type 287
+type informationElementIndex
+{
+    ushort data;
+    override string ToString()
+    {
+        return "informationElementIndex: " + data.ToString();
+    }
+}
+
+// type 288
+type p2pTechnology[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "p2pTechnology: " + data;
+    }
+}
+
+// type 289
+type tunnelTechnology[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "tunnelTechnology: " + data;
+    }
+}
+
+// type 290
+type encryptedTechnology[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "encryptedTechnology: " + data;
+    }
+}
+
+// type 291
+type basicList[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "basicList: " + data.ToString();
+    }
+}
+
+// type 292
+type subTemplateList[ushort Len]
+{
+    subTemplateList data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "subTemplateList: " + data.ToString();
+    }
+}
+
+// type 293
+type subTemplateMultiList[ushort Len]
+{
+    subTemplateMultiList data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "subTemplateMultiList: " + data.ToString();
+    }
+}
+
+// type 294
+type bgpValidityState
+{
+    byte data;
+    override string ToString()
+    {
+        return "bgpValidityState: " + data.ToString();
+    }
+}
+
+// type 295
+type IPSecSPI
+{
+    uint data;
+    override string ToString()
+    {
+        return "IPSecSPI: " + data.ToString();
+    }
+}
+
+// type 296
+type greKey
+{
+    uint data;
+    override string ToString()
+    {
+        return "greKey: " + data.ToString();
+    }
+}
+
+// type 297
+type natType
+{
+    byte data;
+    override string ToString()
+    {
+        return "natType: " + data.ToString();
+    }
+}
+
+// type 298
+type initiatorPackets
+{
+    ulong data;
+    override string ToString()
+    {
+        return "initiatorPackets: " + data.ToString();
+    }
+}
+
+// type 299
+type responderPackets
+{
+    ulong data;
+    override string ToString()
+    {
+        return "responderPackets: " + data.ToString();
+    }
+}
+
+// type 300
+type observationDomainName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "observationDomainName: " + data;
+    }
+}
+
+// type 301
+type selectionSequenceId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectionSequenceId: " + data.ToString();
+    }
+}
+
+// type 302
+type selectorId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectorId: " + data.ToString();
+    }
+}
+
+// type 303
+type Type
+{
+    ushort data;
+    override string ToString()
+    {
+        return "Type: " + data.ToString();
+    }
+}
+
+// type 304
+type selectorAlgorithm
+{
+    ushort data;
+    override string ToString()
+    {
+        return "selectorAlgorithm: " + data.ToString();
+    }
+}
+
+// type 305
+type samplingPacketInterval
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingPacketInterval: " + data.ToString();
+    }
+}
+
+// type 306
+type samplingPacketSpace
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingPacketSpace: " + data.ToString();
+    }
+}
+
+// type 307
+type samplingTimeInterval
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingTimeInterval: " + data.ToString();
+    }
+}
+
+// type 308
+type samplingTimeSpace
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingTimeSpace: " + data.ToString();
+    }
+}
+
+// type 309
+type samplingSize
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingSize: " + data.ToString();
+    }
+}
+
+// type 310
+type samplingPopulation
+{
+    uint data;
+    override string ToString()
+    {
+        return "samplingPopulation: " + data.ToString();
+    }
+}
+
+// type 311
+type samplingProbability
+{
+    double data;
+    override string ToString()
+    {
+        return "samplingProbability: " + data.ToString();
+    }
+}
+
+// type 312
+type dataLinkFrameSize
+{
+    ushort data;
+    override string ToString()
+    {
+        return "dataLinkFrameSize: " + data.ToString();
+    }
+}
+
+// type 313
+type ipHeaderPacketSection[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "ipHeaderPacketSection: " + BinaryToDecString(data);
+    }
+}
+
+// type 314
+type ipPayloadPacketSection[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "ipPayloadPacketSection: " + BinaryToDecString(data);
+    }
+}
+
+// type 315
+type dataLinkFrameSection[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "dataLinkFrameSection: " + BinaryToDecString(data);
+    }
+}
+
+// type 316
+type mplsLabelStackSection[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsLabelStackSection: " + BinaryToDecString(data);
+    }
+}
+
+// type 317
+type mplsPayloadPacketSection[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "mplsPayloadPacketSection: " + BinaryToDecString(data);
+    }
+}
+
+// type 318
+type selectorIdTotalPktsObserved
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectorIdTotalPktsObserved: " + data.ToString();
+    }
+}
+
+// type 319
+type selectorIdTotalPktsSelected
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectorIdTotalPktsSelected: " + data.ToString();
+    }
+}
+
+// type 320
+type absoluteError
+{
+    double data;
+    override string ToString()
+    {
+        return "absoluteError: " + data.ToString();
+    }
+}
+
+// type 321
+type relativeError
+{
+    double data;
+    override string ToString()
+    {
+        return "relativeError: " + data.ToString();
+    }
+}
+
+// type 322
+type observationTimeSeconds
+{
+    dateTimeseconds data;
+    override string ToString()
+    {
+        return "observationTimeSeconds: " + data.ToString();
+    }
+}
+
+// type 323
+type observationTimeMilliseconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "observationTimeMilliseconds: " + data.ToString();
+    }
+}
+
+// type 324
+type observationTimeMicroseconds
+{
+    dateTimeMicroseconds data;
+    override string ToString()
+    {
+        return "observationTimeMicroseconds: " + data.ToString();
+    }
+}
+
+// type 325
+type observationTimeNanoseconds
+{
+    dateTimeNanoseconds data;
+    override string ToString()
+    {
+        return "observationTimeNanoseconds: " + data.ToString();
+    }
+}
+
+// type 326
+type digestHashValue
+{
+    ulong data;
+    override string ToString()
+    {
+        return "digestHashValue: " + data.ToString();
+    }
+}
+
+// type 327
+type hashIPPayloadOffset
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashIPPayloadOffset: " + data.ToString();
+    }
+}
+
+// type 328
+type hashIPPayloadSize
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashIPPayloadSize: " + data.ToString();
+    }
+}
+
+// type 329
+type hashOutputRangeMin
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashOutputRangeMin: " + data.ToString();
+    }
+}
+
+// type 330
+type hashOutputRangeMax
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashOutputRangeMax: " + data.ToString();
+    }
+}
+
+// type 331
+type hashSelectedRangeMin
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashSelectedRangeMin: " + data.ToString();
+    }
+}
+
+// type 332
+type hashSelectedRangeMax
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashSelectedRangeMax: " + data.ToString();
+    }
+}
+
+// type 333
+type hashDigestOutput
+{
+    bool data;
+    override string ToString()
+    {
+        return "hashDigestOutput: " + data.ToString();
+    }
+}
+
+// type 334
+type hashInitialiserValue
+{
+    ulong data;
+    override string ToString()
+    {
+        return "hashInitialiserValue: " + data.ToString();
+    }
+}
+
+// type 335
+type selectorName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "selectorName: " + data;
+    }
+}
+
+// type 336
+type upperCILimit
+{
+    double data;
+    override string ToString()
+    {
+        return "upperCILimit: " + data.ToString();
+    }
+}
+
+// type 337
+type lowerCILimit
+{
+    double data;
+    override string ToString()
+    {
+        return "lowerCILimit: " + data.ToString();
+    }
+}
+
+// type 338
+type confidenceLevel
+{
+    double data;
+    override string ToString()
+    {
+        return "confidenceLevel: " + data.ToString();
+    }
+}
+
+// type 339
+type informationElementDataType
+{
+    byte data;
+    override string ToString()
+    {
+        return "informationElementDataType: " + data.ToString();
+    }
+}
+
+// type 340
+type informationElementDescription[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "informationElementDescription: " + data;
+    }
+}
+
+// type 341
+type informationElementName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "informationElementName: " + data;
+    }
+}
+
+// type 342
+type informationElementRangeBegin
+{
+    ulong data;
+    override string ToString()
+    {
+        return "informationElementRangeBegin: " + data.ToString();
+    }
+}
+
+// type 343
+type informationElementRangeEnd
+{
+    ulong data;
+    override string ToString()
+    {
+        return "informationElementRangeEnd: " + data.ToString();
+    }
+}
+
+// type 344
+type informationElementSemantics
+{
+    byte data;
+    override string ToString()
+    {
+        return "informationElementSemantics: " + data.ToString();
+    }
+}
+
+// type 345
+type informationElementUnits
+{
+    ushort data;
+    override string ToString()
+    {
+        return "informationElementUnits: " + data.ToString();
+    }
+}
+
+// type 346
+type privateEnterpriseNumber
+{
+    uint data;
+    override string ToString()
+    {
+        return "privateEnterpriseNumber: " + data.ToString();
+    }
+}
+
+// type 347
+type virtualStationInterfaceId[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "virtualStationInterfaceId: " + BinaryToDecString(data);
+    }
+}
+
+// type 348
+type virtualStationInterfaceName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "virtualStationInterfaceName: " + data;
+    }
+}
+
+// type 349
+type virtualStationUUID[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "virtualStationUUID: " + BinaryToDecString(data);
+    }
+}
+
+// type 350
+type virtualStationName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "virtualStationName: " + data;
+    }
+}
+
+// type 351
+type layer2SegmentId
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2SegmentId: " + data.ToString();
+    }
+}
+
+// type 352
+type layer2OctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2OctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 353
+type layer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 354
+type ingressUnicastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ingressUnicastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 355
+type ingressMulticastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ingressMulticastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 356
+type ingressBroadcastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ingressBroadcastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 357
+type egressUnicastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "egressUnicastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 358
+type egressBroadcastPacketTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "egressBroadcastPacketTotalCount: " + data.ToString();
+    }
+}
+
+// type 359
+type monitoringIntervalStartMilliSeconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "monitoringIntervalStartMilliSeconds: " + data.ToString();
+    }
+}
+
+// type 360
+type monitoringIntervalEndMilliSeconds
+{
+    dateTimeMilliseconds data;
+    override string ToString()
+    {
+        return "monitoringIntervalEndMilliSeconds: " + data.ToString();
+    }
+}
+
+// type 361
+type portRangeStart
+{
+    ushort data;
+    override string ToString()
+    {
+        return "portRangeStart: " + data.ToString();
+    }
+}
+
+// type 362
+type portRangeEnd
+{
+    ushort data;
+    override string ToString()
+    {
+        return "portRangeEnd: " + data.ToString();
+    }
+}
+
+// type 363
+type portRangeStepSize
+{
+    ushort data;
+    override string ToString()
+    {
+        return "portRangeStepSize: " + data.ToString();
+    }
+}
+
+// type 364
+type portRangeNumPorts
+{
+    ushort data;
+    override string ToString()
+    {
+        return "portRangeNumPorts: " + data.ToString();
+    }
+}
+
+// type 365
+type staMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "staMacAddress: " + data.ToString();
+    }
+}
+
+// type 366
+type staIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "staIPv4Address: " + data.ToString();
+    }
+}
+
+// type 367
+type wtpMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "wtpMacAddress: " + data.ToString();
+    }
+}
+
+// type 368
+type ingressInterfaceType
+{
+    uint data;
+    override string ToString()
+    {
+        return "ingressInterfaceType: " + data.ToString();
+    }
+}
+
+// type 369
+type egressInterfaceType
+{
+    uint data;
+    override string ToString()
+    {
+        return "egressInterfaceType: " + data.ToString();
+    }
+}
+
+// type 370
+type rtpSequenceNumber
+{
+    ushort data;
+    override string ToString()
+    {
+        return "rtpSequenceNumber: " + data.ToString();
+    }
+}
+
+// type 371
+type userName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "userName: " + data;
+    }
+}
+
+// type 372
+type applicationCategoryName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "applicationCategoryName: " + data;
+    }
+}
+
+// type 373
+type applicationSubCategoryName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "applicationSubCategoryName: " + data;
+    }
+}
+
+// type 374
+type applicationGroupName[ushort Len]
+{
+    string data with BinaryEncoding{Length = Len};
+    override string ToString()
+    {
+        return "applicationGroupName: " + data;
+    }
+}
+
+// type 375
+type originalFlowsPresent
+{
+    ulong data;
+    override string ToString()
+    {
+        return "originalFlowsPresent: " + data.ToString();
+    }
+}
+
+// type 376
+type originalFlowsInitiated
+{
+    ulong data;
+    override string ToString()
+    {
+        return "originalFlowsInitiated: " + data.ToString();
+    }
+}
+
+// type 377
+type originalFlowsCompleted
+{
+    ulong data;
+    override string ToString()
+    {
+        return "originalFlowsCompleted: " + data.ToString();
+    }
+}
+
+// type 378
+type distinctCountOfSourceIPAddress
+{
+    ulong data;
+    override string ToString()
+    {
+        return "distinctCountOfSourceIPAddress: " + data.ToString();
+    }
+}
+
+// type 379
+type distinctCountOfDestinationIPAddress
+{
+    ulong data;
+    override string ToString()
+    {
+        return "distinctCountOfDestinationIPAddress: " + data.ToString();
+    }
+}
+
+// type 380
+type distinctCountOfSourceIPv4Address
+{
+    uint data;
+    override string ToString()
+    {
+        return "distinctCountOfSourceIPv4Address: " + data.ToString();
+    }
+}
+
+// type 381
+type distinctCountOfDestinationIPv4Address
+{
+    uint data;
+    override string ToString()
+    {
+        return "distinctCountOfDestinationIPv4Address: " + data.ToString();
+    }
+}
+
+// type 382
+type distinctCountOfSourceIPv6Address
+{
+    ulong data;
+    override string ToString()
+    {
+        return "distinctCountOfSourceIPv6Address: " + data.ToString();
+    }
+}
+
+// type 383
+type distinctCountOfDestinationIPv6Address
+{
+    ulong data;
+    override string ToString()
+    {
+        return "distinctCountOfDestinationIPv6Address: " + data.ToString();
+    }
+}
+
+// type 384
+type valueDistributionMethod
+{
+    byte data;
+    override string ToString()
+    {
+        return "valueDistributionMethod: " + data.ToString();
+    }
+}
+
+// type 385
+type rfc3550JitterMilliseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "rfc3550JitterMilliseconds: " + data.ToString();
+    }
+}
+
+// type 386
+type rfc3550JitterMicroseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "rfc3550JitterMicroseconds: " + data.ToString();
+    }
+}
+
+// type 387
+type rfc3550JitterNanoseconds
+{
+    uint data;
+    override string ToString()
+    {
+        return "rfc3550JitterNanoseconds: " + data.ToString();
+    }
+}
+
+// type 388
+type dot1qDEI
+{
+    bool data;
+    override string ToString()
+    {
+        return "dot1qDEI: " + data.ToString();
+    }
+}
+
+// type 389
+type dot1qCustomerDEI
+{
+    bool data;
+    override string ToString()
+    {
+        return "dot1qCustomerDEI: " + data.ToString();
+    }
+}
+
+// type 390
+type flowSelectorAlgorithm
+{
+    ushort data;
+    override string ToString()
+    {
+        return "flowSelectorAlgorithm: " + data.ToString();
+    }
+}
+
+// type 391
+type flowSelectedOctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowSelectedOctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 392
+type flowSelectedPacketDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowSelectedPacketDeltaCount: " + data.ToString();
+    }
+}
+
+// type 393
+type flowSelectedFlowDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowSelectedFlowDeltaCount: " + data.ToString();
+    }
+}
+
+// type 394
+type selectorIDTotalFlowsObserved
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectorIDTotalFlowsObserved: " + data.ToString();
+    }
+}
+
+// type 395
+type selectorIDTotalFlowsSelected
+{
+    ulong data;
+    override string ToString()
+    {
+        return "selectorIDTotalFlowsSelected: " + data.ToString();
+    }
+}
+
+// type 396
+type samplingFlowInterval
+{
+    ulong data;
+    override string ToString()
+    {
+        return "samplingFlowInterval: " + data.ToString();
+    }
+}
+
+// type 397
+type samplingFlowSpacing
+{
+    ulong data;
+    override string ToString()
+    {
+        return "samplingFlowSpacing: " + data.ToString();
+    }
+}
+
+// type 398
+type flowSamplingTimeInterval
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowSamplingTimeInterval: " + data.ToString();
+    }
+}
+
+// type 399
+type flowSamplingTimeSpacing
+{
+    ulong data;
+    override string ToString()
+    {
+        return "flowSamplingTimeSpacing: " + data.ToString();
+    }
+}
+
+// type 400
+type hashFlowDomain
+{
+    ushort data;
+    override string ToString()
+    {
+        return "hashFlowDomain: " + data.ToString();
+    }
+}
+
+// type 401
+type transportOctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "transportOctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 402
+type transportPacketDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "transportPacketDeltaCount: " + data.ToString();
+    }
+}
+
+// type 403
+type originalExporterIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "originalExporterIPv4Address: " + data.ToString();
+    }
+}
+
+// type 404
+type originalExporterIPv6Address
+{
+    IPv6Address data;
+    override string ToString()
+    {
+        return "originalExporterIPv6Address: " + data.ToString();
+    }
+}
+
+// type 405
+type originalObservationDomainId
+{
+    uint data;
+    override string ToString()
+    {
+        return "originalObservationDomainId: " + data.ToString();
+    }
+}
+
+// type 406
+type intermediateProcessId
+{
+    uint data;
+    override string ToString()
+    {
+        return "intermediateProcessId: " + data.ToString();
+    }
+}
+
+// type 407
+type ignoredDataRecordTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ignoredDataRecordTotalCount: " + data.ToString();
+    }
+}
+
+// type 408
+type dataLinkFrameType
+{
+    ushort data;
+    override string ToString()
+    {
+        return "dataLinkFrameType: " + data.ToString();
+    }
+}
+
+// type 409
+type sectionOffset
+{
+    ushort data;
+    override string ToString()
+    {
+        return "sectionOffset: " + data.ToString();
+    }
+}
+
+// type 410
+type sectionExportedOctets
+{
+    ushort data;
+    override string ToString()
+    {
+        return "sectionExportedOctets: " + data.ToString();
+    }
+}
+
+// type 411
+type dot1qServiceInstanceTag[ushort Len]
+{
+    binary data with BinaryEncoding{Length = Len}, DisplayInfo{ToText = BinaryToDecString};
+    override string ToString()
+    {
+        return "dot1qServiceInstanceTag: " + BinaryToDecString(data);
+    }
+}
+
+// type 412
+type dot1qServiceInstanceId
+{
+    uint data;
+    override string ToString()
+    {
+        return "dot1qServiceInstanceId: " + data.ToString();
+    }
+}
+
+// type 413
+type dot1qServiceInstancePriority
+{
+    byte data;
+    override string ToString()
+    {
+        return "dot1qServiceInstancePriority: " + data.ToString();
+    }
+}
+
+// type 414
+type dot1qCustomerSourceMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "dot1qCustomerSourceMacAddress: " + data.ToString();
+    }
+}
+
+// type 415
+type dot1qCustomerDestinationMacAddress
+{
+    MacAddress data;
+    override string ToString()
+    {
+        return "dot1qCustomerDestinationMacAddress: " + data.ToString();
+    }
+}
+
+// type 417
+type postLayer2OctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postLayer2OctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 418
+type postMCastLayer2OctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastLayer2OctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 420
+type postLayer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postLayer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 421
+type postMCastLayer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "postMCastLayer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 422
+type minimumLayer2TotalLength
+{
+    ulong data;
+    override string ToString()
+    {
+        return "minimumLayer2TotalLength: " + data.ToString();
+    }
+}
+
+// type 423
+type maximumLayer2TotalLength
+{
+    ulong data;
+    override string ToString()
+    {
+        return "maximumLayer2TotalLength: " + data.ToString();
+    }
+}
+
+// type 424
+type droppedLayer2OctetDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedLayer2OctetDeltaCount: " + data.ToString();
+    }
+}
+
+// type 425
+type droppedLayer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "droppedLayer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 426
+type ignoredLayer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ignoredLayer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 427
+type notSentLayer2OctetTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "notSentLayer2OctetTotalCount: " + data.ToString();
+    }
+}
+
+// type 428
+type layer2OctetDeltaSumOfSquares
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2OctetDeltaSumOfSquares: " + data.ToString();
+    }
+}
+
+// type 429
+type layer2OctetTotalSumOfSquares
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2OctetTotalSumOfSquares: " + data.ToString();
+    }
+}
+
+// type 430
+type layer2FrameDeltaCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2FrameDeltaCount: " + data.ToString();
+    }
+}
+
+// type 431
+type layer2FrameTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "layer2FrameTotalCount: " + data.ToString();
+    }
+}
+
+// type 432
+type pseudoWireDestinationIPv4Address
+{
+    IPv4Address data;
+    override string ToString()
+    {
+        return "pseudoWireDestinationIPv4Address: " + data.ToString();
+    }
+}
+
+// type 433
+type ignoredLayer2FrameTotalCount
+{
+    ulong data;
+    override string ToString()
+    {
+        return "ignoredLayer2FrameTotalCount: " + data.ToString();
+    }
+}
+
+// RFC 5102
+pattern FieldTypeEnum = enum ushort
+{
+    octetDeltaCount                          = 1,
+    packetDeltaCount                         = 2,
+    deltaFlowCount                           = 3,
+    protocolIdentifier                       = 4,
+    ipClassOfService                         = 5,
+    tcpControlBits                           = 6,
+    sourceTransportPort                      = 7,
+    sourceIPv4Address                        = 8,
+    sourceIPv4PrefixLength                   = 9,
+    ingressInterface                         = 10,
+    destinationTransportPort                 = 11,
+    destinationIPv4Address                   = 12,
+    destinationIPv4PrefixLength              = 13,
+    egressInterface                          = 14,
+    ipNextHopIPv4Address                     = 15,
+    bgpSourceAsNumber                        = 16,
+    bgpDestinationAsNumber                   = 17,
+    bgpNextHopIPv4Address                    = 18,
+    postMCastPacketDeltaCount                = 19,
+    postMCastOctetDeltaCount                 = 20,
+    flowEndSysUpTime                         = 21,
+    flowStartSysUpTime                       = 22,
+    postOctetDeltaCount                      = 23,
+    postPacketDeltaCount                     = 24,
+    minimumIpTotalLength                     = 25,
+    maximumIpTotalLength                     = 26,
+    sourceIPv6Address                        = 27,
+    destinationIPv6Address                   = 28,
+    sourceIPv6PrefixLength                   = 29,
+    destinationIPv6PrefixLength              = 30,
+    flowLabelIPv6                            = 31,
+    icmpTypeCodeIPv4                         = 32,
+    igmpType                                 = 33,
+    samplingInterval                         = 34,
+    samplingAlgorithm                        = 35,
+    flowActiveTimeout                        = 36,
+    flowIdleTimeout                          = 37,
+    engineType                               = 38,
+    engineId                                 = 39,
+    exportedOctetTotalCount                  = 40,
+    exportedMessageTotalCount                = 41,
+    exportedFlowRecordTotalCount             = 42,
+    ipv4RouterSc                             = 43,
+    sourceIPv4Prefix                         = 44,
+    destinationIPv4Prefix                    = 45,
+    mplsTopLabelType                         = 46,
+    mplsTopLabelIPv4Address                  = 47,
+    samplerId                                = 48,
+    samplerMode                              = 49,
+    samplerRandomInterval                    = 50,
+    classId                                  = 51,
+    minimumTTL                               = 52,
+    maximumTTL                               = 53,
+    fragmentIdentification                   = 54,
+    postIpClassOfService                     = 55,
+    sourceMacAddress                         = 56,
+    postDestinationMacAddress                = 57,
+    vlanId                                   = 58,
+    postVlanId                               = 59,
+    ipVersion                                = 60,
+    flowDirection                            = 61,
+    ipNextHopIPv6Address                     = 62,
+    bgpNextHopIPv6Address                    = 63,
+    ipv6ExtensionHeaders                     = 64,
+    mplsTopLabelStackSection                 = 70,
+    mplsLabelStackSection2                   = 71,
+    mplsLabelStackSection3                   = 72,
+    mplsLabelStackSection4                   = 73,
+    mplsLabelStackSection5                   = 74,
+    mplsLabelStackSection6                   = 75,
+    mplsLabelStackSection7                   = 76,
+    mplsLabelStackSection8                   = 77,
+    mplsLabelStackSection9                   = 78,
+    mplsLabelStackSection10                  = 79,
+    destinationMacAddress                    = 80,
+    postSourceMacAddress                     = 81,
+    interfaceName                            = 82,
+    interfaceDescription                     = 83,
+    samplerName                              = 84,
+    octetTotalCount                          = 85,
+    packetTotalCount                         = 86,
+    flagsAndSamplerId                        = 87,
+    fragmentOffset                           = 88,
+    forwardingStatus                         = 89,
+    mplsVpnRouteDistinguisher                = 90,
+    mplsTopLabelPrefixLength                 = 91,
+    srcTrafficIndex                          = 92,
+    dstTrafficIndex                          = 93,
+    applicationDescription                   = 94,
+    applicationId                            = 95,
+    applicationName                          = 96,
+    postIpDiffServCodePoint                  = 98,
+    multicastReplicationFactor               = 99,
+    className                                = 100,
+    classificationEngineId                   = 101,
+    layer2packetSectionOffset                = 102,
+    layer2packetSectionSize                  = 103,
+    layer2packetSectionData                  = 104,
+    bgpNextAdjacentAsNumber                  = 128,
+    bgpPrevAdjacentAsNumber                  = 129,
+    exporterIPv4Address                      = 130,
+    exporterIPv6Address                      = 131,
+    droppedOctetDeltaCount                   = 132,
+    droppedPacketDeltaCount                  = 133,
+    droppedOctetTotalCount                   = 134,
+    droppedPacketTotalCount                  = 135,
+    flowEndReason                            = 136,
+    commonPropertiesId                       = 137,
+    observationPointId                       = 138,
+    icmpTypeCodeIPv6                         = 139,
+    mplsTopLabelIPv6Address                  = 140,
+    lineCardId                               = 141,
+    portId                                   = 142,
+    meteringProcessId                        = 143,
+    exportingProcessId                       = 144,
+    templateId                               = 145,
+    wlanChannelId                            = 146,
+    wlanSSID                                 = 147,
+    flowId                                   = 148,
+    observationDomainId                      = 149,
+    flowStartSeconds                         = 150,
+    flowEndSeconds                           = 151,
+    flowStartMilliseconds                    = 152,
+    flowEndMilliseconds                      = 153,
+    flowStartMicroseconds                    = 154,
+    flowEndMicroseconds                      = 155,
+    flowStartNanoseconds                     = 156,
+    flowEndNanoseconds                       = 157,
+    flowStartDeltaMicroseconds               = 158,
+    flowEndDeltaMicroseconds                 = 159,
+    systemInitTimeMilliseconds               = 160,
+    flowDurationMilliseconds                 = 161,
+    flowDurationMicroseconds                 = 162,
+    observedFlowTotalCount                   = 163,
+    ignoredPacketTotalCount                  = 164,
+    ignoredOctetTotalCount                   = 165,
+    notSentFlowTotalCount                    = 166,
+    notSentPacketTotalCount                  = 167,
+    notSentOctetTotalCount                   = 168,
+    destinationIPv6Prefix                    = 169,
+    sourceIPv6Prefix                         = 170,
+    postOctetTotalCount                      = 171,
+    postPacketTotalCount                     = 172,
+    flowKeyIndicator                         = 173,
+    postMCastPacketTotalCount                = 174,
+    postMCastOctetTotalCount                 = 175,
+    icmpTypeIPv4                             = 176,
+    icmpCodeIPv4                             = 177,
+    icmpTypeIPv6                             = 178,
+    icmpCodeIPv6                             = 179,
+    udpSourcePort                            = 180,
+    udpDestinationPort                       = 181,
+    tcpSourcePort                            = 182,
+    tcpDestinationPort                       = 183,
+    tcpSequenceNumber                        = 184,
+    tcpAcknowledgementNumber                 = 185,
+    tcpWindowSize                            = 186,
+    tcpUrgentPointer                         = 187,
+    tcpHeaderLength                          = 188,
+    ipHeaderLength                           = 189,
+    totalLengthIPv4                          = 190,
+    payloadLengthIPv6                        = 191,
+    ipTTL                                    = 192,
+    nextHeaderIPv6                           = 193,
+    mplsPayloadLength                        = 194,
+    ipDiffServCodePoint                      = 195,
+    ipPrecedence                             = 196,
+    fragmentFlags                            = 197,
+    octetDeltaSumOfSquares                   = 198,
+    octetTotalSumOfSquares                   = 199,
+    mplsTopLabelTTL                          = 200,
+    mplsLabelStackLength                     = 201,
+    mplsLabelStackDepth                      = 202,
+    mplsTopLabelExp                          = 203,
+    ipPayloadLength                          = 204,
+    udpMessageLength                         = 205,
+    isMulticast                              = 206,
+    ipv4IHL                                  = 207,
+    ipv4Options                              = 208,
+    tcpOptions                               = 209,
+    paddingOctets                            = 210,
+    collectorIPv4Address                     = 211,
+    collectorIPv6Address                     = 212,
+    exportInterface                          = 213,
+    exportProtocolVersion                    = 214,
+    exportTransportProtocol                  = 215,
+    collectorTransportPort                   = 216,
+    exporterTransportPort                    = 217,
+    tcpSynTotalCount                         = 218,
+    tcpFinTotalCount                         = 219,
+    tcpRstTotalCount                         = 220,
+    tcpPshTotalCount                         = 221,
+    tcpAckTotalCount                         = 222,
+    tcpUrgTotalCount                         = 223,
+    ipTotalLength                            = 224,
+    postNATSourceIPv4Address                 = 225,
+    postNATDestinationIPv4Address            = 226,
+    postNAPTSourceTransportPort              = 227,
+    postNAPTDestinationTransportPort         = 228,
+    natOriginatingAddressRealm               = 229,
+    natEvent                                 = 230,
+    initiatorOctets                          = 231,
+    responderOctets                          = 232,
+    firewallEvent                            = 233,
+    ingressVRFID                             = 234,
+    egressVRFID                              = 235,
+    VRFname                                  = 236,
+    postMplsTopLabelExp                      = 237,
+    tcpWindowScale                           = 238,
+    biflowDirection                          = 239,
+    ethernetHeaderLength                     = 240,
+    ethernetPayloadLength                    = 241,
+    ethernetTotalLength                      = 242,
+    dot1qVlanId                              = 243,
+    dot1qPriority                            = 244,
+    dot1qCustomerVlanId                      = 245,
+    dot1qCustomerPriority                    = 246,
+    metroEvcId                               = 247,
+    metroEvcType                             = 248,
+    pseudoWireId                             = 249,
+    pseudoWireType                           = 250,
+    pseudoWireControlWord                    = 251,
+    ingressPhysicalInterface                 = 252,
+    egressPhysicalInterface                  = 253,
+    postDot1qVlanId                          = 254,
+    postDot1qCustomerVlanId                  = 255,
+    ethernetType                             = 256,
+    postIpPrecedence                         = 257,
+    collectionTimeMilliseconds               = 258,
+    exportSctpStreamId                       = 259,
+    maxExportSeconds                         = 260,
+    maxFlowEndSeconds                        = 261,
+    messageMD5Checksum                       = 262,
+    messageScope                             = 263,
+    minExportSeconds                         = 264,
+    minFlowStartSeconds                      = 265,
+    opaqueOctets                             = 266,
+    sessionScope                             = 267,
+    maxFlowEndMicroseconds                   = 268,
+    maxFlowEndMilliseconds                   = 269,
+    maxFlowEndNanoseconds                    = 270,
+    minFlowStartMicroseconds                 = 271,
+    minFlowStartMilliseconds                 = 272,
+    minFlowStartNanoseconds                  = 273,
+    collectorCertificate                     = 274,
+    exporterCertificate                      = 275,
+    dataRecordsReliability                   = 276,
+    observationPointType                     = 277,
+    newConnectionDeltaCount                  = 278,
+    connectionSumDurationSeconds             = 279,
+    connectionTransactionId                  = 280,
+    postNATSourceIPv6Address                 = 281,
+    postNATDestinationIPv6Address            = 282,
+    natPoolId                                = 283,
+    natPoolName                              = 284,
+    anonymizationFlags                       = 285,
+    anonymizationTechnique                   = 286,
+    informationElementIndex                  = 287,
+    p2pTechnology                            = 288,
+    tunnelTechnology                         = 289,
+    encryptedTechnology                      = 290,
+    basicList                                = 291,
+    subTemplateList                          = 292,
+    subTemplateMultiList                     = 293,
+    bgpValidityState                         = 294,
+    IPSecSPI                                 = 295,
+    greKey                                   = 296,
+    natType                                  = 297,
+    initiatorPackets                         = 298,
+    responderPackets                         = 299,
+    observationDomainName                    = 300,
+    selectionSequenceId                      = 301,
+    selectorId                               = 302,
+    Type                     = 303,
+    selectorAlgorithm                        = 304,
+    samplingPacketInterval                   = 305,
+    samplingPacketSpace                      = 306,
+    samplingTimeInterval                     = 307,
+    samplingTimeSpace                        = 308,
+    samplingSize                             = 309,
+    samplingPopulation                       = 310,
+    samplingProbability                      = 311,
+    dataLinkFrameSize                        = 312,
+    ipHeaderPacketSection                    = 313,
+    ipPayloadPacketSection                   = 314,
+    dataLinkFrameSection                     = 315,
+    mplsLabelStackSection                    = 316,
+    mplsPayloadPacketSection                 = 317,
+    selectorIdTotalPktsObserved              = 318,
+    selectorIdTotalPktsSelected              = 319,
+    absoluteError                            = 320,
+    relativeError                            = 321,
+    observationTimeSeconds                   = 322,
+    observationTimeMilliseconds              = 323,
+    observationTimeMicroseconds              = 324,
+    observationTimeNanoseconds               = 325,
+    digestHashValue                          = 326,
+    hashIPPayloadOffset                      = 327,
+    hashIPPayloadSize                        = 328,
+    hashOutputRangeMin                       = 329,
+    hashOutputRangeMax                       = 330,
+    hashSelectedRangeMin                     = 331,
+    hashSelectedRangeMax                     = 332,
+    hashDigestOutput                         = 333,
+    hashInitialiserValue                     = 334,
+    selectorName                             = 335,
+    upperCILimit                             = 336,
+    lowerCILimit                             = 337,
+    confidenceLevel                          = 338,
+    informationElementDataType               = 339,
+    informationElementDescription            = 340,
+    informationElementName                   = 341,
+    informationElementRangeBegin             = 342,
+    informationElementRangeEnd               = 343,
+    informationElementSemantics              = 344,
+    informationElementUnits                  = 345,
+    privateEnterpriseNumber                  = 346,
+    virtualStationInterfaceId                = 347,
+    virtualStationInterfaceName              = 348,
+    virtualStationUUID                       = 349,
+    virtualStationName                       = 350,
+    layer2SegmentId                          = 351,
+    layer2OctetDeltaCount                    = 352,
+    layer2OctetTotalCount                    = 353,
+    ingressUnicastPacketTotalCount           = 354,
+    ingressMulticastPacketTotalCount         = 355,
+    ingressBroadcastPacketTotalCount         = 356,
+    egressUnicastPacketTotalCount            = 357,
+    egressBroadcastPacketTotalCount          = 358,
+    monitoringIntervalStartMilliSeconds      = 359,
+    monitoringIntervalEndMilliSeconds        = 360,
+    portRangeStart                           = 361,
+    portRangeEnd                             = 362,
+    portRangeStepSize                        = 363,
+    portRangeNumPorts                        = 364,
+    staMacAddress                            = 365,
+    staIPv4Address                           = 366,
+    wtpMacAddress                            = 367,
+    ingressInterfaceType                     = 368,
+    egressInterfaceType                      = 369,
+    rtpSequenceNumber                        = 370,
+    userName                                 = 371,
+    applicationCategoryName                  = 372,
+    applicationSubCategoryName               = 373,
+    applicationGroupName                     = 374,
+    originalFlowsPresent                     = 375,
+    originalFlowsInitiated                   = 376,
+    originalFlowsCompleted                   = 377,
+    distinctCountOfSourceIPAddress           = 378,
+    distinctCountOfDestinationIPAddress      = 379,
+    distinctCountOfSourceIPv4Address         = 380,
+    distinctCountOfDestinationIPv4Address    = 381,
+    distinctCountOfSourceIPv6Address         = 382,
+    distinctCountOfDestinationIPv6Address    = 383,
+    valueDistributionMethod                  = 384,
+    rfc3550JitterMilliseconds                = 385,
+    rfc3550JitterMicroseconds                = 386,
+    rfc3550JitterNanoseconds                 = 387,
+    dot1qDEI                                 = 388,
+    dot1qCustomerDEI                         = 389,
+    flowSelectorAlgorithm                    = 390,
+    flowSelectedOctetDeltaCount              = 391,
+    flowSelectedPacketDeltaCount             = 392,
+    flowSelectedFlowDeltaCount               = 393,
+    selectorIDTotalFlowsObserved             = 394,
+    selectorIDTotalFlowsSelected             = 395,
+    samplingFlowInterval                     = 396,
+    samplingFlowSpacing                      = 397,
+    flowSamplingTimeInterval                 = 398,
+    flowSamplingTimeSpacing                  = 399,
+    hashFlowDomain                           = 400,
+    transportOctetDeltaCount                 = 401,
+    transportPacketDeltaCount                = 402,
+    originalExporterIPv4Address              = 403,
+    originalExporterIPv6Address              = 404,
+    originalObservationDomainId              = 405,
+    intermediateProcessId                    = 406,
+    ignoredDataRecordTotalCount              = 407,
+    dataLinkFrameType                        = 408,
+    sectionOffset                            = 409,
+    sectionExportedOctets                    = 410,
+    dot1qServiceInstanceTag                  = 411,
+    dot1qServiceInstanceId                   = 412,
+    dot1qServiceInstancePriority             = 413,
+    dot1qCustomerSourceMacAddress            = 414,
+    dot1qCustomerDestinationMacAddress       = 415,
+    postLayer2OctetDeltaCount                = 417,
+    postMCastLayer2OctetDeltaCount           = 418,
+    postLayer2OctetTotalCount                = 420,
+    postMCastLayer2OctetTotalCount           = 421,
+    minimumLayer2TotalLength                 = 422,
+    maximumLayer2TotalLength                 = 423,
+    droppedLayer2OctetDeltaCount             = 424,
+    droppedLayer2OctetTotalCount             = 425,
+    ignoredLayer2OctetTotalCount             = 426,
+    notSentLayer2OctetTotalCount             = 427,
+    layer2OctetDeltaSumOfSquares             = 428,
+    layer2OctetTotalSumOfSquares             = 429,
+    layer2FrameDeltaCount                    = 430,
+    layer2FrameTotalCount                    = 431,
+    pseudoWireDestinationIPv4Address         = 432,
+    ignoredLayer2FrameTotalCount             = 433,
+    ...
+};
+
+optional any DecodePrimitiveType(stream s, ushort id, ushort length, optional uint enterpriseNumber)
+{
+    switch (id)
+    {
+        case 1 =>
+            return BinaryDecoder<octetDeltaCount[length]>(s);
+        case 2 =>
+            return BinaryDecoder<packetDeltaCount[length]>(s);
+        case 3 =>
+            return BinaryDecoder<deltaFlowCount[length]>(s);
+        case 4 =>
+            return BinaryDecoder<protocolIdentifier>(s);
+        case 5 =>
+            return BinaryDecoder<ipClassOfService>(s);
+        case 6 =>
+            return BinaryDecoder<tcpControlBits[length]>(s);
+        case 7 =>
+            return BinaryDecoder<sourceTransportPort>(s);
+        case 8 =>
+            return BinaryDecoder<sourceIPv4Address>(s);
+        case 9 =>
+            return BinaryDecoder<sourceIPv4PrefixLength>(s);
+        case 10 =>
+            return BinaryDecoder<ingressInterface>(s);
+        case 11 =>
+            return BinaryDecoder<destinationTransportPort>(s);
+        case 12 =>
+            return BinaryDecoder<destinationIPv4Address>(s);
+        case 13 =>
+            return BinaryDecoder<destinationIPv4PrefixLength>(s);
+        case 14 =>
+            return BinaryDecoder<egressInterface>(s);
+        case 15 =>
+            return BinaryDecoder<ipNextHopIPv4Address>(s);
+        case 16 =>
+            return BinaryDecoder<bgpSourceAsNumber>(s);
+        case 17 =>
+            return BinaryDecoder<bgpDestinationAsNumber>(s);
+        case 18 =>
+            return BinaryDecoder<bgpNextHopIPv4Address>(s);
+        case 19 =>
+            return BinaryDecoder<postMCastPacketDeltaCount>(s);
+        case 20 =>
+            return BinaryDecoder<postMCastOctetDeltaCount>(s);
+        case 21 =>
+            return BinaryDecoder<flowEndSysUpTime>(s);
+        case 22 =>
+            return BinaryDecoder<flowStartSysUpTime>(s);
+        case 23 =>
+            return BinaryDecoder<postOctetDeltaCount>(s);
+        case 24 =>
+            return BinaryDecoder<postPacketDeltaCount>(s);
+        case 25 =>
+            return BinaryDecoder<minimumIpTotalLength>(s);
+        case 26 =>
+            return BinaryDecoder<maximumIpTotalLength>(s);
+        case 27 =>
+            return BinaryDecoder<sourceIPv6Address>(s);
+        case 28 =>
+            return BinaryDecoder<destinationIPv6Address>(s);
+        case 29 =>
+            return BinaryDecoder<sourceIPv6PrefixLength>(s);
+        case 30 =>
+            return BinaryDecoder<destinationIPv6PrefixLength>(s);
+        case 31 =>
+            return BinaryDecoder<flowLabelIPv6>(s);
+        case 32 =>
+            return BinaryDecoder<icmpTypeCodeIPv4>(s);
+        case 33 =>
+            return BinaryDecoder<igmpType>(s);
+        case 34 =>
+            return BinaryDecoder<samplingInterval>(s);
+        case 35 =>
+            return BinaryDecoder<samplingAlgorithm[length]>(s);
+        case 36 =>
+            return BinaryDecoder<flowActiveTimeout>(s);
+        case 37 =>
+            return BinaryDecoder<flowIdleTimeout>(s);
+        case 38 =>
+            return BinaryDecoder<engineType>(s);
+        case 39 =>
+            return BinaryDecoder<engineId>(s);
+        case 40 =>
+            return BinaryDecoder<exportedOctetTotalCount[length]>(s);
+        case 41 =>
+            return BinaryDecoder<exportedMessageTotalCount[length]>(s);
+        case 42 =>
+            return BinaryDecoder<exportedFlowRecordTotalCount[length]>(s);
+        case 43 =>
+            return BinaryDecoder<ipv4RouterSc>(s);
+        case 44 =>
+            return BinaryDecoder<sourceIPv4Prefix>(s);
+        case 45 =>
+            return BinaryDecoder<destinationIPv4Prefix>(s);
+        case 46 =>
+            return BinaryDecoder<mplsTopLabelType>(s);
+        case 47 =>
+            return BinaryDecoder<mplsTopLabelIPv4Address>(s);
+        case 48 =>
+            return BinaryDecoder<samplerId>(s);
+        case 49 =>
+            return BinaryDecoder<samplerMode>(s);
+        case 50 =>
+            return BinaryDecoder<samplerRandomInterval>(s);
+        case 51 =>
+            return BinaryDecoder<classId>(s);
+        case 52 =>
+            return BinaryDecoder<minimumTTL>(s);
+        case 53 =>
+            return BinaryDecoder<maximumTTL>(s);
+        case 54 =>
+            return BinaryDecoder<fragmentIdentification>(s);
+        case 55 =>
+            return BinaryDecoder<postIpClassOfService>(s);
+        case 56 =>
+            return BinaryDecoder<sourceMacAddress>(s);
+        case 57 =>
+            return BinaryDecoder<postDestinationMacAddress>(s);
+        case 58 =>
+            return BinaryDecoder<vlanId>(s);
+        case 59 =>
+            return BinaryDecoder<postVlanId>(s);
+        case 60 =>
+            return BinaryDecoder<ipVersion>(s);
+        case 61 =>
+            return BinaryDecoder<flowDirection>(s);
+        case 62 =>
+            return BinaryDecoder<ipNextHopIPv6Address>(s);
+        case 63 =>
+            return BinaryDecoder<bgpNextHopIPv6Address>(s);
+        case 64 =>
+            return BinaryDecoder<ipv6ExtensionHeaders>(s);
+        case 70 =>
+            return BinaryDecoder<mplsTopLabelStackSection>(s);
+        case 71 =>
+            return BinaryDecoder<mplsLabelStackSection2>(s);
+        case 72 =>
+            return BinaryDecoder<mplsLabelStackSection3>(s);
+        case 73 =>
+            return BinaryDecoder<mplsLabelStackSection4>(s);
+        case 74 =>
+            return BinaryDecoder<mplsLabelStackSection5>(s);
+        case 75 =>
+            return BinaryDecoder<mplsLabelStackSection6>(s);
+        case 76 =>
+            return BinaryDecoder<mplsLabelStackSection7>(s);
+        case 77 =>
+            return BinaryDecoder<mplsLabelStackSection8>(s);
+        case 78 =>
+            return BinaryDecoder<mplsLabelStackSection9>(s);
+        case 79 =>
+            return BinaryDecoder<mplsLabelStackSection10>(s);
+        case 80 =>
+            return BinaryDecoder<destinationMacAddress>(s);
+        case 81 =>
+            return BinaryDecoder<postSourceMacAddress>(s);
+        case 82 =>
+            return BinaryDecoder<interfaceName[length]>(s);
+        case 83 =>
+            return BinaryDecoder<interfaceDescription[length]>(s);
+        case 84 =>
+            return BinaryDecoder<samplerName[length]>(s);
+        case 85 =>
+            return BinaryDecoder<octetTotalCount>(s);
+        case 86 =>
+            return BinaryDecoder<packetTotalCount>(s);
+        case 87 =>
+            return BinaryDecoder<flagsAndSamplerId>(s);
+        case 88 =>
+            return BinaryDecoder<fragmentOffset>(s);
+        case 89 =>
+            return BinaryDecoder<forwardingStatus>(s);
+        case 90 =>
+            return BinaryDecoder<mplsVpnRouteDistinguisher[length]>(s);
+        case 91 =>
+            return BinaryDecoder<mplsTopLabelPrefixLength>(s);
+        case 92 =>
+            return BinaryDecoder<srcTrafficIndex>(s);
+        case 93 =>
+            return BinaryDecoder<dstTrafficIndex>(s);
+        case 94 =>
+            return BinaryDecoder<applicationDescription[length]>(s);
+        case 95 =>
+            return BinaryDecoder<applicationId[length]>(s);
+        case 96 =>
+            return BinaryDecoder<applicationName[length]>(s);
+        case 98 =>
+            return BinaryDecoder<postIpDiffServCodePoint>(s);
+        case 99 =>
+            return BinaryDecoder<multicastReplicationFactor>(s);
+        case 100 =>
+            return BinaryDecoder<className[length]>(s);
+        case 101 =>
+            return BinaryDecoder<classificationEngineId>(s);
+        case 102 =>
+            return BinaryDecoder<layer2packetSectionOffset>(s);
+        case 103 =>
+            return BinaryDecoder<layer2packetSectionSize>(s);
+        case 104 =>
+            return BinaryDecoder<layer2packetSectionData[length]>(s);
+        case 128 =>
+            return BinaryDecoder<bgpNextAdjacentAsNumber>(s);
+        case 129 =>
+            return BinaryDecoder<bgpPrevAdjacentAsNumber>(s);
+        case 130 =>
+            return BinaryDecoder<exporterIPv4Address>(s);
+        case 131 =>
+            return BinaryDecoder<exporterIPv6Address>(s);
+        case 132 =>
+            return BinaryDecoder<droppedOctetDeltaCount>(s);
+        case 133 =>
+            return BinaryDecoder<droppedPacketDeltaCount>(s);
+        case 134 =>
+            return BinaryDecoder<droppedOctetTotalCount>(s);
+        case 135 =>
+            return BinaryDecoder<droppedPacketTotalCount>(s);
+        case 136 =>
+            return BinaryDecoder<flowEndReason>(s);
+        case 137 =>
+            return BinaryDecoder<commonPropertiesId>(s);
+        case 138 =>
+            return BinaryDecoder<observationPointId>(s);
+        case 139 =>
+            return BinaryDecoder<icmpTypeCodeIPv6>(s);
+        case 140 =>
+            return BinaryDecoder<mplsTopLabelIPv6Address>(s);
+        case 141 =>
+            return BinaryDecoder<lineCardId>(s);
+        case 142 =>
+            return BinaryDecoder<portId>(s);
+        case 143 =>
+            return BinaryDecoder<meteringProcessId>(s);
+        case 144 =>
+            return BinaryDecoder<exportingProcessId>(s);
+        case 145 =>
+            return BinaryDecoder<templateId>(s);
+        case 146 =>
+            return BinaryDecoder<wlanChannelId>(s);
+        case 147 =>
+            return BinaryDecoder<wlanSSID[length]>(s);
+        case 148 =>
+            return BinaryDecoder<flowId>(s);
+        case 149 =>
+            return BinaryDecoder<observationDomainId>(s);
+        case 150 =>
+            return BinaryDecoder<flowStartSeconds>(s);
+        case 151 =>
+            return BinaryDecoder<flowEndSeconds>(s);
+        case 152 =>
+            return BinaryDecoder<flowStartMilliseconds>(s);
+        case 153 =>
+            return BinaryDecoder<flowEndMilliseconds>(s);
+        case 154 =>
+            return BinaryDecoder<flowStartMicroseconds>(s);
+        case 155 =>
+            return BinaryDecoder<flowEndMicroseconds>(s);
+        case 156 =>
+            return BinaryDecoder<flowStartNanoseconds>(s);
+        case 157 =>
+            return BinaryDecoder<flowEndNanoseconds>(s);
+        case 158 =>
+            return BinaryDecoder<flowStartDeltaMicroseconds>(s);
+        case 159 =>
+            return BinaryDecoder<flowEndDeltaMicroseconds>(s);
+        case 160 =>
+            return BinaryDecoder<systemInitTimeMilliseconds>(s);
+        case 161 =>
+            return BinaryDecoder<flowDurationMilliseconds>(s);
+        case 162 =>
+            return BinaryDecoder<flowDurationMicroseconds>(s);
+        case 163 =>
+            return BinaryDecoder<observedFlowTotalCount>(s);
+        case 164 =>
+            return BinaryDecoder<ignoredPacketTotalCount>(s);
+        case 165 =>
+            return BinaryDecoder<ignoredOctetTotalCount>(s);
+        case 166 =>
+            return BinaryDecoder<notSentFlowTotalCount>(s);
+        case 167 =>
+            return BinaryDecoder<notSentPacketTotalCount>(s);
+        case 168 =>
+            return BinaryDecoder<notSentOctetTotalCount>(s);
+        case 169 =>
+            return BinaryDecoder<destinationIPv6Prefix>(s);
+        case 170 =>
+            return BinaryDecoder<sourceIPv6Prefix>(s);
+        case 171 =>
+            return BinaryDecoder<postOctetTotalCount>(s);
+        case 172 =>
+            return BinaryDecoder<postPacketTotalCount>(s);
+        case 173 =>
+            return BinaryDecoder<flowKeyIndicator>(s);
+        case 174 =>
+            return BinaryDecoder<postMCastPacketTotalCount>(s);
+        case 175 =>
+            return BinaryDecoder<postMCastOctetTotalCount>(s);
+        case 176 =>
+            return BinaryDecoder<icmpTypeIPv4>(s);
+        case 177 =>
+            return BinaryDecoder<icmpCodeIPv4>(s);
+        case 178 =>
+            return BinaryDecoder<icmpTypeIPv6>(s);
+        case 179 =>
+            return BinaryDecoder<icmpCodeIPv6>(s);
+        case 180 =>
+            return BinaryDecoder<udpSourcePort>(s);
+        case 181 =>
+            return BinaryDecoder<udpDestinationPort>(s);
+        case 182 =>
+            return BinaryDecoder<tcpSourcePort>(s);
+        case 183 =>
+            return BinaryDecoder<tcpDestinationPort>(s);
+        case 184 =>
+            return BinaryDecoder<tcpSequenceNumber>(s);
+        case 185 =>
+            return BinaryDecoder<tcpAcknowledgementNumber>(s);
+        case 186 =>
+            return BinaryDecoder<tcpWindowSize>(s);
+        case 187 =>
+            return BinaryDecoder<tcpUrgentPointer>(s);
+        case 188 =>
+            return BinaryDecoder<tcpHeaderLength>(s);
+        case 189 =>
+            return BinaryDecoder<ipHeaderLength>(s);
+        case 190 =>
+            return BinaryDecoder<totalLengthIPv4>(s);
+        case 191 =>
+            return BinaryDecoder<payloadLengthIPv6>(s);
+        case 192 =>
+            return BinaryDecoder<ipTTL>(s);
+        case 193 =>
+            return BinaryDecoder<nextHeaderIPv6>(s);
+        case 194 =>
+            return BinaryDecoder<mplsPayloadLength>(s);
+        case 195 =>
+            return BinaryDecoder<ipDiffServCodePoint>(s);
+        case 196 =>
+            return BinaryDecoder<ipPrecedence>(s);
+        case 197 =>
+            return BinaryDecoder<fragmentFlags>(s);
+        case 198 =>
+            return BinaryDecoder<octetDeltaSumOfSquares>(s);
+        case 199 =>
+            return BinaryDecoder<octetTotalSumOfSquares>(s);
+        case 200 =>
+            return BinaryDecoder<mplsTopLabelTTL>(s);
+        case 201 =>
+            return BinaryDecoder<mplsLabelStackLength>(s);
+        case 202 =>
+            return BinaryDecoder<mplsLabelStackDepth>(s);
+        case 203 =>
+            return BinaryDecoder<mplsTopLabelExp>(s);
+        case 204 =>
+            return BinaryDecoder<ipPayloadLength>(s);
+        case 205 =>
+            return BinaryDecoder<udpMessageLength>(s);
+        case 206 =>
+            return BinaryDecoder<isMulticast>(s);
+        case 207 =>
+            return BinaryDecoder<ipv4IHL>(s);
+        case 208 =>
+            return BinaryDecoder<ipv4Options>(s);
+        case 209 =>
+            return BinaryDecoder<tcpOptions>(s);
+        case 210 =>
+            return BinaryDecoder<paddingOctets[length]>(s);
+        case 211 =>
+            return BinaryDecoder<collectorIPv4Address>(s);
+        case 212 =>
+            return BinaryDecoder<collectorIPv6Address>(s);
+        case 213 =>
+            return BinaryDecoder<exportInterface>(s);
+        case 214 =>
+            return BinaryDecoder<exportProtocolVersion>(s);
+        case 215 =>
+            return BinaryDecoder<exportTransportProtocol>(s);
+        case 216 =>
+            return BinaryDecoder<collectorTransportPort>(s);
+        case 217 =>
+            return BinaryDecoder<exporterTransportPort>(s);
+        case 218 =>
+            return BinaryDecoder<tcpSynTotalCount>(s);
+        case 219 =>
+            return BinaryDecoder<tcpFinTotalCount>(s);
+        case 220 =>
+            return BinaryDecoder<tcpRstTotalCount>(s);
+        case 221 =>
+            return BinaryDecoder<tcpPshTotalCount>(s);
+        case 222 =>
+            return BinaryDecoder<tcpAckTotalCount>(s);
+        case 223 =>
+            return BinaryDecoder<tcpUrgTotalCount>(s);
+        case 224 =>
+            return BinaryDecoder<ipTotalLength>(s);
+        case 225 =>
+            return BinaryDecoder<postNATSourceIPv4Address>(s);
+        case 226 =>
+            return BinaryDecoder<postNATDestinationIPv4Address>(s);
+        case 227 =>
+            return BinaryDecoder<postNAPTSourceTransportPort>(s);
+        case 228 =>
+            return BinaryDecoder<postNAPTDestinationTransportPort>(s);
+        case 229 =>
+            return BinaryDecoder<natOriginatingAddressRealm>(s);
+        case 230 =>
+            return BinaryDecoder<natEvent>(s);
+        case 231 =>
+            return BinaryDecoder<initiatorOctets>(s);
+        case 232 =>
+            return BinaryDecoder<responderOctets>(s);
+        case 233 =>
+            return BinaryDecoder<firewallEvent>(s);
+        case 234 =>
+            return BinaryDecoder<ingressVRFID>(s);
+        case 235 =>
+            return BinaryDecoder<egressVRFID>(s);
+        case 236 =>
+            return BinaryDecoder<VRFname[length]>(s);
+        case 237 =>
+            return BinaryDecoder<postMplsTopLabelExp>(s);
+        case 238 =>
+            return BinaryDecoder<tcpWindowScale>(s);
+        case 239 =>
+            return BinaryDecoder<biflowDirection>(s);
+        case 240 =>
+            return BinaryDecoder<ethernetHeaderLength>(s);
+        case 241 =>
+            return BinaryDecoder<ethernetPayloadLength>(s);
+        case 242 =>
+            return BinaryDecoder<ethernetTotalLength>(s);
+        case 243 =>
+            return BinaryDecoder<dot1qVlanId>(s);
+        case 244 =>
+            return BinaryDecoder<dot1qPriority>(s);
+        case 245 =>
+            return BinaryDecoder<dot1qCustomerVlanId>(s);
+        case 246 =>
+            return BinaryDecoder<dot1qCustomerPriority>(s);
+        case 247 =>
+            return BinaryDecoder<metroEvcId[length]>(s);
+        case 248 =>
+            return BinaryDecoder<metroEvcType>(s);
+        case 249 =>
+            return BinaryDecoder<pseudoWireId>(s);
+        case 250 =>
+            return BinaryDecoder<pseudoWireType>(s);
+        case 251 =>
+            return BinaryDecoder<pseudoWireControlWord>(s);
+        case 252 =>
+            return BinaryDecoder<ingressPhysicalInterface>(s);
+        case 253 =>
+            return BinaryDecoder<egressPhysicalInterface>(s);
+        case 254 =>
+            return BinaryDecoder<postDot1qVlanId>(s);
+        case 255 =>
+            return BinaryDecoder<postDot1qCustomerVlanId>(s);
+        case 256 =>
+            return BinaryDecoder<ethernetType>(s);
+        case 257 =>
+            return BinaryDecoder<postIpPrecedence>(s);
+        case 258 =>
+            return BinaryDecoder<collectionTimeMilliseconds>(s);
+        case 259 =>
+            return BinaryDecoder<exportSctpStreamId>(s);
+        case 260 =>
+            return BinaryDecoder<maxExportSeconds>(s);
+        case 261 =>
+            return BinaryDecoder<maxFlowEndSeconds>(s);
+        case 262 =>
+            return BinaryDecoder<messageMD5Checksum[length]>(s);
+        case 263 =>
+            return BinaryDecoder<messageScope>(s);
+        case 264 =>
+            return BinaryDecoder<minExportSeconds>(s);
+        case 265 =>
+            return BinaryDecoder<minFlowStartSeconds>(s);
+        case 266 =>
+            return BinaryDecoder<opaqueOctets[length]>(s);
+        case 267 =>
+            return BinaryDecoder<sessionScope>(s);
+        case 268 =>
+            return BinaryDecoder<maxFlowEndMicroseconds>(s);
+        case 269 =>
+            return BinaryDecoder<maxFlowEndMilliseconds>(s);
+        case 270 =>
+            return BinaryDecoder<maxFlowEndNanoseconds>(s);
+        case 271 =>
+            return BinaryDecoder<minFlowStartMicroseconds>(s);
+        case 272 =>
+            return BinaryDecoder<minFlowStartMilliseconds>(s);
+        case 273 =>
+            return BinaryDecoder<minFlowStartNanoseconds>(s);
+        case 274 =>
+            return BinaryDecoder<collectorCertificate[length]>(s);
+        case 275 =>
+            return BinaryDecoder<exporterCertificate[length]>(s);
+        case 276 =>
+            return BinaryDecoder<dataRecordsReliability>(s);
+        case 277 =>
+            return BinaryDecoder<observationPointType>(s);
+        case 278 =>
+            return BinaryDecoder<newConnectionDeltaCount>(s);
+        case 279 =>
+            return BinaryDecoder<connectionSumDurationSeconds>(s);
+        case 280 =>
+            return BinaryDecoder<connectionTransactionId>(s);
+        case 281 =>
+            return BinaryDecoder<postNATSourceIPv6Address>(s);
+        case 282 =>
+            return BinaryDecoder<postNATDestinationIPv6Address>(s);
+        case 283 =>
+            return BinaryDecoder<natPoolId>(s);
+        case 284 =>
+            return BinaryDecoder<natPoolName[length]>(s);
+        case 285 =>
+            return BinaryDecoder<anonymizationFlags>(s);
+        case 286 =>
+            return BinaryDecoder<anonymizationTechnique>(s);
+        case 287 =>
+            return BinaryDecoder<informationElementIndex>(s);
+        case 288 =>
+            return BinaryDecoder<p2pTechnology[length]>(s);
+        case 289 =>
+            return BinaryDecoder<tunnelTechnology[length]>(s);
+        case 290 =>
+            return BinaryDecoder<encryptedTechnology[length]>(s);
+        case 291 =>
+            return BinaryDecoder<basicList>(s);
+        case 292 =>
+            return BinaryDecoder<subTemplateList>(s);
+        case 293 =>
+            return BinaryDecoder<subTemplateMultiList>(s);
+        case 294 =>
+            return BinaryDecoder<bgpValidityState>(s);
+        case 295 =>
+            return BinaryDecoder<IPSecSPI>(s);
+        case 296 =>
+            return BinaryDecoder<greKey>(s);
+        case 297 =>
+            return BinaryDecoder<natType>(s);
+        case 298 =>
+            return BinaryDecoder<initiatorPackets>(s);
+        case 299 =>
+            return BinaryDecoder<responderPackets>(s);
+        case 300 =>
+            return BinaryDecoder<observationDomainName[length]>(s);
+        case 301 =>
+            return BinaryDecoder<selectionSequenceId>(s);
+        case 302 =>
+            return BinaryDecoder<selectorId>(s);
+        case 303 =>
+            return BinaryDecoder<Type>(s);
+        case 304 =>
+            return BinaryDecoder<selectorAlgorithm>(s);
+        case 305 =>
+            return BinaryDecoder<samplingPacketInterval>(s);
+        case 306 =>
+            return BinaryDecoder<samplingPacketSpace>(s);
+        case 307 =>
+            return BinaryDecoder<samplingTimeInterval>(s);
+        case 308 =>
+            return BinaryDecoder<samplingTimeSpace>(s);
+        case 309 =>
+            return BinaryDecoder<samplingSize>(s);
+        case 310 =>
+            return BinaryDecoder<samplingPopulation>(s);
+        case 311 =>
+            return BinaryDecoder<samplingProbability>(s);
+        case 312 =>
+            return BinaryDecoder<dataLinkFrameSize>(s);
+        case 313 =>
+            return BinaryDecoder<ipHeaderPacketSection[length]>(s);
+        case 314 =>
+            return BinaryDecoder<ipPayloadPacketSection[length]>(s);
+        case 315 =>
+            return BinaryDecoder<dataLinkFrameSection[length]>(s);
+        case 316 =>
+            return BinaryDecoder<mplsLabelStackSection[length]>(s);
+        case 317 =>
+            return BinaryDecoder<mplsPayloadPacketSection[length]>(s);
+        case 318 =>
+            return BinaryDecoder<selectorIdTotalPktsObserved>(s);
+        case 319 =>
+            return BinaryDecoder<selectorIdTotalPktsSelected>(s);
+        case 320 =>
+            return BinaryDecoder<absoluteError>(s);
+        case 321 =>
+            return BinaryDecoder<relativeError>(s);
+        case 322 =>
+            return BinaryDecoder<observationTimeSeconds>(s);
+        case 323 =>
+            return BinaryDecoder<observationTimeMilliseconds>(s);
+        case 324 =>
+            return BinaryDecoder<observationTimeMicroseconds>(s);
+        case 325 =>
+            return BinaryDecoder<observationTimeNanoseconds>(s);
+        case 326 =>
+            return BinaryDecoder<digestHashValue>(s);
+        case 327 =>
+            return BinaryDecoder<hashIPPayloadOffset>(s);
+        case 328 =>
+            return BinaryDecoder<hashIPPayloadSize>(s);
+        case 329 =>
+            return BinaryDecoder<hashOutputRangeMin>(s);
+        case 330 =>
+            return BinaryDecoder<hashOutputRangeMax>(s);
+        case 331 =>
+            return BinaryDecoder<hashSelectedRangeMin>(s);
+        case 332 =>
+            return BinaryDecoder<hashSelectedRangeMax>(s);
+        case 333 =>
+            return BinaryDecoder<hashDigestOutput>(s);
+        case 334 =>
+            return BinaryDecoder<hashInitialiserValue>(s);
+        case 335 =>
+            return BinaryDecoder<selectorName[length]>(s);
+        case 336 =>
+            return BinaryDecoder<upperCILimit>(s);
+        case 337 =>
+            return BinaryDecoder<lowerCILimit>(s);
+        case 338 =>
+            return BinaryDecoder<confidenceLevel>(s);
+        case 339 =>
+            return BinaryDecoder<informationElementDataType>(s);
+        case 340 =>
+            return BinaryDecoder<informationElementDescription[length]>(s);
+        case 341 =>
+            return BinaryDecoder<informationElementName[length]>(s);
+        case 342 =>
+            return BinaryDecoder<informationElementRangeBegin>(s);
+        case 343 =>
+            return BinaryDecoder<informationElementRangeEnd>(s);
+        case 344 =>
+            return BinaryDecoder<informationElementSemantics>(s);
+        case 345 =>
+            return BinaryDecoder<informationElementUnits>(s);
+        case 346 =>
+            return BinaryDecoder<privateEnterpriseNumber>(s);
+        case 347 =>
+            return BinaryDecoder<virtualStationInterfaceId[length]>(s);
+        case 348 =>
+            return BinaryDecoder<virtualStationInterfaceName[length]>(s);
+        case 349 =>
+            return BinaryDecoder<virtualStationUUID[length]>(s);
+        case 350 =>
+            return BinaryDecoder<virtualStationName[length]>(s);
+        case 351 =>
+            return BinaryDecoder<layer2SegmentId>(s);
+        case 352 =>
+            return BinaryDecoder<layer2OctetDeltaCount>(s);
+        case 353 =>
+            return BinaryDecoder<layer2OctetTotalCount>(s);
+        case 354 =>
+            return BinaryDecoder<ingressUnicastPacketTotalCount>(s);
+        case 355 =>
+            return BinaryDecoder<ingressMulticastPacketTotalCount>(s);
+        case 356 =>
+            return BinaryDecoder<ingressBroadcastPacketTotalCount>(s);
+        case 357 =>
+            return BinaryDecoder<egressUnicastPacketTotalCount>(s);
+        case 358 =>
+            return BinaryDecoder<egressBroadcastPacketTotalCount>(s);
+        case 359 =>
+            return BinaryDecoder<monitoringIntervalStartMilliSeconds>(s);
+        case 360 =>
+            return BinaryDecoder<monitoringIntervalEndMilliSeconds>(s);
+        case 361 =>
+            return BinaryDecoder<portRangeStart>(s);
+        case 362 =>
+            return BinaryDecoder<portRangeEnd>(s);
+        case 363 =>
+            return BinaryDecoder<portRangeStepSize>(s);
+        case 364 =>
+            return BinaryDecoder<portRangeNumPorts>(s);
+        case 365 =>
+            return BinaryDecoder<staMacAddress>(s);
+        case 366 =>
+            return BinaryDecoder<staIPv4Address>(s);
+        case 367 =>
+            return BinaryDecoder<wtpMacAddress>(s);
+        case 368 =>
+            return BinaryDecoder<ingressInterfaceType>(s);
+        case 369 =>
+            return BinaryDecoder<egressInterfaceType>(s);
+        case 370 =>
+            return BinaryDecoder<rtpSequenceNumber>(s);
+        case 371 =>
+            return BinaryDecoder<userName[length]>(s);
+        case 372 =>
+            return BinaryDecoder<applicationCategoryName[length]>(s);
+        case 373 =>
+            return BinaryDecoder<applicationSubCategoryName[length]>(s);
+        case 374 =>
+            return BinaryDecoder<applicationGroupName[length]>(s);
+        case 375 =>
+            return BinaryDecoder<originalFlowsPresent>(s);
+        case 376 =>
+            return BinaryDecoder<originalFlowsInitiated>(s);
+        case 377 =>
+            return BinaryDecoder<originalFlowsCompleted>(s);
+        case 378 =>
+            return BinaryDecoder<distinctCountOfSourceIPAddress>(s);
+        case 379 =>
+            return BinaryDecoder<distinctCountOfDestinationIPAddress>(s);
+        case 380 =>
+            return BinaryDecoder<distinctCountOfSourceIPv4Address>(s);
+        case 381 =>
+            return BinaryDecoder<distinctCountOfDestinationIPv4Address>(s);
+        case 382 =>
+            return BinaryDecoder<distinctCountOfSourceIPv6Address>(s);
+        case 383 =>
+            return BinaryDecoder<distinctCountOfDestinationIPv6Address>(s);
+        case 384 =>
+            return BinaryDecoder<valueDistributionMethod>(s);
+        case 385 =>
+            return BinaryDecoder<rfc3550JitterMilliseconds>(s);
+        case 386 =>
+            return BinaryDecoder<rfc3550JitterMicroseconds>(s);
+        case 387 =>
+            return BinaryDecoder<rfc3550JitterNanoseconds>(s);
+        case 388 =>
+            return BinaryDecoder<dot1qDEI>(s);
+        case 389 =>
+            return BinaryDecoder<dot1qCustomerDEI>(s);
+        case 390 =>
+            return BinaryDecoder<flowSelectorAlgorithm>(s);
+        case 391 =>
+            return BinaryDecoder<flowSelectedOctetDeltaCount>(s);
+        case 392 =>
+            return BinaryDecoder<flowSelectedPacketDeltaCount>(s);
+        case 393 =>
+            return BinaryDecoder<flowSelectedFlowDeltaCount>(s);
+        case 394 =>
+            return BinaryDecoder<selectorIDTotalFlowsObserved>(s);
+        case 395 =>
+            return BinaryDecoder<selectorIDTotalFlowsSelected>(s);
+        case 396 =>
+            return BinaryDecoder<samplingFlowInterval>(s);
+        case 397 =>
+            return BinaryDecoder<samplingFlowSpacing>(s);
+        case 398 =>
+            return BinaryDecoder<flowSamplingTimeInterval>(s);
+        case 399 =>
+            return BinaryDecoder<flowSamplingTimeSpacing>(s);
+        case 400 =>
+            return BinaryDecoder<hashFlowDomain>(s);
+        case 401 =>
+            return BinaryDecoder<transportOctetDeltaCount>(s);
+        case 402 =>
+            return BinaryDecoder<transportPacketDeltaCount>(s);
+        case 403 =>
+            return BinaryDecoder<originalExporterIPv4Address>(s);
+        case 404 =>
+            return BinaryDecoder<originalExporterIPv6Address>(s);
+        case 405 =>
+            return BinaryDecoder<originalObservationDomainId>(s);
+        case 406 =>
+            return BinaryDecoder<intermediateProcessId>(s);
+        case 407 =>
+            return BinaryDecoder<ignoredDataRecordTotalCount>(s);
+        case 408 =>
+            return BinaryDecoder<dataLinkFrameType>(s);
+        case 409 =>
+            return BinaryDecoder<sectionOffset>(s);
+        case 410 =>
+            return BinaryDecoder<sectionExportedOctets>(s);
+        case 411 =>
+            return BinaryDecoder<dot1qServiceInstanceTag[length]>(s);
+        case 412 =>
+            return BinaryDecoder<dot1qServiceInstanceId>(s);
+        case 413 =>
+            return BinaryDecoder<dot1qServiceInstancePriority>(s);
+        case 414 =>
+            return BinaryDecoder<dot1qCustomerSourceMacAddress>(s);
+        case 415 =>
+            return BinaryDecoder<dot1qCustomerDestinationMacAddress>(s);
+        case 417 =>
+            return BinaryDecoder<postLayer2OctetDeltaCount>(s);
+        case 418 =>
+            return BinaryDecoder<postMCastLayer2OctetDeltaCount>(s);
+        case 420 =>
+            return BinaryDecoder<postLayer2OctetTotalCount>(s);
+        case 421 =>
+            return BinaryDecoder<postMCastLayer2OctetTotalCount>(s);
+        case 422 =>
+            return BinaryDecoder<minimumLayer2TotalLength>(s);
+        case 423 =>
+            return BinaryDecoder<maximumLayer2TotalLength>(s);
+        case 424 =>
+            return BinaryDecoder<droppedLayer2OctetDeltaCount>(s);
+        case 425 =>
+            return BinaryDecoder<droppedLayer2OctetTotalCount>(s);
+        case 426 =>
+            return BinaryDecoder<ignoredLayer2OctetTotalCount>(s);
+        case 427 =>
+            return BinaryDecoder<notSentLayer2OctetTotalCount>(s);
+        case 428 =>
+            return BinaryDecoder<layer2OctetDeltaSumOfSquares>(s);
+        case 429 =>
+            return BinaryDecoder<layer2OctetTotalSumOfSquares>(s);
+        case 430 =>
+            return BinaryDecoder<layer2FrameDeltaCount>(s);
+        case 431 =>
+            return BinaryDecoder<layer2FrameTotalCount>(s);
+        case 432 =>
+            return BinaryDecoder<pseudoWireDestinationIPv4Address>(s);
+        case 433 =>
+            return BinaryDecoder<ignoredLayer2FrameTotalCount>(s);
+        default =>
+            return BinaryDecoder<UnknownType[id, length, enterpriseNumber]>(s);
+    }
+}
+
+type UnknownType[ushort TypeId, ushort Len, optional uint EnterpriseNumber]
+{
+    binary data with BinaryEncoding{Length = Len};
+
+    override string ToString()
+    {
+        return "Unknown, Type: " + TypeId.ToString() + ", EnterpriseNumber:" + EnterpriseNumber.ToString();
+    }
+}
+
+// Binary to Decimal
+string BinaryToDecString(any obj)
+{
+    binary bin = obj as binary;
+    switch (bin.Count)
+    {
+        case 1 =>
+            return bin[0].ToString();
+        case 2 =>
+            return (((bin[0] as ushort) << 8) + bin[1]).ToString();
+        case 4 =>
+            return (BinaryPrimitiveTypeDecoder<uint>(bin, Endian.Big) as uint).ToString();
+        case 8 =>
+            return (BinaryPrimitiveTypeDecoder<ulong>(bin, Endian.Big) as ulong).ToString();
+        default =>
+            return bin.ToString();
+    }
+}

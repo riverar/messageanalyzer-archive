@@ -1,0 +1,354 @@
+protocol BRWS with 
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Common Internet File System (CIFS) Browser Protocol",
+    ShortName = "BRWS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-BRWS", Version = "22.0", Date = "6/30/2015", ProgramName = ProgramName.WSPP}
+        ],
+    RevisionSummary = 
+        [
+            new Revision {Class = RevisionClass.Major, Version = "382549", Date = "12/02/2015"}
+        ]
+};
+
+using MAIL;
+using Utility;
+
+endpoint Server 
+    over MAIL.Server
+    issues HostAnnouncement
+    accepts AnnouncementRequest
+    issues RequestElection
+    accepts GetBackupListRequest
+    issues GetBackupListResponse
+    issues BecomeBackup 
+    issues DomainAnnouncement 
+    issues MasterAnnouncement
+    accepts ResetStateRequest
+    issues LocalMasterAnnouncement;
+
+const set<string> MailslotNameOfBRWS = {@"\MAILSLOT\LANMAN", @"\MAILSLOT\BROWSE"};
+
+autostart actor BRWSOverMail(MAIL.Server server)
+{
+    process server accepts mail:MailslotWriteMessage where mail.MailslotName.ToUpper() in MailslotNameOfBRWS && mail.Databytes.Count > 0
+    {
+        binary bin = mail.Databytes;
+        byte opCode = bin[0];
+        switch (opCode)
+        {
+            case OpCodeEnum.HostAnnouncement        =>
+                DecodeMessageAndDispatch<HostAnnouncement>(bin, "HostAnnouncement", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.AnnouncementRequest     =>
+                DecodeMessageAndDispatch<AnnouncementRequest>(bin, "AnnouncementRequest", AcceptsDispather, endpoint Server over server);
+            case OpCodeEnum.RequestElection         =>
+                DecodeMessageAndDispatch<RequestElection>(bin, "RequestElection", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.GetBackupListRequest    =>
+                DecodeMessageAndDispatch<GetBackupListRequest>(bin, "GetBackupListRequest", AcceptsDispather, endpoint Server over server);
+            case OpCodeEnum.GetBackupListResponse   =>
+                DecodeMessageAndDispatch<GetBackupListResponse>(bin, "GetBackupListResponse", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.BecomeBackup            =>
+                DecodeMessageAndDispatch<BecomeBackup>(bin, "BecomeBackup", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.DomainAnnouncement      =>
+                DecodeMessageAndDispatch<DomainAnnouncement>(bin, "DomainAnnouncement", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.MasterAnnouncement      =>
+                DecodeMessageAndDispatch<MasterAnnouncement>(bin, "MasterAnnouncement", IssuesDispather, endpoint Server over server);
+            case OpCodeEnum.ResetStateRequest       =>
+                DecodeMessageAndDispatch<ResetStateRequest>(bin, "ResetStateRequest", AcceptsDispather, endpoint Server over server);
+            case OpCodeEnum.LocalMasterAnnouncement => 
+                DecodeMessageAndDispatch<LocalMasterAnnouncement>(bin, "LocalMasterAnnouncement", IssuesDispather, endpoint Server over server);
+            default =>
+                throw "Invalid op code";
+        }
+    }
+
+    void AcceptsDispather(any message msg, Server server)
+    {
+        dispatch server accepts msg;
+    }
+
+    void IssuesDispather(any message msg, Server server)
+    {
+        dispatch server issues msg;
+    }
+}
+
+void DecodeMessageAndDispatch<T>(binary bin, string msgName, void(T, Server) dispatcher, Server server)
+{
+    switch (bin)
+    {
+        case m:T from BinaryDecoder =>
+            dispatcher(m, server);
+        default =>
+            ThrowDecodingException("BRWS", msgName);
+    }   
+}
+
+//----------
+// Messages
+
+pattern OpCodeEnum = enum  byte
+{
+    HostAnnouncement        = 0x01,
+    AnnouncementRequest     = 0x02,
+    RequestElection         = 0x08,
+    GetBackupListRequest    = 0x09,
+    GetBackupListResponse   = 0x0A,
+    BecomeBackup            = 0x0B,
+    DomainAnnouncement      = 0x0C,
+    MasterAnnouncement      = 0x0D,
+    ResetStateRequest       = 0x0E,
+    LocalMasterAnnouncement = 0x0F,
+    ...
+};
+
+// 2.2.1
+message HostAnnouncement
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.HostAnnouncement;
+    byte UpdateCount where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "BRWS", "UpdateCount", "HostAnnouncement", value);
+    uint Periodicity;
+    string ServerName with BinaryEncoding{WidthForComposedType = 16 * 8, TextEncoding = TextEncoding.ASCII};
+    byte OSVersionMajor;
+    byte OSVersionMinor;
+    ServerType ServerType where ValidationCheckCombinationValue(InRange<ServerType>(value), this, true, ReferenceType.Message, "BRWS", "ServerType", "HostAnnouncement", "ServerType", "MS-RAP]");
+    byte BrowserVersionMajor where ValidationCheckValue(value == 0x0F, this, true, ReferenceType.Message, "BRWS", "BrowserVersionMajor", "HostAnnouncement", 0x0F, value);
+    byte BrowserVersionMinor where ValidationCheckValue(value == 0x01, this, true, ReferenceType.Message, "BRWS", "BrowserVersionMinor", "HostAnnouncement", 0x01, value);
+    ushort Signature where ValidationCheckValue(value == 0xAA55, this, true, ReferenceType.Message, "BRWS", "Signature", "HostAnnouncement", 0xAA55, value);
+    string Comment with BinaryEncoding{MaxLength = 43, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "HostAnnouncement, ServerName: " + ServerName;
+    }
+};
+
+// 2.2.2
+message AnnouncementRequest
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.AnnouncementRequest;
+    byte Reserved where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "BRWS", "Reserved ", "AnnouncementRequest", value);
+    string ResponseName with BinaryEncoding{MaxLength = 16, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "AnnouncementRequest, ResponseName: " + ResponseName;
+    }
+}
+
+// 2.2.3
+message RequestElection
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.RequestElection;
+    byte Version where ValidationCheckValue(value == 1, this, true, ReferenceType.Message, "BRWS", "Version", "RequestElection", 1, value);
+    Criteria Criteria;
+    uint Uptime;
+    uint Unused where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "BRWS", "Unused ", "RequestElection", value);
+    string ServerName with BinaryEncoding{MaxLength = 16, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "RequestElection, ServerName: " + ServerName;
+    }
+}
+
+type Criteria
+{
+    OperatingSystem OperatingSystem with BinaryEncoding{TrailPadding = 4};
+    ushort BrowserVersion 
+        where ValidationCheckValue(value == 0x010F, null, true, ReferenceType.Type, "BRWS", "BrowserVersion", "Criteria", 0x010F, value)
+        with BinaryEncoding{Endian = Endian.Big};
+    RolePattern Role 
+        where ValidationCheckCombinationValue(InRange<RolePattern>(value), null, false, ReferenceType.Type, "BRWS", "Role", "Criteria", "0x01 ~ 0x08, 0x20, 0x80", value);
+} with BinaryEncoding{DecodeAsUnit = true, WidthForComposedType = 32};
+
+pattern RolePattern = flags byte
+{
+    PrimaryDomainController         = 0x80,
+    PreferredMasterBrowserServer    = 0x08,
+    MasterBrowserServer             = 0x04,
+    DomainController                = 0x02,
+    BackupBrowserServer             = 0x01,
+    NetBIOSNameService              = 0x20,
+    ...
+};
+
+pattern OperatingSystem = enum byte
+{
+    Client  = 1,
+    Server  = 2,
+    ...
+} with BinaryEncoding{Width = 4};
+
+// 2.2.4
+message GetBackupListRequest
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.GetBackupListRequest;
+    byte RequestedCount;
+    uint Token;
+
+    override string ToString()
+    {
+        return "GetBackupListRequest, RequestedCount: " + RequestedCount.ToString() + ", Token: " + Token.ToString();
+    }
+}
+
+// 2.2.5
+message GetBackupListResponse
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.GetBackupListResponse;
+    byte BackupServerCount;
+    uint Token;
+    array<string> BackupServerList  with BinaryEncoding{Length = BackupServerCount, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        string summary = "GetBackupListResponse, Token: " + Token.ToString();
+        string serverStr = "";
+        for (int i = 0; i < BackupServerList.Count; i++)
+        {
+            if (i < 3)
+            {
+                serverStr += ", " + BackupServerList[i];
+            }
+            else
+            {
+                break;
+            }
+        }
+        if (serverStr.Count > 2)
+        {
+            summary += ", BackupServerList: [" + serverStr.Segment(2) + "]";
+        }
+        return summary;
+    }
+} 
+
+// 2.2.6
+message BecomeBackup 
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.BecomeBackup;
+    string BrowserToPromote with BinaryEncoding{MaxLength = 16, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "BecomeBackup, BrowserToPromote: " + BrowserToPromote;
+    }
+}
+
+// 2.2.7
+message DomainAnnouncement 
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.DomainAnnouncement;
+    byte UpdateCount where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "BRWS", "UpdateCount ", "DomainAnnouncement", value);
+    uint Periodicity;
+    string MachineGroup with BinaryEncoding{WidthForComposedType = 16 * 8, TextEncoding = TextEncoding.ASCII};
+    byte BrowserConfigVersionMajor;
+    byte BrowserConfigVersionMinor;
+    ServerType ServerType where ValidationCheckCombinationValue(InRange<ServerType>(value), this, true, ReferenceType.Message, "BRWS", "ServerType", "DomainAnnouncement", "ServerType", "MS-RAP]");
+    byte BrowserVersionMajor;
+    byte BrowserVersionMinor;
+    ushort Signature  where ValidationCheckValue(value == 0xAA55, this, true, ReferenceType.Message, "BRWS", "Signature", "DomainAnnouncement", 0xAA55, value);
+    string LocalMasterBrowserName with BinaryEncoding{MaxLength = 16, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "DomainAnnouncement, MachineGroup: " + MachineGroup + ", LocalMasterBrowserName: " + LocalMasterBrowserName;
+    }
+}
+
+// 2.2.8
+message MasterAnnouncement
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.MasterAnnouncement;
+    string MasterBrowserServerName with BinaryEncoding{MaxLength = 16, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "MasterAnnouncement, MasterBrowserServerName: " + MasterBrowserServerName;
+    }
+}
+
+// 2.2.9
+message ResetStateRequest
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.ResetStateRequest;
+    ResetStateRequestType Type where ValidationCheckCombinationValue(InRange<ResetStateRequestType>(value), this, true, ReferenceType.Message, "BRWS", "Type", "ResetStateRequest", "ResetStateRequest", "MS-RAP]"); 
+
+    override string ToString()
+    {
+        return "ResetStateRequest, Type: " + EnumToStringInSummary<ResetStateRequestType>(Type);
+    }
+}
+
+pattern ResetStateRequestType = enum byte
+{
+    RESET_STATE_STOP_MASTER     = 0x01,
+    RESET_STATE_CLEAR_ALL       = 0x02,
+    RESET_STATE_STOP            = 0x04,
+    ...
+};
+
+// 2.2.10
+message LocalMasterAnnouncement
+{
+    OpCodeEnum OpCode where value == OpCodeEnum.LocalMasterAnnouncement;
+    byte UpdateCount where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "BRWS", "UpdateCount ", "LocalMasterAnnouncement", value);
+    uint Periodicity;
+    string ServerName with BinaryEncoding{WidthForComposedType = 16 * 8, TextEncoding = TextEncoding.ASCII};
+    byte OSVersionMajor;
+    byte OSVersionMinor;
+    ServerType ServerType where ValidationCheckCombinationValue(InRange<ServerType>(value), this, true, ReferenceType.Message, "BRWS", "ServerType", "LocalMasterAnnouncement", "ServerType", "MS-RAP]");
+    byte BrowserConfigVersionMajor;
+    byte BrowserConfigVersionMinor;
+    ushort Signature  where ValidationCheckValue(value == 0xAA55, this, true, ReferenceType.Message, "BRWS", "Signature", "LocalMasterAnnouncement", 0xAA55, value);
+    string Comment with BinaryEncoding{MaxLength = 43, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "LocalMasterAnnouncement, ServerName: " + ServerName + ", Comment: " + Comment;
+    }
+}
+
+// MS-RAP, 2.5.5.2.1
+pattern ServerType = flags uint
+{
+    SV_TYPE_WORKSTATION                         =   0x00000001,
+    SV_TYPE_SERVER                              =   0x00000002,
+    SV_TYPE_SQLSERVER                           =   0x00000004,
+    SV_TYPE_DOMAIN_CTRL                         =   0x00000008,
+    SV_TYPE_DOMAIN_BAKCTRL                      =   0x00000010,
+    SV_TYPE_TIME_SOURCE                         =   0x00000020,
+    SV_TYPE_AFP                                 =   0x00000040,
+    SV_TYPE_NOVELL                              =   0x00000080,
+    SV_TYPE_DOMAIN_MEMBER                       =   0x00000100,
+    SV_TYPE_PRINTQ_SERVER                       =   0x00000200,
+    SV_TYPE_DIALIN_SERVER                       =   0x00000400,
+    $"SV_TYPE_SERVER_UNIX/SV_TYPE_XENIX_SERVER" =   0x00000800,
+    SV_TYPE_NT                                  =   0x00001000,
+    SV_TYPE_WFW                                 =   0x00002000,
+    SV_TYPE_SERVER_MFPN                         =   0x00004000,
+    SV_TYPE_SERVER_NT                           =   0x00008000,
+    SV_TYPE_POTENTIAL_BROWSER                   =   0x00010000,
+    SV_TYPE_BACKUP_BROWSER                      =   0x00020000,
+    SV_TYPE_MASTER_BROWSER                      =   0x00040000,
+    SV_TYPE_DOMAIN_MASTER                       =   0x00080000,
+    SV_TYPE_WINDOWS                             =   0x00400000,
+    SV_TYPE_DFS                                 =   0x00800000,
+    SV_TYPE_CLUSTER_NT                          =   0x01000000,
+    SV_TYPE_TERMINALSERVER                      =   0x02000000,
+    SV_TYPE_CLUSTER_VS_NT                       =   0x04000000,
+    SV_TYPE_DCE                                 =   0x10000000,
+    SV_TYPE_ALTERNATE_XPORT                     =   0x20000000,
+    SV_TYPE_LOCAL_LIST_ONLY                     =   0x40000000,
+    SV_TYPE_DOMAIN_ENUM                         =   0x80000000,
+    ...
+};

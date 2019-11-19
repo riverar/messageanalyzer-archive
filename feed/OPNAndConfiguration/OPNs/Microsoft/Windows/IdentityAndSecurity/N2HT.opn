@@ -1,0 +1,215 @@
+protocol N2HT with 
+Documentation
+{
+    ProtocolName = "Negotiate and Nego2 HTTP Authentication Protocol",
+    ShortName = "N2HT",
+    DocumentName = "MS-N2HT",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-N2HT", Version = "8.0", Date = "02/13/2014", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "", Date = "11/14/2014"}
+    ]
+};
+using Utility;
+using HTTP;
+using GSSAPI;
+using NLMP;
+
+autostart actor N2HTExtendsHTTPAuthentication(HTTP.Server node) 
+{
+    observe node issues res:HTTP.HttpContract.Response where (res.Headers.Keys["WWW-Authenticate"] is isWWWAuth:bool && isWWWAuth) ||
+        res.Headers.Keys["Proxy-Authenticate"]
+    {
+        string keyAuthName = isWWWAuth ? "WWW-Authenticate" : "Proxy-Authenticate";
+
+        var authenticate = res.Headers[keyAuthName];
+        if (authenticate is challengeArrayArray:array<array<HTTP.Challenge>>)
+        {
+            array<array<HTTP.Challenge>> challengeArrayArrayResult = [];
+            foreach (array<HTTP.Challenge> challengesArray in challengeArrayArray)
+            {
+                challengeArrayArrayResult += [DecodeGSSAPIChallenge(challengesArray, res)];
+            }
+            res.Headers[keyAuthName] = challengeArrayArrayResult;
+        }
+        else if (authenticate is challengeArray:array<HTTP.Challenge>)
+        {
+            res.Headers[keyAuthName] = DecodeGSSAPIChallenge(challengeArray, res);
+        }
+    }
+    
+    observe node accepts req:HTTP.HttpContract.Request where (req.Headers.Keys["Authorization"] is isAuth:bool && isAuth) ||
+        req.Headers.Keys["Proxy-Authorization"]
+    {
+        string keyAuthName = isAuth ? "Authorization" : "Proxy-Authorization";
+
+        var authorization = req.Headers[keyAuthName];
+        if (authorization is credentialsArray:array<HTTP.Credentials>)
+        {
+            array<HTTP.Credentials> credentialsArrayResult = [];
+            foreach (HTTP.Credentials credential in credentialsArray)
+            {
+                credentialsArrayResult += [DecodeGSSAPICredentials(credential, req)];
+            }
+            req.Headers[keyAuthName] = credentialsArrayResult;
+        }
+        else if (authorization is credentials:HTTP.Credentials)
+        {
+            req.Headers[keyAuthName] = DecodeGSSAPICredentials(credentials, req);
+        }
+    }
+}
+
+HTTP.Credentials DecodeGSSAPICredentials(HTTP.Credentials credentials, HTTP.HttpContract.Request req)
+{
+    if ((credentials.AuthSchema == "Negotiate" || credentials.AuthSchema == "Nego2") && credentials.AuthParam is base64String:string && (base64String != "") && Base64GSSAPIMessageArray(base64String) is base64GSSAPIMessageArray:array<string>)
+    {
+        var gssapiCredentials = new GSSAPICredentials{AuthSchema = credentials.AuthSchema, AuthParam = []};
+        foreach (var base64GSSAPIMessage in base64GSSAPIMessageArray)
+        {
+            if (base64GSSAPIMessage != "")
+            {
+                if (Base64StringToBinary(base64GSSAPIMessage) is b:binary)
+                {
+                    if (IsGSSAPIByCheckingTag(b))
+                    {
+                        if (DecodeGssapiAndSetAnnotation(b, req) is gss:GSSAPI.GssapiType)
+                        {
+                            gssapiCredentials.AuthParam += [gss];
+                            req#AuthInformation = gss#KeyInformation != nothing && GetAuthInfoFromSummary(gss#KeyInformation.ToString()) is str:StringNotNullOrEmpty ? str : nothing;
+                        }
+                        else
+                        {
+                            gssapiCredentials.AuthParam += [base64GSSAPIMessage];
+                            ValidationCheckDecodingMessageFailedWithReason(req, "N2HT", "Challenge.AuthParam", "GssapiType decoding fail");
+                        }
+                    }
+                    else if (IsNLMP(b))
+                    {
+                        var nlmpMessage = NlmpDecoder(b);
+                        if (nlmpMessage != nothing && nlmpMessage is neg:NLMP.NegotiateMessage)
+                        {
+                            gssapiCredentials.AuthParam += [neg];
+                            req#Embedded = {"NLMP" -> ""};
+                            string summary = GetAuthInfoFromSummary(GetSummaryInfo(neg));
+                            if (summary.Count > 0)
+                            {
+                                req#AuthInformation = summary;
+                            }
+                        }
+                        else if (nlmpMessage != nothing && nlmpMessage is auth:NLMP.AuthenticateMessage)
+                        {
+                            gssapiCredentials.AuthParam += [auth];
+                            req#Embedded = {"NLMP" -> ""};
+                            string summary = GetAuthInfoFromSummary(GetSummaryInfo(auth));
+                            if (summary.Count > 0)
+                            {
+                                req#AuthInformation = summary;
+                            }
+                        }
+                        else
+                        {
+                            gssapiCredentials.AuthParam += [base64GSSAPIMessage];
+                            ValidationCheckDecodingMessageFailedWithReason(req, "N2HT", "Challenge.AuthParam", "NLMP message decoding fail");
+                        }
+                    }
+                }
+                else
+                {
+                    gssapiCredentials.AuthParam += [base64GSSAPIMessage];
+                    ValidationCheckDecodingMessageFailedWithReason(req, "N2HT", "Challenge.AuthParam", "base64 decoding fail");
+                }
+            }
+        }
+        return gssapiCredentials;
+    }
+    else
+    {
+        return credentials;
+    }
+}
+
+array<HTTP.Challenge> DecodeGSSAPIChallenge(array<HTTP.Challenge> challengeArray, HTTP.HttpContract.Response res)
+{
+    array<HTTP.Challenge> challengeArrayAfterDecoding = [];
+    foreach (var challenge in challengeArray)
+    {
+        if ((challenge.AuthSchema == "Negotiate" || challenge.AuthSchema == "Nego2") && challenge.AuthParam is base64String:string && (base64String != "") && Base64GSSAPIMessageArray(base64String) is base64GSSAPIMessageArray:array<string>)
+        {
+            var gssapiChallenge = new GSSAPIChallenge{AuthSchema = challenge.AuthSchema, AuthParam = []};
+            foreach (var base64GSSAPIMessage in base64GSSAPIMessageArray)
+            {
+                if (base64GSSAPIMessage != "")
+                {
+                    if (Base64StringToBinary(base64GSSAPIMessage) is b:binary)
+                    {
+                        if (IsGSSAPIByCheckingTag(b))
+                        {
+                            if (DecodeGssapiAndSetAnnotation(b, res) is gss:GSSAPI.GssapiType)
+                            {
+                                gssapiChallenge.AuthParam += [gss];
+                                res#AuthInformation = gss#KeyInformation != nothing ? GetAuthInfoFromSummary(gss#KeyInformation.ToString()) : nothing;
+                            }
+                            else
+                            {
+                                gssapiChallenge.AuthParam += [base64GSSAPIMessage];
+                                ValidationCheckDecodingMessageFailedWithReason(res, "N2HT", "Credentials.AuthParam", "GssapiType decoding fail");
+                            }
+                        }
+                        else if (IsNLMP(b))
+                        {
+                            var nlmpMessage = NlmpDecoder(b);
+                            if (nlmpMessage != nothing && nlmpMessage is cha:NLMP.ChallengeMessage)
+                            {
+                                gssapiChallenge.AuthParam += [cha];
+                                res#Embedded = {"NLMP" -> ""};
+                                string summary = GetAuthInfoFromSummary(GetSummaryInfo(cha));
+                                if (summary.Count > 0)
+                                {
+                                    res#AuthInformation = summary;
+                                }
+                            }
+                            else
+                            {
+                                gssapiChallenge.AuthParam += [base64GSSAPIMessage];
+                                ValidationCheckDecodingMessageFailedWithReason(res, "N2HT", "Credentials.AuthParam", "NLMP message decoding fail");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        gssapiChallenge.AuthParam += [base64GSSAPIMessage];
+                        ValidationCheckDecodingMessageFailedWithReason(res, "N2HT", "Credentials.AuthParam", "base64 decoding fail");
+                    }
+                }
+            }
+            challengeArrayAfterDecoding += [gssapiChallenge];
+        }
+        else
+        {
+            challengeArrayAfterDecoding += [challenge];
+        }
+    }
+    return challengeArrayAfterDecoding;
+}
+    
+syntax Base64String = regex{[^,]*};
+syntax Base64GSSAPIMessageArray = LWS* s1:Base64String s2:(LWS* "," LWS* s20:Base64String => s20)* => ([s1] + s2);
+
+type GSSAPIChallenge : HTTP.Challenge
+{
+    new array<GSSAPI.GssapiType | NlmpMessage | string> AuthParam;
+}
+
+type GSSAPICredentials : HTTP.Credentials
+{
+    new array<GSSAPI.GssapiType | NlmpMessage | string> AuthParam;
+}

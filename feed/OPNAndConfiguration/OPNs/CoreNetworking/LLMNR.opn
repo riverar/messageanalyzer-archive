@@ -1,0 +1,157 @@
+protocol LLMNR with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Link-Local Multicast Name Resolution (LLMNR)",
+    ShortName = "LLMNR",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 4795"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "370484", Date = "11/06/2014"}
+        ]
+};
+
+using Standard;
+using UDP;
+using DNS;
+using Utility;
+using IANA;
+
+endpoint Server
+    over UDP.Host
+    accepts QueryMessage issues ResponseMessages;
+    
+client endpoint Client connected to Server;
+
+// According to [MS-LLMNRP] section 2.1 Transport: An implementation of this profile MUST support UDP as a transport and MAY support TCP as a transport.
+// Accroding to [MS-LLMNRP] section 6 Appendix A: Product Behavior: Windows implementations of this profile do not listen to LLMNR queries on any TCP port, including 5355.
+
+autostart actor LLMNROverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.Payload.Count >= 6 && (d.SourcePort == Port.LLMNR && d.Payload.Segment(4,2) == $[0001])
+    {
+        switch (d.Payload)
+        {
+            case m:ResponseMessages from BinaryDecoder<LLMNR.ResponseMessages> =>
+                dispatch (endpoint Server over host) issues m;
+            default =>
+                ThrowDecodingException("LLMNR", "ResponseMessages");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram where d.Payload.Count >= 6 && (d.DestinationPort == Port.LLMNR && d.Payload.Segment(4,2) == $[0001])
+    {
+        switch (d.Payload)
+        {
+            case m:QueryMessage from BinaryDecoder<LLMNR.QueryMessage> =>
+                dispatch (endpoint Server over host) accepts m;
+            default =>
+                ThrowDecodingException("LLMNR", "QueryMessage");
+        }
+    }
+}
+
+message QueryMessage
+{
+    ushort QueryIdentifier;
+    bool QR where ValidationCheck(value == false, this, "LLMNR: The QR in message QueryMessage should be false.") with BinaryEncoding{Width = 1};
+    ushort OPCode with BinaryEncoding{Width = 4};
+    bool Conflict with BinaryEncoding {Width = 1};
+    bool TC with BinaryEncoding{Width = 1};
+    bool Tentative with BinaryEncoding{Width = 1};
+    ushort Reserved with BinaryEncoding{Width = 4};
+    DNS.RCode RCode with BinaryEncoding{Width = 4};
+    (ushort where value == 1) QuestionCount;
+    ushort AnswerRRCount;
+    ushort NameServerRRCount;
+    ushort AdditionalRRCount;
+    LLMNRQuery Questions;
+    optional [|AnswerRRCount > 0|] array<LLMNRResourceRecord> AnswerRRs with BinaryEncoding{Length = AnswerRRCount};
+    optional [|NameServerRRCount > 0|] array<LLMNRResourceRecord> AuthorityRRs with BinaryEncoding{Length = NameServerRRCount};
+    optional [|AdditionalRRCount > 0|] array<LLMNRResourceRecord> AdditionalRRs with BinaryEncoding{Length = AdditionalRRCount};
+    
+    override string ToString()
+    {
+        string summary = "Query, Id: " + DecToHexFormat(QueryIdentifier) + ", OpCode: " + LLMNROpcodeTable(OPCode) + ", ";
+        if ((QuestionCount >= 1) && (AnswerRRCount == 0) && (NameServerRRCount == 0) && (AdditionalRRCount == 0))     // query
+        {
+            summary += "Query for " + Questions.LLMNRQueryName
+                + " of type " + EnumToString(Questions.Type, "DNS.RRType") + " on class " + EnumToString(Questions.Class, "DNS.RRClass") + ".";
+        }
+        return summary;
+    }
+}
+
+message ResponseMessages
+{
+    ushort QueryIdentifier;
+    bool QR where ValidationCheck(value == true, this, "LLMNR: The QR in message ResponseMessages should be true.") with BinaryEncoding{Width = 1};
+    ushort OPCode with BinaryEncoding{Width = 4};
+    bool Conflict with BinaryEncoding {Width = 1};
+    bool TC with BinaryEncoding{Width = 1};
+    bool Tentative with BinaryEncoding{Width = 1};
+    ushort Reserved with BinaryEncoding{Width = 4};
+    DNS.RCode RCode with BinaryEncoding{Width = 4};
+    (ushort where value == 1) QuestionCount;
+    ushort AnswerRRCount;
+    ushort NameServerRRCount;
+    ushort AdditionalRRCount;
+    array<LLMNRQuery> Questions with BinaryEncoding{Length = QuestionCount}; 
+    array<LLMNRResourceRecord> AnswerRRs with BinaryEncoding{Length = AnswerRRCount};
+    array<LLMNRResourceRecord> AuthorityRRs with BinaryEncoding{Length = NameServerRRCount};
+    array<LLMNRResourceRecord> AdditionalRRs with BinaryEncoding{Length = AdditionalRRCount};
+    
+    override string ToString()
+    {
+        string summary = "Response, Id: " + DecToHexFormat(QueryIdentifier) + ", OpCode: " + LLMNROpcodeTable(OPCode);
+        if ((QuestionCount >= 1) && ((AnswerRRCount > 0) || (NameServerRRCount > 0) || (AdditionalRRCount > 0)))    // response
+        {
+            summary += ", RCode: ";
+            summary += EnumToString(RCode, "DNS.RCode");
+            if (RCode == 0)
+            {   
+                // Get Name of first two ResourceRecord  as one string.
+                string ipAddrs = GetAddressFromAnswerRR(AnswerRRs);
+                if (ipAddrs != null && ipAddrs.Count >= 7)  //use ips.Count >= 7 to determine if existing IPs or not. minimum length of IPAddrss is 7(like 1.2.3.4).
+                {
+                    summary += ", Answer: ";
+                    if (AnswerRRCount == 1)
+                    {
+                        summary += ipAddrs;
+                    }
+                    else
+                    {
+                        summary += "[" + ipAddrs + "]";
+                    }
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+type LLMNRQuery
+{
+    DNSString LLMNRQueryName;
+    ushort Type;
+    ushort Class;
+}
+
+pattern LLMNRResourceRecord = DNS.ResourceRecord;
+
+string LLMNROpcodeTable(ushort opCode)
+{
+    switch (opCode)
+    {
+        case 0 => return "Standard";
+        default => return "Unknown value: " + (opCode as string);
+    }
+}

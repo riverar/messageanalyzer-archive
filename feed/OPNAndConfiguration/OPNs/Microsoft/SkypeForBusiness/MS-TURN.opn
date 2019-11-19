@@ -1,0 +1,483 @@
+protocol MSTURN with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Traversal Using Relay NAT (TURN) Extensions",
+    ShortName = "MS-TURN",
+    DocumentName = "MS-TURN",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+           new Reference{Name = "MS-TURN", Version = "6.0"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "1.0.0", Date = "05/19/2015"}
+        ]
+};
+
+using Utility;
+using TURN;
+using TCP;
+using UDP;
+
+endpoint Server
+    over TURN.Server | over TCP.Server
+    accepts Message issues Message;
+
+client endpoint Client connected to Server;
+
+autostart actor ActorOverTURN(TURN.Server node)
+{
+    process node accepts turnMsg:TURN.Message where IsMsTurnMsg(turnMsg)
+    { 
+        optional Message msg = new Message(turnMsg);	
+		dispatch (endpoint Server over node) accepts msg as Message;
+    } 
+	
+	process node issues turnMsg:TURN.Message where IsMsTurnMsg(turnMsg)
+    {
+        optional Message msg = new Message(turnMsg);	
+		dispatch (endpoint Server over node) issues msg as Message;
+    }    
+}
+
+autostart actor ActorOverTCP(TCP.Server node)
+{
+	process node accepts s:TCP.Segment where IsMsTurnOverTcp(s)
+    {
+		optional Message msg = new Message(s);
+		dispatch (endpoint Server over node) accepts msg as Message;
+	}
+
+	process node issues s:TCP.Segment where IsMsTurnOverTcp(s)
+    {
+		optional Message msg = new Message(s);
+		dispatch (endpoint Server over node) issues msg as Message;
+	}
+}
+
+bool IsMsTurnMsg(TURN.Message turnMsg)
+{
+    ushort messageType = turnMsg.MessageHeader.MessageType;
+	return ValidMsTurnMethod(messageType);
+}
+
+bool IsMsTurnOverTcp(TCP.Segment s)
+{
+	binary payload = s.Payload;
+
+	if ((payload == null) || (payload.Count < 6)) // minimum size of TURN message header
+	{
+		return false;
+	}
+
+	ushort tcpHeaderType = ((payload[0] << 8) + payload[1]) as ushort;
+	ushort messageType = ((payload[4] << 8) + payload[5]) as ushort;
+    
+	return (((tcpHeaderType == 0x0200) || (tcpHeaderType == 0x0300)) && ValidMsTurnMethod(messageType));
+}
+ 
+bool ValidMsTurnMethod(ushort messageType)
+{
+	if (messageType == null)
+	{
+		return false;
+	}
+	
+	if (messageType == 0x0015) // Data Indication
+	{
+		return true;
+	}
+
+	ushort firstPart = (messageType & 0xfeef) as ushort;
+	ushort secondPart = (messageType & 0x0110) as ushort;
+
+	if (firstPart == 0x004)
+	{
+		return secondPart == 0x0000; // Only Send Request supported
+	}
+	else
+	{
+		 return (MsTurnMessageMethods.Keys[firstPart] && MsTurnMessageClasses.Keys[secondPart]);
+	}
+}
+
+const map<ushort, string> MsTurnMessageMethods =
+{
+    0x003 -> "Allocate ",
+    0x004 -> "Send ",
+    0x005 -> "Data ",
+    0x006 -> "Set Active Destination ",
+};
+
+const map<ushort, string> MsTurnMessageClasses =
+{
+    0x0000 -> "Request",
+    0x0010 -> "Indication",
+    0x0100 -> "Success Response",
+    0x0110 -> "Error Response",
+};
+
+message Message[bool IsOverTCP]
+{
+    optional ([|IsOverTCP|] TCPFramingHeader) TCPFramingHeader;    
+    MessageHeader MessageHeader;
+    array<Attribute> Attributes with BinaryEncoding{WidthForComposedType = MessageHeader.MessageLength << 3};
+	
+	Message(TURN.Message turnMsg)
+	{
+		optional Message msTurnMsg;
+		array<any message> tempMsgs = turnMsg.Origins;
+	
+		if (tempMsgs == null || tempMsgs.Count != 1)
+		{
+			ThrowDecodingException("MSTURN", "The TURN frame MUST have only one origin message.", null);
+		}
+		else if (tempMsgs[0] is s:TCP.Segment)
+		{
+			msTurnMsg = BinaryDecoder<Message[true]>(s.Payload);
+		}
+		else if (tempMsgs[0] is d:UDP.Datagram)
+		{
+			msTurnMsg = BinaryDecoder<Message[false]>(d.Payload);
+		}
+		else
+		{
+			ThrowDecodingException("MSTURN", "The origin of TURN frame is neither UDP nor TCP.", null);
+		}
+
+		if ((msTurnMsg != nothing) && (msTurnMsg != null))
+		{
+			Message parsedMessage = msTurnMsg as Message;
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSTURN");
+		}
+	}
+
+	Message(TCP.Segment s)
+    {
+		optional Message tcpMsg = BinaryDecoder<Message[true]>(s.Payload);
+
+		if ((tcpMsg != nothing) && (tcpMsg != null))
+		{
+			Message parsedMessage = tcpMsg as Message;
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSTURN");
+		}
+	}
+
+    override string ToString()
+    {
+        ushort messageType  = this.MessageHeader.MessageType;
+        string summary = "";
+        
+        ushort turnMethod = (messageType & 0xfeef) as ushort;
+        ushort turnClass = (messageType & 0x0110) as ushort;
+		
+        if (messageType == 0x0115)
+        {
+            summary = "Data Indication";
+        }
+        else
+        {
+            if (turnMethod in MsTurnMessageMethods)
+            {
+                summary = MsTurnMessageMethods[turnMethod];
+            }
+
+            if (turnClass in MsTurnMessageClasses)
+            {
+                summary += MsTurnMessageClasses[turnClass];
+            }
+        }
+
+        if (summary.Count == 0)
+        {
+            summary = "Unknown Message Type(" + DecToHexFormat(messageType) + ")";
+        }
+
+		guid transactionID = this.MessageHeader.TransactionID;
+
+		if (transactionID != null)
+		{
+			summary += ", Transaction ID: " + transactionID.ToString();
+		}
+		else
+		{
+			summary += ", Invalid Message Format: Missing Transaction ID Field in Message Header.";
+		}	
+
+		return summary;
+    }
+}
+
+// Section 2.1.2
+type TCPFramingHeader
+{
+    MSTURNType Type where ValidationCheck(value == 2 || value == 3, null, DiagnosisLevel.Error, "MSTURN: The Type in TCPFramingHeader must be either 0x02(2) for TURN control message or 0x03(3) for end-to-end data, not " + (value as string) + ".");
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "MSTURN: The Reserved in TCPFramingHeader must be zero, not " + (value as string) + ".");
+    ushort Length;
+}
+
+// Section 2.2.1
+type MessageHeader
+{
+    ushort MessageType where ValidationCheck((value & 0xC000) == 0, null, DiagnosisLevel.Error, "MSTURN: The most significant two bits of this field MUST be set to zero so that TURN packets can be differentiated from other protocols.");
+    ushort MessageLength;
+    guid TransactionID with BinaryEncoding{Length = 16};
+}
+
+// Section 2.2.2
+pattern Attribute = [|stream.RemainingByteLength() >= 2|]
+    ([|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0001|] MappedAddress |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0006|] UserName |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0008|] MessageIntegrity |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0009|] ErrorCode |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x000A|] UnknownAttributes |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x000D|] LifeTime |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x000E|] AlternateServer |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x000F|] MagicCookie |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0010|] Bandwidth |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0011|] DestinationAddress |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0012|] RemoteAddress |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0013|] Data |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0014|] Nonce |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0015|] Realm |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x0017|] RequestedAddressFamily  |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8008|] MSVersion  |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8020|] XorMappedAddress  |
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8050|] MSSequenceNumber  |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8054|] CandidateIdentifier | // MS-ICE2
+    [|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8055|] MSServiceQuality  |
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8070|] ImplementationVersion | // MS-ICE2
+	[|stream.PeekUShort(stream.BitPosition, Endian.Big) == 0x8090|] MSAlternateMappedAddress  |
+	TURN.Attributes); // Other Attributes
+
+type MappedAddress
+{
+    (ushort where value == 0x0001) Type;
+	ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MappedAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved;
+    FamilyEnum Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute MappedAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+    ushort Port;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) Address;
+}
+
+type UserName
+{
+    (ushort where value == 0x0006) Type;
+    ushort Length;
+    binary UserName with BinaryEncoding{Length = Length};
+}
+
+type MessageIntegrity
+{
+    (ushort where value == 0x0008) Type;
+    ushort Length where ValidationCheck(value == 20 || value == 32, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MessageIntegrity must be either 0x0014(20) in case of HMAC SHA-1 hash algorithm or 0x0020(32) in case of HMAC SHA-256 hash algorithm.") ;
+    binary HMACHash with BinaryEncoding{Length = Length};
+}
+
+type ErrorCode
+{
+    (ushort where value == 0x0009) Type;
+    ushort Length;
+    uint Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURN: The Reserved in attribute ErrorCode should be 0.") with BinaryEncoding{Width = 21};
+    byte Class where ValidationCheck(value >= 1 && value <= 6, null, DiagnosisLevel.Error, "MSTURN: The Class in attribute ErrorCode must be between 1 and 6.") with BinaryEncoding{Width = 3};
+    byte Number where ValidationCheck(value >= 0 && value <= 99, null, DiagnosisLevel.Error, "MSTURN: The Number in attribute ErrorCode must be between 0 and 99.");
+    (string | binary) ReasonPhrase with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = ((Length - 4) << 3)};
+}
+
+type UnknownAttributes
+{
+    (ushort where value == 0x000A) Type;
+    ushort Length;
+    array<ushort> AttributeType with BinaryEncoding{Length = Length / 16};
+}
+
+type LifeTime
+{
+    (ushort where value == 0x000D) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute LifeTime must be 0x0004(4).");
+    uint LifeTime;
+}
+
+type AlternateServer
+{
+    (ushort where value == 0x000E) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute AlternateServer must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved;
+    Family Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute MappedAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+    ushort Port;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) Address;
+}
+
+type MagicCookie
+{
+	(ushort where value == 0x000F) Type;
+	ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MagicCookie must be 0x0004 (4).");
+	uint MagicCookie where ValidationCheck(value == 0x72c64bc6, null, DiagnosisLevel.Error, "MSTURN: The Magic Cookie in attribute MagicCookie must be 0x72c64bc6.");
+}
+
+type Bandwidth
+{
+	(ushort where value == 0x0010) Type;
+	ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute Bandwidth must be 0x0004 (4).");
+	uint Bandwidth;
+}
+
+type DestinationAddress
+{
+	(ushort where value == 0x0011) Type;
+	ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute AlternateServer must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved;
+    Family Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute MappedAddress must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+    ushort Port;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) Address;
+}
+
+type RemoteAddress
+{
+	(ushort where value == 0x0012) Type;
+	ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute RemoteAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+	byte Reserved;
+    Family Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute RemoteAddress must be either0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+    ushort Port;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) Address;
+}
+
+type Data
+{
+    (ushort where value == 0x0013) Type;
+    ushort Length;
+    binary Data with BinaryEncoding{Length = Length};
+}
+
+type Nonce
+{
+    (ushort where value == 0x0014) Type;
+    ushort Length where ValidationCheck(value <= 128, null, DiagnosisLevel.Warning, "MSTURN: The length of Nonce field in attribute Nonce should be less than 128 bytes.");
+    (string | binary) None with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = (Length << 3)};
+}
+
+type Realm
+{
+    (ushort where value == 0x0015) Type;
+    ushort Length where ValidationCheck(value <= 128, null, DiagnosisLevel.Warning, "MSTURN: The length of Nonce field in attribute Realm should be less than 128 bytes.");
+    (string | binary) Realm with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = (Length << 3)};
+}
+
+type RequestedAddressFamily
+{
+	(ushort where value == 0x0017) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute RequestedAddressFamily must be 0x0004 (4).");
+	Family Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute RequestedAddressFamily must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPv6 address.");
+	uint Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Warning, "MSTURN: The Reserved in attribute RequestedAddressFamily should be zero.") with BinaryEncoding{Width = 24};
+}
+
+type XorMappedAddress
+{
+    (ushort where value == 0x8020) Type;
+    ushort Length where ValidationCheck(value == 8 || value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute XorMappedAddress must be either 0x0008(8) for an IPv4 address or 0x0014(20) for an IPv6 address.");
+    byte Reserved;
+    Family Family where ValidationCheck(value == 1 || value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute XorMappedAddres must be either 0x01(1) for an IPv4 address or 0x02(2) for an IPV6 address.");
+    ushort Xport;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) XIPAddress;
+}
+
+type MSVersion
+{
+	(ushort where value == 0x8008) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MSVersion must be 0x0004(4).");
+	VersionEnum Version;
+}
+
+type MSSequenceNumber
+{
+	(ushort where value == 0x8050) Type;
+    ushort Length where ValidationCheck(value == 24, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MSSequenceNumber must be 0x0018(24).");
+	binary ConnectionID with BinaryEncoding{Length = 20};
+	uint SequenceNumber;
+}
+
+type MSServiceQuality
+{
+	(ushort where value == 0x8055) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MSServiceQuality must be 0x0004 (4).");
+	SteamTypeEnum SteamType;
+	ServiceQualityEnum ServiceQuality;
+}
+
+type MSAlternateMappedAddress
+{
+	(ushort where value == 0x8090) Type;
+	ushort Length where ValidationCheck(value == 20, null, DiagnosisLevel.Error, "MSTURN: The Length in attribute MSAlternateMappedAddress must be 0x0014 (20) for an IPv6 address.");
+	byte Reserved;
+    Family Family where ValidationCheck(value == 2, null, DiagnosisLevel.Error, "MSTURN: The Family in attribute MSAlternateMappedAddress must be 0x02 (2) for an IPv6 address.");
+    ushort Port;
+    ([|Family == 0x01|] IPv4Address | [|Family == 0x02|] IPv6Address) Address;
+}	
+
+type CandidateIdentifier
+{
+	(ushort where value == 0x8054) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSICE2: The Length in attribute CandidateIdentifier must be 0x0004(4).");
+    uint Version;
+}
+
+type ImplementationVersion
+{
+	(ushort where value == 0x8070) Type;
+    ushort Length where ValidationCheck(value == 4, null, DiagnosisLevel.Error, "MSICE2: The Length in attribute ImplementationVersion must be 0x0004(4).");
+    uint Foudation;
+}
+
+pattern MSTURNType = enum byte
+{
+	TURNControlMessage = 0x02,
+	EndToEndData = 0x03,
+};
+
+pattern FamilyEnum = enum byte
+{
+	IPv4 = 0x01,
+	IPv6 = 0x02,
+};
+
+pattern VersionEnum = enum uint
+{
+	MSICE = 0x00000001,
+	MSICE2 = 0x00000002,
+	MSICE2AndHMACSHA256 = 0x00000003,
+	MSICE2AndHMACSHA256AndIPv6 = 0x00000004,
+};
+
+pattern SteamTypeEnum = enum ushort
+{
+	Audio = 0x0001,
+	Video = 0x0002,
+	SupplementalVideo = 0x0003,
+	Data = 0x0004,
+	...
+};
+
+pattern ServiceQualityEnum = enum ushort
+{
+	BestEffectDelivery = 0x0000,
+	ReliableDelivery = 0x0001,
+	...
+};

@@ -1,0 +1,315 @@
+protocol RIP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Routing Information Protocol",
+    ShortName = "RIP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1058"},
+            new Reference{Name = "RFC 1582"},
+            new Reference{Name = "RFC 2091"},
+            new Reference{Name = "RFC 2080"},
+            new Reference{Name = "RFC 2453"},
+            new Reference{Name = "RFC 4822"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "360482", Date = "03/21/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+
+endpoint Server over UDP.Host accepts RIPMessage issues RIPMessage accepts RIPOnIpv6 issues RIPOnIpv6;
+client endpoint Client connected to Server;
+
+autostart actor RIPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram{DestinationPort is Port.RIP}
+    {
+        switch (d.Payload)
+        {
+            case m:RIPMessage from RIPMessageDecoder =>
+                dispatch (endpoint Server over host) accepts m;
+            default =>
+                ThrowDecodingException("RIP", "RIPMessage");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram{SourcePort is Port.RIP}
+    {
+        switch (d.Payload)
+        {
+            case m:RIPMessage from RIPMessageDecoder =>
+                dispatch (endpoint Server over host) issues m;
+            default =>
+                ThrowDecodingException("RIP", "RIPMessage");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram{DestinationPort is Port.RIPng}
+    {
+        switch (d.Payload)
+        {
+            case m:RIPOnIpv6 from RIPOnIpv6Decoder =>
+                dispatch (endpoint Server over host) accepts m;
+            default =>
+                ThrowDecodingException("RIP", "RIPOnIpv6");
+        }
+    }
+    
+    process host accepts d:UDP.Datagram{SourcePort is Port.RIPng}
+    {
+        switch (d.Payload)
+        {
+            case m:RIPOnIpv6 from RIPOnIpv6Decoder =>
+                dispatch (endpoint Server over host) issues m;
+            default =>
+                ThrowDecodingException("RIP", "RIPOnIpv6");
+        }
+    }
+}
+
+message RIPMessage
+{
+    Command Command;
+    byte Version;
+    
+    optional [|Version == 1|] ushort Unused;
+    optional [|Version == 2|] ushort RoutingDomain;
+    optional [|Command in {7, 8}|] TriggeredRequestAndResponseHead TriggeredResponseOrACKHead;
+    optional [|Command == 9|] UpdateRequestHead UpdateRequestHead;
+    optional [|Command in {10, 11}|]UpdateResponseOrACK UpdateResponseOrACK;
+    optional RIPAuthentication Authentication with Encoding{Ignore = true};
+    optional array<RIPEntry> Entry with Encoding{Ignore = true};
+    optional any AuthenticationTrailing with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string summary = (InRange<Command>(Command) ? "" : "Unkown Command: ") + EnumToString<RIP.Command>(Command, false) + ", Count: ";
+        if (Entry is arr:array<RIPEntry>)
+        {
+            summary += (arr.Count as string) + ", ";
+        }
+        else 
+        {
+            summary += "0, ";
+        }
+        if (Version == 1)
+        {
+            summary += "Version: 1";
+        }
+        else if (Version == 2)
+        {
+            summary += "Version: 2";
+        }
+        else 
+        {
+            summary += "Unknown Version";
+        }
+        return summary;
+    }
+}
+
+message RIPOnIpv6
+{
+    Command Command;
+    byte Version;
+    ushort Unused where ValidationCheck(value == 0, null, "RIP: The Unused in message RIPOnIpv6 must be zero.");
+    optional array<RouteTableEntry> RouteTableEntrise with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return(InRange<Command>(Command) ? "" : "Unkown Command: ") + EnumToString<RIP.Command>(Command, false) + ", Version: RIPNG for IPv6";
+    }
+}
+
+pattern RIPAuthentication = RIPAuthenticationEntry | RIPCryptographicAuthenticationEntry;
+pattern RIPEntry = (RIPv1Entry | RIPv2Entry);
+
+type RouteTableEntry
+{
+    IPv6Address Ipv6Prefix;
+    ushort TouteTag;
+    byte PrefixLen;
+    byte Metric;
+}
+
+type TriggeredRequestAndResponseHead
+{
+    ushort SequenceNumber;
+    byte Frag;
+    byte NumberofFrag;
+}
+
+type UpdateRequestHead
+{
+    byte Version;
+    uint Unused where ValidationCheck(value == 0, null, "RIP: The Unused in type UpdateRequestHead must be zero.") with BinaryEncoding{Width = 24};
+}
+
+type UpdateResponseOrACK
+{
+    byte Version;
+    byte Flush;
+    ushort SequenceNumber;
+}
+
+type RIPv1Entry
+{
+    ushort AddressFamilyIdentifier;
+    ushort Unused where ValidationCheck(value == 0, null, "RIP: The Unused in type RIPv1Entry must be zero.");
+    IPv4Address IPAddress;
+    uint Unused1 where ValidationCheck(value == 0, null, "RIP: The Unused1 in type RIPv1Entry must be zero.");
+    uint Unused2 where ValidationCheck(value == 0, null, "RIP: The Unused2 in type RIPv1Entry must be zero.");
+    uint Metric;
+}
+
+type RIPv2Entry
+{
+    ushort AddressFamilyIdentifier;
+    ushort RouteTag;
+    IPv4Address IPAddress;
+    IPv4Address SubnetMask;
+    IPv4Address NextHop;
+    uint Metric;
+}
+
+//RFC 2453 page 32
+type RIPAuthenticationEntry
+{
+    ushort AuthIndicator where ValidationCheck(value == 0xFFFF, null, "RIP: The AuthIndicator in type RIPAuthenticationEntry must be OxFFFF.");
+    ushort AuthenticationType where value == 2;
+    string Authentication with BinaryEncoding{Length = 16};
+}
+
+//RFC 4822 page 4
+type RIPCryptographicAuthenticationEntry
+{
+    ushort AuthIndicator where ValidationCheck(value == 0xFFFF, null, "RIP: The AuthIndicator in type RIPCryptographicAuthenticationEntry must be OxFFFF.");
+    ushort AuthenticationType where value == 3;
+    ushort RIPv2PacketLength;
+    byte KeyID;
+    byte AuthDataLen;
+    uint SequenceNumber;
+    uint Reserved1 where ValidationCheck(value == 0, null, "RIP: The Reserved1 in type RIPCryptographicAuthenticationEntry must be zero.");
+    uint Reserved2 where ValidationCheck(value == 0, null, "RIP: The Reserved2 in type RIPCryptographicAuthenticationEntry must be zero.");
+}
+
+type CryptographicAuthenticationTrailing [byte len]
+{
+    ushort AuthIndicator where ValidationCheck(value == 0xFFFF, null, "RIP: The AuthIndicator in type CryptographicAuthenticationTrailing must be OxFFFF.");
+    ushort AuthenticationType where value == 1;
+    string AuthenticationData with BinaryEncoding{Length = len};
+}
+
+optional RIPMessage RIPMessageDecoder(stream s)
+{
+    optional RIPMessage msgOptional = BinaryDecoder<RIPMessage>(s);
+    
+    if (msgOptional == nothing)
+    {
+        ThrowDecodingException("RIP");
+    }
+    else
+    {
+        RIPMessage msg = msgOptional as RIPMessage;
+        // FRC 2453 4.1 Authentication
+        // If the Address Family Identifier of the first (and only the first) entry in the message is 0xFFFF, then the remainder of
+        // the entry contains the authentication. 
+        if (s.PeekBytes(s.BitPosition, 2) == $[ffff])
+        {
+            msg.Authentication =  BinaryDecoder<RIPAuthentication>(s);
+        }
+        else 
+        {
+            msg.Authentication = nothing;
+        }
+    
+        if (msg.Version == 1)
+        {
+            array<any> entris = [];
+            while ((s.ByteLength - s.BytePosition) >= 20 && s.PeekBytes(s.BitPosition, 2) != $[ffff])
+            {
+                RIPv1Entry entry = BinaryDecoder<RIPv1Entry>(s) as RIPv1Entry;
+                entris += [entry];
+            }
+            msg.Entry = entris;
+        }
+        // For Routing Information Protocol Version 2
+        else if (msg.Version == 2)
+        {
+            array<any> entris = [];
+            while ((s.ByteLength - s.BytePosition) >= 20 && s.PeekBytes(s.BitPosition, 2) != $[ffff])
+            {
+                RIPv2Entry entry = BinaryDecoder<RIPv2Entry>(s) as RIPv2Entry;
+                entris += [entry];
+            }
+            msg.Entry = entris;
+        }
+        else 
+        {
+            throw("Unknown RIP Version");
+        }
+        // according to RFC 4822
+        // 2.1 RIPv2 PDU Format
+        if (msg.Authentication != nothing && msg.Authentication is RIPCryptographicAuthenticationEntry)
+        {
+            RIPCryptographicAuthenticationEntry entry = msg.Authentication as RIPCryptographicAuthenticationEntry;
+            msg.AuthenticationTrailing = BinaryDecoder<CryptographicAuthenticationTrailing[entry.AuthDataLen]>(s);
+        }
+        else
+        {
+            msg.AuthenticationTrailing = nothing;
+        }
+        return msg;
+    }
+    return nothing;
+}
+
+optional RIPOnIpv6 RIPOnIpv6Decoder(stream s)
+{
+    optional RIPOnIpv6 msg = BinaryDecoder<RIPOnIpv6>(s);
+    array<RouteTableEntry> entries = [];
+    if (msg == nothing)
+    {
+        ThrowDecodingException("RIP On Ipv6");
+    }
+    else
+    {
+        while (s.ByteLength - s.BytePosition >= 20)
+        {
+            RouteTableEntry entry = new RouteTableEntry();
+            entry = BinaryDecoder<RouteTableEntry>(s) as RouteTableEntry;
+            entries += [entry];
+        }
+        var m = msg as RIPOnIpv6;
+        m.RouteTableEntrise = entries;
+    }
+    return msg;
+}
+
+pattern Command = enum byte
+{
+    $"Request" = 1,
+    $"Response" = 2,
+    $"Trace On" = 3,
+    $"Trace Off" = 4,
+    $"SUN Reserved" = 5,
+    $"Triggered Request" = 6,
+    $"Triggered Response" = 7,
+    $"Triggered Acknowledgement" = 8,
+    $"Update Request" = 9,
+    $"Update Response" = 10,
+    $"Update Acknowledgement" = 11,
+    ...
+};

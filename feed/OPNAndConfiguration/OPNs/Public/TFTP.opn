@@ -1,0 +1,222 @@
+protocol TFTP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Trivial File Transfer Protocol",
+    ShortName = "TFTP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 783"}, 
+            new Reference{Name = "TFTP", Link = "http://www.networksorcery.com/enp/protocol/tftp.htm"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "377036", Date = "04/17/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using UDP;
+
+// Dummy endpoint contains global variable to avoid cross capture impact
+endpoint DummyEndpoint[binary clientAddress, binary serverAddress]
+    accepts any message issues any message
+{
+    // Catched TID (source port) for TFTP
+    ushort TID;
+};
+
+endpoint Node
+    over UDP.Host
+    accepts Packet;
+
+autostart actor TFTPOverUDP(UDP.Host host)
+{
+    DummyEndpoint dummyEndpoint = null;
+    bool isTFTPChecked = false;
+
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && IsTFTP(d)
+    {
+        switch (d.Payload)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+                dispatch (endpoint Node over host) accepts p;
+            default => 
+                ThrowDecodingException("TFTP");
+        }
+    }
+
+    bool IsTFTP(UDP.Datagram datagram)
+    {
+        if (datagram.DestinationPort == Port.TFTP)
+        {
+            // cache TID
+            if (dummyEndpoint == null)
+            {
+                if (host.Address1 < host.Address2)
+                    dummyEndpoint = endpoint DummyEndpoint[host.Address1, host.Address2];
+                else
+                    dummyEndpoint = endpoint DummyEndpoint[host.Address2, host.Address1];
+                dummyEndpoint.TID = datagram.SourcePort;
+            }
+            return true;
+        }
+        else
+        { // check whether it is TFTP data after connection
+            if (!isTFTPChecked)
+            {
+                if (host.Address1 < host.Address2)
+                    dummyEndpoint = endpoint bind DummyEndpoint[host.Address1, host.Address2];
+                else
+                    dummyEndpoint = endpoint bind DummyEndpoint[host.Address2, host.Address1];
+                
+                isTFTPChecked = true;
+            }
+            return dummyEndpoint != null && (dummyEndpoint.TID == datagram.DestinationPort || dummyEndpoint.TID == datagram.SourcePort);
+        }
+    }
+} 
+
+message Packet
+{
+    Tftpcode OpCode;
+    ([|OpCode == 1|] TftpRRQ
+    | [|OpCode == 2|] TftpWRQ
+    | [|OpCode == 3|] TftpDATA
+    | [|OpCode == 4|] TftpACK
+    | [|OpCode == 5|] TftpERROR
+    | [|OpCode == 6|] TftpOACK
+    | binary) TftpMessage;
+    
+    override string ToString()
+    {
+        string summary;
+        switch (OpCode)
+        {
+            case 1 =>
+                TftpRRQ m = TftpMessage as TftpRRQ;
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false) + ", File: " + m.Filename + ", Transfer Mode: " + m.Mode;
+                array<TftpOption> op = m.Options as array<TftpOption>;
+                if(op != nothing)
+                {
+                    summary += ", Options: [";
+                    for (int i = 0; i < op.Count; i++)
+                    {
+                        if(i != 0)
+                        {
+                            summary += ", ";
+                        }
+                        summary += "Option: " + op[i].Option + ", Value: " + op[i].Value;
+                    }
+                    summary += "]";
+                }
+            case 2 =>
+                TftpWRQ m = TftpMessage as TftpWRQ;
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false) + ", File: " + m.Filename + ", Transfer Mode: " + m.Mode;
+                array<TftpOption> op = m.Options as array<TftpOption>;
+                if(op != nothing)
+                {
+                    summary += ", Options: [";
+                    for (int i = 0; i < op.Count; i++)
+                    {
+                        if(i != 0)
+                        {
+                            summary += ", ";
+                        }
+                        summary += "Option: " + op[i].Option + ", Value: " + op[i].Value;
+                    }
+                    summary += "]";
+                }
+                
+            case 3 =>
+                TftpDATA m = TftpMessage as TftpDATA;
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false) + ", Block Number: " + (m.BlockNum as string);
+            case 4 =>
+                TftpACK m = TftpMessage as TftpACK;
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false) + ", Block Number: " + (m.BlockNum as string);
+            case 5 =>
+                TftpERROR m = TftpMessage as TftpERROR;
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false) + ", ErrorCode: " + EnumToString<TFTP.ErrorCode>(m.ErrorCode, true) + ", ErrorMessage: " + m.ErrorMessage;
+            case 6 =>
+                summary = (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false);
+            default =>
+                summary = "Unknown Payload, " + (InRange<Tftpcode>(OpCode) ? "" : "Unknown OpCode: ") + EnumToString<TFTP.Tftpcode>(OpCode, false);
+        }
+        return summary;
+    }
+}
+
+
+type TftpRRQ
+{
+    string Filename with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string Mode with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional array<TftpOption> Options;
+}
+
+type TftpWRQ
+{
+    string Filename with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string Mode with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional array<TftpOption> Options;
+}
+
+type TftpDATA
+{
+    ushort BlockNum;
+    binary Data;
+}
+
+type TftpACK
+{
+    ushort BlockNum;
+}
+
+type TftpERROR
+{
+    ErrorCode ErrorCode;
+    string ErrorMessage with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+type TftpOACK
+{
+    optional array<TftpOption> Options;
+}
+
+type TftpOption
+{
+    string Option where value.Count > 0 with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string Value with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+pattern Tftpcode = enum short
+{
+    $"Read Request" = 0x01,
+    $"Write Request" = 0x02,
+    Data = 0x03,
+    Acknowledgement = 0x04,
+    Error = 0x05,
+    $"Option Acknowledgement" = 0x06,
+    ...
+};
+
+pattern ErrorCode = enum ushort
+{
+    $"No Error" = 0x00,
+    $"File not found" = 0x01,
+    $"Access violation" = 0x02,
+    $"Disk full or allocation exceeded" = 0x03,
+    $"Illegal TFTP operation" = 0x04,
+    $"Unknown transfer ID" = 0x05,
+    $"File already exists" = 0x06,
+    $"No such user" = 0x07,
+    $"Terminate transfer due to option negotiation" = 0x08,
+    ...
+};

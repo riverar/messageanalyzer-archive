@@ -1,0 +1,481 @@
+// This file is integrated from <root>\private\PEF\Product\Src\OPNProduction\Common\AIPS.opn
+protocol AuthIP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Authenticated Internet Protocol",
+    ShortName = "AuthIP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-AIPS", Version = "23.0", Date = "07/12/2012", ProgramName = ProgramName.MCPP},
+            new Reference{Name = "RFC 2408"},
+            new Reference{Name = "RFC 3947"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "367944", Date = "08/19/2014"}
+        ]
+};
+
+using GSSAPI;
+using IKE;
+using UDP;
+using Standard;
+using Utility;
+using IANA;
+using ERREF;
+using MicrosoftCommonResources;
+
+annotation array<byte> IsakmpMessage#PayloadsType;
+
+endpoint Node 
+    over UDP.Host
+    accepts IsakmpMessage;
+
+const set<ushort> AuthIPPort = {IANA.Port.IKE, IANA.Port.GDOI};
+
+autostart actor AuthIPOverUdp(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where (AuthIPPort[d.SourcePort] || AuthIPPort[d.DestinationPort]) &&  IsAuthIP(d.Payload)
+    {
+        switch(d.Payload)
+        {
+            case isakmpMessage:IsakmpMessage from AuthIPDecoder =>
+                dispatch endpoint Node over host accepts isakmpMessage;
+            default =>
+                ThrowDecodingException("AuthIP");
+        }
+    }
+}
+
+// MS-AIPS 2.2.1
+message IsakmpMessage
+{
+    IsakmpHeader IsakmpHeader;
+    array<PayloadChoice> Payloads with Encoding{Ignore = true};
+    override string ToString()
+    {
+        string summary = "ISAKMP, Version: "+ (IsakmpHeader.MajorVersion as string) + "." + (IsakmpHeader.MinorVersion as string) + ", Exchange Type: " 
+            + ExchangeTypeEnum(IsakmpHeader.ExchangeType);
+        string flagsSummary = ", Flags: ";
+        string payloadsSummary = ", Payloads: [HDR";
+        if (IsakmpHeader.Flags is f1:Flagsv1)
+        {
+            flagsSummary += f1.ToString();
+            if (f1.Encryption == 1)
+            {
+                payloadsSummary += "*";
+            }
+        }
+        else if (IsakmpHeader.Flags is f2:Flagsv2)
+        {
+            flagsSummary += f2.ToString();
+        }
+        
+        array<byte> payloadsType = this#PayloadsType as array<byte>;
+        if (payloadsType.Count > 0)
+        {
+            string payloadTypeString;
+            foreach (byte pt in payloadsType)
+            {
+                payloadTypeString = GetPayloadSummaryForAuthIP(pt);
+                if (payloadsSummary.IndexOf(payloadTypeString) == -1)
+                {
+                    payloadsSummary += ", " + payloadTypeString;
+                }
+            }
+            
+            int authIndex = payloadsType.IndexOf([135]);
+            int gssidIndex = payloadsType.IndexOf([134]);
+            if (IsakmpHeader.ResponderCookie == [0,0,0,0,0,0,0,0])
+            {
+                if (authIndex != -1)
+                {
+                    AuthPayloadPacket ap = Payloads[authIndex] as AuthPayloadPacket;
+                    if (ap.Auth_Methods.Count > 0)
+                    {
+                        summary += ", Initiator provides proposal ";
+                        string comma = "";
+                        foreach (AuthMethodType item in ap.Auth_Methods)
+                        {
+                            summary += comma + EnumToString(item.Auth_Method, "AuthIP.AuthPayloadPacket_AuthMethod");
+                            comma = ", ";
+                        }
+                        summary += " for negotiation";
+                    }
+                }
+                if (gssidIndex != -1)
+                {
+                    GssIDPayloadPacket gssid = Payloads[gssidIndex] as GssIDPayloadPacket;
+                    summary += ", First Exchange with known peer SPN: " + gssid.SPN;
+                }
+            }
+            else if (gssidIndex != -1)
+            {
+                GssIDPayloadPacket gssid = Payloads[gssidIndex] as GssIDPayloadPacket;
+                summary += ", The responder send the SPN: " + gssid.SPN;
+            }
+        }
+        
+        payloadsSummary += "]";
+                
+        summary += payloadsSummary + flagsSummary + ", Length: " + (IsakmpHeader.Length as string);
+        return summary;
+    }
+}
+
+string GetPayloadSummaryForAuthIP(byte next)
+{
+    switch (next)
+    {
+        case 133 => return "CRYPTO";
+        case 134 => return "GSSID";
+        case 135 => return "AUTH";
+        default => return GetPayloadSummary(next);
+    }
+}
+
+// MS-AIPS 2.2.1
+pattern Cookie = array<byte> with BinaryEncoding{Length = 8};
+
+// MS-AIPS 2.2.1
+pattern ExchangeType = enum byte
+{
+    MM      = 0xF3,
+    QM      = 0xF4,
+    EM      = 0xF5,
+    Notify  = 0xF6
+};
+
+// MS-AIPS 2.2.1
+type IsakmpHeader
+{
+    Cookie InitiatorCookie;
+    Cookie ResponderCookie;
+    byte NextPayload;
+    byte MajorVersion with BinaryEncoding{Width = 4};
+    byte MinorVersion with BinaryEncoding{Width = 4};
+    ExchangeType ExchangeType;
+    ([|MajorVersion == 1|] Flagsv1 | [|MajorVersion == 2|] Flagsv2) Flags;
+    uint MessageId;
+    uint Length;
+}
+
+type Payloads[byte Type]
+{ 
+    ([|Type == 1|] SecurityAssociationPayloadv1                         // 1
+        | [|Type == 2|] ProposalPayloadv1                               // 2
+        | [|Type == 3|] TransformPayloadv1                              // 3
+        | [|Type == 4|] KeyExchangePayloadv1                            // 4
+        | [|Type == 5|] IdentificationPayloadv1                         // 5
+        | [|Type == 6|] CertificatePayloadv1                            // 6
+        | [|Type == 7|] CertificateRequestPayloadv1                     // 7
+        | [|Type == 8|] HashPayloadv1                                   // 8
+        | [|Type == 9|] SignaturePayloadv1                              // 9
+        | [|Type == 10|] NoncePayloadv1                                 // 10
+        | [|Type == 11|] NotifyPayloadPacket                            // 11
+        | [|Type == 12|] DeletePayloadv1                                // 12
+        | [|Type == 13|] VendorIDPayloadv1                              // 13
+        | [|Type == 20|] NATDiscoveryPayload                            // 20
+        | [|Type == 21|] NATOriginalAddressPayload                      // 21
+        | [|Type == 33|] SecurityAssociationPayloadv2                   // 33
+        | [|Type == 34|] KeyExchangePayloadv2                           // 34
+        | [|Type == 35 || Type == 36|] IdentificationPayloadsv2         // 35/36
+        | [|Type == 37|] CertificatePayloadv2                           // 37
+        | [|Type == 38|] CertificateRequestPayloadv2                    // 38
+        | [|Type == 39|] AuthenticationPayloadv2                        // 39
+        | [|Type == 40|] NoncePayloadv2                                 // 40
+        | [|Type == 41|] NotifyPayloadv2                                // 41
+        | [|Type == 42|] DeletePayloadv2                                // 42
+        | [|Type == 43|] VendorIDPayloadv2                              // 43
+        | [|Type == 44 || Type == 45|] TrafficSelectorPayloadv2         // 44/45
+        | [|Type == 46|] EncryptedPayloadv2                             // 46
+        | [|Type == 47|] ConfigurationPayloadv2                         // 47
+        | [|Type == 48|] EAPPayloadv2                                   // 48
+        | [|Type >= 49 && Type <= 127|] ReservedPayload                 // 49~127
+        | [|Type == 129|] GssapiPayloadPacket                           // 129
+        | [|Type == 133|] CryptoPayloadEncryptionFlagNotSet             // 133
+        | [|Type == 134|] GssIDPayloadPacket                            // 134
+        | [|Type == 135|] AuthPayloadPacket                             // 135
+        | [|Type >= 128|] PrivateUsePayload) Payload;                   // 128~255
+}
+
+pattern PayloadChoice = SecurityAssociationPayloadv1 | ProposalPayloadv1 | TransformPayloadv1 | KeyExchangePayloadv1 | IdentificationPayloadv1
+        | CertificatePayloadv1 | CertificateRequestPayloadv1 | HashPayloadv1 | SignaturePayloadv1 | NoncePayloadv1 | NotifyPayloadPacket
+        | DeletePayloadv1 | VendorIDPayloadv1 | NATDiscoveryPayload | NATOriginalAddressPayload | SecurityAssociationPayloadv2 | KeyExchangePayloadv2
+        | IdentificationPayloadsv2 | CertificatePayloadv2 | CertificateRequestPayloadv2 | AuthenticationPayloadv2 | NoncePayloadv2 | NotifyPayloadv2
+        | DeletePayloadv2 | VendorIDPayloadv2 | TrafficSelectorPayloadv2 | EncryptedPayloadv2 | ConfigurationPayloadv2 | EAPPayloadv2 | ReservedPayload 
+        | GssapiPayloadPacket | CryptoPayloadEncryptionFlagNotSet | GssIDPayloadPacket | AuthPayloadPacket | PrivateUsePayload | CryptoPayloadEncryptionFlagSet | binary;
+       
+// [MS-AIPS] 2.2.3.1 GSS-API Payload (Payload Type 0x81) Packet
+type GssapiPayloadPacket:GenericPayloadHeader
+{
+    uint Status with DisplayInfo{ToText = (any input) => NtStatusValuesToText(input as uint)};
+    GssapiPayload_Flag Flags where ValidationCheckCombinationValueTooManyItems(InRange<GssapiPayload_Flag>(value), null, true, ReferenceType.Type, "AuthIP", "Flags", "GssapiPayloadPacket", "GSS-API Payload (Payload Type 0x81) Packet", "MS-AIPS");
+    optional [|PayloadLength - 9 > 0|] (binary | GssapiType) Gssapi_Token with BinaryEncoding{Length = (PayloadLength - 9)};
+}
+
+pattern GssapiPayload_Flag = flags byte
+{
+    GSS_NEW_GSS_EXCHANGE = 0x01,
+    GSS_IMPERSONATION_ACTIVE = 0x02,
+    GSS_RETRY_CURRENT_AUTHENTICATION = 0x04,
+    GSS_EXPLICIT_CREDENTIALS = 0x08,
+    GSS_RESPONDER_AUTH_COMPLETE = 0x10,
+    ...
+};           
+            
+// [MS-AIPS] 2.2.3.2 Crypto Payload (Payload Type 0x85) Packet
+
+// [MS-AIPS] 2.2.3.2.1 Crypto Payload 0x85 Encryption Flag Set
+type CryptoPayloadEncryptionFlagSet[uint MessageLength]:GenericPayloadHeader
+{
+    uint seqNUM;
+    binary Initialization_Vector with BinaryEncoding{Length = (PayloadLength - 8)};
+    binary Encrypted_Payloads with BinaryEncoding{Length = (MessageLength - PayloadLength - 12 - 28)};
+    binary Integrity_Checksum_Data with BinaryEncoding{Length = 12};
+}
+
+// [MS-AIPS] 2.2.3.2.2 Crypto Payload 0x85 Encryption Flag Not Set
+type CryptoPayloadEncryptionFlagNotSet:GenericPayloadHeader
+{
+    uint seqNUM;
+    optional [|PayloadLength - 8 > 0|] binary Initialization_Vector with BinaryEncoding{Length = (PayloadLength - 8)};
+}
+
+pattern String16 = string with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+
+// [MS-AIPS] 2.2.3.3 GSS_ID 0x86 Payload Packet
+type GssIDPayloadPacket:GenericPayloadHeader
+{
+    String16 SPN with BinaryEncoding{Length = ((PayloadLength - 4) / 2)};
+}
+
+// [MS-AIPS] 2.2.3.4 Auth Payload (Payload Type 0x87) Packet
+type AuthPayloadPacket:GenericPayloadHeader
+{
+    array<AuthMethodType> Auth_Methods with BinaryEncoding{Length = ((PayloadLength - 4) / 4)};
+}
+
+pattern AuthPayloadPacket_AuthMethod = enum ushort
+{
+    Kerberos    = 0x0002,
+    Anonymous   = 0x0003,
+    TLS         = 0x0004,
+    NTLM        = 0x0005,
+    ...
+};
+
+type AuthMethodType
+{
+    AuthPayloadPacket_AuthMethod Auth_Method
+        where ValidationCheckEnumValue(InRange<AuthPayloadPacket_AuthMethod>(value), null, true, ReferenceType.Type, "AuthIP", "Auth_Method", "AuthMethodType", "0x0002, 0x0003, 0x0004, 0x0005", value);
+    ushort Flags 
+        where ValidationCheckValue(value == 0, null, true, ReferenceType.Type, "AuthIP", "Flags", "AuthPayloadItem", "0", value);
+}
+
+// [MS-AIPS] 2.2.3.5 Notify Payload (Payload Type 0x0B) Packet
+type NotifyPayloadPacket:GenericPayloadHeader
+{
+    uint Domain_of_Interpretation 
+        where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "AuthIP", "Domain_of_Interpretation", "NotifyPayloadPacket", "1", value);
+    byte ProtocolID with DisplayInfo{ToText = (any input) => ProtocolIDToText(input as byte)};
+    NotifyPayloadPacket_Flags Flags 
+        where ValidationCheckCombinationValueIncludeZero(InRange<NotifyPayloadPacket_Flags>(value), null, true, ReferenceType.Type, "AuthIP", "Flags", "NotifyPayloadPacket", "0x01", value);
+    NotifyPayloadPacket_NotifyMessageType Notify_Message_Type 
+        where ValidationCheckEnumValueTooManyItems(InRange<NotifyPayloadPacket_NotifyMessageType>(value), null, true, ReferenceType.Type, "AuthIP", "Notify_Message_Type", "NotifyPayloadPacket", "Notify_Message_Type", "MS-AIPS");
+    optional [|(PayloadLength - 12) > 0|]
+        ([|Notify_Message_Type is NotifyPayloadPacket_NotifyMessageType.NOTIFY_STATUS|] NOTIFY_STATUS_Type
+        | [|Notify_Message_Type is NotifyPayloadPacket_NotifyMessageType.NOTIFY_DOS_COOKIE|] IKE.NOTIFY_DOS_COOKIE_Type
+        | [|Notify_Message_Type is NotifyPayloadPacket_NotifyMessageType.EXCHANGE_INFO|] IKE.EXCHANGE_INFO_Type
+        | [|Notify_Message_Type is NotifyPayloadPacket_NotifyMessageType.NOTIFY_ACK|] NOTIFY_ACK_Type
+        | [|Notify_Message_Type is NotifyPayloadPacket_NotifyMessageType.NOTIFY_ACQUIRE|] NotifyAcquirePacket
+        | binary) NotificationData with BinaryEncoding{WidthForComposedType = ((PayloadLength - 12) * 8) as int};
+        
+    static string ProtocolIDToText(byte input)
+    {
+        switch(input)
+        {
+            case 0x01 => return "MM/EM notification(" + input.ToString() + ")";
+            case 0x02 => return "QM notification(" + input.ToString() + ")";
+            default => return input.ToString();
+        }
+    }
+}
+
+pattern NotifyPayloadPacket_Flags = flags byte
+{
+    RELIABLE_NOTIFY_FLAG = 0x01,
+    ...
+};
+
+pattern NotifyPayloadPacket_NotifyMessageType = enum ushort
+{
+    EXCHANGE_INFO = 0x9C45,
+    NOTIFY_STATUS = 0x9C54,
+    NOTIFY_DOS_COOKIE = 0x9C55,
+    NOTIFY_ACK = 0x9C56,
+    NOTIFY_QM_SYNCHRONIZE = 0x9C57,
+    NOTIFY_ACQUIRE = 0x9C58,
+    ...
+};
+
+type NOTIFY_STATUS_Type
+{
+    uint NOTIFY_STATUS with DisplayInfo{ToText = (any input) => NtStatusValuesToText(input as uint)};
+}
+
+type NOTIFY_ACK_Type
+{
+    uint NOTIFY_ACK;
+}
+
+// [MS-AIPS] 2.2.3.6 Notify Payload (Payload Type 0x0B) Notify Acquire Packet
+type NotifyAcquirePacket
+{
+    uint Encapsulation_Mode;
+    NotifyAcquirePacket_Flags Flags 
+        where ValidationCheckCombinationValueIncludeZero(InRange<NotifyAcquirePacket_Flags>(value), null, true, ReferenceType.Type, "AuthIP", "Flags", "NotifyAcquirePacket", "0x00000002", value);
+}
+
+pattern NotifyAcquirePacket_Flags = flags uint
+{
+    IKE_EXCHANGE_INFO_GUARANTEE_ENCRYPTION = 0x00000002,
+    ...
+};
+
+// [MS-AIPS] 2.2.3.7 Key Dictation Payload (Payload Type 0x88)
+// The definition here is only for TDGen, for it will always be encrypted on the wire.
+type KeyDictationPayload:GenericPayloadHeader
+{
+    binary Initialization_Vector;
+    binary Encrypted_Payloads;
+    binary Padding;
+    byte Pad_Length;
+    byte Next_Payload;
+    binary Integrity_Checksum_Data;
+}
+
+// [MS-AIPS] 2.2.3.8 Key Dictation Weight Payload (Payload Type 0x89)
+// The definition here is only for TDGen, for it will always be encrypted on the wire.
+type KeyDictationWeightPayload:GenericPayloadHeader
+{
+    uint Key_Dictation_Weight;
+}
+
+// 49~127
+type ReservedPayload:GenericPayloadHeader
+{
+    binary Data with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+// 128~255
+type PrivateUsePayload:GenericPayloadHeader
+{
+    binary Data with BinaryEncoding{Length = (PayloadLength - 4)};
+}
+
+optional IsakmpMessage AuthIPDecoder(binary binaryValue)
+{
+    if (binaryValue.Count < 4)
+    {
+        return nothing;
+    }
+    if (binaryValue.Segment(0,4) == $[00000000])
+    {
+        binaryValue = binaryValue.Segment(4);
+    }
+    stream s = binaryValue;
+    
+    // head processing
+    var datagram = BinaryDecoder<IsakmpMessage>(s);
+    if (datagram == nothing)
+    {
+        return nothing;
+    }
+    IsakmpMessage d = datagram as IsakmpMessage;
+    array<byte> payloadsType = [];
+    array<AuthIP.PayloadChoice> arrPayloads = [];
+    if (d.IsakmpHeader.Flags is f1:Flagsv1)
+    {
+        if (f1.Encryption == 1 && d.IsakmpHeader.NextPayload == 133)
+        {
+            DataChunks pChunk = new DataChunks{
+                        DataSource = s, 
+                        Chunks = [new BinaryChunk{BitPosition = s.BitPosition, BitLength = s.BitLength - s.BitPosition}],
+                        };
+            var p = BinaryDecoder<CryptoPayloadEncryptionFlagSet[d.IsakmpHeader.Length]>(s);
+            if (p != nothing)
+            {
+                arrPayloads += [p as CryptoPayloadEncryptionFlagSet];
+                payloadsType += [d.IsakmpHeader.NextPayload];
+            }
+            else
+            {
+                arrPayloads += [s.PeekBytes(s.BitPosition)];
+                ValidationCheck(false, d, DiagnosisLevel.Warning, AuthIP_STR_CANNOT_DECODE_CRYPTO_PAYLOAD);
+            }
+            d.Payloads = arrPayloads;
+            d#PayloadsType = payloadsType;
+            d.AssociateArrayField("Payloads", [pChunk]);
+            d.AssociateField("Payloads", pChunk);
+            return d;
+        }
+    }
+    
+    //payload processing
+    int prePos = s.BitPosition;
+    byte nextType = d.IsakmpHeader.NextPayload;
+    array<DataChunks> chunks = [];
+    DataChunks payloadChunk = new DataChunks{
+                DataSource = s, 
+                Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitLength - prePos }],
+                };
+    while (s.BytePosition < s.ByteLength)
+    {
+        byte currentType = nextType;
+        nextType = s.CurrentByte;
+        var p = BinaryDecoder<AuthIP.Payloads[currentType]>(s);
+        if (p != nothing)
+        {
+            PayloadChoice payload = (p as Payloads).Payload;
+            if (currentType == 129 && 
+                payload is gssapiPayloadPacket:GssapiPayloadPacket &&
+                gssapiPayloadPacket.Gssapi_Token is b:binary &&
+                IsGSSAPIByCheckingTag(b))
+            {
+                var gssapi = DecodeGssapiAndSetAnnotation(b, d);
+                if (gssapi != nothing)
+                {
+                    gssapiPayloadPacket.Gssapi_Token = gssapi;
+                }
+            }
+            arrPayloads += [payload];
+            chunks += [new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitPosition - prePos}]}];
+            payloadsType += [currentType];
+            prePos = s.BitPosition;
+        }
+        else
+        {
+            // WORKAROUND for truncation parsing: disable the validation since it's very easy to trigger under truncation situation.
+            // ValidationCheck(false, d, "Parsing payload failed due to invalid data.");
+            break;
+        }
+            
+        if (nextType == 0)
+        {
+            break;
+        }
+    }
+    d.Payloads = arrPayloads;
+    d#PayloadsType = payloadsType;
+    d.AssociateArrayField("Payloads", chunks);
+    d.AssociateField("Payloads", payloadChunk);
+    
+    return d;
+}

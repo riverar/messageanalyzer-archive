@@ -1,0 +1,418 @@
+protocol MSFSSHTTP with
+Documentation
+{
+    ProtocolName = "File Synchronization via SOAP over HTTP Protocol",
+    ShortName = "MS-MSFSSHTTP",
+    DocumentName = "MS-MSFSSHTTP",
+    ProtocolType = "SOAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2014 Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-MSFSSHTTP", Version = "3.3"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision {Class=RevisionClass.Major, Version="1.0.0", Date="06/10/2014"},
+        ]
+};
+
+using SOAP;
+using HTTP;
+using MSFSSHTTPB;
+using Utility;
+using Technologies.SOAP;
+using XSD;
+using Diagnostics;
+
+// --------- Const variables ------------
+const string TnsNamespace = "http://schemas.microsoft.com/sharepoint/soap/";
+const string XopNamespace = "http://www.w3.org/2004/08/xop/include";
+const string ModuleName = "MSFSSHTTP";
+const binary XopMimeContentType = $[6170706C69636174696F6E2F786F702B786D6C]; // "application/xop+xml"
+const binary FSSHTTPBMarker = $[0C000B00];
+
+// WORKAROUND: We found the 0D magic number in some FSSHTTPB traffic.
+const binary FSSHTTPBMarker_2 = $[0D000B00]; 
+const binary CRLF = $[0D0A];  // "\r\n"
+const binary ContentID = $[436F6E74656E742D49443A]; // "Content-ID:"
+const binary OpenAngele  = $[3C]; //  "<"
+const binary CloseAngele = $[3E]; //  ">"
+const binary Boundary = $[2D2D]; // "--"
+const string CID = "cid:";
+syntax LiteralString = s:regex{[\x00-\x7F]+} => s; 
+
+// WORKAROUND: Using global variable to keep the raw XOP binary required by FSSHTTP codec.
+map<string, binary> _requestXOPBinaryMap = {};
+map<string, binary> _responseXOPBinaryMap = {};
+
+annotation map<ulong, map<ulong, string>> RequestMessage#TypeMap;
+annotation map<ulong, map<ulong, string>> ResponseMessage#TypeMap;
+
+const map<string, string> SoapActionsMap =
+{
+    "http://schemas.microsoft.com/sharepoint/soap/ICellStorages/ExecuteCellStorageRequest" -> "ExecuteCellStorageRequest"
+};
+
+endpoint Server over SOAP.Server accepts RequestMessage issues ResponseMessage;
+client endpoint Client connected to Server;
+
+autostart actor ActorOverSOAP(SOAP.Server soapServer)
+{
+    map<ulong, map<ulong, string>> _requestTypeMap = {};
+    
+    observe soapServer accepts soapMsg:SOAP.SoapMessage where ((soapMsg.SoapAction as string) in SoapActionsMap)
+    {
+        any message underlyingMessage = soapMsg.Origins[0];
+        if (underlyingMessage is HttpContract.Request)
+        {
+            HttpContract.Request httpRequestMessage = underlyingMessage as HttpContract.Request;
+            binary rawBytes = httpRequestMessage.Payload;
+            UpdateXopReferenceData(rawBytes, ref _requestXOPBinaryMap);
+        }      
+    }
+    
+    observe soapServer issues soapMsg:SOAP.SoapMessage where ((soapMsg.SoapAction as string) in SoapActionsMap)
+    {
+        any message underlyingMessage = soapMsg.Origins[0];
+        if (underlyingMessage is HttpContract.Response)
+        {
+            HttpContract.Response httpResponseMessage = underlyingMessage as HttpContract.Response;
+            binary rawBytes = httpResponseMessage.Payload;
+            UpdateXopReferenceData(rawBytes, ref _responseXOPBinaryMap);
+        }
+    }
+    
+    process soapServer accepts soapMsg:SOAP.SoapMessage where ((soapMsg.SoapAction as string) in SoapActionsMap)
+    {
+        switch (soapMsg.Body)
+        {
+            case msg:MSFSSHTTP.RequestMessage from XmlDecoder<MSFSSHTTP.RequestMessage> =>
+                _requestTypeMap = {};
+                 UpdateRequestTypeMap(msg, ref _requestTypeMap);
+                 msg#TypeMap = _requestTypeMap;
+                 dispatch (endpoint Server over soapServer) accepts msg;
+            default =>
+                ThrowDecodingException("MS-FSSHTTP", "Request Message");
+        }
+    }   
+    
+    process soapServer issues soapMsg:SOAP.SoapMessage where ((soapMsg.SoapAction as string) in SoapActionsMap)
+    {
+        switch (soapMsg.Body)
+        {
+            case msg:MSFSSHTTP.ResponseMessage from XmlDecoder<MSFSSHTTP.ResponseMessage> =>
+                 map<ulong, map<ulong, string>> _responseTypeMap = {};
+                 GetResponseTypeMap(msg, ref _requestTypeMap, ref _responseTypeMap);
+                 msg#TypeMap = _responseTypeMap;
+                 dispatch (endpoint Server over soapServer) issues msg;
+            default =>
+                ThrowDecodingException("MS-FSSHTTP", "Response Message");
+        }
+    }
+}
+
+// 2.2.2.1   Request
+message RequestMessage
+{
+    VersionType RequestVersion with XmlEncoding{Name = "RequestVersion", Kind = XmlKind.Element, Namespace = TnsNamespace};
+    RequestCollectionType RequestCollection with XmlEncoding{Name = "RequestCollection",  Kind = XmlKind.Element, Namespace = TnsNamespace};
+
+    override string ToString()
+    {
+        string summary = "Request";
+        map<ulong, map<ulong, string>> typeMap = this#TypeMap as map<ulong, map<ulong, string>>;
+        int count = 0;
+        string types = "";
+        
+        foreach (var rk in typeMap.Keys)
+        {
+            foreach (var sk in typeMap[rk].Keys)
+            {
+                count++;
+                types += typeMap[rk][sk] + ",";
+            }
+        }
+        
+        if (count == 1)
+            return Format("{0}, {1} sub-request", summary, types.Segment(0, types.Count - 1));
+
+        return Format("{0}, {1} sub-request(s)", summary, count);
+    }
+}
+
+// 2.2.2.2   Response
+message ResponseMessage
+{
+    VersionType ResponseVersion with XmlEncoding{Name = "ResponseVersion", Kind = XmlKind.Element, Namespace = TnsNamespace};
+    optional ResponseCollectionType ResponseCollection with XmlEncoding{Name = "ResponseCollection",  Kind = XmlKind.Element, Namespace = TnsNamespace};
+
+    override string ToString()
+    {
+        string summary = "Response";
+        map<ulong, map<ulong, string>> typeMap = this#TypeMap as map<ulong, map<ulong, string>>;
+        int count = 0;
+        string types = "";
+        
+        foreach (var rk in typeMap.Keys)
+        {
+            foreach (var sk in typeMap[rk].Keys)
+            {
+                count++;
+                types += typeMap[rk][sk] + ",";
+            }
+        }
+        
+        if (count == 1)
+        {   
+            var responseCollection = this.ResponseCollection as ResponseCollectionType;
+            var status =  responseCollection.Response[0].SubResponse[0].ErrorCode;
+            return Format("{0}, {1} sub-response, Status: {2}", 
+                          summary, 
+                          types.Segment(0, types.Count - 1),
+                          status);
+        }
+        
+        if (count == 0)
+            return Format("{0}, Status: {1}, 0 sub-response(s)", summary, this.ResponseVersion.ErrorCode as string);
+
+        return Format("{0}, {1} sub-response(s)", summary, count);
+    }
+}
+
+type VersionType
+{
+    string Version with XmlEncoding{Name = "Version", Kind = XmlKind.Attribute};
+    string MinorVersion with XmlEncoding{Name = "MinorVersion", Kind = XmlKind.Attribute};
+    optional string ErrorCode with XmlEncoding{Name = "ErrorCode", Kind = XmlKind.Attribute};
+}
+
+// 2.2.3.2   Request
+type RequestType
+{
+    array<SubRequestElementGenericType> SubRequest with XmlEncoding{Name = "SubRequest", Namespace = TnsNamespace};
+    optional string Url with XmlEncoding{Name = "Url", Kind = XmlKind.Attribute}; // TODO: optional or required?
+    optional uint Interval with XmlEncoding{Name = "Interval", Kind = XmlKind.Attribute};
+    optional int MetaData with XmlEncoding{Name = "MetaData", Kind = XmlKind.Attribute};
+    ulong RequestToken with XmlEncoding{Name = "RequestToken", Kind = XmlKind.Attribute};
+}
+
+// 2.2.3.3   RequestCollection
+type RequestCollectionType
+{
+    array<RequestType> Request with XmlEncoding{Name = "Request", Namespace = TnsNamespace};
+    string CorrelationId with XmlEncoding{Name = "CorrelationId", Kind = XmlKind.Attribute};
+}
+
+// 2.2.3.5   Response
+type ResponseType
+{
+    array<SubResponseElementGenericType> SubResponse with XmlEncoding{Name = "SubResponse", Namespace = TnsNamespace};
+    string Url with XmlEncoding{Name = "Url", Kind = XmlKind.Attribute};
+    ulong RequestToken with XmlEncoding{Name = "RequestToken", Kind = XmlKind.Attribute};
+    int HealthScore with XmlEncoding{Name = "HealthScore", Kind = XmlKind.Attribute};
+    optional string ErrorCode with XmlEncoding{Name = "ErrorCode", Kind = XmlKind.Attribute};
+    optional string ErrorMessage with XmlEncoding{Name = "ErrorMessage", Kind = XmlKind.Attribute};
+}
+
+// 2.2.3.6   ResponseCollection
+type ResponseCollectionType
+{
+    array<ResponseType> Response with XmlEncoding{Name = "Response", Namespace = TnsNamespace};
+    string WebUrl with XmlEncoding{Name = "WebUrl", Kind = XmlKind.Attribute};
+}
+
+// 2.2.4.1   SubRequestDataGenericType
+type SubRequestDataGenericType
+{
+    optional XOPIncludeElementType Include with XmlEncoding{Name = "Include", Kind = XmlKind.Element, Namespace = XopNamespace};
+    uint BinaryDataSize with XmlEncoding{Name = "BinaryDataSize", Kind = XmlKind.Attribute};    
+    optional MSFSSHTTPB.RequestMessage SubRequestBinaryData with XmlEncoding{Kind = XmlKind.Text},
+                Encoding{Decoder = BinaryDecoder<MSFSSHTTPB.RequestMessage>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+}with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// 2.2.4.2   SubRequestElementGenericType
+type SubRequestElementGenericType : SubRequestType
+{
+    optional SubRequestDataGenericType SubRequestData with XmlEncoding{Name = "SubRequestData", Kind = XmlKind.Element, Namespace = TnsNamespace};
+    string Type with XmlEncoding{Name = "Type", Kind = XmlKind.Attribute};
+}
+
+// 2.2.4.3   SubRequestType
+type SubRequestType
+{
+    ulong SubRequestToken with XmlEncoding{Name = "SubRequestToken",  Kind = XmlKind.Attribute};
+    optional ulong DependsOn with XmlEncoding{Name = "DependsOn",  Kind = XmlKind.Attribute};
+}
+
+// 2.2.4.4   SubResponseDataGenericType
+type SubResponseDataGenericType
+{
+    optional MSFSSHTTPB.ResponseMessage SubResponseBinaryData with XmlEncoding{Kind = XmlKind.Text},
+                Encoding{Decoder = BinaryDecoder<MSFSSHTTPB.ResponseMessage>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+    optional XOPIncludeElementType Include with XmlEncoding{Name = "Include", Kind = XmlKind.Element, Namespace = XopNamespace};
+    optional GetDocMetaInfoPropertySetType DocProps with XmlEncoding{Name = "DocProps", Namespace = TnsNamespace};
+    optional GetDocMetaInfoPropertySetType FolderProps with XmlEncoding{Name = "FolderProps", Namespace = TnsNamespace};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// http://www.w3.org/TR/2005/REC-xop10-20050125/#xop_include
+
+type XOPIncludeElementType
+{
+   string Href with XmlEncoding{Name = "href",  Kind = XmlKind.Attribute};
+}
+
+// 2.2.4.5   SubResponseElementGenericType
+type SubResponseElementGenericType : SubResponseType
+{
+    optional SubResponseDataGenericType SubResponseData with XmlEncoding{Name = "SubResponseData", Kind = XmlKind.Element, Namespace = TnsNamespace};
+    optional SubResponseStreamInvalidType SubResponseStreamInvalid with XmlEncoding{Name = "SubResponseStreamInvalid", Kind = XmlKind.Element, Namespace = TnsNamespace};
+    // TODO: GetVersionsResponse
+    // <xs:element ref="GetVersionsResponse" minOccurs="0" maxOccurs="1" />
+}
+
+type SubResponseStreamInvalidType
+{
+    // empty element
+}
+
+// 2.2.4.6   SubResponseType
+type SubResponseType
+{
+    ulong SubRequestToken with XmlEncoding{Name = "SubRequestToken",  Kind = XmlKind.Attribute};
+    string ErrorCode with XmlEncoding{Name = "ErrorCode",  Kind = XmlKind.Attribute};
+    long HResult with XmlEncoding{Name = "HResult",  Kind = XmlKind.Attribute};
+    optional string ErrorMessage with XmlEncoding{Name = "ErrorMessage",  Kind = XmlKind.Attribute};
+}
+
+// 2.3.1.28   GetDocMetaInfoPropertySetType
+type GetDocMetaInfoPropertySetType
+{
+    optional array<GetDocMetaInfoPropertyType> Properties with XmlEncoding{Name = "Property", Namespace = TnsNamespace};
+}
+
+// 2.3.1.29   GetDocMetaInfoPropertyType
+type GetDocMetaInfoPropertyType
+{
+    string Key with XmlEncoding{Name = "Key",  Kind = XmlKind.Attribute};
+    string Value with XmlEncoding{Name = "Value",  Kind = XmlKind.Attribute};
+}
+
+//===================Utility functions===================
+void UpdateRequestTypeMap(RequestMessage reqMsg, ref map<ulong, map<ulong, string>> _requestTypeMap)
+{ 
+    foreach (RequestType requestItem in reqMsg.RequestCollection.Request)
+    {
+        if (!(requestItem.RequestToken in _requestTypeMap))
+        {
+            _requestTypeMap[requestItem.RequestToken] = {};
+        }
+        
+        foreach (SubRequestElementGenericType subRequestItem in requestItem.SubRequest)
+        {
+            if (!(subRequestItem.SubRequestToken in _requestTypeMap[requestItem.RequestToken]))
+            {
+                _requestTypeMap[requestItem.RequestToken][subRequestItem.SubRequestToken] = subRequestItem.Type;
+            }
+        }
+    }
+    
+    reqMsg#TypeMap = _requestTypeMap;
+}
+
+void GetResponseTypeMap(ResponseMessage resMsg, ref map<ulong, map<ulong, string>> _requestTypeMap, ref map<ulong, map<ulong, string>> _responseTypeMap)
+{
+    if (_requestTypeMap.Count == 0)
+    {
+        _responseTypeMap = {};
+        return;
+    }
+        
+    if (resMsg.ResponseCollection != nothing)
+    {
+      foreach (ResponseType responseItem in (resMsg.ResponseCollection as ResponseCollectionType).Response)
+      {
+          if (!(responseItem.RequestToken in _responseTypeMap))
+          {
+              _responseTypeMap[responseItem.RequestToken] = {};
+          }
+      
+          foreach (SubResponseElementGenericType subResponseItem in responseItem.SubResponse)
+          {
+              if (!(subResponseItem.SubRequestToken in _responseTypeMap[responseItem.RequestToken]))
+              {
+                  _responseTypeMap[responseItem.RequestToken][subResponseItem.SubRequestToken] = 
+                      _requestTypeMap[responseItem.RequestToken][subResponseItem.SubRequestToken];
+              }
+          }
+      }
+    }
+}
+
+void UpdateXopReferenceData(binary rawData, ref map<string, binary> xopBinaryMap)
+{
+    int length = rawData.Count;
+    int pos = 0;
+    
+    while (pos < length)
+    {
+        int xopTypeIndex = rawData.IndexOf(XopMimeContentType, pos);
+        
+        if (xopTypeIndex < 0)
+            break;
+
+        // jump to next body
+        int boundaryIndex = rawData.IndexOf(Boundary, xopTypeIndex);
+        
+        // exit if no xop reference data found
+        int cidIndex = rawData.IndexOf(ContentID, boundaryIndex);
+        if (cidIndex < 0)
+            break;
+ 
+        int openAngeleIndex = rawData.IndexOf(OpenAngele, cidIndex);
+        int closeAngeleIndex = rawData.IndexOf(CloseAngele, openAngeleIndex);
+        string cid = LiteralString(rawData.Segment(openAngeleIndex + 1, closeAngeleIndex - openAngeleIndex - 1)) as string;
+        int fsshttpBitsStartIndex = rawData.IndexOf(FSSHTTPBMarker, closeAngeleIndex);
+        
+        if (fsshttpBitsStartIndex < 0)
+            fsshttpBitsStartIndex = rawData.IndexOf(FSSHTTPBMarker_2, closeAngeleIndex);
+
+        if (fsshttpBitsStartIndex < 0)
+            throw Format("Can't find FSSHTTPB resource with cid = {0}", cid);
+
+        int fsshttpBitsEndIndex = rawData.IndexOf(CRLF, fsshttpBitsStartIndex);
+        binary fsshttpBits = rawData.Segment(fsshttpBitsStartIndex, fsshttpBitsEndIndex - fsshttpBitsStartIndex);
+        xopBinaryMap[NormalizeContentID(cid)] = fsshttpBits;
+        pos = fsshttpBitsEndIndex;
+    }
+}
+
+string NormalizeContentID(string cid)
+{
+    string tmp = cid.Replace("%3A", ":");
+    tmp = tmp.Replace("%2F", "/");
+    return tmp;
+}
+
+string BinaryToString(binary rawBytes)
+{
+    string result = "";
+    int bytesLen = rawBytes.Count;
+    int linkBreakNum = 16;
+    
+    for (int i = 0; i < bytesLen; i++)
+    {
+        if (i < bytesLen - 1)
+            result = result + Format("0x{0:X2}, ", rawBytes[i]);
+        else
+            result = result + Format("0x{0:X2}", rawBytes[i]);
+            
+        if ((i + 1) % linkBreakNum == 0)
+            result = result + "\r\n";
+    }
+    
+    return result;
+}

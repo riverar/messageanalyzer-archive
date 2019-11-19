@@ -1,0 +1,214 @@
+protocol PKAP with
+Documentation
+{
+    ProtocolName = "Public Key Authentication Protocol",
+    ShortName = "PKAP"
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-PKAP", Version = "2.0", Date = "06/01/2017", ProgramName = ProgramName.WSPP},
+        new Reference {Name = "RFC 7515"},
+        new Reference {Name = "RFC 7519"},
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "376702", Date = "07/21/2015"}
+    ]
+};
+
+using Utility;
+using HTTP;
+using X509;
+using IdentityAndSecurityResources;
+
+autostart actor PKAPExtendsHTTPAuthentication(HTTP.Server node) 
+{
+    // 3.2.5.1  Issuer based certificate challenge
+    observe node issues res:HTTP.HttpContract.Response where res.StatusCode == 302 && res.Headers.Keys["Location"] 
+    {
+        if (res.Headers["Location"] is urn:UrnType && 
+            urn.NamespaceIdentifier == "http-auth" && urn.NamespaceSpecificString == "PKeyAuth" && 
+            urn.Query is q:map<string, string> && "SubmitUrl" in q.Keys)
+        {
+            q["SubmitUrl"] = PercentDecoder(q["SubmitUrl"]) as string;
+            urn.Query = q; // map was clone in 'if' statement.
+            res#AuthInformation = "PKeyAuth";
+        }
+    }
+    
+    // 3.2.5.2 Thumbprint based certificate challenge
+    observe node issues res:HTTP.HttpContract.Response where res.StatusCode == 401 && 
+        res.Headers.Keys["WWW-Authenticate"] && res.Headers["WWW-Authenticate"] is challenges:array<HTTP.Challenge> && 
+        challenges.Count > 0 && challenges[0].AuthSchema == "PKeyAuth"
+    {
+        array<HTTP.Challenge> challengeArrayRet = [];
+        foreach (HTTP.Challenge challenge in challenges)
+        {
+            if (challenge.AuthSchema == "PKeyAuth" && challenge.AuthParam is authParam:string && authParam is StringNotNullOrEmpty)
+            {
+                if (AuthParams(authParam as string) is authParamMap:map<string, string>)
+                {
+                    var ret = new PKeyAuthChallenge{AuthSchema = "PKeyAuth", AuthParam = authParamMap};
+                    challengeArrayRet += [ret];
+                }
+                else
+                {
+                    challengeArrayRet += [challenge];
+                }
+            }
+            else
+            {
+                challengeArrayRet += [challenge];
+            }
+        }
+        res.Headers["WWW-Authenticate"] = challengeArrayRet;
+        res#AuthInformation = "PKeyAuth";
+    }
+
+    // 3.1.5.2  Issuer based certificate challenge response
+    // 3.1.5.3  Thumbprint based certificate challenge response
+    observe node accepts req:HTTP.HttpContract.Request where req.Headers.Keys["Authorization"] && 
+        req.Headers["Authorization"] is credentials:HTTP.Credentials && credentials.AuthSchema == "PKeyAuth"
+    {
+        if (credentials.AuthParam is str:string &&
+            AuthParams(str) is authparams:map<string, string>)
+        {
+             map<string, any> authParamMap = {}.ToOrdered();
+             foreach (var pair in authparams)
+             {
+                // decode AuthToken as JWS
+                if (pair.Key == "AuthToken" && pair.Value is StringNotNullOrEmpty)
+                {
+                    array<string> jwsParts = pair.Value.Split(['.']);
+                    if (jwsParts.Count == 3)
+                    {
+                        JWS jws = new JWS();
+                        // header
+                        if (Base64StringToBinary(jwsParts[0]) is headerBin:binary)
+                        {
+                             if (JsonDecoder<ClientTokenJWSHeaders>(headerBin) is header:ClientTokenJWSHeaders)
+                                jws.header = header;
+                             else 
+                                jws.header = headerBin;
+                        }
+                        else
+                        {
+                            jws.header = jwsParts[0];
+                        }
+                        // body
+                        if (Base64StringToBinary(jwsParts[1]) is payloadBin:binary)
+                        {
+                            if (JsonDecoder<ClientToken>(payloadBin) is token:ClientToken)
+                                jws.payload = token;
+                            else
+                                jws.payload = payloadBin;
+                        }
+                        else
+                        {
+                            jws.payload = jwsParts[1];
+                        }
+                        // signature
+                        if (Base64StringToBinary(jwsParts[2]) is sig:binary)
+                        {
+                            jws.signature = sig;
+                        }
+                        else
+                        {
+                            jws.signature = jwsParts[2];
+                        }
+                        authParamMap[pair.Key] = jws;
+                    }
+                    else
+                    {
+                        authParamMap[pair.Key] = pair.Value;
+                    }
+                }
+                else
+                {
+                    authParamMap[pair.Key] = pair.Value;
+                }
+             }
+             credentials.AuthParam = authParamMap;
+             req#AuthInformation = "PKeyAuth";
+        }
+    }
+}
+
+// http://tools.ietf.org/html/rfc7515#section-3
+// JWS header ¡®.¡¯ Payload ¡®.¡¯ JWS signature
+// JSON Web Signature (JWS): A data structure representing a digitally signed or MACed message.
+type JWS
+{
+    (ClientTokenJWSHeaders | string | binary) header;
+    (ClientToken | string | binary) payload;
+    (binary | string) signature;
+
+    override string ToString()
+    {
+        return header.ToString();
+    }
+}
+
+type ClientTokenJWSHeaders
+{
+    string token_type with JsonEncoding{Name = "typ"};
+    string signing_algorithm with JsonEncoding{Name = "alg"};
+    // http://tools.ietf.org/html/rfc7515#section-4.1.6
+    array<X509.Certificate> signing_cert with JsonEncoding{Name = "x5c"},
+        Encoding{Decoder = Certs_Decoder, SourcePattern = TypeOf<array<string>>()};
+
+    optional array<X509.Certificate> Certs_Decoder(array<string> strs)
+    {
+        array<X509.Certificate> certs = [];
+        foreach (string s in strs)
+        {
+            if (Base64StringToBinary(s) is bin:binary && Asn1BerDecoder<X509.Certificate>(bin) is cert:X509.Certificate)
+            {
+                certs += [cert];
+            }
+            else
+            {
+                ValidationCheck(false, null, PKAP_CERT_DECODING_FAILURE);
+            }
+        }
+        return certs;
+    }
+
+    override string ToString()
+    {
+        return "token_type: " + token_type + ", signing_algorithm: " + signing_algorithm;
+    }
+}
+
+type ClientToken
+{
+    string server_challenge_nonce with JsonEncoding{Name = "nonce"};
+    string server_endpoint with JsonEncoding{Name = "aud"};
+    long creation_timestamp with JsonEncoding{Name = "iat"}
+        with DisplayInfo{ToText = (any data) => CreateDateTime(1970, 1, 1).AddSeconds(data as long).ToString() + " UTC"};
+
+    override string ToString()
+    {
+        return "server_challenge_nonce: " + server_challenge_nonce + 
+            ", server_endpoint: " + server_endpoint;
+    }
+}
+
+// a="v1", b = "v2", ...
+syntax AuthParams = s1:HTTP.AuthParam s2:(LWS* "," LWS* s21:HTTP.AuthParam => s21)*
+     => MergeQueryParameters([s1] + s2);
+
+// 3.2.5.2  Thumbprint based certificate challenge
+type PKeyAuthChallenge : HTTP.Challenge
+{
+    new map<string, string> AuthParam;
+}
+
+type PKeyAuthCredentials : HTTP.Credentials
+{
+    new JWS AuthParam;
+}
+

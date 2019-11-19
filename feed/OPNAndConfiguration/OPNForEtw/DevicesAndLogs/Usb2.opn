@@ -1,0 +1,2674 @@
+// Parse USB2 host controller events (usbhub and usbport drivers)
+protocol Usb2;
+using Etw;
+using EtwEvent;
+using Standard;
+using Diagnostics;
+
+using Microsoft_Windows_USB_USBHUB;
+using Microsoft_Windows_USB_USBPORT;
+using NtStatusModule;
+using UsbCommon;
+using UsbSpec;
+using UsbMessageProt;
+
+endpoint Usb2Globals accepts EmptyMessage {
+
+    map<ulong, int> DeviceInstanceFromUsb2DeviceHandle = {};
+    map<string, int> DeviceInstanceFromControllerAndPortPathUsb2 = {};
+    map<string, ulong> Usb2DeviceHandleFromControllerAndPortPath = {};
+
+    map<ulong, int> ControllerInstanceFromUsb2ControllerObject = {};
+    map<string, int> ControllerInstanceFromControllerIdsUsb2 = {};
+    map<string, ulong> Usb2ControllerObjectFromControllerIds = {};
+}
+
+int GetDeviceInstanceUsb2(int controllerInstance, ulong deviceHandle, string portPath)
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    var usb2Globals = endpoint Usb2Globals;
+    string controllerAndPortPath = Format("{0} {1}", controllerInstance, portPath);
+    if (!(deviceHandle in usb2Globals.DeviceInstanceFromUsb2DeviceHandle)) {
+
+        //
+        // First appearance of this device handle. Determine new vs. existing device instance.
+        //
+        if (controllerAndPortPath in usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2 &&
+            !(controllerAndPortPath in usb2Globals.Usb2DeviceHandleFromControllerAndPortPath)) {
+
+            //
+            // Port path already seen, but never associated with a device handle. Copy the device
+            // instance that was associated to the port path.
+            //
+            usb2Globals.DeviceInstanceFromUsb2DeviceHandle[deviceHandle] =
+                usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2[controllerAndPortPath];
+
+        } else {
+
+            //
+            // Port path not seen before or seen with a different device handle. Create a new device
+            // instance.
+            //
+            usb2Globals.DeviceInstanceFromUsb2DeviceHandle[deviceHandle] =
+                usbCommonGlobals.g_NextUnusedDeviceInstance;
+            usbCommonGlobals.g_NextUnusedDeviceInstance++;
+
+            usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2[controllerAndPortPath] =
+                usb2Globals.DeviceInstanceFromUsb2DeviceHandle[deviceHandle];
+            UpdateDeviceMap(usb2Globals.DeviceInstanceFromUsb2DeviceHandle[deviceHandle]);
+        }
+
+        //
+        // Ensure that events carrying port path and not device handle get the latest device handle
+        // that was created at that port path.
+        //
+        usb2Globals.Usb2DeviceHandleFromControllerAndPortPath[controllerAndPortPath] = deviceHandle;
+    }
+
+    return usb2Globals.DeviceInstanceFromUsb2DeviceHandle[deviceHandle];
+}
+int GetDeviceInstanceUsb2(int controllerInstance, string portPath) // for events that don't have a device handle
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    var usb2Globals = endpoint Usb2Globals;
+    string controllerAndPortPath = Format("{0} {1}", controllerInstance, portPath);
+    if (!(controllerAndPortPath in usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2)) {
+
+        usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2[controllerAndPortPath] =
+            usbCommonGlobals.g_NextUnusedDeviceInstance;
+        usbCommonGlobals.g_NextUnusedDeviceInstance++;
+
+        UpdateDeviceMap(usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2[controllerAndPortPath]);
+    }
+
+    return usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2[controllerAndPortPath];
+}
+int GetDeviceInstanceUsb2(int controllerInstance, fid_USBHUB_Device device)
+{
+    return GetDeviceInstanceUsb2(controllerInstance,
+                                 UlongFromEtwPointer(device.Fid_DeviceHandle),
+                                 PortPathToString(device.Fid_PortPath));
+}
+int GetDeviceInstanceUsb2(int controllerInstance, fid_USBPORT_Device device)
+{
+    return GetDeviceInstanceUsb2(controllerInstance,
+                                 UlongFromEtwPointer(device.DeviceHandle),
+                                 PortPathToString(device.PortPath));
+}
+int GetDeviceInstanceUsb2(int controllerInstance, fid_USBHUB_Hub device)
+{
+    return GetDeviceInstanceUsb2(controllerInstance, PortPathToString(device.Fid_PortPath));
+}
+void DeviceInstanceRemovedUsb2(int controllerInstance, fid_USBHUB_Device device)
+{
+    var usb2Globals = endpoint Usb2Globals;
+    ulong deviceHandle = UlongFromEtwPointer(device.Fid_DeviceHandle);
+    string portPath = PortPathToString(device.Fid_PortPath);
+    string controllerAndPortPath = Format("{0} {1}", controllerInstance, portPath);
+    usb2Globals.DeviceInstanceFromUsb2DeviceHandle.Remove(deviceHandle);
+    usb2Globals.DeviceInstanceFromControllerAndPortPathUsb2.Remove(controllerAndPortPath);
+    usb2Globals.Usb2DeviceHandleFromControllerAndPortPath.Remove(controllerAndPortPath);
+}
+
+int GetControllerInstanceUsb2(ulong controllerObject, string controllerIds)
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    var usb2Globals = endpoint Usb2Globals;
+    if (!(controllerObject in usb2Globals.ControllerInstanceFromUsb2ControllerObject)) {
+
+        //
+        // First appearance of this controller object. Determine new vs. existing controller instance.
+        //
+        if (controllerIds in usb2Globals.ControllerInstanceFromControllerIdsUsb2 &&
+            !(controllerIds in usb2Globals.Usb2ControllerObjectFromControllerIds)) {
+
+            //
+            // Controller IDs already seen, but never associated with a controller object. Copy the
+            // controller instance that was associated to the port path.
+            //
+            usb2Globals.ControllerInstanceFromUsb2ControllerObject[controllerObject] =
+                usb2Globals.ControllerInstanceFromControllerIdsUsb2[controllerIds];
+
+        } else {
+
+            //
+            // Controller IDs not seen before or seen with a different controller object. Create a
+            // new controller instance.
+            //
+            usb2Globals.ControllerInstanceFromUsb2ControllerObject[controllerObject] =
+                usbCommonGlobals.g_NextUnusedControllerInstance;
+            usbCommonGlobals.g_NextUnusedControllerInstance++;
+
+            usb2Globals.ControllerInstanceFromControllerIdsUsb2[controllerIds] =
+                usb2Globals.ControllerInstanceFromUsb2ControllerObject[controllerObject];
+            UpdateControllerMap(usb2Globals.ControllerInstanceFromUsb2ControllerObject[controllerObject]);
+        }
+
+        //
+        // Ensure that events carrying port path and not controller object get the latest controller object
+        // that was created at that port path.
+        //
+        usb2Globals.Usb2ControllerObjectFromControllerIds[controllerIds] = controllerObject;
+    }
+
+    return usb2Globals.ControllerInstanceFromUsb2ControllerObject[controllerObject];
+}
+int GetControllerInstanceUsb2(string controllerIds) // for events that don't have a controller object
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    var usb2Globals = endpoint Usb2Globals;
+    if (!(controllerIds in usb2Globals.ControllerInstanceFromControllerIdsUsb2)) {
+
+        usb2Globals.ControllerInstanceFromControllerIdsUsb2[controllerIds] =
+            usbCommonGlobals.g_NextUnusedControllerInstance;
+        usbCommonGlobals.g_NextUnusedControllerInstance++;
+
+        UpdateControllerMap(usb2Globals.ControllerInstanceFromControllerIdsUsb2[controllerIds]);
+    }
+
+    return usb2Globals.ControllerInstanceFromControllerIdsUsb2[controllerIds];
+}
+int GetControllerInstanceUsb2(fid_USBPORT_HC controller)
+{
+    return GetControllerInstanceUsb2(UlongFromEtwPointer(controller.DeviceObject),
+                                     Usb2PciControllerIdsToString(controller.PciBus,
+                                                                  controller.PciDevice,
+                                                                  controller.PciFunction,
+                                                                  controller.PciVendorId,
+                                                                  controller.PciDeviceId));
+}
+int GetControllerInstanceUsb2(fid_USBHUB_HC controller)
+{
+    return GetControllerInstanceUsb2(Usb2PciControllerIdsToString(controller.Fid_PciBus,
+                                                                  controller.Fid_PciDevice,
+                                                                  controller.Fid_PciFunction,
+                                                                  controller.Fid_PciVendorId,
+                                                                  controller.Fid_PciDeviceId));
+}
+void ControllerInstanceRemovedUsb2(fid_USBPORT_HC controller)
+{
+    var usb2Globals = endpoint Usb2Globals;
+    ulong controllerObject = UlongFromEtwPointer(controller.DeviceObject);
+    string controllerIds = Usb2PciControllerIdsToString(controller.PciBus,
+                                                        controller.PciDevice,
+                                                        controller.PciFunction,
+                                                        controller.PciVendorId,
+                                                        controller.PciDeviceId);
+    usb2Globals.ControllerInstanceFromUsb2ControllerObject.Remove(controllerObject);
+    usb2Globals.ControllerInstanceFromControllerIdsUsb2.Remove(controllerIds);
+    usb2Globals.Usb2ControllerObjectFromControllerIds.Remove(controllerIds);
+}
+
+string Usb2PciControllerIdsToString(
+    uint pciBus,
+    ushort pciDevice,
+    ushort pciFunction,
+    ushort pciVendorId,
+    ushort pciDeviceId
+    )
+{
+    return Format("{0}-{1}-{2}",
+                  ToHex(pciBus),
+                  ToHex(pciDevice),
+                  Format("{0} VEN_{1}&DEV_{2}",
+                         ToHex(pciFunction),
+                         ToHex(pciVendorId),
+                         ToHex(pciDeviceId))); // TODO: #q: last 2 should be 0-padded, first 3 should not
+}
+
+TransferUrbControl
+NormalizeControlTransfer(
+    fid_USBPORT_URB_CONTROL_TRANSFER urb
+    )
+{
+    TransferUrbControl normalized = new TransferUrbControl { };
+    normalized.Fid_URB_Hdr_Length           = urb.Fid_URB_Hdr_Length;
+    normalized.Fid_URB_Hdr_Function         = urb.Fid_URB_Hdr_Function;
+    normalized.Fid_URB_Hdr_Status           = urb.Fid_URB_Hdr_Status;
+    normalized.Fid_URB_Hdr_UsbdDeviceHandle = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdDeviceHandle);
+    normalized.Fid_URB_Hdr_UsbdFlags        = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdFlags);
+    normalized.Fid_URB_PipeHandle           = UlongFromEtwPointer(urb.Fid_URB_PipeHandle);
+    normalized.Fid_URB_TransferFlags        = urb.Fid_URB_TransferFlags;
+    normalized.Fid_URB_TransferBufferLength = urb.Fid_URB_TransferBufferLength;
+    normalized.Fid_URB_TransferBuffer       = UlongFromEtwPointer(urb.Fid_URB_TransferBuffer);
+    normalized.Fid_URB_TransferBufferMDL    = UlongFromEtwPointer(urb.Fid_URB_TransferBufferMDL);
+    normalized.Fid_URB_TimeoutOrReserved    = UlongFromEtwPointer(urb.Fid_URB_ReservedMBZ);
+    normalized.Fid_URB_ReservedHcd = [
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[0]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[1]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[2]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[3]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[4]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[5]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[6]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[7]),
+        ];
+    normalized.Fid_URB_Setup_bmRequestType  = urb.Fid_URB_Setup_bmRequestType;
+    normalized.Fid_URB_Setup_bRequest       = urb.Fid_URB_Setup_bRequest;
+    normalized.Fid_URB_Setup_wValue         = urb.Fid_URB_Setup_wValue;
+    normalized.Fid_URB_Setup_wIndex         = urb.Fid_URB_Setup_wIndex;
+    normalized.Fid_URB_Setup_wLength        = urb.Fid_URB_Setup_wLength;
+    return normalized;
+}
+
+TransferUrbBulkOrInterrupt
+NormalizeBulkOrInterruptTransfer(
+    fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER urb
+    )
+{
+    TransferUrbBulkOrInterrupt normalized = new TransferUrbBulkOrInterrupt { };
+    normalized.Fid_URB_Hdr_Length           = urb.Fid_URB_Hdr_Length;
+    normalized.Fid_URB_Hdr_Function         = urb.Fid_URB_Hdr_Function;
+    normalized.Fid_URB_Hdr_Status           = urb.Fid_URB_Hdr_Status;
+    normalized.Fid_URB_Hdr_UsbdDeviceHandle = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdDeviceHandle);
+    normalized.Fid_URB_Hdr_UsbdFlags        = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdFlags);
+    normalized.Fid_URB_PipeHandle           = UlongFromEtwPointer(urb.Fid_URB_PipeHandle);
+    normalized.Fid_URB_TransferFlags        = urb.Fid_URB_TransferFlags;
+    normalized.Fid_URB_TransferBufferLength = urb.Fid_URB_TransferBufferLength;
+    normalized.Fid_URB_TransferBuffer       = UlongFromEtwPointer(urb.Fid_URB_TransferBuffer);
+    normalized.Fid_URB_TransferBufferMDL    = UlongFromEtwPointer(urb.Fid_URB_TransferBufferMDL);
+    normalized.Fid_URB_TimeoutOrReserved    = UlongFromEtwPointer(urb.Fid_URB_ReservedMBZ);
+    normalized.Fid_URB_ReservedHcd = [
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[0]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[1]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[2]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[3]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[4]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[5]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[6]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[7]),
+        ];
+    return normalized;
+}
+
+TransferUrbIsoch
+NormalizeIsochTransfer(
+    fid_USBPORT_URB_ISOCH_TRANSFER urb
+    )
+{
+    TransferUrbIsoch normalized = new TransferUrbIsoch { };
+    normalized.Fid_URB_Hdr_Length           = urb.Fid_URB_Hdr_Length;
+    normalized.Fid_URB_Hdr_Function         = urb.Fid_URB_Hdr_Function;
+    normalized.Fid_URB_Hdr_Status           = urb.Fid_URB_Hdr_Status;
+    normalized.Fid_URB_Hdr_UsbdDeviceHandle = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdDeviceHandle);
+    normalized.Fid_URB_Hdr_UsbdFlags        = UlongFromEtwPointer(urb.Fid_URB_Hdr_UsbdFlags);
+    normalized.Fid_URB_PipeHandle           = UlongFromEtwPointer(urb.Fid_URB_PipeHandle);
+    normalized.Fid_URB_TransferFlags        = urb.Fid_URB_TransferFlags;
+    normalized.Fid_URB_TransferBufferLength = urb.Fid_URB_TransferBufferLength;
+    normalized.Fid_URB_TransferBuffer       = UlongFromEtwPointer(urb.Fid_URB_TransferBuffer);
+    normalized.Fid_URB_TransferBufferMDL    = UlongFromEtwPointer(urb.Fid_URB_TransferBufferMDL);
+    normalized.Fid_URB_TimeoutOrReserved    = UlongFromEtwPointer(urb.Fid_URB_ReservedMBZ);
+    normalized.Fid_URB_ReservedHcd = [
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[0]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[1]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[2]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[3]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[4]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[5]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[6]),
+        UlongFromEtwPointer(urb.Fid_URB_ReservedHcd[7]),
+        ];
+    normalized.Fid_URB_StartFrame           = urb.Fid_URB_StartFrame;
+    normalized.Fid_URB_NumberOfPackets      = urb.Fid_URB_NumberOfPackets;
+    normalized.Fid_URB_ErrorCount           = urb.Fid_URB_ErrorCount;
+    return normalized;
+}
+
+public autostart actor ObserveUsbHubDriverEvent (ep_Microsoft_Windows_USB_USBHUB node)
+{
+    observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_101 // device remove
+    {
+        int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+        DeviceInstanceRemovedUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    }
+    observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_1 // hub added
+    {
+        SaveDeviceInstanceAsHub(GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBHUB_HC),
+                                                      m.Fid_USBHUB_Hub));
+    }
+    observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_3 // hub information
+    {
+        SaveDeviceInstanceAsHub(GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBHUB_HC),
+                                                      m.Fid_USBHUB_Hub));
+    }
+}
+public autostart actor ObserveUsbPortDriverEvent (ep_Microsoft_Windows_USB_USBPORT node)
+{
+    observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3 // host controller information
+    {
+        if (m.Fid_USBPORT_HC_Idle_Status.Fid_HC_HighSpeed != 0) {
+            SaveControllerType(GetControllerInstanceUsb2(m.Fid_USBPORT_HC), ControllerTypeEhci);
+        } else {
+            SaveControllerType(GetControllerInstanceUsb2(m.Fid_USBPORT_HC), ControllerTypeUsb1);
+        }
+        SaveControllerId(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                         ToHex(m.Fid_USBPORT_HC.PciVendorId),
+                         ToHex(m.Fid_USBPORT_HC.PciDeviceId));
+    }
+    observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_15 // device information
+    {
+        int deviceInstance = GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                                             m.Fid_USBPORT_Device);
+ 
+        if (m.Fid_USBPORT_Device.PortPath[0] == 0) {
+
+            SaveRootHub(deviceInstance, m.Fid_USBPORT_Device_Descriptor.Fid_bcdUSB);
+
+        } else {
+
+            SaveDevicePortPath(deviceInstance, m.Fid_USBPORT_Device.PortPath);
+            SaveUsbDeviceId(deviceInstance,
+                            m.Fid_USBPORT_Device.IdVendor,
+                            m.Fid_USBPORT_Device.IdProduct,
+                            m.Fid_USBPORT_Device_Descriptor.Fid_bcdUSB,
+                            m.Fid_USBPORT_Device_Descriptor.Fid_iProduct,
+                            m.Fid_USBPORT_Device_Descriptor.Fid_iManufacturer,
+                            m.Fid_USBPORT_Device_Descriptor.Fid_iSerialNumber);
+        }
+    }
+    observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_18 // endpoint open
+    {
+        if (m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress == 0) {
+
+            //
+            // This is the first event, when enumerating a device, that contains the device's port
+            // path. (VID/PID are unknown at this time.)
+            //
+            SaveDevicePortPath(GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                     m.Fid_USBPORT_Device),
+                               m.Fid_USBPORT_Device.PortPath);
+        }
+    }
+    observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_13 // device initialize
+    {
+        SaveUsbDeviceId(GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                              m.Fid_USBPORT_Device),
+                        m.Fid_USBPORT_Device.IdVendor,
+                        m.Fid_USBPORT_Device.IdProduct,
+                        m.Fid_USBPORT_Device_Descriptor.Fid_bcdUSB,
+                        m.Fid_USBPORT_Device_Descriptor.Fid_iProduct,
+                        m.Fid_USBPORT_Device_Descriptor.Fid_iManufacturer,
+                        m.Fid_USBPORT_Device_Descriptor.Fid_iSerialNumber);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.EventTemplate_10 // various control
+    {
+        //
+        // EventTemplate_10 is "tid_USBPORT_Dispatch_Urb_Function_Control_Transfer" which corresponds to:
+        // Dispatch:
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CONTROL_TRANSFER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CONTROL_TRANSFER_EX
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_DESCRIPTOR_TO_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_DESCRIPTOR_FROM_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_DESCRIPTOR_TO_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_DESCRIPTOR_FROM_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_DESCRIPTOR_TO_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_FEATURE_TO_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_FEATURE_TO_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_FEATURE_TO_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLEAR_FEATURE_TO_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLEAR_FEATURE_TO_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLEAR_FEATURE_TO_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLEAR_FEATURE_TO_OTHER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_SET_FEATURE_TO_OTHER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_STATUS_FROM_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_STATUS_FROM_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_STATUS_FROM_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_STATUS_FROM_OTHER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_VENDOR_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_VENDOR_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_VENDOR_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLASS_DEVICE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLASS_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLASS_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_CLASS_OTHER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_VENDOR_OTHER
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_CONFIGURATION
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_INTERFACE
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_FUNCTION_GET_MS_FEATURE_DESCRIPTOR
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_INVALID_CONTROL_TRANSFER_ENDPOINT
+        //   USBPORT_ETW_EVENT_DISPATCH_URB_INVALID_CONTROL_TRANSFER_BUFFER_LENGTH
+        // Complete (no data, should mean wLength == 0):
+        //   USBPORT_ETW_EVENT_COMPLETE_URB_FUNCTION_CONTROL_TRANSFER (Event 66)
+        //   USBPORT_ETW_EVENT_COMPLETE_URB_FUNCTION_CONTROL_TRANSFER_EX (Event 67)
+        //
+        if (m is Microsoft_Windows_USB_USBPORT.Event_66 ||
+            m is Microsoft_Windows_USB_USBPORT.Event_67) {
+
+            ProcessControlTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                   GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                         m.Fid_USBPORT_Device),
+                                   UlongFromEtwPointer(m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_PipeHandle),
+                                   UlongFromEtwPointer(m.Fid_URB_Ptr),
+                                   NormalizeControlTransfer(m.Fid_USBPORT_URB_CONTROL_TRANSFER),
+                                   null,
+                                   m,
+                                   null,
+                                   m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+        } else {
+            ProcessUrbDispatch(m,
+                               UlongFromEtwPointer(m.Fid_URB_Ptr),
+                               m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_TransferBufferLength);
+        }
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.EventTemplate_15 // control transfer complete with data
+    {
+        ProcessControlTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                               GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                     m.Fid_USBPORT_Device),
+                               UlongFromEtwPointer(m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_PipeHandle),
+                               UlongFromEtwPointer(m.Fid_URB_Ptr),
+                               NormalizeControlTransfer(m.Fid_USBPORT_URB_CONTROL_TRANSFER),
+                               m.Fid_URB_TransferData as binary,
+                               m,
+                               null,
+                               m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_74 // internal control transfer dispatch
+    {
+        ProcessUrbDispatch(m,
+                           UlongFromEtwPointer(m.Fid_URB_Ptr),
+                           m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_TransferBufferLength);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_75 // internal control transfer complete
+    {
+        ProcessControlTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                               GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                     m.Fid_USBPORT_Device),
+                               UlongFromEtwPointer(m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_PipeHandle),
+                               UlongFromEtwPointer(m.Fid_URB_Ptr),
+                               NormalizeControlTransfer(m.Fid_USBPORT_URB_CONTROL_TRANSFER),
+                               null,
+                               m,
+                               null,
+                               m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_76 // internal control transfer complete with data
+    {
+        ProcessControlTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                               GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                     m.Fid_USBPORT_Device),
+                               UlongFromEtwPointer(m.Fid_USBPORT_URB_CONTROL_TRANSFER.Fid_URB_PipeHandle),
+                               UlongFromEtwPointer(m.Fid_URB_Ptr),
+                               NormalizeControlTransfer(m.Fid_USBPORT_URB_CONTROL_TRANSFER),
+                               m.Fid_URB_TransferData as binary,
+                               m,
+                               null,
+                               m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_26 // bulk or interrupt dispatch
+    {
+        ProcessUrbDispatch(m,
+                           UlongFromEtwPointer(m.Fid_URB_Ptr),
+                           m.Fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER.Fid_URB_TransferBufferLength);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_27 // isoch dispatch
+    {
+        ProcessUrbDispatch(m,
+                           UlongFromEtwPointer(m.Fid_URB_Ptr),
+                           m.Fid_USBPORT_URB_ISOCH_TRANSFER.Fid_URB_TransferBufferLength);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_70 // bulk or interrupt complete
+    {
+        ProcessBulkOrInterruptTransfer(
+            GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+            GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                  m.Fid_USBPORT_Device),
+            UlongFromEtwPointer(m.Fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER.Fid_URB_PipeHandle),
+            UlongFromEtwPointer(m.Fid_URB_Ptr),
+            NormalizeBulkOrInterruptTransfer(m.Fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER),
+            null,
+            m,
+            null,
+            UsbEndpointTypeFromBmAttributes(m.Fid_USBPORT_Endpoint_Descriptor.Fid_bmAttributes),
+            m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_71 // bulk or interrupt complete with data
+    {
+        ProcessBulkOrInterruptTransfer(
+            GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+            GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                  m.Fid_USBPORT_Device),
+            UlongFromEtwPointer(m.Fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER.Fid_URB_PipeHandle),
+            UlongFromEtwPointer(m.Fid_URB_Ptr),
+            NormalizeBulkOrInterruptTransfer(m.Fid_USBPORT_URB_BULK_OR_INTERRUPT_TRANSFER),
+            m.Fid_URB_TransferData as binary,
+            m,
+            null,
+            UsbEndpointTypeFromBmAttributes(m.Fid_USBPORT_Endpoint_Descriptor.Fid_bmAttributes),
+            m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_72 // isoch complete
+    {
+        ProcessIsochTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                             GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                   m.Fid_USBPORT_Device),
+                             UlongFromEtwPointer(m.Fid_USBPORT_URB_ISOCH_TRANSFER.Fid_URB_PipeHandle),
+                             UlongFromEtwPointer(m.Fid_URB_Ptr),
+                             NormalizeIsochTransfer(m.Fid_USBPORT_URB_ISOCH_TRANSFER),
+                             m,
+                             null,
+                             m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+    process node accepts m:Microsoft_Windows_USB_USBPORT.Event_73 // isoch complete with data
+    {
+        ProcessIsochTransfer(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                             GetDeviceInstanceUsb2(GetControllerInstanceUsb2(m.Fid_USBPORT_HC),
+                                                   m.Fid_USBPORT_Device),
+                             UlongFromEtwPointer(m.Fid_USBPORT_URB_ISOCH_TRANSFER.Fid_URB_PipeHandle),
+                             UlongFromEtwPointer(m.Fid_URB_Ptr),
+                             NormalizeIsochTransfer(m.Fid_USBPORT_URB_ISOCH_TRANSFER),
+                             m,
+                             null,
+                             m.Fid_USBPORT_Endpoint_Descriptor.Fid_bEndpointAddress);
+    }
+}
+
+// !!!!GENERATED CODE - DO NOT MODIFY BELOW THIS POINT!!!!
+
+public autostart actor AddColumnsToUsbhubEvent(ep_Microsoft_Windows_USB_USBHUB node)
+{
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_1
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_3
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_2
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_10
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_11
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_12
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_13
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_14
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_15
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_16
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_17
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_20
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_21
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_22
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_23
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_24
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_25
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_26
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_27
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_28
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_29
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_30
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_31
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_32
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_33
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_34
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_35
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_36
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_37
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_39
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_40
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_41
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_49
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_50
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_51
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_59
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_60
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_61
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_62
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_63
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_64
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_70
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_71
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_83
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_84
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_150
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_151
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_159
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_172
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_173
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_174
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_175
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_176
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_177
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_178
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_179
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_180
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_181
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_183
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_184
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_185
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_18
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_19
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_80
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_81
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_82
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_100
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_102
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_101
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_110
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_111
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_112
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_113
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_119
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_130
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_139
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_140
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_149
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_220
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_229
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_231
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_232
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_120
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_121
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_122
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_123
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_160
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_161
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_169
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_170
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_171
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_189
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_190
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_199
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_200
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_209
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_210
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_211
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBHUB.Event_230
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBHUB_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBHUB_Hub);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+}
+public autostart actor AddColumnsToUsbportEvent(ep_Microsoft_Windows_USB_USBPORT node)
+{
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_4
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_5
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_6
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_7
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_8
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_9
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_10
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_11
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1024
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1031
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1032
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1033
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1034
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1035
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2048
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2055
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2056
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2057
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2058
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2059
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3072
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3078
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3079
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3080
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3081
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3082
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_12
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_13
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_14
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_15
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_16
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_17
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_18
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_19
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_20
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_21
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_22
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_23
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_24
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_25
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_28
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_29
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_30
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_31
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_32
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_33
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_34
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_35
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_36
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_37
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_38
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_39
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_40
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_41
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_42
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_43
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_44
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_45
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_46
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_47
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_48
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_49
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_50
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_51
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_52
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_53
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_58
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_59
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_60
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_66
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_67
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_89
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_90
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_26
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_70
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_91
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_92
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_27
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_72
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_73
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_54
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_55
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_56
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_57
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_77
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_68
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_69
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_71
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_74
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_75
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_76
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_78
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_79
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_80
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_81
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_82
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_83
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_84
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_85
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_86
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_87
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_88
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_98
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_93
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_99
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_100
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_94
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_95
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_96
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_97
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_101
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    int deviceInstance = GetDeviceInstanceUsb2(controllerInstance, m.Fid_USBPORT_Device);
+    m#UsbDeviceInstanceAnnotation = deviceInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+    AnnotateDeviceMessage(m, deviceInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_102
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_103
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_104
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_105
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_106
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_107
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_108
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_110
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_109
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_112
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_111
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1025
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1026
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1027
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1028
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1029
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1030
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2049
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2050
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2051
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2052
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2053
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2054
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3073
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3074
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3075
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3076
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3077
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1036
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1037
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1038
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1039
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1040
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1041
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_1042
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2060
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2061
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2062
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2063
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2064
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_2065
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3083
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3084
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3085
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3086
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3087
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+observe node accepts m:Microsoft_Windows_USB_USBPORT.Event_3088
+{
+    int controllerInstance = GetControllerInstanceUsb2(m.Fid_USBPORT_HC);
+    m#UsbControllerInstanceAnnotation = controllerInstance;
+    AnnotateControllerMessage(m, controllerInstance);
+}
+}

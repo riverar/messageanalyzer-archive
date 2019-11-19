@@ -1,0 +1,1713 @@
+protocol AllJoyn with 
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "AllJoyn",
+    ShortName = "AllJoyn",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "D-BUS", Link = "http://dbus.freedesktop.org/doc/dbus-specification.html"},
+            new Reference{Name = "AllJoyn System Description", Link = "https://allseenalliance.org/developers/learn/core/system-description", Version = "15.04"},
+            new Reference{Name = "AllJoyn Source Code", Link = "https://git.allseenalliance.org/cgit/core/alljoyn.git/", Version = "15.04"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using IANA;
+using Diagnostics;
+using PublicResources;
+using TCP;
+using ARDP;
+using DNS;
+using Configurations;
+
+// Endpoints.
+endpoint NameServiceServer
+    over UDP.Host
+    accepts NameServiceMessage issues NameServiceMessage;
+
+endpoint Server
+    over TCP.Server | over ARDP.Server
+    accepts AllJoynMessage issues AllJoynMessage
+    accepts SASLMessage issues SASLMessage
+    issues AllJoynOp;
+
+// Actors.
+autostart actor AllJoynNameServiceOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.DestinationPort == Port.AllJoyn
+    {
+        switch (d.Payload)
+        {
+            case m:NameServiceMessage from BinaryDecoder<NameServiceMessage> =>
+                map<binary, PortEntry> curPorts = m.GetAllJoynServerPorts();
+                AppendPortEntriesToGlobal(ref curPorts);
+                dispatch (endpoint NameServiceServer over host) accepts m;
+            default => 
+                ThrowDecodingException("AllJoyn", "NameServiceMessage");
+        }
+    }
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.SourcePort == Port.AllJoyn
+    {
+        switch (d.Payload)
+        {
+            case m:NameServiceMessage from BinaryDecoder<NameServiceMessage> =>
+                map<binary, PortEntry> curPorts = m.GetAllJoynServerPorts();
+                AppendPortEntriesToGlobal(ref curPorts);
+                dispatch (endpoint NameServiceServer over host) issues m;
+            default => 
+                ThrowDecodingException("AllJoyn", "NameServiceMessage");
+        }
+    }
+}
+
+autostart actor AllJoynOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+    AllJoynConfiguration config = GetConfigurableValue<AllJoynConfiguration>();
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.$"AllJoyn-STM" || 
+            s.DestinationPort in config.Ports ||
+            PortsContains(s#DestinationAddrBin as binary, s.DestinationPort, true)
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server issues s:TCP.Segment where s.SourcePort == Port.$"AllJoyn-STM" ||
+            s.SourcePort in config.Ports ||
+            PortsContains(s#SourceAddrBin as binary, s.SourcePort, true)
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        (s.DestinationPort == Port.$"AllJoyn-STM" || s.DestinationPort in config.Ports ||
+         PortsContains(s#DestinationAddrBin as binary, s.DestinationPort, true))
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        (s.SourcePort == Port.$"AllJoyn-STM" || s.DestinationPort in config.Ports ||
+         PortsContains(s#SourceAddrBin as binary, s.SourcePort, true))
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    void InitializeDecodingHelperIfNot()
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCP.TCPDecodingCache(), new TCP.TCPDecodingCache(), "AllJoyn", endpoint Server over server, IsAllJoyn, IsSufficientForSingleMsg, DecodeSingleAllJoynMsg, (binary s) => nothing);
+        }
+    }
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+        // Not remove server port from global variables even when TCP connection is closed.
+        // Because other client is still able to connect to that server even after this TCP connection get closed.
+    }
+}
+
+autostart actor AllJoynOverARDP(ARDP.Server server)
+{
+    process server accepts p:Packet where p.Payload.Count > 0
+    {
+        Endian endian = p.Payload[0] == Endianess.BigEndian ? Endian.Big : Endian.Little;
+        switch (p.Payload)
+        {
+            case aj:AllJoynMessage from BinaryDecoder<AllJoynMessage[endian]> =>
+                dispatch (endpoint Server over server) accepts aj;
+            default => 
+                ThrowDecodingException("AllJoyn", "AllJoynMessage");
+        }
+    }
+    process server issues p:Packet where p.Payload.Count > 0
+    {
+        Endian endian = p.Payload[0] == Endianess.BigEndian ? Endian.Big : Endian.Little;
+        switch (p.Payload)
+        {
+            case aj:AllJoynMessage from BinaryDecoder<AllJoynMessage[endian]> =>
+                if (aj.Header.MessageType == MessageTypeEnum.METHOD_RETURN && "REPLY_SERIAL" in aj.HeaderFields.Keys)
+                {
+                    aj#ReplyToSerNumber = (aj.HeaderFields["REPLY_SERIAL"] as HeaderFieldReplySerial).ReplyTo;
+                }
+                dispatch (endpoint Server over server) issues aj;
+            default => 
+                ThrowDecodingException("AllJoyn", "AllJoynMessage");
+        }
+    }
+}
+
+// ARDP over arbitrary udp port number advertised by AllJoyn name service
+autostart actor ARDPOverUDP(UDP.Host host)
+{
+    bool isReq;
+    AllJoynConfiguration config = GetConfigurableValue<AllJoynConfiguration>();
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && IsArdpOverUdp(d)
+    {
+        switch (d.Payload)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+                if (isReq)
+                    dispatch (endpoint ARDP.OrderingServer[p.SourcePort] over host) accepts p;
+                else
+                    dispatch (endpoint ARDP.OrderingServer[p.DestinationPort] over host) issues p;
+            default => 
+                ThrowDecodingException("ARDP", "Packet");
+        }
+    }
+
+    bool IsArdpOverUdp(UDP.Datagram d)
+    {
+        if (config.Ports[d.DestinationPort] || 
+            d#DestinationAddress is dstAddr:binary && PortsContains(dstAddr, d.DestinationPort, false))
+        {
+            isReq = true;
+            return true;
+        }
+        else if (config.Ports[d.SourcePort] ||
+            d#SourceAddress is srcAddr:binary && PortsContains(srcAddr, d.SourcePort, false))
+        {
+            isReq = false;
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+}
+
+// Get Server ports from mDNS Response message.
+autostart actor ObserveAllJoynPortsFrommDNS(DNS.Server server)
+{
+/*
+https://allseenalliance.org/developers/learn/core/system-description/advertisement-discovery
+The mDNS response in AllJoyn Name Service formats as below, get server port and address from RR and save to global variables.
+
++ Header
+    + OpCode: QUERY(0)
+    + RCode: NoError(0)
+    + ANCOUNT: >= 3, multiple of 3
+    + ARCOUNT: >= 3
+    <other fields>
++ Answer: array of ResourceRecord, count is equal to ANCOUNT
+    + ResourceRecord #0: PTR
+        + Name: _alljoyn._tcp.local
+        + Type: PTR(12)
+        <other fields>
+    # ResourceRecord #1: SRV
+        + Name: <guid>._alljoyn._tcp.local
+        + Type: SRV(33)
+        + Port: <service port>      ---------------------------------------------> Server Port represents port number used for the router-router connection.
+        + Target: <guid>.local
+        + ...
+    # ResourceRecord #2: TXT
+        + Name: <guid>._alljoyn._tcp.local
+        + Type: TXT(16)
+        + ....
+    Follow 3 similar ResourceRecord for TCP.
++ Additional : array of ResourceRecord, count is equal to ARCOUNT
+    + ResourceRecord #0: TXT
+        + Name: advertise.<guid>.local
+        + Type: TXT(16)
+        <other fields>
+    + ResourceRecord #1: TXT
+        + Name: sender-info.<guid>.local
+        + Type: TXT(16)
+        <other fields>
+    + ResourceRecord #2: A or AAAA
+        + Name: <guid>.local
+        + Type: A(1)  or AAAA(28)
+        + RData: IPv4 or IPv6 address stands for service address. ----------------> Server Address
+        <other fields>
+*/
+
+    // mDNS message direction cannot guarantee by checking UDP ports in "ArdpOverUdp" actor, so checking both accepts and issues directions here. 
+    observe server issues m:DNSMessage where IsmDNS(m) && m.OpCode == DNS.OpCode.QUERY && m.RCode == DNS.RCode.NoError && 
+        m.ANCOUNT > 3 && m.ANCOUNT % 3 == 0 && m.ARCOUNT >= 3 && m.ARCOUNT % 3 == 0
+    {
+        GetAllJoynPortsFrommDNSReponse(m);
+    }
+
+    observe server accepts m:DNSMessage where IsmDNS(m) && m.OpCode == DNS.OpCode.QUERY && m.RCode == DNS.RCode.NoError && 
+        m.ANCOUNT >= 3 && m.ANCOUNT % 3 == 0 && m.ARCOUNT >= 3 && m.ARCOUNT % 3 == 0
+    {
+        GetAllJoynPortsFrommDNSReponse(m);
+    }
+
+    void GetAllJoynPortsFrommDNSReponse(DNSMessage m)
+    {
+        // Name of Resource record 
+        string rrName = null;
+        // IP address of above RR name
+        binary address = null;
+
+        // Get RR name and ip address from Additional RRs of DNS Response message.
+        if (m.Additional is arrs:array<any>)
+        {
+            foreach (any obj in arrs)
+            {
+                if (obj is arr:ResourceRecord)
+                {
+                    if (arr.Type == RRType.A) // ipv4
+                    {
+                        if (arr.RData is ipv4Addr:IPv4Address)
+                        {
+                            rrName = arr.Name;
+                            address = ipv4Addr.Octets;
+                        }
+                        break;
+                    }
+                    else if (arr.Type == RRType.AAAA) // ipv6
+                    {
+                        if (arr.RData is ipv6Addr:IPv6Address)
+                        {
+                            rrName = arr.Name;
+                            address = ipv6Addr.Octets;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        if (address == null) return;
+
+        // Now get TCP/UDP port of the service from Answer RRs of DNS Response message.
+        map<binary, PortEntry> curPorts = {};
+        if (m.Answer is rrs:array<ResourceRecord>)
+        {
+            foreach (ResourceRecord rr in rrs)
+            {
+                if (rr.Type == RRType.SRV) // SRV RR
+                {
+                    if (rr.RData is data:DNS.ServerSelection)
+                    {
+                        string target = data.Target;
+                        ushort port = data.Port;
+                        if (target == rrName)
+                        {
+                            if (!(address in curPorts.Keys))
+                            {
+                                curPorts[address] = new PortEntry();
+                            }
+                            if (rr.Name.ToLower().IndexOf("._tcp.") > 0)
+                            {
+                                curPorts[address].TcpPorts[port] = true;
+                            }
+                            else if (rr.Name.ToLower().IndexOf("._udp.") > 0)
+                            {
+                                curPorts[address].UdpPorts[port] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (curPorts.Keys.Count > 0)
+        {
+            AppendPortEntriesToGlobal(ref curPorts);
+        }
+    }
+
+    bool IsmDNS(DNSMessage m)
+    {
+        if (m.Origins.Count > 0 && m.Origins[0] is udp:UDP.Datagram)
+        {
+            return udp.SourcePort == Port.mDNS || udp.DestinationPort == Port.mDNS;
+        }
+        else
+        {
+            return false;
+        }
+    }
+}
+
+// Global variables and utilities 
+
+// Starting from AllJoyn v15.04, TCP/UDP port number used to exchange AllJoyn data messages are not fixed.
+// AllJoyn service advertise ports through name service(IS-AT v0 and v1, mDNS).
+// Because NameService and AllData Exchange service belong to different connections, 
+// global variables is defined for saving server ports so that AllJoyn actor could get server ports across connections.
+endpoint DummyEndpoint accepts any message
+{
+    // In "Advertisement and Discovery" phase, ports used in "Data Exchange" are negotiated,
+    // Since both phases are over different connections, we need to use below global variables 
+    // to communicate crossing different connections.
+    // key ---- IPv4/IPv6 address of server, in binary format
+    // value -- server ports which AllJoyn is listening on.
+    map<binary, PortEntry> AllJoynServerPorts = {};
+};
+
+type PortEntry
+{
+    set<ushort> TcpPorts = {};
+    set<ushort> UdpPorts = {};
+}
+
+void AppendPortEntriesToGlobal(ref map<binary, PortEntry> others)
+{
+    if (others != null && others.Keys.Count > 0)
+    {
+        var ep =endpoint DummyEndpoint;
+        ep.AllJoynServerPorts = Add(ep.AllJoynServerPorts, others);
+    }
+}
+
+map<binary, PortEntry> Add(map<binary, PortEntry> x, map<binary, PortEntry> y)
+{
+    if (x == null || x.Keys.Count == 0) return y;
+    if (y == null || y.Keys.Count == 0) return x;
+    set<binary> xKeys = x.Keys;
+    foreach (binary yKey in y.Keys)
+    {
+        if (!(yKey in xKeys))
+        {
+            x[yKey] = new PortEntry();
+        }
+        x[yKey].TcpPorts += y[yKey].TcpPorts;
+        x[yKey].UdpPorts += y[yKey].UdpPorts;
+    }
+    return x;
+}
+
+// Remove port entries by address.
+void RemoveEntriesByAddress(binary address, bool tcp, bool udp)
+{
+    var ep =endpoint DummyEndpoint;
+    if (address in ep.AllJoynServerPorts.Keys)
+    {
+        if (tcp && udp)
+        {
+            ep.AllJoynServerPorts = ep.AllJoynServerPorts.Remove(address);
+        }
+        else if (tcp)
+        {
+            ep.AllJoynServerPorts[address].TcpPorts = {};
+        }
+        else if (udp)
+        {
+            ep.AllJoynServerPorts[address].UdpPorts = {};
+        }
+    }
+}
+
+// Check if a port number exists in saved ports.
+bool PortsContains(binary address, ushort port, bool isTcp)
+{
+    DummyEndpoint ep = endpoint DummyEndpoint;
+    if (address in ep.AllJoynServerPorts.Keys)
+    {
+        if (isTcp)
+            return (port in ep.AllJoynServerPorts[address].TcpPorts);
+        else
+            return (port in ep.AllJoynServerPorts[address].UdpPorts);
+    }
+    else
+    {
+        return false;
+    }
+}
+
+// Name service message and types.
+message NameServiceMessage
+{
+    byte MVer with BinaryEncoding{Width = 4}; // The version (0...15) of the actual message.
+    byte SVer with BinaryEncoding{Width = 4}; // The version (0...15) of the sender's latest implemented protocol.
+    byte QCount;
+    byte ACount;
+    byte Timer;
+    optional [|QCount > 0|] ([|MVer == 0|] array<WhoHasv0> | [|MVer == 1|] array<WhoHasv1>) $"WHO-HAS messages" with BinaryEncoding{Length = QCount};
+    optional [|ACount > 0|] ([|MVer == 0|] array<IsAtv0> | [|MVer == 1|] array<IsAtv1>) $"IS-AT messages" with BinaryEncoding{Length = ACount};
+
+    override string ToString()
+    {
+        string summary = "NameService, Version: " + MVer.ToString();
+        // Just show the first element in array of WhoHas/IsAt in summary line.
+        if (QCount > 0) 
+        {
+            if (MVer == 0 && $"WHO-HAS messages" is whoHasv0:array<WhoHasv0> && whoHasv0.Count > 0)
+            {
+                summary += ", Who has BusName: " + whoHasv0[0].ToString();
+            }
+            else if (MVer == 1 && $"WHO-HAS messages" is whoHasv1:array<WhoHasv1> && whoHasv1.Count > 0)
+            {
+                summary += ", Who has BusName: " + whoHasv1[0].ToString();
+            }
+        }
+        if (ACount > 0)
+        {
+            if (MVer == 0 && $"IS-AT messages" is isAtv0:array<IsAtv0> && isAtv0.Count > 0)
+            {
+                summary += ", " + isAtv0[0].ToString();
+            }
+            else if (MVer == 1 && $"IS-AT messages" is isAtv1:array<IsAtv1> && isAtv1.Count > 0)
+            {
+                summary += ", " + isAtv1[0].ToString();
+            }
+        }
+        return summary;
+    }
+
+    map<binary, PortEntry> GetAllJoynServerPorts()
+    {
+        map<binary, PortEntry> ports = {};
+        if (ACount > 0 && MVer == 0) // v0
+        {
+            array<IsAtv0> isAtv0s = $"IS-AT messages" as array<IsAtv0>;
+            foreach (IsAtv0 v0 in isAtv0s)
+            {
+                map<binary, PortEntry> v0ret = v0.GetAllJoynServerPorts();
+                ports = Add(ports, v0ret);
+            }
+        }
+        else if (ACount > 0 && MVer == 1) // v1
+        {
+            array<IsAtv1> isAtv1s = $"IS-AT messages" as array<IsAtv1>;
+            foreach (IsAtv1 v1 in isAtv1s)
+            {
+                map<binary, PortEntry> v1ret = v1.GetAllJoynServerPorts();
+                ports = Add(ports, v1ret);
+            }
+        }
+        return ports;
+    }
+};
+
+// alljoyn_core\router\ns\IpNsProtocol.h
+type IsAtv0
+{
+    byte M with BinaryEncoding{Width = 2}; // 01
+    bool G with BinaryEncoding{Width = 1}; // If '1' indicates that a variable length daemon GUID string is present.
+    bool C with BinaryEncoding{Width = 1}; // If '1' indicates that the list of StringData records is a complete list of all well-known names exported by the responding daemon.
+    bool T with BinaryEncoding{Width = 1}; // If '1' indicates that the responding daemon is listening on TCP.
+    bool U with BinaryEncoding{Width = 1}; // If '1' indicates that the responding daemon is listening on UDP.
+    bool S with BinaryEncoding{Width = 1}; // If '1' indicates that the responding daemon is listening on an IPv6 address and that an IPv6 address is present in the message.  If '0'
+                                           // indicates is no IPv6 address present.
+    bool F with BinaryEncoding{Width = 1}; // If '1' indicates that the responding daemon is listening on an IPv4 address and that an IPv4 address is present in the message.  If '0'
+                                           // indicates is no IPv4 address present.
+    byte Count;
+    ushort Port;
+    optional [|F|] IPv4Address IPv4Address;
+    optional [|S|] IPv6Address IPv6Address;
+    optional [|G|] StringType DaemonGUID;
+    array<StringType> BusNames with BinaryEncoding{Length = Count};
+
+    override string ToString()
+    {
+        if (BusNames.Count > 0)
+        {
+            string summary = "BusName: " + BusNames[0].ToString() + " is at: [";
+            if (F)
+            {   
+                if (T && U)       summary += "TCP/UDP:";
+                else if (T && !U) summary += "TCP:";
+                else if (!T && U) summary += "UDP:";
+
+                summary += IPv4Address.ToString() + ":" + Port.ToString();
+            }
+            if (S)
+            {
+                if (T && U)       summary += "TCP/UDP:";
+                else if (T && !U) summary += "TCP:";
+                else if (!T && U) summary += "UDP:";
+
+                summary += IPv6Address.ToString() + ":" + Port.ToString();
+            }
+            return summary + "]";
+        }
+        return "";
+    }
+
+    map<binary, PortEntry> GetAllJoynServerPorts()
+    {
+        map<binary, PortEntry> ports = {};
+        if (F) // ipv4
+        {
+            binary ipv4Addr = (IPv4Address as Utility.IPv4Address).Octets;
+            ports[ipv4Addr] = new PortEntry();
+            if (T) // tcp
+            {
+                ports[ipv4Addr].TcpPorts[Port] = true;
+            }
+            if (U) // udp
+            {
+                ports[ipv4Addr].UdpPorts[Port] = true;
+            }
+        }
+
+        if (S) // ipv6
+        {
+            binary ipv6Addr = (IPv6Address as Utility.IPv6Address).Octets;
+            ports[ipv6Addr] = new PortEntry();
+            if (T) // tcp
+            {
+                ports[ipv6Addr].TcpPorts[Port] = true;
+            }
+            if (U) // udp
+            {
+                ports[ipv6Addr].UdpPorts[Port] = true;
+            }
+        }
+        return ports;
+    }
+};
+
+// alljoyn_core\router\ns\IpNsProtocol.h
+type IsAtv1
+{
+    byte M with BinaryEncoding{Width = 2}; // 01
+    bool G with BinaryEncoding{Width = 1};  // If '1' indicates that a variable length daemon GUID string is present.
+    bool C with BinaryEncoding{Width = 1};  // If '1' indicates that the list of StringData records is a complete list of all well-known names exported by the responding daemon.
+    bool R4 with BinaryEncoding{Width = 1}; // If '1' indicates that the IPv4 endpoint of a reliable method (TCP) transport (IP address and port) is present
+    bool U4 with BinaryEncoding{Width = 1}; // If '1' indicates that the IPv4 endpoint of an unreliable method (UDP) transport (IP address and port) is present
+    bool R6 with BinaryEncoding{Width = 1}; // If '1' indicates that the IPv6 endpoint of a reliable method (TCP) transport (IP address and port) is present
+    bool U6 with BinaryEncoding{Width = 1}; // If '1' indicates that the IPv6 endpoint of an unreliable method (UDP) transport (IP address and port) is present
+    byte Count;
+    TransportMask TransportMask;
+    optional [|R4|] IPv4Address ReliableIPv4Address;
+    optional [|R4|] ushort ReliableIPv4Port;
+    optional [|U4|] IPv4Address UnreliableIPv4Address;
+    optional [|U4|] ushort UnreliableIPv4Port;
+    optional [|R6|] IPv6Address ReliableIPv6Address;
+    optional [|R6|] ushort ReliableIPv6Port;
+    optional [|U6|] IPv6Address UnreliableIPv6Address;
+    optional [|U6|] ushort UnreliableIPv6Port;
+    optional [|G|] StringType DaemonGUID;
+    array<StringType> BusNames with BinaryEncoding{Length = Count};
+
+    override string ToString()
+    {
+        if (BusNames.Count > 0)
+        {
+            string summary = "BusName: " + BusNames[0].ToString() + " is at: [";
+            if (R4)
+            {
+                summary += "TCP:" + ReliableIPv4Address.ToString() + ":" + ReliableIPv4Port.ToString();
+            }
+            if (U4)
+            {  
+                if (R4) summary += ", ";
+                summary += "UDP:" + UnreliableIPv4Address.ToString() + ":" + UnreliableIPv4Port.ToString();
+            }
+            if (R6)
+            {
+                if (R4 | U4) summary += ", ";
+                summary += "TCP:" + ReliableIPv6Address.ToString() + ":" + ReliableIPv6Port.ToString();
+            }
+            if (U6)
+            {
+                if (R4 | U4 | R6) summary += ", ";
+                summary += "UDP:" + UnreliableIPv6Address.ToString() + ":" + UnreliableIPv6Port.ToString();
+            }
+            return summary + "]";
+        }
+        return "";
+    }
+
+    map<binary, PortEntry> GetAllJoynServerPorts()
+    {
+        map<binary, PortEntry> ports = {};
+        if (R4) // ipv4, tcp
+        {
+            binary ipv4TcpAddr = (ReliableIPv4Address as Utility.IPv4Address).Octets;
+            ports[ipv4TcpAddr] = new PortEntry();
+            ports[ipv4TcpAddr].TcpPorts[ReliableIPv4Port as ushort] = true;
+        }
+        if (U4) // ipv4, udp
+        {
+            binary ipv4UdpAddr = (UnreliableIPv4Address as Utility.IPv4Address).Octets;
+            if (!(ipv4UdpAddr in ports.Keys))
+            {
+                ports[ipv4UdpAddr] = new PortEntry();
+            }
+            ports[ipv4UdpAddr].UdpPorts[UnreliableIPv4Port as ushort] = true;
+        }
+        if (R6) // ipv6, tcp
+        {
+            binary ipv6TcpAddr = (ReliableIPv6Address as Utility.IPv6Address).Octets;
+            ports[ipv6TcpAddr] = new PortEntry();
+            ports[ipv6TcpAddr].TcpPorts[ReliableIPv6Port as ushort] = true;
+        }
+        if (U6) // ipv6, udp
+        {
+            binary ipv6UdpAddr = (ReliableIPv6Address as Utility.IPv6Address).Octets;
+            if (!(ipv6UdpAddr in ports.Keys))
+            {
+                ports[ipv6UdpAddr] = new PortEntry();
+            }
+            ports[ipv6UdpAddr].UdpPorts[UnreliableIPv6Port as ushort] = true;
+        }
+        return ports;
+    }
+};
+
+// alljoyn_core\inc\alljoyn\TransportMask.h
+pattern TransportMask = flags ushort
+{
+    TRANSPORT_NONE      = 0x0000,   /**< no transports */
+    TRANSPORT_LOCAL     = 0x0001,   /**< Local (same device) transport */
+    TRANSPORT_BLUETOOTH = 0x0002,   /**< Blue tooth transport */
+    TRANSPORT_TCP       = 0x0004,   /**< Transport using TCP (same as TRANSPORT_WLAN) */
+    TRANSPORT_WLAN      = 0x0004,   /**< Wireless local-area network transport (same as TRANSPORT_TCP) */
+    TRANSPORT_WWAN      = 0x0008,   /**< Wireless wide-area network transport */
+    TRANSPORT_LAN       = 0x0010,   /**< Wired local-area network transport */
+    TRANSPORT_WFD       = 0x0080,   /**< Transport using WiFi Direct transport (currently unused) */
+    TRANSPORT_UDP       = 0x0100,   /**< Transport using the AllJoyn Reliable Datagram Protocol (flavor of reliable UDP) */
+    ...
+};
+
+// alljoyn_core\router\ns\IpNsProtocol.h
+type WhoHasv0
+{
+    byte M with BinaryEncoding{Width = 2}; // 01
+    byte Reserved with BinaryEncoding{Width = 2};
+    bool T with BinaryEncoding{Width = 1};
+    bool U with BinaryEncoding{Width = 1};
+    bool S with BinaryEncoding{Width = 1};
+    bool F with BinaryEncoding{Width = 1};
+    byte Count;
+    array<StringType> BusNames with BinaryEncoding{Length = Count};
+
+    override string ToString()
+    {
+        string summary = "";
+        for (int i = 0; i < BusNames.Count && i < 3; i++) // show at most 3 bus names in summary.
+        {
+            summary += ", " + BusNames[i].ToString();
+        }
+        if (summary.Count > 0)
+        {
+            return "[" + summary.Segment(2) + "]";
+        }
+        else
+        {
+            return "";
+        }
+    }
+};
+
+type WhoHasv1
+{
+    byte M with BinaryEncoding{Width = 2}; // 10
+    byte Reserved with BinaryEncoding{Width = 6};
+    byte Count;
+    array<StringType> BusNames with BinaryEncoding{Length = Count};
+
+    override string ToString()
+    {
+        string summary = "";
+        for (int i = 0; i < BusNames.Count && i < 3; i++) // show at most 3 bus names in summary.
+        {
+            summary += ", " + BusNames[i].ToString();
+        }
+        if (summary.Count > 0)
+        {
+            return "[" + summary.Segment(2) + "]";
+        }
+        else
+        {
+            return "";
+        }
+    }
+};
+
+type StringType
+{
+    byte Size;
+    string String with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = Size * 8};
+    override string ToString()
+    {
+        return String;
+    }
+}
+
+// AllJoyn data exchange messages.
+message AllJoynMessage[Endian Endianess]
+{
+    MessageHeader[Endianess] Header;
+    // header covers 24 bytes, so there must not be leading pad for header fields.
+    map<string, HeaderField> HeaderFields 
+        with BinaryEncoding{Length = Header.HeaderLength},
+            Encoding{Decoder = HeaderFieldsDecoder, SourcePattern = TypeOf<binary>()}, // use MixEncong to work around that pattern can not accept value parameter.
+            DisplayInfo{ToText = (any obj) => DisplayHeaderFieldsToText(obj as map<string, HeaderField>)};
+
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    optional [|(Header.HeaderFlags & HeaderFlags.ENCRYPTED) == 0 && Header.BodyLength > 0|] array<DBusType> Body 
+        with Encoding{Decoder = BodyDecoder} 
+        with DisplayInfo{ToText = (any obj) => GetSignature()};
+    optional [|(Header.HeaderFlags & HeaderFlags.ENCRYPTED) > 0 && Header.BodyLength > 0|] binary EncryptedBody with BinaryEncoding{Length = Header.BodyLength};
+
+    override string ToString()
+    {
+        string summary = EnumToStringInSummary<MessageTypeEnum>(Header.MessageType);
+        string header = DisplayHeaderFieldsToText(HeaderFields);
+        if (header.Count > 0)
+        {
+            summary += ", " + header;
+        }
+        summary += ", SerialNumber: " + Header.SerialNumber.ToString();
+        if (Header.MessageType == MessageTypeEnum.METHOD_RETURN && this#ReplyToSerNumber is replyTo:uint)
+        {
+            summary += ", ReplyTo: " + replyTo.ToString(); // ReplySerial header fields is required in 'METHOD_RETURN' message.
+        }
+        return summary;
+    }
+
+    optional map<string, HeaderField> HeaderFieldsDecoder(stream s)
+    {
+        map<string, HeaderField> resutls = {};
+        while (s.RemainingByteLength > 0)
+        {
+            byte fieldCode = s.CurrentByte;
+            if (BinaryDecoder<HeaderFieldWrapper[Endianess]>(s) is header:HeaderFieldWrapper)
+            {
+                resutls[EnumToString<HeaderFieldEnum>(fieldCode)]  = header.Value;
+            }
+            else
+            {
+                ValidationCheck(false, null, PublicResources.AllJoyn_HeaderDecodingFailed);
+                break;
+            }
+        }
+        return resutls;
+    }
+
+    optional array<DBusType> BodyDecoder(stream s)
+    {
+        string sig = GetSignature();
+        if (sig.Count == 0)
+        {
+            return nothing;
+        }
+        else
+        {
+            return DecodeBasedOnSignagure(s, sig, Endianess);
+        }
+    }
+
+    string GetSignature()
+    {
+        if ("SIGNATURE" in HeaderFields.Keys)
+        {
+            return (HeaderFields["SIGNATURE"] as HeaderFieldSignature).Signature;
+        }
+        return "";
+    }
+
+    string DisplayHeaderFieldsToText(map<string, HeaderField> headerFields)
+    {
+        if ("MEMBER" in headerFields.Keys)
+        {
+            return "Member: " + (headerFields["MEMBER"] as HeaderFieldStringType).Value + "(" + GetSignature() + ")";
+        }
+        else
+        {
+            return "Signature: " + GetSignature();
+        }
+        return "";
+    }
+}
+
+// Record "ReplyTo" serial number, it is used to find related request and response to group virtual operation.
+annotation uint AllJoynMessage#ReplyToSerNumber;
+
+virtual operation AllJoynOp
+{
+    string Member = (req.HeaderFields["MEMBER"] as HeaderFieldStringType).Value + "(" + req.GetSignature() + ")";
+
+    override string ToString()
+    {
+        return "Operation, Member: " + Member;
+    }
+}
+=
+accepts AllJoynMessage{value is var req, Header is MessageHeader{MessageType == MessageTypeEnum.METHOD_CALL, SerialNumber is serNum:uint}}
+issues AllJoynMessage{value is var res, Header is MessageHeader{MessageType == MessageTypeEnum.METHOD_RETURN}, #ReplyToSerNumber == serNum};
+
+// alljoyn_core\inc\alljoyn\Message.h, line 853.
+type MessageHeader[Endian Endianess]
+{
+    Endianess EndianessFlag;
+    MessageTypeEnum MessageType;
+    HeaderFlags HeaderFlags;
+    byte MajorProtoVersion;
+    uint BodyLength;
+    uint SerialNumber; // Serial number of this message. 
+    uint HeaderLength;
+
+    override string ToString()
+    {
+        return EnumToStringInSummary<MessageTypeEnum>(MessageType) + ", SerialNumber: " + SerialNumber.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+pattern Endianess = enum byte
+{
+    BigEndian       = 0x42, // ASCII 'B' for big-endian
+    LittleEndian    = 0x6C, // ASCII 'l' for little-endian
+};
+
+pattern MessageTypeEnum = enum byte
+{
+    INVALID     = 0,    // /< an invalid message type
+    METHOD_CALL = 1,    // /< a method call message type
+    METHOD_RETURN  = 2, // /< a method return message type
+    ERROR       = 3,    // /< an error message type
+    SIGNAL      = 4,    // /< a signal message type
+    ...
+};
+
+pattern HeaderFlags = flags byte
+{
+    NO_REPLY_EXPECTED  = 0x01,
+    AUTO_START         = 0x02,
+    ALLOW_REMOTE_MSG   = 0x04,  // Indicates that messages from remote hosts should be allowed (valid only in Hello message sent from app to the AllJoyn core).
+    SESSIONLESS        = 0x10,  // Indicates a sessionless signal message
+    GLOBAL_BROADCAST   = 0x20,  // Indicates a global (bus-to-bus) broadcast signal.
+    COMPRESSED         = 0x40,  // Indicates that the AllJoyn message header is compressed
+    ENCRYPTED          = 0x80,  // Indicates that the AllJoyn message body is encrypted
+    ...
+};
+
+// Header fields
+pattern HeaderFieldEnum = enum byte
+{   /* Wire-protocol defined header field types */
+    INVALID         = 0,                        // an invalid header field type
+    PATH            = 1,                        // an object path header field type
+    INTERFACE       = 2,                        // a message interface header field type
+    MEMBER          = 3,                        // a member (message/signal) name header field type
+    ERROR_NAME      = 4,                        // an error name header field type
+    REPLY_SERIAL    = 5,                        // a reply serial number header field type
+    DESTINATION     = 6,                        // message destination header field type
+    SENDER          = 7,                        // senders well-known name header field type
+    SIGNATURE       = 8,                        // message signature header field type
+    HANDLES         = 9,                        // number of file/socket handles that accompany the message
+    /* AllJoyn defined header field types */
+    TIMESTAMP       = 0x10,                       // /< time stamp header field type
+    TIME_TO_LIVE    = 0x11,                       // /< messages time-to-live header field type
+    COMPRESSION_TOKEN   = 0x12,                   // /< message compression token header field type
+    SESSION_ID      = 0x13,                       // /< Session id field type
+    ...
+};
+
+// Header fields are marshaled as alljoyn_core\src\Message_Gen.cc, line 625.
+pattern HeaderField = HeaderFieldStringType | HeaderFieldReplySerial | HeaderFieldUint32Type |
+                            HeaderFieldSignature | HeaderFieldUint16Type;
+
+// wrapper type is defined to work around the issue that pattern doesn't accept value parameter.
+type HeaderFieldWrapper[Endian Endianess]
+{
+    ([|CurrentByte(stream) in [1, 2, 3, 4, 6, 7]|] HeaderFieldStringType[Endianess] | 
+    [|CurrentByte(stream) == 5|] HeaderFieldReplySerial[Endianess] |
+    [|CurrentByte(stream) in [0x10, 0x12, 0x13]|] HeaderFieldUint32Type[Endianess] |
+    [|CurrentByte(stream) == 8|] HeaderFieldSignature[Endianess] |
+    [|CurrentByte(stream) == 0x11|] HeaderFieldUint16Type[Endianess]) Value;
+}
+
+type HeaderFieldReplySerial[Endian Endianess]
+{
+    HeaderFieldEnum FiledCode; // 5
+    byte Byte1;
+    byte Type;
+    byte Byte0;
+    uint ReplyTo;
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes}; // A struct must start on an 8-byte boundary regardless of the type of the struct fields.
+    
+    override string ToString()
+    {
+        return "ReplyTo: " + ReplyTo.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type HeaderFieldStringType[Endian Endianess]
+{
+    HeaderFieldEnum FiledCode;
+    byte Byte1;
+    byte Type;
+    byte Byte0;
+    uint Size;
+    string Value with BinaryEncoding{WidthForComposedType = (Size + 1) * 8, TextEncoding = TextEncoding.UTF8};
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    
+    override string ToString()
+    {
+        return Value;
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type HeaderFieldUint32Type[Endian Endianess]
+{
+    HeaderFieldEnum FiledCode;
+    byte Byte1;
+    byte Type;
+    byte Byte0;
+    uint Value;
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes}; // A struct must start on an 8-byte boundary regardless of the type of the struct fields.
+    
+    override string ToString()
+    {
+        return Value.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type HeaderFieldUint16Type[Endian Endianess]
+{
+    HeaderFieldEnum FiledCode;
+    byte Byte1;
+    byte Type;
+    byte Byte0;
+    ushort Value;
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes}; // A struct must start on an 8-byte boundary regardless of the type of the struct fields.
+    
+    override string ToString()
+    {
+        return Value.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type HeaderFieldSignature[Endian Endianess]
+{
+    HeaderFieldEnum FiledCode;
+    byte Byte1;
+    byte Type;
+    byte Byte0;
+    byte Size;
+    string Signature with BinaryEncoding{Length = Size + 1, TextEncoding = TextEncoding.ASCII};
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes}; // A struct must start on an 8-byte boundary regardless of the type of the struct fields.
+    
+    override string ToString()
+    {
+        return Signature;
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+// type systems
+pattern DBusTypeEnum = enum char
+{
+    BYTE            = 'y',  // 121
+    BOOLEAN         = 'b',  // 98,
+    INT16           = 'n',  // 110
+    UINT16          = 'q',  // 113
+    INT32           = 'i',  // 105
+    UINT32          = 'u',  // 117
+    INT64           = 'x',  // 120
+    UINT64          = 't',  // 116
+    DOUBLE          = 'd',  // 100
+    STRING          = 's',  // 115
+    OBJECT_PATH     = 'o',  // 111
+    SIGNATURE       = 'g',  // 103
+    ARRAY           = 'a',  // 97
+    STRUCT          = '(',  // 114
+    VARIANT         = 'v',  // 118
+    DICT_ENTRY      = '{',  // 101
+};
+
+// Basic types consist of fixed types and string-like types.
+const set<char> BasicType = {'y', 'b', 'n', 'q', 'i', 'u', 'x', 't', 'd', 's', 'o', 'g', 'h',};
+
+pattern ContainerType = enum char
+{
+    ARRAY               = 'a',
+    STRUCT              = '(',
+    VARIANT             = 'v',
+    DICT_ENTRY          = '{',
+};
+
+pattern DBusType = BYTE | BOOLEAN | INT16 | UINT16 | INT32 | UINT32 | INT64 | UINT64 | 
+                    STRING | OBJECT_PATH | SIGNATURE | 
+                    ARRAY | VARIANT | STRUCT | DICT_ENTRY | array<DBusType>;
+
+type BYTE
+{
+    byte BTYE;
+    override string ToString()
+    {
+        return "BTYE, " + BTYE.ToString();
+    }
+}
+
+type BOOLEAN[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo4Bytes};
+    uint BOOLEAN where ValidationCheck(value == 0 || value == 1, null, "AllJoyn: only 0 and 1 are valid value for BOOLEAN type");
+
+    override string ToString()
+    {
+        if (BOOLEAN == 0)
+        {
+            return "BOOLEAN, False";
+        }
+        else if (BOOLEAN == 1)
+        {
+            return "BOOLEAN, True";
+        }
+        else
+        {
+            return "Invalid value(" + BOOLEAN.ToString() + ")";
+        }
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type INT16[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo2Bytes};
+    short INT16;
+
+    override string ToString()
+    {
+        return "INT16, " + INT16.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type UINT16[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo2Bytes};
+    ushort UINT16;
+
+    override string ToString()
+    {
+        return "UINT16, " + UINT16.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type INT32[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo4Bytes};
+    int INT32;
+
+    override string ToString()
+    {
+        return "INT32, " + INT32.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type UINT32[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo4Bytes};
+    uint UINT32;
+
+    override string ToString()
+    {
+        return "UINT32, " + UINT32.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type INT64[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    long INT64;
+
+    override string ToString()
+    {
+        return "INT64, " + INT64.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type UINT64[Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    ulong UINT64;
+
+    override string ToString()
+    {
+        return "UINT64, " + UINT64.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type DOUBLE[Endian Endianess]
+{
+    float DOUBLE;
+    override string ToString()
+    {
+        return "DOUBLE, " + DOUBLE.ToString();
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type STRING[Endian Endianess]
+{
+    UINT32[Endianess] Size; // the size doesn't include trailer '\0'
+    string STRING with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = (Size.UINT32 + 1) * 8};
+
+    override string ToString()
+    {
+        return "STRING, " + STRING;
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type OBJECT_PATH[Endian Endianess]
+{
+    UINT32[Endianess] Size; // the size doesn't include trailer '\0'
+    string OBJECT_PATH with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = (Size.UINT32 + 1) * 8};
+
+    override string ToString()
+    {
+        return "OBJECT_PATH, " + OBJECT_PATH;
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type SIGNATURE
+{
+    byte Size;
+    string SIGNATURE with BinaryEncoding{Length = Size + 1, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        return "SIGNATURE, " + SIGNATURE;
+    }
+}
+
+type ARRAY[string Signagure, Endian Endianess]
+{
+    UINT32[Endianess] Size;
+    // the pad before the first element is not included in Size, pad between elements is included in Size.
+    array<DBusType> ARRAY with Encoding{Decoder = ParseArrayDecoder} with DisplayInfo{ToText = DisplayDBusTypesToString};
+    // can not define SourcePattern aspect since it recreate a new stream which messes up the alignment boundary. In AllJonyn alignment refer to the beginning the whole message.
+    optional array<DBusType> ParseArrayDecoder(stream s)
+    {
+        return ParseArray(s, Signagure, Size.UINT32, Endianess);
+    }
+
+    override string ToString()
+    {
+        return Format("ARRAY, Size: {0}, Signature: {1}, Value: {3}", Size.ToString(), Signagure, DisplayDBusTypesToString(ARRAY));
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type STRUCT[string Signagure, Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    array<DBusType> STRUCT with Encoding{Decoder = PaserStructDecoder} with DisplayInfo{ToText = DisplayDBusTypesToString};
+
+    optional array<DBusType> PaserStructDecoder(stream s)
+    {
+        return DecodeBasedOnSignagure(s, Signagure, Endianess);
+    }
+
+    override string ToString()
+    {
+        return "STRUCT, Signature: " + Signagure + ", Value: " + DisplayDBusTypesToString(STRUCT);
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type VARIANT[Endian Endianess]
+{
+    SIGNATURE Signature;
+    array<DBusType> VARIANT with Encoding{Decoder = PaserVariantDecoder} with DisplayInfo{ToText = DisplayDBusTypesToString};
+
+    optional array<DBusType> PaserVariantDecoder(stream s)
+    {
+        return DecodeBasedOnSignagure(s, Signature.SIGNATURE, Endianess);
+    }
+
+    override string ToString()
+    {
+        return "VARIANT, Signature: " + Signature.SIGNATURE + ", Value: " + DisplayDBusTypesToString(VARIANT);
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+type DICT_ENTRY[string Signagure, Endian Endianess]
+{
+    optional binary Pad with Encoding{Decoder = AlignTo8Bytes};
+    array<DBusType> DICT_ENTRY with Encoding{Decoder = ParseDictEntryDecoder} with DisplayInfo{ToText = DisplayDBusTypesToString};
+
+    optional array<DBusType> ParseDictEntryDecoder(stream s)
+    {
+        return DecodeBasedOnSignagure(s, Signagure, Endianess);
+    }
+
+    override string ToString()
+    {
+        return "DICT_ENTRY, Signature: " + Signagure + ", Value: " + DisplayDBusTypesToString(DICT_ENTRY);
+    }
+} with BinaryEncodingDefaults{Endian = Endianess};
+
+string DisplayDBusTypesToString(any obj)
+{
+    array<DBusType> types = obj as array<DBusType>;
+    string summary;
+    foreach (DBusType dt in types)
+    {
+        summary += ", " + dt.ToString();
+    }
+    return summary.Count < 2 ? "" : summary.Segment(2);
+}
+
+// Entry function for decoding body based on signature.
+optional array<DBusType> DecodeBasedOnSignagure(stream s, string sig, Endian endian)
+{
+    array<DBusType> results = [];
+    for (int i = 0; i < sig.Count; i++)
+    {
+        char c = sig[i];
+        if (c in BasicType) // basic types
+        {
+            optional DBusType v = ParseBasicType(s, c, endian);
+            if (v is data:DBusType)
+            {
+                results += [data];
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        else if (c == 'a') // array
+        {
+            int subSigLen = FindSubSignatureLengthForArray(sig.Segment(i + 1));
+            string subSig = sig.Segment(i + 1, subSigLen); // subSig is the signature of element of array, do not has leading 'a'
+            i = i + subSigLen;
+            if (BinaryDecoder<ARRAY[subSig, endian]>(s) is arrValue:ARRAY)
+            {
+                results += [arrValue.ARRAY]; // remove array wrapper.
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        else if (c == '(') // struct open
+        {
+            int subSigLen = FindSubSignatureLengthForContainerType(sig.Segment(i + 1), ContainerType.STRUCT);
+            string subSig = sig.Segment(i + 1, subSigLen);
+            i = i + 1 + subSigLen;
+            if (BinaryDecoder<STRUCT[subSig, endian]>(s) is structValue:STRUCT)
+            {
+                results += [structValue];
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        else if (c == 'v') // variant
+        {
+            if (BinaryDecoder<VARIANT[endian]>(s) is varValue:VARIANT)
+            {
+                results += [varValue];
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        else if (c == '{')
+        {
+            int subSigLen = FindSubSignatureLengthForContainerType(sig.Segment(i + 1), ContainerType.DICT_ENTRY);
+            string subSig = sig.Segment(i + 1, subSigLen);
+            i = i + 1 + subSigLen;
+            if (BinaryDecoder<DICT_ENTRY[subSig, endian]>(s) is entryValue:DICT_ENTRY)
+            {
+                results += [entryValue];
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        else
+        {
+            throw "AllJoyn: Invalid type Id: " + c.ToString() + ".";
+            return nothing;
+        }
+    }
+    return results;
+}
+
+int FindSubSignatureLengthForArray(string sig)
+{
+    if (sig[0] == '(' || sig[0] == '{')
+    {
+        ContainerType ct = sig[0] == '(' ?  ContainerType.STRUCT : ContainerType.DICT_ENTRY;
+        return FindSubSignatureLengthForContainerType(sig.Segment(1), ct) + 2;
+    }
+    else // array of array 
+    {
+        return 1;
+    }
+}
+
+int FindSubSignatureLengthForContainerType(string sig, ContainerType ct)
+{
+    char openTag = ct == ContainerType.STRUCT ? '(' : '{';
+    char closeTag = ct == ContainerType.STRUCT ? ')' : '}';
+    // handle nested situation.
+    int nestedOpenTagCount = 0;
+    for (int i = 0; i < sig.Count; i++)
+    {
+        if (sig[i] == openTag)
+        {
+            nestedOpenTagCount++;
+        }
+        else if (sig[i] == closeTag)
+        {
+            nestedOpenTagCount--;
+        }
+
+        if (nestedOpenTagCount == -1)
+        {
+            return i;
+        }
+    }
+
+    throw "AllJoyn: Invalid signature: " + sig + ".";
+    return sig.Count; // will never be called in real case.
+}
+
+optional DBusType ParseBasicType(stream s, char c, Endian endian)
+{
+    optional DBusType result;
+    switch (c)
+    {
+        case DBusTypeEnum.BYTE =>
+            result = BinaryDecoder<BYTE>(s);
+        case DBusTypeEnum.BOOLEAN =>
+            result = BinaryDecoder<BOOLEAN[endian]>(s);
+        case DBusTypeEnum.INT16 =>
+            result = BinaryDecoder<INT16[endian]>(s);
+        case DBusTypeEnum.UINT16 =>
+            result = BinaryDecoder<UINT16[endian]>(s);
+        case DBusTypeEnum.INT32 =>
+            result = BinaryDecoder<INT32[endian]>(s);
+        case DBusTypeEnum.UINT32 =>
+            result = BinaryDecoder<UINT32[endian]>(s);
+        case DBusTypeEnum.INT64 =>
+            result = BinaryDecoder<INT64[endian]>(s);
+        case DBusTypeEnum.UINT64 =>
+            result = BinaryDecoder<UINT64[endian]>(s);
+        case DBusTypeEnum.DOUBLE =>
+            result = BinaryDecoder<DOUBLE[endian]>(s);
+        case DBusTypeEnum.STRING =>
+            result = BinaryDecoder<STRING[endian]>(s);
+        case DBusTypeEnum.OBJECT_PATH =>
+            result = BinaryDecoder<OBJECT_PATH[endian]>(s);
+        case DBusTypeEnum.SIGNATURE =>
+            result = BinaryDecoder<SIGNATURE>(s);
+        default => 
+            throw "AllJoyn: Invalid type id: " + c.ToString() + ".";
+    }
+    if (result != nothing)
+    {
+        return result;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+const set<DBusTypeEnum> TypesAlignTo8Bytes = {DBusTypeEnum.INT64, DBusTypeEnum.UINT64, DBusTypeEnum.DOUBLE, DBusTypeEnum.STRUCT, DBusTypeEnum.DICT_ENTRY};
+const set<DBusTypeEnum> TypesAlignTo4Bytes = {DBusTypeEnum.BOOLEAN, DBusTypeEnum.INT32, DBusTypeEnum.UINT32, DBusTypeEnum.OBJECT_PATH, DBusTypeEnum.STRING};
+const set<DBusTypeEnum> TypesAlignTo2Bytes = {DBusTypeEnum.INT16, DBusTypeEnum.UINT16};
+
+void AlignBasedOnType(stream s, DBusTypeEnum t)
+{
+    int n = 1;
+    if (t in TypesAlignTo8Bytes)
+    {
+        n = 8;
+    }
+    else if (t in TypesAlignTo4Bytes)
+    {
+        n = 4;
+    }
+    else if (t in TypesAlignTo2Bytes)
+    {
+        n = 2;
+    }
+    AlignToNBytes(s, n);
+}
+
+// parameter <sig> is the signature of element of array, not the full signature string.
+optional array<DBusType> ParseArray(stream s, string sig, uint size, Endian endian)
+{
+    // consume alignment pad prior to first element since 'size' doesn't include the padding.
+    AlignBasedOnType(s, sig[0]);
+    array<DBusType> results = [];
+    int startPos = s.BytePosition;
+    while (s.BytePosition - startPos < size)
+    {
+        if (DecodeBasedOnSignagure(s, sig, endian) is data:array<DBusType>)
+        {
+            results += data;
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+    return results;
+}
+
+// message for SASL
+message SASLMessage
+{
+    optional byte ConnectionInitialByte;
+    optional string Command;
+    optional string Parameter;
+
+    override string ToString()
+    {
+        if (ConnectionInitialByte != nothing)
+        {
+            return "CONNECT-initial byte";
+        }
+        else
+        {
+            return "SASL-" + (Command as string);
+        }
+    }
+}
+
+syntax SASL = b:"\x00" => new SASLMessage{ConnectionInitialByte = 0} | 
+                c:SASLCommand " "* para:regex{[^\r\n]*} "\r\n" => new SASLMessage{Command = c, Parameter = para};
+const binary CRLFBinary = $[0D0A];
+
+syntax SASLCommand = "AUTH" | "CANCEL" | "BEGIN" | "DATA" | "OK" | "REJECTED" | "ERROR";
+// properties
+// Since the header fields are type of map which is not convenient to filter, so define property for important field for user to filter.
+// Save property's vlaue via annotation to avoid re-computing every time.
+annotation string AllJoynMessage#ObjectPathProp;
+string get ObjectPath(this AllJoynMessage aj)
+{
+    if (aj#ObjectPathProp is objPath:string)
+    {
+        return objPath;
+    }
+    else
+    {
+        string ret = GetStringFormatHeaderField(aj, HeaderFieldEnum.PATH);
+        aj#ObjectPathProp = ret;
+        return ret;
+    }
+}
+
+annotation string AllJoynMessage#InterfaceProp;
+string get Interface(this AllJoynMessage aj)
+{
+    if (aj#InterfaceProp is interf:string)
+    {
+        return interf;
+    }
+    else
+    {
+        string ret = GetStringFormatHeaderField(aj, HeaderFieldEnum.INTERFACE);
+        aj#InterfaceProp = ret;
+        return ret;
+    }
+}
+
+annotation string AllJoynMessage#MemberProp;
+string get Member(this AllJoynMessage aj)
+{
+    if (aj#MemberProp is memb:string)
+    {
+        return memb;
+    }
+    else
+    {
+        string ret = GetStringFormatHeaderField(aj, HeaderFieldEnum.MEMBER);
+        aj#MemberProp = ret;
+        return ret;
+    }
+}
+
+annotation (IPv4Address | IPv6Address | string) AllJoynMessage#SourceProp;
+(IPv4Address | IPv6Address | string) get Source(this AllJoynMessage aj)
+{
+    if (aj#SourceProp is srcProp:(IPv4Address | IPv6Address | string))
+    {
+        return srcProp;
+    }
+    else
+    {
+        (IPv4Address | IPv6Address | string) src = "";
+        if (aj.Sender is sender:string && sender.Count > 0)
+        {
+            src = sender;
+        }
+        else
+        {
+            any message firstOrigin = aj.Origins[0];
+            if (firstOrigin is s:Segment && s#SourceAddrBin is srcBin:binary)
+            {
+                src = srcBin.Count == 4 ? new IPv4Address{Octets = srcBin} : new IPv6Address{Octets = srcBin};
+            }
+            else if (firstOrigin is ardp:ARDP.Packet && ardp.Origins[0] is d:UDP.Datagram && d#SourceAddress is srcBin2:binary)
+            {
+                src = srcBin2.Count == 4 ? new IPv4Address{Octets = srcBin2} : new IPv6Address{Octets = srcBin2};
+            }
+        }
+        aj#SourceProp = src;
+        return src;
+    }
+}
+
+annotation (IPv4Address | IPv6Address | string) AllJoynMessage#DestinationProp;
+(IPv4Address | IPv6Address | string) get Destination(this AllJoynMessage aj)
+{
+    if (aj#DestinationProp is dstProp:(IPv4Address | IPv6Address | string))
+    {
+        return dstProp;
+    }
+    else
+    {
+        (IPv4Address | IPv6Address | string) dest = "";
+        string destStr = GetStringFormatHeaderField(aj, HeaderFieldEnum.DESTINATION);
+        if (destStr.Count > 0)
+        {
+            dest = destStr;
+        }
+        else
+        {
+            any message firstOrigin = aj.Origins[0];
+            if (firstOrigin is s:Segment && s#DestinationAddrBin is dstBin:binary)
+            {
+                dest = dstBin.Count == 4 ? new IPv4Address{Octets = dstBin} : new IPv6Address{Octets = dstBin};
+            }
+            else if (firstOrigin is ardp:ARDP.Packet && ardp.Origins[0] is d:UDP.Datagram && d#DestinationAddress is dstBin2:binary)
+            {
+                dest = dstBin2.Count == 4 ? new IPv4Address{Octets = dstBin2} : new IPv6Address{Octets = dstBin2};
+            }
+        }
+        aj#DestinationProp = dest;
+        return dest;
+    }
+}
+
+string get Sender(this AllJoynMessage aj)
+{
+    return GetStringFormatHeaderField(aj, HeaderFieldEnum.SENDER);
+}
+
+string GetStringFormatHeaderField(AllJoynMessage aj, HeaderFieldEnum fieldCode)
+{
+    string key = EnumToString<HeaderFieldEnum>(fieldCode);
+    if (key in aj.HeaderFields.Keys && aj.HeaderFields[key] is sf:HeaderFieldStringType)
+    {
+        return sf.Value;
+    }
+    return "";
+}
+
+// Apply TCPDecodingCache
+bool? IsAllJoyn(binary bin)
+{
+    if (bin.Count > 0)
+    {
+        // SASL connection initial byte, after underlying TCP connection is established, Server must send a single null byte.
+        // http://dbus.freedesktop.org/doc/dbus-specification.html, section "Special credentials-passing nul byte"
+        if (bin[0] == 0) 
+            return true;
+    }
+    if (InRange<Endianess>(bin[0]) && InRange<MessageTypeEnum>(bin[1])) // data exchange message
+    {
+        return true;
+    }
+    if (SASLCommand(bin) != nothing) // SASL message
+    {
+        return true;
+    }
+    if (bin.Count >= 8) // 8 is the longest length for SASL commands: REJECTED
+    {
+        return false;
+    }
+    else
+    {
+        return null;
+    }
+}
+
+uint? IsSufficientForSingleMsg(binary bin)
+{   
+    stream s = bin;
+    if (IsDataExchangeMessage(s))
+    {
+        if (bin.Count < 13)
+        {   
+            return null;
+        }
+        uint msgLen = CalculateMsgLength(s);
+        return msgLen <= bin.Count ? 0 : msgLen;
+    }
+    else 
+    {
+        if (bin.LastIndexOf(CRLFBinary) > 0 || bin.Count > 0 && bin[0] == 0)
+        {
+            return 0;
+        }
+        else
+        {
+            return null;
+        }
+    }
+}
+
+uint CalculateMsgLength(stream s)
+{
+    Endian endian = s.PeekByte(0) == Endianess.BigEndian ? Endian.Big : Endian.Little;
+    uint headerLen = s.PeekUInt(12 * 8, endian);
+    uint bodyLen = s.PeekUInt(4 * 8, endian);
+    uint msgLen = 16 +                      // header is fixed length 16.
+                    headerLen +
+                    (headerLen % 8 == 0 ? 0 : (8 - headerLen % 8)) + // body needs align to 8, but padding prior to body doesn't count in any length.
+                    bodyLen;
+    return msgLen;
+}
+
+optional any message DecodeSingleAllJoynMsg(stream s)
+{
+    if (IsDataExchangeMessage(s))
+    {
+        Endian endian = s.PeekByte(0) == Endianess.BigEndian ? Endian.Big : Endian.Little;
+        int beginPos = s.BytePosition;
+        if (BinaryDecoder<AllJoynMessage[endian]>(s) is aj:AllJoynMessage)
+        {
+            uint msgLen = CalculateMsgLength(s);
+            if (msgLen > s.BytePosition - beginPos)
+            {
+                BinaryDecoder<Blob[msgLen - (s.BytePosition - beginPos) as uint]>(s); // consume remaining bytes in case of partially decoding.
+            }
+            // Assign ReplyToSerNumber annotation for method reply message.
+            if (aj.Header.MessageType == MessageTypeEnum.METHOD_RETURN && "REPLY_SERIAL" in aj.HeaderFields.Keys)
+            {
+                aj#ReplyToSerNumber = (aj.HeaderFields["REPLY_SERIAL"] as HeaderFieldReplySerial).ReplyTo;
+            }
+            return aj as any message;
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+    else
+    {
+        return SASL(s);
+    }
+}
+
+bool IsDataExchangeMessage(stream s)
+{
+    return s.ByteLength > 2 && s.PeekByte(0) is Endianess &&
+        InRange<MessageTypeEnum>(s.PeekByte(8));
+}

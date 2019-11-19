@@ -1,0 +1,424 @@
+module CapFileActors with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376577", Date = "04/07/2015"}
+        ]
+};
+
+using Standard;
+using CapFile;
+using Ethernet;
+using IP1394;
+using WebProxy;
+using WiFi;
+using Utility;
+using HTTP;
+using WiFiChannelInfo;
+using Etw;
+using EtwEvent;
+using PefNdisProvider;
+using WFPCapture;
+using IPv4;
+using IPv6;
+using PayloadHeader;
+using DecryptedPayloadHeader;
+using Netmon;
+using LinuxCookedMode;
+using CoreNetworkingResources;
+
+const binary PPPmarker1 = $[2053454E44];
+const binary PPPmarker2 = $[2052454356];
+
+autostart actor CapFileToPayloadHeader(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame{MediaType is MediaTypes.PayloadHeader}
+    {
+        switch (cf.Payload)
+        {
+            case f:PayloadHeader.ReassembledFrame from BinaryDecoder<PayloadHeader.ReassembledFrame> =>
+                dispatch (endpoint PayloadHeader.Node) accepts f;
+            default =>
+                ThrowDecodingException("PayloadHeader");
+        }
+    }
+}
+
+autostart actor CapFileToDecryptedPayloadHeader(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame{MediaType is MediaTypes.DecryptedPayloadHeader}
+    {
+        switch (cf.Payload)
+        {
+            case f:DecryptedPayloadHeader.DecryptedFrame from BinaryDecoder<DecryptedPayloadHeader.DecryptedFrame> =>
+                if (f.EncryptionErrorStatus != 0)
+                {
+                    ErrorCodeIf(true, f, DiagnosisLevel.Warning, CAPFILEACTORS_DECRYPTION_ERROR);
+                }
+                dispatch (endpoint DecryptedPayloadHeader.Node[f.Network, f.Transport]) accepts f;
+            default =>
+                ThrowDecodingException("DecryptedPayloadHeader");
+        }
+    }
+}
+
+autostart actor CapFileToNetmonFilter(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame{MediaType is MediaTypes.NetmonFilter}
+    {
+        switch (cf.Payload)
+        {
+            case f:Netmon.NetmonFilter from BinaryDecoder<Netmon.NetmonFilter> =>
+                dispatch (endpoint Netmon.Node) accepts f;
+            default =>
+                ThrowDecodingException("Netmon", "NetmonFilter");
+        }
+    }
+    process cap accepts cf:CapFile.CapFrame {MediaType is MediaTypes.NetworkInfo}
+    {
+        switch (cf.Payload)
+        {
+            case f:Netmon.NetworkInfo from BinaryDecoder<Netmon.NetworkInfo> =>
+                dispatch (endpoint Netmon.Node) accepts f;
+            default =>
+                ThrowDecodingException("Network", "NetworkInfo");
+        }
+    }
+    process cap accepts cf:CapFile.CapFrame {MediaType is MediaTypes.NetworkInfoEx}
+    {
+        switch (cf.Payload)
+        {
+           case f:Netmon.NetworkInfoEx from BinaryDecoder<Netmon.NetworkInfoEx> =>
+               dispatch (endpoint Netmon.Node) accepts f;
+           default =>
+               ThrowDecodingException("Network", "NetworkInfoEx");
+        }
+    }
+}
+
+autostart actor CapFileToLinuxCookedMode(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame {MediaType is MediaTypes.LinuxCookedMode}
+    {
+        switch (cf.Payload)
+        {
+            case d:LinuxCookedMode.Datagram from BinaryDecoder<LinuxCookedMode.Datagram> =>
+                dispatch (endpoint LinuxCookedMode.Node) accepts d;
+            default =>
+                ThrowDecodingException("LinuxCookedMode");
+        }
+    }
+}
+
+autostart actor CapFileToEthernet(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame
+        where !cf.IsSessionTruncated && (cf.MediaType is (MediaTypes.Ethernet | MediaTypes.Ethernet0)) && !IsPPPPayload(cf.Payload) 
+    {
+        switch (cf.Payload)
+        {
+            case f:Ethernet.Frame from BinaryDecoder<Ethernet.Frame[false]> =>
+                dispatch (endpoint Ethernet.Node) accepts f;
+            default =>
+                ThrowDecodingException("Ethernet");
+        }
+    }
+}
+
+autostart actor CapFileToIP1394(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame{MediaType is MediaTypes.Ip1394} 
+    {
+        switch (cf.Payload)
+        {
+            case f:IP1394.Frame from BinaryDecoder<IP1394.Frame> =>
+                dispatch (endpoint IP1394.ReassemblyNode[f.DestinationAddress.FlatAddress < f.SourceAddress.FlatAddress ? f.DestinationAddress.FlatAddress: f.SourceAddress.FlatAddress]) accepts f;
+            default =>
+                ThrowDecodingException("IP1394");
+        }
+    }
+}
+
+autostart actor CapFileToWebProxy(CapFile.CapFileEndpoint cap)
+{
+    map<uint, string> host = {};
+    process cap accepts cf:CapFile.CapFrame{MediaType is (MediaTypes.WebProxy | MediaTypes.MAExportedWebProxy)}
+    {
+        switch (cf.Payload)
+        {
+            case fm:WebProxy.Message from BinaryDecoder<WebProxy.Message> =>
+                stream s = fm.Payload;
+                if (fm.IsRequest == 1)
+                {
+                    var requestHeaderOptional = RequestHeader(s);
+                    if (requestHeaderOptional != nothing)
+                    {
+                        var requestHeader = requestHeaderOptional as HttpContract.Request;
+                        if ("Host" in requestHeader.Headers)
+                        {
+                            host[fm.SessionId] = requestHeader.Headers["Host"] as string;
+                            fm.DestinationAddress = host[fm.SessionId];
+                            fm.SourceAddress = "Local";
+                        }
+                    }
+                    
+                    dispatch (endpoint WebProxy.Server[fm.SessionId]) accepts fm;
+                }
+                else
+                {
+                    if (fm.SessionId in host)
+                    {
+                        fm.SourceAddress = host[fm.SessionId];
+                        fm.DestinationAddress = "Local";
+                        host = host.Remove(fm.SessionId);
+                    }
+
+                    dispatch (endpoint WebProxy.Server[fm.SessionId]) issues fm;
+                }
+            default =>
+                ThrowDecodingException("Web proxy");
+        }
+    }
+}
+
+autostart actor CapFileToWiFi(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame{MediaType == MediaTypes.WiFi}
+    {
+        switch (cf.Payload)
+        {
+            case wifi:NetMon3WiFiChannelMessage from BinaryDecoder<NetMon3WiFiChannelMessage> =>
+                dispatch endpoint WiFiChannelNode accepts wifi;
+            default =>
+                if (!DecodeWiFiMessageAndDispatch(cf.Payload))
+                {
+                    ThrowDecodingException("WiFi");
+                }
+        }
+    }
+
+    process cap accepts cf:CapFile.CapFrame{MediaType == MediaTypes.MAExportedWiFi}
+    {
+        if (!DecodeWiFiMessageAndDispatch(cf.Payload))
+        {
+            ThrowDecodingException("WiFi");
+        }
+    }
+}
+
+autostart actor CapFileToEtwEvent(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedEtwEvent
+    {
+        switch (cf.Payload)
+        {
+            case msg:Etw.EtwProviderMsg from EtwDecoder =>
+                dispatch (endpoint EtwEvent.EtwNode) accepts msg;
+            default =>
+                ThrowDecodingException("Etw");
+        }
+    }
+}
+
+optional Etw.EtwProviderMsg EtwDecoder(binary payload)
+{
+    stream s = payload;
+    var record = BinaryDecoder<EventRecord>(s);
+    
+    if (record == nothing)
+        return nothing;
+    
+    var msg = new Etw.EtwProviderMsg {
+        EventRecord = record as EventRecord,
+        // skip one byte because we exported whether etw is reassembled in cap file
+        Payload = s.PeekBytes(s.BitPosition + 8)
+    };
+    
+    msg.SourceData = payload;
+    msg.AssignFieldEncodingInfo("EventRecord", 0, 88 * 8);
+    msg.AssignFieldEncodingInfo("Payload", 89 * 8, (payload.Count - 89) * 8);
+    
+    return msg;
+}
+
+autostart actor CapFileToWiFiChannelInfo(CapFile.CapFileEndpoint cap)
+{
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWiFiChannelInfo
+    {
+        switch (cf.Payload)
+        {
+            case ndisWifi:WiFiChannelInfo.NdisEtwWiFiChannelMessage from BinaryDecoder<WiFiChannelInfo.NdisEtwWiFiChannelMessage> =>
+                dispatch endpoint WiFiChannelInfo.WiFiChannelNode accepts ndisWifi;
+            default =>
+                ThrowDecodingException("WiFiChannelInfo");
+        }
+    }
+}
+
+autostart actor CapFileToWfp(CapFile.CapFileEndpoint cap)
+{
+    // WFP v4 message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpMessageV4
+    {
+        switch (cf.Payload)
+        {
+            case m:MessageV4 from BinaryDecoder<MessageV4> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP", "MessageV4");
+        }
+    }
+
+    // WFP v6 message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpMessageV6
+    {
+        switch (cf.Payload)
+        {
+            case m:MessageV6 from BinaryDecoder<MessageV6> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP", "MessageV6");
+        }
+    }
+
+    // WFP v4 message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpMessage2V4
+    {
+        switch (cf.Payload)
+        {
+            case m:Message2V4 from BinaryDecoder<Message2V4> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP2", "Message2V4");
+        }
+    }
+
+    // WFP v6 message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpMessage2V6
+    {
+        switch (cf.Payload)
+        {
+            case m:Message2V6 from BinaryDecoder<Message2V6> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP2", "Message2V6");
+        }
+    }
+
+    // WFP v4 ALE Auth message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpAuthMessageV4
+    {
+        switch (cf.Payload)
+        {
+            case m:AuthMessageV4 from BinaryDecoder<AuthMessageV4> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP2", "AuthMessageV4");
+        }
+    }
+
+    // WFP v6 ALE Auth message.
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedWfpAuthMessageV6
+    {
+        switch (cf.Payload)
+        {
+            case m:AuthMessageV6 from BinaryDecoder<AuthMessageV6> =>
+                binary localAddr;
+                binary remoteAddr;
+                WFPCapture.GetLocalAndRemoteAddress(m.DestinationAddress.FlatAddress, m.SourceAddress.FlatAddress, out localAddr, out remoteAddr);
+                dispatch (endpoint WFPFrame[localAddr, remoteAddr]) accepts m;
+            default =>
+                ThrowDecodingException("WFP2", "AuthMessageV6");
+        }
+    }
+}
+
+autostart actor CapFileToPefNdis(CapFile.CapFileEndpoint cap)
+{
+    // PEF Ndis message
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedPefNdisPefNdisMsg
+    {
+        switch (cf.Payload)
+        {
+            case m:PefNdisMsg from BinaryDecoder<PefNdisMsg> =>
+                //m#EtwKeywords = etwMsg.EventRecord.Header.Descriptor.Keywords;
+                //m#EtwThreadID = etwMsg.EventRecord.Header.ThreadId;
+                dispatch (endpoint PefNdisNode) accepts m;
+            default =>
+                ThrowDecodingException("PefNdisMsg");
+        }
+    }
+    
+    // PEF Ndis Wifi MetaData message
+    process cap accepts cf:CapFile.CapFrame where cf.MediaType == MediaTypes.MAExportedPefNdisPefNdisWifiMetaMsg
+    {
+        switch (cf.Payload)
+        {
+            case m:PefNdisWifiMetaMsg from BinaryDecoder<PefNdisWifiMetaMsg> =>
+                dispatch (endpoint PefNdisNode) accepts m;
+            default =>
+                ThrowDecodingException("PefNdisWifiMetaMsg");
+        }
+    }
+}
+
+// ref to npl
+autostart actor CapFileToIPv6(CapFile.CapFileEndpoint cap)
+{
+    set<ushort> mediaTypes = {MediaTypes.Tunneling, MediaTypes.WWan, MediaTypes.RawIPFrames, 0xE00C, 0xE064, 0xE065, 0xE066, 0xE067};
+    
+    process cap accepts cf:CapFile.CapFrame where (cf.MediaType in mediaTypes && (cf.Payload[0] & 0xF0) == 0x60)
+    {
+        switch (cf.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv6");
+        }
+    }
+}
+
+autostart actor CapFileToIPv4(CapFile.CapFileEndpoint cap)
+{
+    set<ushort> mediaTypes = {MediaTypes.Tunneling, MediaTypes.WWan, MediaTypes.RawIPFrames, 0xE00C, 0xE064, 0xE065, 0xE066, 0xE067};
+
+    process cap accepts cf:CapFile.CapFrame where (cf.MediaType in mediaTypes && (cf.Payload[0] & 0xF0) == 0x40)
+    {
+        switch (cf.Payload)
+        {
+            case d:IPv4.Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPv4");
+        }
+    }
+}
+
+bool IsPPPPayload(binary payload)
+{
+    if (payload.Count < 5)
+        return false;
+    var segment = payload.Segment(0, 5);
+    return segment == PPPmarker1 || segment == PPPmarker2;
+}

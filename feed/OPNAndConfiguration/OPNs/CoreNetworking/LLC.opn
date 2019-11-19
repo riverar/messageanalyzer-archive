@@ -1,0 +1,191 @@
+protocol LLC with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Logic Link Control (IEEE 802.2)",
+    ShortName = "LLC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "IEEE Std 802.2", Version = "1998 Endition", Link = "http://standards.ieee.org/getieee802/download/802.2-1998.pdf"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "369414", Date = "10/22/2014"}
+        ]
+};
+    
+using Standard;
+using Ethernet;
+using WiFi;
+using Utility;
+
+endpoint Node accepts Segment;
+
+// Since Bug 36618, change all the "binding" to actor temporarily.
+//binding LLCOverEthernet: LLC.Node over node:Ethernet.Node
+//{
+    //rule node accepts Ethernet.Frame{LengthOrType is ushort where value <= 0x05DC, MacClientData is m:Segment from BinaryDecoder<Segment>}
+        //=>LLC.Node accepts m;
+//}
+
+autostart actor LLCOverEthernet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType is ushort where value <= 0x05DC
+    {
+        // Check if the value of LengthOrType field is equal or less than the length of MacClientData field
+        // And then assign the real payload of the Ethernet.Then LLC can consume correctly.
+        int length = f.MacClientData.Count;
+        
+        switch (f.MacClientData.Segment(0, f.LengthOrType > 0 && f.LengthOrType <= length ? f.LengthOrType : length))
+        {
+            case m:Segment from BinaryDecoder<Segment> =>
+                dispatch (endpoint LLC.Node) accepts m;
+            default => 
+                ThrowDecodingException("LLC");
+        }
+    }
+}
+
+autostart actor LLCOverWiFi(WiFi.Node wifi)
+{
+    process wifi accepts m:WiFiMessage
+        where ((m.MacHeader as MacHeaderBase).FrameControl).Type == MessageType.Data
+            && !(m#IsEncrypted as bool)
+    {
+        if (!DecodeAndDispatchLLCMessageFromWiFiFrame(m))
+        {
+            reject;
+        }
+    }
+}
+
+bool DecodeAndDispatchLLCMessageFromWiFiFrame(WiFiMessage frame)
+{
+    if (frame == null || frame.Body == nothing || frame.Body == null)
+    {
+        return false;
+    }
+    
+    if (frame.Body is data:binary && BinaryDecoder<Segment>(data) is segment:Segment)
+    {
+        dispatch (endpoint LLC.Node) accepts segment;
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+message Segment
+{
+    byte DSAPaddress    with BinaryEncoding{Width = 7};
+    byte IG             with BinaryEncoding{Width = 1};
+    byte SSAPaddress    with BinaryEncoding{Width = 7};
+    byte CR             with BinaryEncoding{Width = 1};
+    (Information | Supervisory | Unnumbered[CR]) Control;
+    optional ([|Control is Information || Control is Unnumbered|] InformationData) InformationData;
+    
+    override string ToString()
+    {
+        string summary;
+        if (Control is Information)
+        {
+            summary += "Information frame";
+        }
+        else if (Control is Supervisory)
+        {
+            summary += "Supervisory frame";
+        }
+        else if (Control is Unnumbered)
+        {
+            summary += "Unnumbered frame";
+        }
+        
+        summary += ", C/R: ";
+        if (CR == 1)
+        {
+            summary += "Response";
+        }
+        else if (CR == 0)
+        {
+            summary += "Command";
+        }
+        summary += ", SSAP: " + (SSAPaddress as string) + ", DSAP: " + (DSAPaddress as string);
+        return summary;
+    }
+}
+
+type InformationData
+{
+    binary Payload;
+}
+
+type Information
+{
+    byte SendSequenceNumber     with BinaryEncoding{Width = 7};
+    byte Type where value == 0  with BinaryEncoding{Width = 1};
+    byte ReceiveSequenceNumber  with BinaryEncoding{Width = 7};
+    byte PF                     with BinaryEncoding{Width = 1};
+}
+
+type Supervisory
+{
+    byte Reserved               with BinaryEncoding{Width = 4};
+    byte SupervisoryFunctions   with BinaryEncoding{Width = 2};
+    byte Type where value == 1  with BinaryEncoding{Width = 2};
+    byte ReceiveSequenceNumber  with BinaryEncoding{Width = 7};
+    byte PF                     with BinaryEncoding{Width = 1};
+}
+
+type Unnumbered[byte CR]
+{
+    byte MMM                    with BinaryEncoding{Width = 3};
+    byte PF                     with BinaryEncoding{Width = 1};
+    byte MM                     with BinaryEncoding{Width = 2};
+    byte Type where value == 3  with BinaryEncoding{Width = 2};
+    optional [|CR == 1 && MMM == 4 && MM == 1|] FRMR FRMR;
+    optional [|CR == 1 && MMM in {6, 7} && MM == 1|] ACnResponse ACnResponse;
+}
+
+type FRMRUnnumbered
+{
+    byte MMM                    with BinaryEncoding{Width = 3};
+    byte PF                     with BinaryEncoding{Width = 1};
+    byte MM                     with BinaryEncoding{Width = 2};
+    byte Type where value == 3  with BinaryEncoding{Width = 2};
+    byte Reserved               with BinaryEncoding{Width = 8};
+}
+
+pattern FRMRControl = Information | Supervisory | FRMRUnnumbered;
+
+//FRMR - Frame Reject
+//802.2-1998.pdf page 58 Fig 17
+type FRMR
+{
+    FRMRControl Control;
+    byte SendStateVariable      with BinaryEncoding{Width = 7};
+    byte Reserved               with BinaryEncoding{Width = 1};
+    byte ReceiveStateVariable   with BinaryEncoding{Width = 7};
+    byte CR                     with BinaryEncoding{Width = 1};
+    byte Unused                 with BinaryEncoding{Width = 3};
+    bool V                      with BinaryEncoding{Width = 1};
+    bool Z                      with BinaryEncoding{Width = 1};
+    bool Y                      with BinaryEncoding{Width = 1};
+    bool X                      with BinaryEncoding{Width = 1};
+    bool W                      with BinaryEncoding{Width = 1};
+}
+
+//ACn Reponse
+//802.2-1998.pdf page 59 Fig 19
+type ACnResponse
+{
+    byte RRRR      with BinaryEncoding{Width = 4};
+    byte CCCC      with BinaryEncoding{Width = 4};
+    optional binary LinkServiceDataUnit;
+}

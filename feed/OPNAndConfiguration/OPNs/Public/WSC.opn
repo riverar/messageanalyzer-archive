@@ -1,0 +1,1566 @@
+protocol WSC with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "WiFi Simple Configuration Protocol",
+    ShortName = "WSC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "Wi-Fi Simple Configuration Technical Specification", Version = "2.0.2"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380594", Date = "08/13/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using EAP;
+using InfrastructureResources;
+using PublicResources;
+
+endpoint Server over EAP.Server issues Packet accepts Packet;
+client endpoint Client connected to Server;
+
+autostart actor WSCOverEAP(EAP.Server node)
+{
+    array<Packet> sentFragments = [];
+    array<Packet> receivedFragments = [];
+
+    process node accepts p:EAP.Packet 
+        where (p.Type == EAP.MethodType.ExpandedTypes && p.Type_Data is expandedTypes:ExpandedTypes && 
+        expandedTypes.Vendor_Id == ExpandedTypesVendorId.WiFiAlliance && expandedTypes.Vendor_Type == Vendor_Type_SimpleConfig)
+    {
+        if (BinaryDecoder<WSC.Packet>(expandedTypes.Vendor_Data) is packet:WSC.Packet)
+        {
+            if (packet.MessageData != nothing)
+            {
+                ReassembleWSCFragment(packet, ref sentFragments, true, endpoint Server over node);
+            }
+            else
+            {
+                dispatch endpoint Server over node accepts packet;
+            }
+        }
+        else
+        {
+            ThrowDecodingException("WSC");
+        }
+    }
+
+    process node issues p:EAP.Packet 
+        where (p.Type == EAP.MethodType.ExpandedTypes && p.Type_Data is expandedTypes:ExpandedTypes && 
+        expandedTypes.Vendor_Id == ExpandedTypesVendorId.WiFiAlliance && expandedTypes.Vendor_Type == Vendor_Type_SimpleConfig)
+    {
+        if (BinaryDecoder<WSC.Packet>(expandedTypes.Vendor_Data) is packet:WSC.Packet)
+        {
+            if (packet.MessageData != nothing)
+            {
+                ReassembleWSCFragment(packet, ref receivedFragments, false, endpoint Server over node);
+            }
+            else
+            {
+                dispatch endpoint Server over node issues packet;
+            }
+        }
+        else
+        {
+            ThrowDecodingException("WSC");
+        }
+    }
+
+     ~endpoint(EAP.Server node)
+    {
+        if (sentFragments.Count > 0)
+        {
+            ClearArray(ref sentFragments);
+        }
+        
+        if (receivedFragments.Count > 0)
+        {
+            ClearArray(ref receivedFragments);
+        }
+    }
+}
+
+void ReassembleWSCFragment(Packet p, ref array<Packet> packetArray, bool isAccept, Server ept)
+{
+    if (packetArray.Count > 0 && (p.OpCode != (packetArray[0] as Packet).OpCode))
+    {
+        ClearArray(ref packetArray);
+    }
+    if ((p.Flags & PacketFlags.MF) > 0)
+    {
+        packetArray += [p];
+    }
+    else
+    {
+        Packet packet = p;
+        if (packetArray.Count > 0)
+        {
+            packetArray += [p];
+            binary reassembledBin = Utility.EmptyBinary;
+            foreach (Packet ele in packetArray)
+            {
+                if (ele.MessageData is messageBinCur:binary)
+                {
+                    reassembledBin += messageBinCur;
+                }
+            }
+            packet.MessageData = reassembledBin;
+            if (packetArray[0].MessageLength is expectedLen:uint && expectedLen > (reassembledBin.Count as uint))
+            {
+                ClearArray(ref packetArray);
+            }
+            else
+            {
+                binary sourceData = Utility.EmptyBinary;
+                foreach (Packet ele in packetArray)
+                {
+                    packet.Origins += [ele]; // packet.Origins = packetArray may cause compiling error
+                    sourceData += (ele.SourceData as binary);
+                }
+                packet.SourceData = sourceData;
+                packetArray = [];
+            }
+        }
+        if (packet.MessageData is messageDataBin:binary)
+        {
+            switch (packet.OpCode)
+            {
+                case PacketOpCode.WSC_ACK =>
+                    packet.MessageData = BinaryDecoder<WSC_ACK>(messageDataBin);
+                case PacketOpCode.WSC_NACK =>
+                    packet.MessageData = BinaryDecoder<WSC_NACK>(messageDataBin);
+                case PacketOpCode.WSC_Done =>
+                    packet.MessageData = BinaryDecoder<WSC_Done>(messageDataBin);
+                case PacketOpCode.WSC_MSG =>
+                    if (messageDataBin.Count >= 10)
+                    {
+                        switch (messageDataBin[9])
+                        {
+                            case MessageTypeData.M1 =>
+                                packet.MessageData = BinaryDecoder<M1>(messageDataBin);
+                            case MessageTypeData.M2 =>
+                                packet.MessageData = BinaryDecoder<M2>(messageDataBin);
+                            case MessageTypeData.M2D =>
+                                packet.MessageData = BinaryDecoder<M2D>(messageDataBin);
+                            case MessageTypeData.M3 =>
+                                packet.MessageData = BinaryDecoder<M3>(messageDataBin);
+                            case MessageTypeData.M4 =>
+                                packet.MessageData = BinaryDecoder<M4>(messageDataBin);
+                            case MessageTypeData.M5 =>
+                                packet.MessageData = BinaryDecoder<M5>(messageDataBin);
+                            case MessageTypeData.M6 =>
+                                packet.MessageData = BinaryDecoder<M6>(messageDataBin);
+                            case MessageTypeData.M7 =>
+                                packet.MessageData = BinaryDecoder<M7>(messageDataBin);
+                            case MessageTypeData.M8 =>
+                                packet.MessageData = BinaryDecoder<M8>(messageDataBin);
+                            case MessageTypeData.WSC_ACK =>
+                                packet.MessageData = BinaryDecoder<WSC_ACK>(messageDataBin);
+                            case MessageTypeData.WSC_NACK =>
+                                packet.MessageData = BinaryDecoder<WSC_NACK>(messageDataBin);
+                            case MessageTypeData.WSC_Done =>
+                                packet.MessageData = BinaryDecoder<WSC_Done>(messageDataBin);
+                            default =>;
+                                ThrowDecodingException("WSC", UTILITY_INVALID_DATA, ["MessageType", messageDataBin[9].ToString()]);
+                        }
+                    }
+                    else
+                    {
+                        ThrowDecodingException("WSC", WSC_DATA_NOT_ENOUGH, []);
+                    }
+                default =>;
+                    ThrowDecodingException("WSC", UTILITY_INVALID_DATA, ["OpCode"]);
+            }
+        }
+        if (isAccept)
+        {
+            dispatch ept accepts packet;
+        }
+        else
+        {
+            dispatch ept issues packet;
+        }
+    }
+}
+
+void ClearArray(ref array<Packet> packetArray)
+{
+    foreach (Packet packet in packetArray)
+    {
+        DisplayTopLevelMessage(packet, "WSC: Insufficient fragments for full reassembly.");
+    }
+    packetArray = [];
+}
+
+// 7.7.1
+message Packet
+{
+    PacketOpCode OpCode;
+    PacketFlags Flags;
+    optional [|(Flags & PacketFlags.LF) > 0|] uint MessageLength;
+    optional [|OpCode != PacketOpCode.WSC_Start|] 
+        (binary | M1 | M2 | M2D | M3 | M4 | M5 | M6 | M7 | M8 | WSC_ACK | WSC_NACK | WSC_Done) MessageData;
+    
+    override string ToString()
+    {
+        string summary = EnumToStringInSummary<PacketOpCode>(OpCode);
+        if (Flags > 0)
+        {
+            summary += ", " + EnumToStringInSummary<PacketFlags>(Flags);
+        }
+        if (MessageData != nothing && !(MessageData is binary))
+        {
+            summary += ", " + MessageData.ToString();
+        }
+        return summary;
+    }
+}
+
+pattern PacketOpCode = enum byte
+{
+    WSC_Start = 0x01,
+    WSC_ACK = 0x02,
+    WSC_NACK = 0x03,
+    WSC_MSG = 0x04,
+    WSC_Done = 0x05,
+    WSC_FRAG_ACK = 0x06,
+    ...
+};
+
+pattern PacketFlags = flags byte
+{
+    LF = 0x01,
+    MF = 0x02,
+    ...
+};
+
+// 8.3.1
+type M1
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    UUID_ETLV UUID_E;
+    MACAddressTLV MACAddress;
+    EnrolleeNonceTLV EnrolleeNonce;
+    PublicKeyTLV PublicKey;
+    AuthenticationTypeFlagsTLV AuthenticationTypeFlags;
+    EncryptionTypeFlagsTLV EncryptionTypeFlags;
+    ConnectionTypeFlagsTLV ConnectionTypeFlags;
+    ConfigurationMethodsTLV ConfigurationMethods;
+    Wi_FiSimpleConfigurationStateTLV Wi_FiSimpleConfigurationState;
+    ManufacturerTLV Manufacturer;
+    ModelNameTLV ModelName;
+    ModelNumberTLV ModelNumber;
+    SerialNumberTLV SerialNumber;
+    PrimaryDeviceTypeTLV PrimaryDeviceType;
+    DeviceNameTLV DeviceName;
+    RFBandsTLV RFBands;
+    AssociationStateTLV AssociationState;
+    DevicePasswordIDTLV DevicePasswordID;
+    ConfigurationErrorTLV ConfigurationError;
+    OSVersionTLV OSVersion;
+    Version2TLV Version2;
+    optional RequestToEnrollTLV RequestToEnroll;
+    optional [|RemainingByteLength(stream) > 0|] array<OtherTLV> other;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.2
+type M2
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    RegistrarNonceTLV RegistrarNonce;
+    UUID_RTLV UUID_R;
+    PublicKeyTLV PublicKey;
+    AuthenticationTypeFlagsTLV AuthenticationTypeFlags;
+    EncryptionTypeFlagsTLV EncryptionTypeFlags;
+    ConnectionTypeFlagsTLV ConnectionTypeFlags;
+    ConfigurationMethodsTLV ConfigurationMethods;
+    ManufacturerTLV Manufacturer;
+    ModelNameTLV ModelName;
+    ModelNumberTLV ModelNumber;
+    SerialNumberTLV SerialNumber;
+    PrimaryDeviceTypeTLV PrimaryDeviceType;
+    DeviceNameTLV DeviceName;
+    RFBandsTLV RFBands;
+    AssociationStateTLV AssociationState;
+    ConfigurationErrorTLV ConfigurationError;
+    DevicePasswordIDTLV DevicePasswordID;
+    OSVersionTLV OSVersion;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.3
+type M2D
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    RegistrarNonceTLV RegistrarNonce;
+    UUID_RTLV UUID_R;
+    AuthenticationTypeFlagsTLV AuthenticationTypeFlags;
+    EncryptionTypeFlagsTLV EncryptionTypeFlags;
+    ConnectionTypeFlagsTLV ConnectionTypeFlags;
+    ConfigurationMethodsTLV ConfigurationMethods;
+    ManufacturerTLV Manufacturer;
+    ModelNameTLV ModelName;
+    ModelNumberTLV ModelNumber;
+    SerialNumberTLV SerialNumber;
+    PrimaryDeviceTypeTLV PrimaryDeviceType;
+    DeviceNameTLV DeviceName;
+    RFBandsTLV RFBands;
+    AssociationStateTLV AssociationState;
+    ConfigurationErrorTLV ConfigurationError;
+    OSVersionTLV OSVersion;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 0|] array<OtherTLV> other;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.4
+type M3
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    RegistrarNonceTLV RegistrarNonce;
+    E_Hash1TLV E_Hash1;
+    E_Hash2TLV E_Hash2;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.5
+type M4
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    R_Hash1TLV R_Hash1;
+    R_Hash2TLV R_Hash2;
+    EncryptedSettingsTLV EncryptedSettings;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.6
+type M5
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    RegistrarNonceTLV RegistrarNonce;
+    EncryptedSettingsTLV EncryptedSettings;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.7
+type M6
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    EncryptedSettingsTLV EncryptedSettings;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.8
+type M7
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    RegistrarNonceTLV RegistrarNonce;
+    EncryptedSettingsTLV EncryptedSettings;
+    optional SettingsDelayTimeTLV SettingsDelayTime;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    optional AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.9
+type M8
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    EncryptedSettingsTLV EncryptedSettings;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 12|] array<OtherTLV[TLVAttributeType.Authenticator]> other;
+    AuthenticatorTLV Authenticator;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.10
+type WSC_ACK
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    RegistrarNonceTLV RegistrarNonce;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 0|] array<OtherTLV> other;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.11
+type WSC_NACK
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    RegistrarNonceTLV RegistrarNonce;
+    ConfigurationErrorTLV ConfigurationError;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 0|] array<OtherTLV> other;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// 8.3.12
+type WSC_Done
+{
+    VersionTLV Version;
+    MessageTypeTLV MessageType;
+    EnrolleeNonceTLV EnrolleeNonce;
+    RegistrarNonceTLV RegistrarNonce;
+    Version2TLV Version2;
+    optional [|RemainingByteLength(stream) > 0|] array<OtherTLV> other;
+    override string ToString()
+    {
+        return MessageType.ToString();
+    }
+}
+
+// chap 12, Table 28
+type Enabled8021XTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type APChannelTLV : TLVBase
+{
+    ushort Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type APSetupLockedTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ApplicationExtensionTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type AppSessionKeyTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type AssociationStateTLV : TLVBase
+{
+    AssociationStateData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<AssociationStateData>(Data);
+    }
+}
+
+pattern AssociationStateData = enum ushort
+{
+    NotAssociated = 0,
+    ConnectionSuccess = 1,
+    ConfigurationFailure = 2,
+    AssociationFailure = 3,
+    IPFailure = 4,
+    ...
+};
+
+type AuthenticationTypeTLV : TLVBase
+{
+    ushort Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type AuthenticationTypeFlagsTLV : TLVBase
+{
+    AuthenticationTypeFlagsData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<AuthenticationTypeFlagsData>(Data);
+    }
+}
+
+pattern AuthenticationTypeFlagsData = flags ushort
+{
+    Open = 0x0001,
+    WPA_Personal = 0x0002,
+    Shared = 0x0004,
+    WPA_Enterprise = 0x0008,
+    WPA2_Enterprise = 0x0010,
+    WPA2_Personal = 0x0020,
+    ...
+};
+
+type AuthenticatorTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 8};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ConfigurationErrorTLV : TLVBase
+{
+    ConfigurationErrorData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<ConfigurationErrorData>(Data);
+    }
+}
+
+pattern ConfigurationErrorData = enum ushort
+{
+    NoError = 0,
+    Out_of_BandInterfaceReadError = 1,
+    DecryptionCRCFailure = 2,
+    $"2.4channelnotsupported" = 3,
+    $"5.0channelnotsupported" = 4,
+    Signaltooweak = 5,
+    NetworkAuthFailure = 6,
+    NetworkAssociationFailure = 7,
+    NoDHCPResponse = 8,
+    FailedDHCPConfig = 9,
+    IPaddressConflict = 10,
+    CouldNotConnectToRegistrar = 11,
+    MultiplePBCSessionsDetected = 12,
+    RogueActivitySuspected = 13,
+    DeviceBusy = 14,
+    SetupLocked = 15,
+    MessageTimeout = 16,
+    RegistrationSessionTimeout = 17,
+    DevicePasswordAuthFailure = 18,
+    ...
+};
+
+type ConfigurationMethodsTLV : TLVBase
+{
+    ConfigurationMethodsData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<ConfigurationMethodsData>(Data);
+    }
+}
+
+pattern ConfigurationMethodsData = enum ushort
+{
+     USBA = 0x0001,
+     Ethernet = 0x0002,
+     Label = 0x0004,
+     Display = 0x0008,
+     ExternalNFCToken = 0x0010,
+     IntegratedNFCToken = 0x0020,
+     NFCInterface = 0x0040,
+     PushButton = 0x0080,
+     Keypad = 0x0100,
+     VirtualPushButton = 0x0280,
+     PhysicalPushButton = 0x0480,
+     VirtualDisplayPIN = 0x2008,
+     PhysicalDisplayPIN = 0x4008,
+     ...
+};
+
+type ConfirmationURL4TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ConfirmationURL6TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ConnectionTypeTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ConnectionTypeFlagsTLV : TLVBase
+{
+    ConnectionTypeFlagsData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<ConnectionTypeFlagsData>(Data);
+    }
+}
+
+pattern ConnectionTypeFlagsData = flags byte
+{
+    ESS = 0x1,
+    IBSS = 0x2,
+    ...
+};
+
+type CredentialTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type DeviceNameTLV : TLVBase
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = DataLength * 8};
+    override string ToString()
+    {
+        return Data;
+    }
+}
+
+type DevicePasswordIDTLV : TLVBase
+{
+    DevicePasswordIDData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<DevicePasswordIDData>(Data);
+    }
+}
+
+pattern DevicePasswordIDData = enum ushort
+{
+    $"Default(PIN)" = 0x0000,
+    User_specified = 0x0001,
+    Machine_specified = 0x0002,
+    Rekey = 0x0003,
+    PushButton = 0x0004,
+    Registrar_specified = 0x0005,
+    ...
+};
+
+type EAPIdentityTLV : TLVBase
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DataLength};
+    override string ToString()
+    {
+        return Data;
+    }
+}
+
+type EAPTypeTLV : TLVBase
+{
+    EAP.MethodType Type;
+    optional [|DataLength > 1|] EAP.ExpandedTypesVendorId Vendor_Id with BinaryEncoding{Width = 24};
+    optional [|DataLength > 1|] uint Vendor_Type;
+}
+
+type E_Hash1TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type E_Hash2TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type EncryptedSettingsTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength}; // encrypted, so keep binary here
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type EncryptionTypeTLV : TLVBase
+{
+    ushort Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type EncryptionTypeFlagsTLV : TLVBase
+{
+    EncryptionTypeFlagsData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<EncryptionTypeFlagsData>(Data);
+    }
+}
+
+pattern EncryptionTypeFlagsData = flags ushort
+{
+    None = 0x0001,
+    WEP = 0x0002,
+    TKIP = 0x0004,
+    AES = 0x0008,
+    ...
+};
+
+type EnrolleeNonceTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type E_SNonce1TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type E_SNonce2TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type FeatureIDTLV : TLVBase
+{
+    uint Data;
+}
+
+type IdentityTLV : TLVBase
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DataLength};
+    override string ToString()
+    {
+        return Data;
+    }
+}
+
+type IdentityProofTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type InitializationVectorTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type KeyIdentifierTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type KeyLifetimeTLV : TLVBase
+{
+    uint Data;
+}
+
+type KeyProvidedAutomaticallyTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type KeyWrapAuthenticatorTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 8};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type MACAddressTLV : TLVBase
+{
+    MacAddress Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ManufacturerTLV : TLVBase
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DataLength};
+    override string ToString()
+    {
+        return Data;
+    }
+}
+
+type MessageCounterTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 8};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type MessageTypeTLV : TLVBase
+{
+    MessageTypeData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<MessageTypeData>(Data);
+    }
+}
+
+pattern MessageTypeData = enum byte
+{
+    Beacon = 0x01,
+    ProbeRequest = 0x02,
+    ProbeResponse = 0x03,
+    M1 = 0x04,
+    M2 = 0x05,
+    M2D = 0x06,
+    M3 = 0x07,
+    M4 = 0x08,
+    M5 = 0x09,
+    M6 = 0x0A,
+    M7 = 0x0B,
+    M8 = 0x0C,
+    WSC_ACK = 0x0D,
+    WSC_NACK = 0x0E,
+    WSC_Done = 0x0F,
+    ...
+};
+
+type ModelNameTLV : TLVBase
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = DataLength};
+    override string ToString()
+    {
+        return Data;
+    }
+}
+
+type ModelNumberTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type NetworkIndexTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type NetworkKeyTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type NetworkKeyIndexTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type NewDeviceNameTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type NewPasswordTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type Out_of_BandDevicePasswordTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type OSVersionTLV : TLVBase
+{
+    uint Data;
+    override string ToString()
+    {
+        return DecToHexFormat(Data);
+    }
+}
+
+type PermittedConfigurationMethodsTLV : TLVBase
+{
+    ushort Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PortableDeviceTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PowerLevelTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PrimaryDeviceTypeTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PSKCurrentTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PSKMaxTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PublicKeyTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 192};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type PublicKeyHashTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 20};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RadioEnabledTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RebootTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RegistrarCurrentTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RegistrarEstablishedTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RegistrarListTLV : TLVBase
+{
+    array<RegistrarListElement> Data;
+}
+
+type RegistrarListElement
+{
+    guid UUID;
+    string DeviceName;
+}
+
+type RegistrarMaxTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RegistrarNonceTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RekeyKeyTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 32};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RequestTypeTLV : TLVBase
+{
+    RequestTypeData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<RequestTypeData>(Data);
+    }
+}
+
+pattern RequestTypeData = enum byte
+{
+    Enrollee_Info_Only = 0x00,
+    Enrollee_Open8021X = 0x01,
+    Registrar = 0x02,
+    WLANManagerRegistrar = 0x03,
+    ...
+};
+
+type RequestedDeviceTypeTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 8};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type ResponseTypeTLV : TLVBase
+{
+    ResponseTypeData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<ResponseTypeData>(Data);
+    }
+}
+
+pattern ResponseTypeData = enum byte
+{
+    Enrollee_Info_Only = 0x00,
+    Enrollee_Open8021X = 0x01,
+    Registrar = 0x02,
+    AP = 0x03,
+    ...
+};
+
+type RFBandsTLV : TLVBase
+{
+    RFBandsData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<RFBandsData>(Data);
+    }
+}
+
+pattern RFBandsData = enum byte
+{
+    $"2.4GHz" = 0x01,
+    $"5.0GHz" = 0x02,
+    ...
+};
+
+type R_Hash1TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 32};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type R_Hash2TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 32};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type R_SNonce1TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type R_SNonce2TLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SecondaryDeviceTypeListTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SelectedRegistrarTLV : TLVBase
+{
+    bool Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SelectedRegistrarConfigurationMethodsTLV : TLVBase
+{
+    ushort Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SerialNumberTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SSIDTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type TotalNetworksTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type UUID_ETLV : TLVBase
+{
+    guid Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type UUID_RTLV : TLVBase
+{
+    guid Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type VendorExtensionTLV : TLVBase
+{
+     EAP.ExpandedTypesVendorId VendorID with BinaryEncoding{Width = 24};
+     VendorExtensionSubelementsID SubelementsID;
+     byte SubelementLength;
+}
+
+type Version2TLV : VendorExtensionTLV
+{
+    byte Data where SubelementsID == VendorExtensionSubelementsID.Version2;
+    override string ToString()
+    {
+        ushort majorVersion = ((Data & 0xF0) >> 4) as ushort;
+        ushort minorVersion = (Data & 0x0F) as ushort;
+        return "Version " + majorVersion.ToString() + "." + minorVersion.ToString();
+    }
+}
+
+type AuthorizedMACsTLV : VendorExtensionTLV
+{
+    binary Data where SubelementsID == VendorExtensionSubelementsID.AuthorizedMACs
+        with BinaryEncoding{Length = SubelementLength};
+}
+
+type NetworkKeyShareableTLV : VendorExtensionTLV
+{
+    bool Data where SubelementsID == VendorExtensionSubelementsID.NetworkKeyShareable;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type RequestToEnrollTLV : VendorExtensionTLV
+{
+    bool Data where SubelementsID == VendorExtensionSubelementsID.RequestToEnroll;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type SettingsDelayTimeTLV : VendorExtensionTLV
+{
+    byte Data where SubelementsID == VendorExtensionSubelementsID.SettingsDelayTime;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+pattern VendorExtensionSubelementsID = enum byte
+{
+    Version2 = 0x00,
+    AuthorizedMACs = 0x01,
+    NetworkKeyShareable = 0x02,
+    RequestToEnroll = 0x03,
+    SettingsDelayTime = 0x04,
+    ...
+};
+
+type VersionTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type WEPTransmitKeyTLV : TLVBase
+{
+    byte Data;
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type Wi_FiSimpleConfigurationStateTLV : TLVBase
+{
+    Wi_FiSimpleConfigurationStateData Data;
+    override string ToString()
+    {
+        return EnumToStringInSummary<Wi_FiSimpleConfigurationStateData>(Data);
+    }
+}
+
+pattern Wi_FiSimpleConfigurationStateData = enum byte
+{
+    Reserved = 0x00,
+    NotConfigured = 0x01,
+    Configured = 0x02,
+    ...
+};
+
+type X509CertificateTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+type X509CertificateRequestTLV : TLVBase
+{
+    binary Data with BinaryEncoding{Length = DataLength};
+    override string ToString()
+    {
+        return Data.ToString();
+    }
+}
+
+pattern TLVAttributeType = enum ushort
+{
+    $"802.1XEnabled" = 0x1062,
+    APChannel = 0x1001,
+    APSetupLocked = 0x1057,
+    ApplicationExtension = 0x1058,
+    AppSessionKey = 0x1063,
+    AssociationState = 0x1002,
+    AuthenticationType = 0x1003,
+    AuthenticationTypeFlags = 0x1004,
+    Authenticator = 0x1005,
+    ConfigurationError = 0x1009,
+    ConfigurationMethods = 0x1008,
+    ConfirmationURL4 = 0x100A,
+    ConfirmationURL6 = 0x100B,
+    ConnectionType = 0x100C,
+    ConnectionTypeFlags = 0x100D,
+    Credential = 0x100E,
+    DeviceName = 0x1011,
+    DevicePasswordID = 0x1012,
+    EAPIdentity = 0x104D,
+    EAPType = 0x1059,
+    E_Hash1 = 0x1014,
+    E_Hash2 = 0x1015,
+    EncryptedSettings = 0x1018,
+    EncryptionType = 0x100F,
+    EncryptionTypeFlags = 0x1010,
+    EnrolleeNonce = 0x101A,
+    E_SNonce1 = 0x1016,
+    E_SNonce2 = 0x1017,
+    FeatureID = 0x101B,
+    Identity = 0x101C,
+    IdentityProof = 0x101D,
+    InitializationVector = 0x1060,
+    KeyIdentifier = 0x101F,
+    KeyLifetime = 0x1051,
+    KeyProvidedAutomatically = 0x1061,
+    KeyWrapAuthenticator = 0x101E,
+    MACAddress = 0x1020,
+    Manufacturer = 0x1021,
+    MessageCounter = 0x104E,
+    MessageType = 0x1022,
+    ModelName = 0x1023,
+    ModelNumber = 0x1024,
+    NetworkIndex = 0x1026,
+    NetworkKey = 0x1027,
+    NetworkKeyIndex = 0x1028,
+    NewDeviceName = 0x1029,
+    NewPassword = 0x102A,
+    Out_of_BandDevicePassword = 0x102C,
+    OSVersion = 0x102D,
+    PermittedConfigurationMethods = 0x1052,
+    PortableDevice = 0x1056,
+    PowerLevel = 0x102F,
+    PrimaryDeviceType = 0x1054,
+    PSKCurrent = 0x1030,
+    PSKMax = 0x1031,
+    PublicKey = 0x1032,
+    PublicKeyHash = 0x104F,
+    RadioEnabled = 0x1033,
+    Reboot = 0x1034,
+    RegistrarCurrent = 0x1035,
+    RegistrarEstablished = 0x1036,
+    RegistrarList = 0x1037,
+    RegistrarMax = 0x1038,
+    RegistrarNonce = 0x1039,
+    RekeyKey = 0x1050,
+    RequestType = 0x103A,
+    RequestedDeviceType = 0x106A,
+    ResponseType = 0x103B,
+    RFBands = 0x103C,
+    R_Hash1 = 0x103D,
+    R_Hash2 = 0x103E,
+    R_SNonce1 = 0x103F,
+    R_SNonce2 = 0x1040,
+    SecondaryDeviceTypeList = 0x1055,
+    SelectedRegistrar = 0x1041,
+    SelectedRegistrarConfiguration,
+    Methods = 0x1053,
+    SerialNumber = 0x1042,
+    SSID = 0x1045,
+    TotalNetworks = 0x1046,
+    UUID_E = 0x1047,
+    UUID_R = 0x1048,
+    VendorExtension = 0x1049,
+    Version = 0x104A,
+    WEPTransmitKey = 0x1064,
+    Wi_FiSimpleConfigurationState = 0x1044,
+    X509Certificate = 0x104C,
+    X509CertificateRequest = 0x104B,
+    ...
+};
+
+type OtherTLV[TLVAttributeType ExceptAttributeType]
+{
+    TLVAttributeType AttributeType where value != ExceptAttributeType;
+    ushort DataLength;
+    binary Data with BinaryEncoding{Length = DataLength};
+}
+
+type TLVBase
+{
+    TLVAttributeType AttributeType;
+    ushort DataLength;
+}
+
+const uint Vendor_Type_SimpleConfig = 0x00000001;

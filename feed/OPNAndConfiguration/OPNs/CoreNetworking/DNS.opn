@@ -1,0 +1,1083 @@
+protocol DNS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Domain Name System",
+    ShortName = "DNS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [   // 1034,1035,1183,2671,3225,2930,4408,2845,5205,1706,1348,2163,1712,1876 2535,1002,2782,2230,4398,3403,2874,2672,3123,4255,4025,4701,5155,3596,6195,4034,5966
+            new Reference{Name = "RFC 1034"},
+            new Reference{Name = "RFC 1035"},
+            new Reference{Name = "RFC 1183"},
+            new Reference{Name = "RFC 2671"},
+            new Reference{Name = "RFC 3225"},
+            new Reference{Name = "RFC 2930"},
+            new Reference{Name = "RFC 4408"},
+            new Reference{Name = "RFC 2845"},
+            new Reference{Name = "RFC 5205"},
+            new Reference{Name = "RFC 1706"},
+            new Reference{Name = "RFC 1348"},
+            new Reference{Name = "RFC 2163"}, 
+            new Reference{Name = "RFC 1712"},
+            new Reference{Name = "RFC 1876"},
+            new Reference{Name = "RFC 2535"},
+            new Reference{Name = "RFC 1002"},
+            new Reference{Name = "RFC 2782"},
+            new Reference{Name = "RFC 2230"},
+            new Reference{Name = "RFC 4398"},
+            new Reference{Name = "RFC 3403"},
+            new Reference{Name = "RFC 2874"},
+            new Reference{Name = "RFC 2672"},
+            new Reference{Name = "RFC 3123"},
+            new Reference{Name = "RFC 4255"},
+            new Reference{Name = "RFC 4025"},
+            new Reference{Name = "RFC 4701"},
+            new Reference{Name = "RFC 5155"},
+            new Reference{Name = "RFC 3596"},
+            new Reference{Name = "RFC 6195"},
+            new Reference{Name = "RFC 4034"},
+            new Reference{Name = "RFC 5966"},
+            new Reference{Name = "RFC 6762"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "373354", Date = "01/19/2015"}
+        ]
+};
+
+using Standard;
+using UDP;
+using IANA;
+using Utility;
+using TCP;
+
+endpoint Server 
+    over UDP.Host | over DNS.SocketServer
+    accepts mutable DNSMessage issues mutable DNSMessage issues QueryOp;
+client endpoint Client connected to Server;
+
+endpoint SocketServer 
+    over TCP.Server
+    accepts MessageOverTCP issues MessageOverTCP
+{
+    process this accepts msg:DNS.MessageOverTCP
+    {
+        switch (msg.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage> =>
+                dispatch (endpoint DNS.Server over this) accepts m;
+            default =>
+                ThrowDecodingException("DNS", "DNSMessage");
+        }
+    }
+    process this issues msg:DNS.MessageOverTCP
+    {
+        switch (msg.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage> =>
+                dispatch (endpoint DNS.Server over this) issues m;
+            default =>
+                ThrowDecodingException("DNS", "DNSMessage");
+        }   
+    }
+}
+
+client endpoint SocketClient connected to SocketServer;
+
+autostart actor DNSOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.DestinationPort == Port.DNS
+    {
+        switch (d.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage> =>
+                dispatch (endpoint DNS.Server over host) accepts m;
+            default => 
+                ThrowDecodingException("DNS", "DNSMessage");
+        }
+    }
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.SourcePort == Port.DNS
+    {
+        switch (d.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage> =>
+                dispatch (endpoint DNS.Server over host) issues m;
+            default => 
+                ThrowDecodingException("DNS", "DNSMessage");
+        }
+    }
+}
+
+// Reassemble message from TCP.
+autostart actor SocketOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+    
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.DNS
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "DNS", endpoint SocketServer over server, 
+                                    IsDNS,
+                                    IsSufficientForDNS,
+                                    (stream s) => BinaryDecoder<MessageOverTCP>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<MessageOverTCP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment where s.SourcePort == Port.DNS
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "DNS", endpoint SocketServer over server, 
+                                    IsDNS, 
+                                    IsSufficientForDNS,
+                                    (stream s) => BinaryDecoder<MessageOverTCP>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<MessageOverTCP>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+bool? IsDNS(binary b)
+{
+    if (b.Count < 5)
+        return null;
+    var OpCode = ((b[4] & 0x7F) >> 3) as OpCode;
+    if (InRange<DNS.OpCode>(OpCode))
+        return true;
+    else
+        return false;
+}
+
+uint? IsSufficientForDNS(binary b)
+{
+    if (b.Count < 2)
+        return null;
+    var length = ((b[0] as ushort) << 8) + b[1] + 2 as uint;
+
+    if (length <= b.Count)
+        return 0;
+    else
+        return length;
+}
+
+autostart actor mDNSOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.DestinationPort == Port.mDNS 
+    {
+        switch (d.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage[true]> =>
+                dispatch (endpoint DNS.Server over host) accepts m;
+            default => 
+                ThrowDecodingException("DNS", "DNSMessage");
+        }
+    }
+    process host accepts d:UDP.Datagram where d.Payload.Count > 0 && d.SourcePort == Port.mDNS 
+    {
+        switch (d.Payload)
+        {
+            case m:DNSMessage from BinaryDecoder<DNSMessage[true]> =>
+                dispatch (endpoint DNS.Server over host) issues m;
+            default => 
+                ThrowDecodingException("DNS", "DNSMessage");
+        }
+    }
+}
+message Header
+{
+    ushort Identification;
+    bool QR with BinaryEncoding{Width = 1};
+    OpCode OpCode with BinaryEncoding{Width = 4};
+    bool AA with BinaryEncoding{Width = 1};
+    bool TC with BinaryEncoding{Width = 1};
+    bool RD with BinaryEncoding{Width = 1};
+    bool RA with BinaryEncoding{Width = 1};
+    bool Z with BinaryEncoding{Width = 1};
+    bool AD with BinaryEncoding{Width = 1}; // RFC 6195
+    bool CD with BinaryEncoding{Width = 1}; // RFC 6195
+    RCode RCode where ErrorCodeIf(QR && value != 0 , this, "DNS: The RCode of the message is " + EnumToString(value, "DNS.RCode") + "(" + (value as string) + "). Please refer to section 4.1.1 in Technical Document RFC 1035.") with BinaryEncoding{Width = 4};
+    ushort QDCOUNT;
+    ushort ANCOUNT;
+    ushort NSCOUNT;
+    ushort ARCOUNT;
+}
+
+message DNSMessage[bool IsmDNS] : Header
+{
+    optional [|QDCOUNT > 0|] array<Query[IsmDNS]> Question with BinaryEncoding{Length = QDCOUNT};
+    optional [|ANCOUNT > 0|] array<ResourceRecord[IsmDNS]> Answer with BinaryEncoding{Length = ANCOUNT};
+    optional [|NSCOUNT > 0|] array<ResourceRecord[IsmDNS]> Authority with BinaryEncoding{Length = NSCOUNT};
+    optional [|ARCOUNT > 0|] array<[|CurrentByte(stream) == 0|] OPTPseudoResourceRecord | ResourceRecord[IsmDNS]> Additional with BinaryEncoding{Length = ARCOUNT};
+    
+    override string ToString()
+    {
+        string summary;
+        if (QR) // response
+        {
+            summary = "Response, RCode: " + EnumToStringInSummary<RCode>(RCode) + ", Query ID: " + Utility.DecToHexFormat(Identification);
+            if (RCode is DNS.RCode.NoError && ANCOUNT > 0) // Query successfully.
+            {   
+                string ips = GetAddressFromAnswerRR(Answer);
+                if (ips != null && ips.Count > 0)
+                {
+                    summary += ", Answers: [" + ips + "]";
+                }
+            }
+        }
+        else
+        {
+            summary = "Request, Query ID: " + Utility.DecToHexFormat(Identification) + ", OpCode: " + EnumToStringInSummary<OpCode>(OpCode);
+            if (Question != nothing)
+            {
+                var query = (Question as array<Query>)[0];
+                summary += ", Query Name: " + query.QueryName +
+                    ", RR Type: " + EnumToStringInSummary<RRType>(query.Type) + ", RR Class: " + EnumToStringInSummary<RRClass>(query.Class);
+            }
+        }
+        return summary;
+    }
+}
+
+virtual operation QueryOp
+{
+    in ushort Identification = id;
+    in DNS.OpCode OpCode = opcode;
+    in string QueryName = GetQuery(questions).QueryName;
+    in RRType Type = GetQuery(questions).Type;
+    in RRClass Class = GetQuery(questions).Class;
+    out RCode QResult = ret;
+    out string IPs = GetAddressFromAnswerRR(answerRRs);
+    
+    override string ToString()
+    {
+        string summary = "Query Operation, QResult: " + EnumToStringInSummary<DNS.RCode>(QResult) + 
+                ", Query ID: " + DecToHexFormat(Identification) + 
+                ", OpCode: " + EnumToStringInSummary<DNS.RCode>(OpCode) +
+                ", Query Name: " + QueryName + ", RR Type: " + EnumToStringInSummary<RRType>(Type) + 
+                ", RR Class: " + EnumToStringInSummary<RRClass>(Class);
+        if ((IPs != null) && (IPs.Count > 0))
+        {
+            summary += ", Answers: [" + IPs + "]";
+        }
+        return summary;
+    }
+} 
+= 
+accepts DNSMessage{Identification is id:ushort, OpCode is var opcode, Question is questions:optional array<Query>}
+issues DNSMessage{Identification == id, RCode is var ret, Answer is answerRRs: optional array<ResourceRecord>};
+
+Query GetQuery(optional array<Query> arr)
+{
+    if (arr is nothing)
+    {
+        return new Query{};
+    }
+    else
+    {
+        return (arr as array<Query>)[0];
+    }
+}
+
+string GetAddressFromAnswerRR(optional array<ResourceRecord> answerRRs)
+{
+    string ipAddrs = "";
+    if (answerRRs is nothing)
+    {
+        return ipAddrs;
+    }
+    var rrs = answerRRs as array<ResourceRecord>;
+    int cnt = 0;
+    if (rrs.Count > 0)
+    {
+        foreach (ResourceRecord rr in rrs)
+        {
+            if (rr.RDLength > 0)
+            {
+                string tempAddr;
+                if (rr.Type is RRType.A)
+                {
+                    tempAddr = (rr.RData as IPv4Address).ToString();
+                }
+                else if (rr.Type is RRType.AAAA)
+                {
+                    tempAddr = (rr.RData as IPv6Address).ToString();
+                }
+                if (tempAddr != null && cnt < 2)
+                {
+                    if (cnt == 1)
+                    {
+                        ipAddrs += ", ";
+                    }
+                    ipAddrs += tempAddr;
+                    cnt++;
+                }
+                else if (tempAddr != null && cnt == 2)
+                {
+                    ipAddrs += " ...";
+                    break;
+                }
+            }
+        }
+    }
+    return ipAddrs;
+}
+
+// RFC 1035 page 32
+// DNS.Message: MessageOverTCP
+// Description: 
+// 4.2.2 TCP Usage
+// The message is prefixed with a two byte length field which gives the message
+// length, excluding the two byte length field. 
+message MessageOverTCP
+{
+    ushort TCPLength;
+    binary Payload with BinaryEncoding{MaxLength = TCPLength};
+    
+    override string ToString()
+    {
+        return "Message Over TCP, " + "Length: " + (TCPLength as string);
+    }
+}
+
+type Query[bool IsmDNS]
+{
+    DNSString QueryName;
+    RRType Type;
+    // http://tools.ietf.org/html/rfc6762#section-5.4
+    optional [|IsmDNS|] bool QU with BinaryEncoding{Width = 1};
+    RRClass Class with BinaryEncoding{Width = IsmDNS ? 15 : 16};
+
+    override string ToString()
+    {
+        return "Name: " + QueryName + 
+                ", Type: " + EnumToStringInSummary<RRType>(Type) +
+                ", Class: " + EnumToStringInSummary<RRClass>(Class);
+    }
+}
+
+type ResourceRecord[bool IsmDNS]
+{
+    DNSString Name;
+    RRType Type;
+    // http://tools.ietf.org/html/rfc6762#section-10.2
+    optional [|IsmDNS|] bool CacheFlush with BinaryEncoding{Width = 1};
+    RRClass Class with BinaryEncoding{Width = IsmDNS ? 15 : 16};
+    uint TTL;
+    ushort RDLength;
+    // Resource Record ref: http://www.iana.org/assignments/dns-parameters
+    optional ([|RDLength > 0|] 
+    ([|Type == RRType.A|] IPv4Address
+    | [|Type == RRType.NS|] NameServer
+    | [|(Type == RRType.MD) || (Type == RRType.MF) || (Type == RRType.MX)|] MailExchange 
+    | [|Type == RRType.CNAME|] CanonicalName
+    | [|Type == RRType.SOA|] StartOfAuthority
+    | [|Type == RRType.MB|] MailBox
+    | [|Type == RRType.MG|] MailGroupMember
+    | [|Type == RRType.MR|] MailRename
+    | [|Type == RRType.NULL|] NullRR
+    | [|Type == RRType.WKS|] WellKnowService
+    | [|Type == RRType.PTR|] Pointer
+    | [|Type == RRType.HINFO|] HostInformation
+    | [|Type == RRType.MINFO|] MailboxInformation
+    | [|Type == RRType.TXT|] TxtData
+    | [|Type == RRType.RP|] ResponsiblePerson
+    | [|Type == RRType.AFSDB|] AFSDataBase
+    | [|Type == RRType.X25|] X25
+    | [|Type == RRType.ISDN|] ISDNAddress
+    | [|Type == RRType.RT|] RouteThrough
+    | [|Type == RRType.NSAP && RDLength == 20|] NSAPAddress
+    | [|Type == RRType.NSAP && RDLength != 20|] NSAPToName
+    | [|Type == RRType.NSAPPTR|] NSAPPTR
+    | [|Type == RRType.SIG|] SecuritySignature
+    | [|Type == RRType.KEY|] SecurityKey
+    | [|Type == RRType.PX|] PointerToX400
+    | [|Type == RRType.GPOS|] GeographicalPosition
+    | [|Type == RRType.AAAA|] IPv6Address
+    | [|Type == RRType.NXT|] NextDomain
+    | [|Type == RRType.NIMLOC|] NetBIOS
+    | [|Type == RRType.SRV|] ServerSelection
+    | [|Type == RRType.NAPTR|] NamingAuthorityPointer
+    | [|Type == RRType.KX|] KeyExchanger
+    | [|Type == RRType.CERT|] Certificate
+    | [|Type == RRType.A6|] A6
+    | [|Type == RRType.DNAME|] DName
+    | [|Type == RRType.OPT|] DNS.Option
+    | [|Type == RRType.APL|] AddressPrefixeList
+    | [|Type == RRType.DS|] DelegationSigner
+    | [|Type == RRType.SSHFP|] SSHKeyFingerprint
+    | [|Type == RRType.IPSECKEY|] DelegationSigner
+    | [|Type == RRType.RRSIG|] ResourceRecordSignature
+    | [|Type == RRType.NSEC|] NextSecure
+    | [|Type == RRType.DNSKEY|] KeyRData
+    | [|Type == RRType.DHCID|] DHCPInformation
+    | [|Type == RRType.NSEC3|] NSEC3
+    | [|Type == RRType.NSEC3PARAM|] NSEC3PARAM
+    | [|Type == RRType.HIP|] HostIdentityProtocol
+    | [|Type == RRType.SPF|] SenderPolicyFramework
+    | [|Type == RRType.TKEY|] TransactionKey
+    | [|Type == RRType.TSIG|] TransactionSignature
+    | binary)) RData with BinaryEncoding{WidthForComposedType = RDLength * 8};
+    
+    override string ToString()
+    {
+        return "Name: " + Name + 
+                ", Type: " + EnumToStringInSummary<RRType>(Type) +
+                ", Class: " + EnumToStringInSummary<RRClass>(Class);
+    }
+}
+
+// RFC 2671
+type OPTPseudoResourceRecord
+{
+    (byte where value == 0) NAME with DisplayInfo{ToText = e => "<Root>"};
+    RRType TYPE where value is RRType.OPT;
+    ushort UDPPayloadSize;
+    OPTExtendedRCodeAndFlags ExtendedRCodeAndFlags;
+    ushort RDLEN;
+    optional [|RDLEN > 0|] Option RDATA;
+}
+
+type OPTExtendedRCodeAndFlags
+{
+    ExtendedRCode ExtendedRCode;
+    byte Version;
+    bool DNSSEC with BinaryEncoding{Width = 1}; // RFC 3225
+    ushort Z with BinaryEncoding{Width = 15};
+}
+
+pattern ExtendedRCode = enum byte
+{
+    BADVERS = 1,
+    ...
+};
+
+// RFC 1035
+type CharacterString
+{
+    byte Length;
+    string CharacterString with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+
+    override string ToString()
+    {
+        return CharacterString;
+    }
+}
+
+// RFC 1035
+type NameServer // 2
+{
+    DNSString NSDName;
+}
+
+type CanonicalName // 5
+{
+    DNSString Name;
+}
+
+type StartOfAuthority // 6
+{
+    DNSString MName;
+    DNSString RName;
+    uint Serial;
+    uint Refresh;
+    uint Retry;
+    uint Expire;
+    uint Minimum;
+}
+
+type MailBox // 7
+{
+    DNSString Name;
+}
+
+type MailGroupMember // 8
+{
+    DNSString Name;
+}
+
+type MailRename // 9
+{
+    DNSString Name;
+}
+
+type NullRR // 10
+{
+    binary NullData;
+}
+
+type WellKnowService      // 11
+{
+    IPv4Address Address;
+    ProtocolType Protocol;
+    array<byte> BitMap;
+}
+
+type Pointer    // 12
+{
+    DNSString PointerName;
+}
+
+type HostInformation  // 13
+{
+    CharacterString CPU;
+    CharacterString OS;
+}
+
+type MailboxInformation  // 14
+{
+    DNSString ResponsibleMailBox;
+    DNSString ErrorMailBox;
+}
+
+type MailExchange // 3, 4, 15
+{
+    ushort Preference;
+    DNSString Exchange;
+}
+
+type TxtData // 16
+{
+    array<CharacterString> TxtData;
+}
+
+// RFC 1183
+type ResponsiblePerson  // 17
+{
+    DNSString ResponsibleMailbox;
+    DNSString ErrorMailBox;
+}
+
+type AFSDataBase  // 18
+{
+    ushort Subtype;
+    DNSString HostName;
+}
+
+type X25 // 19
+{
+    CharacterString PSDNAddress;
+}
+
+type ISDNAddress   // 20
+{
+    CharacterString ISDNAddress;
+    CharacterString SubAddress;
+}
+
+type RouteThrough // 21
+{
+    ushort Preference;
+    DNSString IntermediateHost;
+}
+
+// RFC 1706
+type NSAPAddress   // 22
+{
+    byte AFI;
+    ushort IDI;
+    byte DFI;
+    array<byte> AA with BinaryEncoding{Length = 3};
+    ushort Rsvd;
+    ushort RD;
+    ushort Area;
+    array<byte> ID with BinaryEncoding{Length = 6};
+    byte Selector;
+}
+
+type NSAPToName
+{
+    array<byte> NSAPToName;
+}
+
+// RFC 1348
+type NSAPPTR    // 23
+{
+    DNSString Owner;
+}
+
+ // RFC 4034
+type SecuritySignature // 24
+{
+    ushort TypeCovered;
+    byte Algorithm;
+    byte Labels;
+    uint OriginalTTL;
+    uint SignatureExpiration;
+    uint SignatureInception;
+    ushort KeyTag;
+    DNSString SignaturesName;
+    binary Signature;
+}
+
+// RFC3445
+type SecurityKey // 25
+{
+    SecurityKeyFlag Flags;
+    byte Protocol where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "DNS", "Protocol", "SecurityKey", "3", value);
+    byte Algorithm;
+    array<byte> PublicKey;
+}
+
+type SecurityKeyFlag
+{
+    ushort Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "DNS", "Reserved1", "SecurityKeyFlag", value) with BinaryEncoding{Width = 7};
+    ushort Flag with BinaryEncoding{Width = 1};
+    byte Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "DNS", "Reserved2", "SecurityKeyFlag", value);
+}
+
+// RFC 2163
+type PointerToX400 // 26
+{
+    ushort Preference;
+    DNSString Map822;
+    DNSString MapX400;
+}
+
+// RFC 1712
+type GeographicalPosition   // 27
+{
+    string Longitude with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string Latitude with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string Altitude with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// RFC 1876
+type LocationInformation    // 29
+{
+    byte Version;
+    byte Size;
+    byte HorizPre;
+    byte VertPre;
+    ushort Latitude;
+    ushort Longitude;
+    ushort Altitude;
+}
+
+// RFC 2535
+type NextDomain // 30
+{
+    DNSString NextDomainName;
+    array<byte> TypeBitMap;
+}
+
+// RFC 1002, Page 12
+type NetBIOS     // 32
+{
+    ushort GroupNameFlag with BinaryEncoding{Width = 1};
+    ushort OwnerNodeType with BinaryEncoding{Width = 2};
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "DNS", "Reserved", "NetBIOS", value) 
+        with BinaryEncoding{Width = 13};
+    IPv4Address NBAddress;
+}
+
+// RFC 2782
+type ServerSelection    // 33
+{
+    ushort Priority;
+    ushort Weight;
+    ushort Port;
+    DNSString Target;
+}
+
+// RFC 3403
+type NamingAuthorityPointer  // 35
+{
+    ushort Order;
+    ushort Preference;
+    CharacterString Flags;
+    CharacterString Services;
+    CharacterString Regexp;
+    DNSString Replacement;
+}
+
+// RFC 2230, Page 8
+type KeyExchanger // 36
+{
+    ushort Preference;
+    DNSString ExchangerName;
+}
+
+// RFC 4398
+type Certificate    // 37
+{
+    ushort Type;
+    ushort KeyTag;
+    byte Algorithm;
+    array<byte> CertificateOrCRL;
+}
+
+// RFC 2874
+type A6 // 38
+{
+    byte PrefixLen;
+    array<byte> AddressSuffix with BinaryEncoding{Length = ((128 - PrefixLen) % 8 > 0 ? (128 - PrefixLen) / 8 + 1 : (128 - PrefixLen) / 8)};
+    optional DNSString PrefixName;
+}
+
+// RFC 2672
+type DName  // 39
+{
+    DNSString Target;
+}
+
+// RFC 2671
+type Option    // 41
+{
+    ushort OptionCode;
+    ushort OptionLength;
+    array<byte> OptionData with BinaryEncoding{Length = OptionLength};
+}
+
+// RFC 3123
+type AddressPrefixeList    // 42
+{
+    ushort AddressFamily;
+    byte Prefix;
+    byte NegationFlag with BinaryEncoding{Width = 1};
+    byte AFDLength with BinaryEncoding{Width = 7};
+    array<byte> AFDPart with BinaryEncoding{Length = AFDLength};
+}
+
+// RFC 4034
+type DelegationSigner       // 43
+{
+    ushort KeyTag;
+    byte Algorithm;
+    byte DigestType;
+    array<byte> Digest;
+}
+
+// RFC 4255
+type SSHKeyFingerprint    // 44
+{
+    byte Algorithm;
+    byte FingerprintType;
+    array<byte> Fingerprint;
+}
+
+// RFC 4025
+type IPsecKey    // 45
+{
+    byte Precedence;
+    byte GatewayType where ValidationCheckLessThanOrEqualTo(value <= 3, null, true, ReferenceType.Type, "DNS", "GatewayType", "IPsecKey", 3, value);
+    byte Algorithm;
+    optional ([|GatewayType == 1|] IPv4Address
+    | [|GatewayType == 2|] IPv6Address
+    | [|GatewayType == 3|] DNSString) Gateway;
+    array<byte> PublicKey;
+}
+
+// RFC 4034
+type ResourceRecordSignature  // 46
+{
+    ushort TypeConvered;
+    byte Algorithm;
+    byte Labels;
+    int OriginalTTL;
+    int SignatureExpiration;
+    int SignatureInception;
+    ushort KeyTag;
+    DNSString SignerName;
+    binary Signature;
+}
+
+// RFC 4034
+type NextSecure     // 47
+{
+    DNSString NextDomainName;
+    array<byte> BitMaps;
+}
+
+// RFC4034
+type KeyRData  // 48
+{
+    KeyRDataFlag Flags;
+    byte Protocol where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "DNS", "Protocol", "KeyRData", "3", value);
+    byte Algorithm;
+    array<byte> PublicKey;
+}
+
+type KeyRDataFlag
+{
+    ushort Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "DNS", "Reserved1", "KeyRDataFlag", value) with BinaryEncoding{Width = 7};
+    ushort ZoneKey with BinaryEncoding{Width = 1};
+    ushort Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "DNS", "Reserved2", "KeyRDataFlag", value) with BinaryEncoding{Width = 7};
+    ushort SecEntry with BinaryEncoding{Width = 1};
+}
+
+// RFC 4701
+type DHCPInformation   // 49
+{
+    ushort IdentifierType;
+    byte DigestType;
+    array<byte> Digest;
+}
+
+// RFC 5155
+type NSEC3   // 50
+{
+    byte HashAlgorithm;
+    byte Flags;
+    ushort Iterations;
+    byte SaltLength;
+    array<byte> Salt with BinaryEncoding{Length = SaltLength};
+    byte HashLength;
+    array<byte> NextHashedOwnerName with BinaryEncoding{Length = HashLength};
+    array<byte> TypeBitMaps;
+}
+
+// RFC 5155
+type NSEC3PARAM     // 51
+{
+    byte HashAlgorithm;
+    byte Flags;
+    ushort Iterations;
+    byte SaltLength;
+    array<byte> Salt with BinaryEncoding{Length = SaltLength};
+}
+
+// RFC 5205
+type HostIdentityProtocol    // 55
+{
+    byte HITLength;
+    byte PKAlgorithm;
+    ushort PKLength;
+    array<byte> HostIdentityTag  with BinaryEncoding{Length = HITLength};
+    array<byte> PublicKey with BinaryEncoding{Length = HITLength}; // Future Reference: PublicKey should be DAS or RSA. Not implement. RFC 2536, 3110.
+    array<DNSString> RendezvousServers;
+}
+
+// RFC 4408
+type SenderPolicyFramework      // 99
+{
+    array<byte> Record;
+}
+
+// RFC 2930
+type TransactionKey   // 249
+{
+    DNSString Algorithm;
+    uint Inception;
+    uint Expiration;
+    TKEYMode Mode;
+    TKEYError Error;
+    ushort KeySize;
+    optional binary KeyData with BinaryEncoding{Length = KeySize};
+    // Cannot replace any to GssapiType defined in GSSAPI.opn, otherwise circular reference issue will be introduced.
+    optional any Gssapi with Encoding{Ignore = true};
+    ushort OtherSize;
+    binary Otherdata with BinaryEncoding{Length = OtherSize};
+}
+
+pattern TKEYMode = enum ushort
+{
+    Reserved                = 0,
+    ServerAssignment        = 1,
+    DiffieHellmanExchange   = 2,
+    GSSAPINegotiation       = 3,
+    ResolverAssignment      = 4,
+    KeyDeletion             = 5,
+    ...
+};
+
+pattern TKEYError = enum RCode
+{
+    BADSIG    = 16,
+    BADKEY    = 17,
+    BADTIME   = 18, 
+    BADMODE   = 19,
+    BADNAME   = 20,
+    BADALG    = 21,
+    BADTRUC   = 22,
+    ...
+};
+
+// RFC 2845
+type TransactionSignature   // 250
+{
+    DNSString AlgorithmName;
+    array<byte> TimeSigned with BinaryEncoding{Length = 6};
+    ushort Fudge;
+    ushort MACSize;
+    array<byte> MAC with BinaryEncoding{Length = MACSize};
+    ushort OriginalID;
+    ushort Error;
+    ushort OtherLen;
+    optional [|Error == 18|] Blob[OtherLen] OtherData;
+}
+
+pattern RRType = enum ushort
+{
+    A           = 1,
+    NS          = 2,
+    MD          = 3,
+    MF          = 4,
+    CNAME       = 5,
+    SOA         = 6,
+    MB          = 7,
+    MG          = 8,
+    MR          = 9,
+    NULL        = 10,
+    WKS         = 11,
+    PTR         = 12,
+    HINFO       = 13,
+    MINFO       = 14,
+    MX          = 15,
+    TXT         = 16, // RFC 1035 above
+    RP          = 17, // RFC 1183 below
+    AFSDB       = 18,
+    X25         = 19,
+    ISDN        = 20,
+    RT          = 21, // RFC 1183 above
+    NSAP        = 22, // RFC 1706
+    NSAPPTR     = 23, // RFC 1706
+    SIG         = 24, // RFC 4034
+    KEY         = 25, // RFC 4034
+    PX          = 26, // RFC 2163
+    GPOS        = 27, // RFC 1712
+    AAAA        = 28, // RFC 3596
+    LOC         = 29, // RFC 1876
+    NXT         = 30, // RFC 3755
+    EID         = 31, 
+    NIMLOC      = 32,
+    SRV         = 33, // RFC 2782
+    ATMA        = 34, // 
+    NAPTR       = 35, // RFC 3403
+    KX          = 36, // RFC 2230
+    CERT        = 37, // RFC 4398
+    A6          = 38, // RFC 6563
+    DNAME       = 39, // RFC 6672
+    SINK        = 40, // 
+    OPT         = 41,
+    APL         = 42, // RFC 3123
+    DS          = 43, // RFC 4034
+    SSHFP       = 44, // RFC 4255
+    IPSECKEY    = 45, // RFC 4025
+    RRSIG       = 46, // RFC 4034
+    NSEC        = 47, // RFC 4034
+    DNSKEY      = 48, // RFC 4034
+    DHCID       = 49, // RFC 4701
+    NSEC3       = 50, // RFC 5155
+    NSEC3PARAM  = 51, // RFC 5155
+    TLSA        = 52, // RFC 6698
+    HIP         = 55, // RFC 5205
+    NINFO       = 56,
+    RKEY        = 57,
+    TALINK      = 58,
+    CDS         = 59,
+    SPF         = 99, // RFC 4408
+    UINFO       = 100,
+    UID         = 101,
+    GID         = 102,
+    UNSPEC      = 103,
+    NID         = 104,
+    L32         = 105,
+    L64         = 106,
+    LP          = 107,
+    TKEY        = 249, // RFC 2930
+    TSIG        = 250, // RFC 2845
+    IXFR        = 251, // RFC 1995
+    AXFR        = 252, // RFC 1035 below
+    MAILB       = 253,
+    MAILA       = 254,
+    ALL         = 255,
+    URI         = 256,
+    CAA         = 257,
+    TA          = 32768,
+    DLV         = 32769,
+    ...
+};
+
+// RFC 6195
+pattern RRClass = enum ushort
+{
+    Reserved = 0,
+    Internet = 1,
+    CSNET = 2,
+    CHAOS = 3,
+    Hesiod = 4,
+    None = 254,
+    Any = 255,
+    ...
+};
+
+// RFC 6195
+pattern RCode = enum ushort
+{
+    NoError   = 0,
+    FormErr   = 1,
+    ServFail  = 2,
+    NXDomain  = 3,
+    NotImp    = 4,
+    Refused   = 5,
+    YXDomain  = 6,
+    YXRRSet   = 7,
+    NXRRSet   = 8,
+    NotAuth   = 9,
+    NotZone   = 10,
+    ...
+};
+
+pattern OpCode = enum byte
+{
+    QUERY = 0,
+    IQUERY = 1,
+    STATUS = 2, 
+    Notify = 4,
+    Update = 5,
+    ...
+} with BinaryEncoding{Width = 4};
+
+type TypeBitMaps
+{
+    array<TypeBlock> TypeBlocks;
+}
+
+type TypeBlock
+{
+    byte WindowBlockNo;
+    byte BitmapLength where value >= 1 && value <= 32;
+    array<byte> Bitmap with BinaryEncoding{Length = (BitmapLength as ushort)}, DisplayInfo{ToText = BitmapToText};
+    
+    static string BitmapToText(any data)
+    {
+        TypeBlock block = data as TypeBlock;
+        string typeStr = "";
+        ushort typeValue;
+        for (int index; index < block.Bitmap.Count; index++)
+        {
+            int bitPosition = 0;
+            while (bitPosition < 8)
+            {
+                if (((block.Bitmap[index] as uint) & (128 >> bitPosition)) > 0)
+                {
+                    typeValue = (256 * block.WindowBlockNo + index * 8 + bitPosition) as ushort;
+                    typeStr += EnumToString(typeValue, "DNS.RRType") + " ";
+                }
+                bitPosition++;
+            }
+        }
+        return typeStr;
+    }
+}

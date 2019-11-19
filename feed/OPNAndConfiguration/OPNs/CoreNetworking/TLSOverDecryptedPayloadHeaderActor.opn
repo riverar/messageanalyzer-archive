@@ -1,0 +1,151 @@
+module TLSOverDecryptedPayloadHeaderActor with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376878", Date = "04/14/2015"}
+        ]
+};
+
+using Utility;
+using TCP;
+using Standard;
+using TLS;
+using DecryptedPayloadHeader;
+
+autostart actor TLSOverDecryptedPayloadHeader(DecryptedPayloadHeader.Node node)
+{
+    SessionContext ClientContext = null;
+    SessionContext ServerContext = null;
+    TLS.Server EPT;
+    uint AcceptsInitialSequenceNumber;
+    uint IssuesInitialSequenceNumber;
+    binary LocalAddr;
+    binary RemoteAddr;
+    
+    process node accepts d:DecryptedFrame where d.EncryptionErrorStatus == 0 && IsTlsHeader(d.TLSSSLData) && (d.TcpLayer.DstPort as ushort) in TCP.EncryptionPorts
+    {
+        if (ClientContext == null)
+        {
+            EPT = endpoint TLS.Server over node;
+            InitializeContextPair(ref ClientContext, ref ServerContext);
+            AcceptsInitialSequenceNumber = d.TcpLayer.SequenceNumber as uint;
+            if (!EPT.IsContextSet())
+            {
+                InitializeTLSServer(d, MessageDirection.Accepts);
+            }
+        }
+        
+        // Set the IsEncryptedCipher to false and HasChangeCipherSent to true to force decoding the data as unencrypted RecordLayer
+        ClientContext.IsEncryptedCipher = false;
+        ClientContext.HasChangeCipherSent = true;
+
+        TryDecodingAndDispatchingTLSMessage(d.TLSSSLData, ClientContext, EPT,
+            MessageDirection.Accepts);
+    }
+    
+    // Decrypted TLS messages are complete message, no fragments.
+    process node accepts d:DecryptedFrame where d.EncryptionErrorStatus == 0 && IsTlsHeader(d.TLSSSLData) && (d.TcpLayer.SrcPort as ushort) in TCP.EncryptionPorts
+    {
+        if (ServerContext == null)
+        {
+            EPT = endpoint TLS.Server over node;
+            InitializeContextPair(ref ClientContext, ref ServerContext);
+            IssuesInitialSequenceNumber = d.TcpLayer.SequenceNumber as uint;
+            if (!EPT.IsContextSet())
+            {
+                InitializeTLSServer(d, MessageDirection.Issues);
+            }
+        }
+        
+        // Set the IsEncryptedCipher to false and HasChangeCipherSent to true to force decoding the data as unencrypted RecordLayer
+        ServerContext.IsEncryptedCipher = false;
+        ServerContext.HasChangeCipherSent = true;
+        
+        TryDecodingAndDispatchingTLSMessage(d.TLSSSLData, ServerContext, EPT,
+            MessageDirection.Issues);
+    }
+        
+    void GetAddressBin((IPv4Layer | IPv6Layer) ipLayer, out binary srcAddr, out binary dstAddr)
+    {
+        if (ipLayer is ipv4Layer:IPv4Layer)
+        {
+            srcAddr = ipv4Layer.SourceAddress.FlatAddress;
+            dstAddr = ipv4Layer.DestinationAddress.FlatAddress;
+        }
+        else if (ipLayer is ipv6Layer:IPv6Layer)
+        {
+            srcAddr = ipv6Layer.SourceAddress.FlatAddress;
+            dstAddr = ipv6Layer.DestinationAddress.FlatAddress;
+        }
+    }
+        
+    void DispathDecrytedMessageBack(binary bin, RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        if (rls.Origins[0] is d:DecryptedFrame)
+        {
+            Segment newSeg = new Segment
+            {
+                SourcePort = d.TcpLayer.SrcPort as ushort,
+                DestinationPort = d.TcpLayer.DstPort as ushort,
+                SequenceNumber = d.TcpLayer.SequenceNumber as uint,
+                DataOffset = new DataOffset(),
+                Flags = new TCP.Flags{ACK = true, PSH = true},
+                Payload = bin
+            };
+            newSeg.SourceData = bin;
+            if (bin != null && bin.Count != 0)
+            {
+                AssociateFieldPosition(newSeg, "Payload", bin, 0, bin.Count * 8);
+            }
+
+            newSeg#NextSeqNumber = d.TcpLayer.NextSequenceNumber as uint;
+
+            // 1 capture file can contain both encrypted messages and the corresponding decrypted messages.
+            // So the segment here should not dispatch to the normal TCP.Server.
+            // Here it will be dispatched back to TCP.Server over TLS.Server.
+            var ept = endpoint TCP.Server[server.ClientAddress, server.ServerAddress, server.ClientPort, server.ServerPort] over server;
+            ept.IsFromTLS = true;
+            if (direction == MessageDirection.Accepts)
+            {
+                newSeg#InitialSequenceNumber = AcceptsInitialSequenceNumber;
+                newSeg#SourceAddrBin = RemoteAddr;
+                newSeg#DestinationAddrBin = LocalAddr;
+
+                dispatch ept accepts newSeg;
+            }
+            else
+            {
+                newSeg#InitialSequenceNumber = IssuesInitialSequenceNumber;
+                newSeg#SourceAddrBin = LocalAddr;
+                newSeg#DestinationAddrBin = RemoteAddr;
+
+                dispatch ept issues newSeg;
+            }
+        }
+    }
+    
+    void InitializeTLSServer(DecryptedFrame d, MessageDirection direction)
+    {
+        ushort localPort;
+        ushort remotePort;
+        if (direction == MessageDirection.Accepts)
+        {
+            GetAddressBin(d.IPLayer, out RemoteAddr, out LocalAddr);
+            localPort = d.TcpLayer.DstPort as ushort;
+            remotePort = d.TcpLayer.SrcPort as ushort;
+        }
+        else
+        {
+            GetAddressBin(d.IPLayer, out LocalAddr, out RemoteAddr);
+            localPort = d.TcpLayer.SrcPort as ushort;
+            remotePort = d.TcpLayer.DstPort as ushort;
+        }
+        
+        EPT.InitializeContext(LocalAddr, RemoteAddr, localPort, remotePort, DispathDecrytedMessageBack);
+    }
+}

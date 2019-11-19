@@ -1,0 +1,901 @@
+module MSOXCFXICS with
+Documentation
+{
+    ProtocolName = "Bulk Data Transfer Protocol",
+    ShortName = "MS-OXCFXICS",
+    DocumentName = "MS-OXCFXICS",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-OXCFXICS", Version = "18.0"},
+    ],
+    RevisionSummary =    
+    [
+        new Revision{Class=RevisionClass.Major, Version="1.3.1", Date="08/31/2015"},
+    ]
+};
+
+using Diagnostics;
+using MSOXCDATA;
+using MSOXPROPS;
+using MSOXCRPC;
+
+// 2.2.1.1  and 2.2.1.3 Meta-Properties
+const map<uint, string> MetaPropertiesMap =
+{
+    0x40170003 -> "MetaTagIdsetGiven",
+    0x67960102 -> "MetaTagCnsetSeen",
+    0x67DA0102 -> "MetaTagCnsetSeenFAI",
+    0x67D20102 -> "MetaTagCnsetRead",
+    0x67E50102 -> "MetaTagIdsetDeleted",
+    0x40210102 -> "MetaTagIdsetNoLongerInScope",
+    0x67930102 -> "MetaTagIdsetExpired",
+    0x40D20102 -> "MetaTagIdsetRead",
+    0x402E0102 -> "MetaTagIdsetUnread",
+};
+
+// 2.2.2.1 CN Structure
+type CN
+{
+    ushort ReplicaId;
+    ulong GlobalCounter with BinaryEncoding{Endian = Endian.Big, Width = 6 * 8};
+    
+    override string ToString()
+    {
+        return Format("{0:X4}", ReplicaId) + "-" + Format("{0:X12}", GlobalCounter);
+    }
+}
+
+// 2.2.2.2 XID Structure
+// In section 2.2.2.2, it specifies that the size of the LocalId field can be determined by SizedXid structure or the propValue element, so define XID for these two situations separately.
+type XID_InPropValue: PtypMultipleBase 
+{
+    optional [|this.count as uint > 0|] guid NamespaceGuid;
+    optional [|this.count as uint > 0|] array<byte> LocalId with BinaryEncoding{Length = (count as uint)- 16};
+}
+
+type XID_InSizeXid[byte XidSize]
+{
+    optional [|XidSize > 0|] guid NamespaceGuid;
+    optional [|XidSize > 0|] array<byte> LocalId with BinaryEncoding{Length = (XidSize as uint) -16};
+}
+
+// 2.2.2.3  PredecessorChangeList Structure
+type PredecessorChangeList: PtypMultipleBase
+{
+    array<SizedXid> PredecessorChangeList with BinaryEncoding{WidthForComposedType = (this.count as uint) * 8};
+}
+
+// 2.2.2.3.1 SizedXid Structure
+type SizedXid
+{
+    byte XidSize;
+    XID_InSizeXid[XidSize] XID;
+}
+
+// 2.2.2.4.1 IDSET Structure Containing a REPLID Structure
+type IDSET_REPLID_Array: PtypMultipleBase
+{
+    optional [|this.count as uint > 0|] array<IDSET_REPLID> IDSET_REPLID_Array with BinaryEncoding{WidthForComposedType = (this.count as uint)* 8};
+}
+
+type IDSET_REPLID
+{
+    (ushort where CommonStackLengthClear()) REPLID;
+    GLOBSET GLOBSET;
+}
+
+// 2.2.2.4.2 IDSET Structure Containing a REPLGUID Structure
+type IDSET_REPLGUID_Array: PtypMultipleBase
+{
+    optional [|this.count as uint > 0|] array<IDSET_REPLGUID> IDSET_REPLGUID_Array with BinaryEncoding{WidthForComposedType = (this.count as uint) * 8};
+}
+
+type IDSET_REPLGUID
+{
+    (guid where CommonStackLengthClear()) REPLGUID;
+    GLOBSET GLOBSET;
+}
+
+// Global variables used to get the length for Range command for GLOBSET structure.
+uint CommonStackLength = 0;
+array<uint> CommonStackCollection = []; 
+
+// 2.2.2.6 GLOBSET Structure
+type GLOBSET
+{
+    array<GLOBSETCommand> GLOBSET;
+    End End;
+}
+
+type GLOBSETCommand
+{
+    ([|CurrentByte(stream) <= 0x06 && CurrentByte(stream) >= 0x01|] Push     |
+    [|CurrentByte(stream) == 0x50|]                                 Pop      |
+    [|CurrentByte(stream) == 0x42|]                                 Bitmask  |
+    [|CurrentByte(stream) == 0x52|]                                 Range[(6 - CommonStackLength) as uint]) GLOBSETCommand where CommonStackLengthUpdate();
+    bool CommonStackLengthUpdate()
+    {
+        if (GLOBSETCommand is Push && ((CommonStackLength + (GLOBSETCommand as Push).Command) < 6))  
+        {
+            CommonStackCollection += [(GLOBSETCommand as Push).Command];
+            CommonStackLength += CommonStackCollection[CommonStackCollection.Count - 1];  
+            
+        }
+        else if (GLOBSETCommand is Pop)
+        {
+            CommonStackLength -= CommonStackCollection[CommonStackCollection.Count - 1]; 
+        }
+
+        return true;
+    }
+}
+
+// 2.2.2.6.1 Push Command 
+type Push
+{
+    byte Command where (value <= 0x06 && value >= 0x01);
+    array<byte> CommandBytes with BinaryEncoding{Length = Command};
+}
+
+// 2.2.2.6.2 Pop Command 
+type Pop
+{
+    byte Command where value == 0x50;
+}
+
+// 2.2.2.6.3 Bitmask Command
+type Bitmask
+{
+    byte Command where value == 0x42;
+    byte StartingValue;
+    byte Bitmask;
+}
+
+// 2.2.2.6.4 Range Command
+type Range[uint rangeLength]
+{
+    byte Command where value == 0x52;
+    array<byte> LowValue with BinaryEncoding{Length = rangeLength};
+    array<byte> HighValue with BinaryEncoding{Length = rangeLength};
+}
+
+// 2.2.2.6.5 End Command
+type End
+{
+    byte Command where value == 0x00;
+}
+
+// 2.2.2.7  ProgressInformation
+type ProgressInformation
+{
+    ushort Version;
+    ushort padding;
+    uint FAIMessageCount;
+    ulong FAIMessageTotalSize;
+    uint NormalMessageCount;
+    uint paddingII;
+    ulong NormalMessageTotalSize;
+}
+
+// 2.2.2.8 PropertyGroupInfo
+type PropertyGroupInfo
+{
+    uint GroupId;
+    uint Reserved where ValidationCheck(value == 0x0, null, "The Reserved field in type PropertyGroupInfo MUST be 0x00000000");
+    uint GroupCount where ValidationCheck(value != 0x0, null, "The GroupCount field in type PropertyGroupInfo MUST not be 0x00000000");
+    array<PropertyGroup> Groups with BinaryEncoding{Length = GroupCount};
+}
+
+// 2.2.2.8.1 PropertyGroup
+type PropertyGroup
+{
+    uint PropertyTagCount where ValidationCheck(value != 0x0, null, "The PropertyTagCount field in type PropertyGroup MUST not be 0x00000000");
+    array<PropertyTagWithGroupPropertyName> PropertyTags with BinaryEncoding{Length = PropertyTagCount};
+}
+
+// This structure is a PropertyTag Structure (MS-OXCDATA section 2.9) which is special for named properties   
+type PropertyTagWithGroupPropertyName
+{
+    ushort PropertyType with DisplayInfo{ToText = PropTypeValueToText};
+    ushort PropertyId with DisplayInfo{ToText = (any data) => GetPropNameByTag(data as ushort, PropertyType)};
+    optional [|PropertyId >= 0x8000|] GroupPropertyName groupPropertyName;
+}
+
+// 2.2.2.8.1.1  GroupPropertyName
+type GroupPropertyName
+{
+    guid GUID;
+    Kind kind;
+    optional [|kind == Kind.LID|] uint LID;
+    optional [|kind == Kind.Name|] uint NameSize;
+    optional [|kind == Kind.Name|] string Name with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = (NameSize as uint)/2};
+}
+
+pattern Kind = enum uint
+{
+    LID = 0x00000000,
+    Name = 0x00000001
+};
+
+// 2.2.2.9  FolderReplicaInfo
+type FolderReplicaInfo: PtypMultipleBase
+{
+    uint Flags where ValidationCheck(value == 0x0, null, "The Flags field in type FolderReplicaInfo MUST be 0x00000000.");
+    uint Depth where ValidationCheck(value == 0x0, null, "The Depth field in type FolderReplicaInfo MUST be 0x00000000.");
+    MSOXCDATA.LongTermID FolderLongTermId;
+    uint ServerDNCount where ValidationCheck(value != 0x0, null, "The ServerDNCount field in type FolderReplicaInfo MUST not be 0x00000000.");
+    uint CheapServerDNCount where ValidationCheck(value <= ServerDNCount, null, "The value of the CheapServerDNCount field MUST be less than or equal to value of the ServerDNCount field.");
+    array<string> ServerDNArray with BinaryEncoding{TextEncoding= TextEncoding.ASCII};
+}
+
+// Section 2.2.3.1.1.1  
+pattern CopyFlags_SourceCopyTo = flags uint
+{
+    Move = 0x00000001,
+    Unused1 =0x00000002,
+    Unused2 =0x00000004,
+    Unused3 =0x00000008,
+    Unused4 =0x00000200,
+    Unused5 =0x00000400,
+    BestBody  =0x00002000,
+    ...
+};
+
+// 2.2.3.1.1.2.1
+pattern CopyFlags_SourceCopyProperties = flags byte
+{
+    Move = 0x01,
+    Unused1 =0x02,
+    Unused2 =0x04,
+    Unused3 =0x08,
+    ...
+};
+
+// 2.2.3.1.1.3.1
+pattern CopyFlags_SourceCopyMessages = flags byte
+{
+    Move = 0x01,
+    Unused1 =0x02,
+    Unused2 =0x04,
+    Unused3 =0x08,
+    BestBody  =0x10,
+    SendEntryId =0x20,
+    ...
+};
+
+// 2.2.3.1.1.4.1
+pattern CopyFlags_SourceCopyFolder = flags byte
+{
+    Move =           0x01,
+    Unused1 =        0x02,
+    Unused2 =        0x04,
+    Unused3 =        0x08,
+    CopySubfolders = 0x10,
+    ...
+};
+
+//Section 2.2.3.1.1.1
+pattern SendOptions = flags byte
+{
+    Unicode = 0x01,
+    UseCpid =0x02,
+    ForUpload  =0x03,
+    RecoverMode  =0x04,
+    ForceUnicode  =0x08,
+    PartialItem  =0x10,
+    Reserved1  =0x20,
+    Reserved2  =0x40,
+    ...
+};
+
+//2.2.3.1.1.5.2
+pattern TransferStatus = enum ushort
+{
+   Error=       0x0000,
+   Partial=     0x0001,
+   NoRoom=      0x0002,
+   Done =       0x0003,
+   ... 
+};
+
+//2.2.3.1.2.1.1
+pattern SourceOperation = enum byte
+{
+  CopyTo = 0x01,
+  CopyProperties = 0x02,
+  CopyMessages  = 0x03,
+  CopyFolder = 0x04,
+  ...
+};
+//2.2.3.1.2.1.1
+pattern CopyFlags = flags byte
+{
+  Move = 0x01,
+  ...
+};
+
+//2.2.3.2.1.1.1
+pattern SynchronizationType = enum byte
+{
+  Contents = 0x01,
+  Hierarchy = 0x02,
+  ...
+};
+
+//2.2.3.2.1.1.1   
+pattern SynchronizationFlags  = flags ushort
+{
+  Unicode = 0x0001,
+  NoDeletions = 0x0002,
+  IgnoreNoLongerInScope  = 0x0004,
+  ReadState = 0x0008,
+  FAI = 0x0010, 
+  Normal  = 0x0020,
+  OnlySpecifiedProperties  = 0x0080,
+  NoForeignIdentifiers   = 0x0100,
+  Reserved  = 0x1000,
+  BestBody  = 0x2000,   
+  IgnoreSpecifiedOnFAI   = 0x4000,
+  Progress   = 0x8000, 
+  ...    
+};
+
+//2.2.3.2.1.1.1
+pattern SynchronizationExtraFlags = flags uint
+{
+  Eid  = 0x00000001,
+  MessageSize  = 0x00000002,
+  CN   = 0x00000004,
+  OrderByDeliveryTime  = 0x00000008,
+  ...    
+};
+
+// 2.2.3.2.4.2.1
+pattern ImportFlag = flags byte
+{
+  Associated = 0x10,
+  FailOnConflict = 0x40,
+  ...
+};
+
+//2.2.3.2.4.5.1
+pattern ImportDeleteFlags = flags byte
+{
+  Hierachy = 0x01,
+  HardDelete = 0x02,
+  ...
+};
+
+type PtypString8InFixcs
+{
+  uint size;
+  string PtypString8 with BinaryEncoding{TextEncoding= TextEncoding.ASCII, Length = size};
+}
+
+type PtypStringInFixcs
+{
+  uint size;
+  string PtypString with BinaryEncoding{TextEncoding= TextEncoding.Unicode, Length = size/2};
+}
+
+// 2.2.4.1.1 fixedPropType
+pattern FixedPropType = enum ushort 
+{
+    PtypInteger16            = PropertyDataType.PtypInteger16,
+    PtypInteger32            = PropertyDataType.PtypInteger32,
+    PtypFloating32           = PropertyDataType.PtypFloating32,
+    PtypFloating64           = PropertyDataType.PtypFloating64,
+    PtypCurrency             = PropertyDataType.PtypCurrency,
+    PtypFloatingTime         = PropertyDataType.PtypFloatingTime, 
+    PtypErrorCode            = PropertyDataType.PtypErrorCode,
+    PtypBoolean              = PropertyDataType.PtypBoolean,
+    PtypInteger64            = PropertyDataType.PtypInteger64,
+    PtypTime                 = PropertyDataType.PtypTime,
+    PtypGuid                 = PropertyDataType.PtypGuid,
+    PtypUnspecified          = PropertyDataType.PtypUnspecified,
+    PtypNull                 = PropertyDataType.PtypNull
+};
+
+// 2.2.4.1.1 varPropType
+pattern VarPropType = enum ushort  
+{
+    PtypString                          = PropertyDataType.PtypString,
+    PtypString8                         = PropertyDataType.PtypString8,
+    PtypServerId                        = PropertyDataType.PtypServerId,
+    PtypBinary                          = PropertyDataType.PtypBinary,
+    PtypObject                          = PropertyDataType.PtypObject_Or_PtypEmbeddedTable,
+    ptypCodePageUnicode                 = 0x84B0,
+    ptypCodePageUnicodeBigendian        = 0x84B1,
+    ptypCodePageWesternEuropean         = 0x84E4
+};
+
+// 2.2.4.1.1 mvPropType
+pattern MvPropType = enum ushort
+{
+    PtypMultipleInteger16    = PropertyDataType.PtypMultipleInteger16,
+    PtypMultipleInteger32    = PropertyDataType.PtypMultipleInteger32,
+    PtypMultipleFloating32   = PropertyDataType.PtypMultipleFloating32,
+    PtypMultipleFloating64   = PropertyDataType.PtypMultipleFloating64,
+    PtypMultipleCurrency     = PropertyDataType.PtypMultipleCurrency,
+    PtypMultipleFloatingTime = PropertyDataType.PtypMultipleFloatingTime,
+    PtypMultipleInteger64    = PropertyDataType.PtypMultipleInteger64,
+    PtypMultipleString       = PropertyDataType.PtypMultipleString,
+    PtypMultipleString8      = PropertyDataType.PtypMultipleString8,
+    PtypMultipleTime         = PropertyDataType.PtypMultipleTime,
+    PtypMultipleGuid         = PropertyDataType.PtypMultipleGuid,
+    PtypMultipleBinary       = PropertyDataType.PtypMultipleBinary
+};
+
+// 2.2.4.1.1.1  Code Page Property Types
+type CodePagePropertyTypes
+{
+    byte A with BinaryEncoding{Width = 1};
+    ushort CodePageId with BinaryEncoding{Width = 15};
+}
+
+// 2.2.4.1.2 propValue Lexical Element
+type PropValue
+{
+    ushort propType with DisplayInfo{ToText = PropTypeValueToText};
+    (PropInfo[propType] where value.propId != 0x4016 
+                 && value.propId != 0x400F 
+                 && value.propId != 0x4011 
+                 && value.propId != 0x407c 
+                 && value.propId != 0x407A 
+                 && value.propId != 0x4008
+                 && value.propId != 0x4009 
+                 && value.propId != 0x400a 
+                 && value.propId != 0x400b 
+                 && value.propId != 0x400c 
+                 && value.propId != 0x400d 
+                 && value.propId != 0x4010 
+                 && value.propId != 0x4000
+                 && value.propId != 0x4001
+                 && value.propId != 0x4002
+                 && value.propId != 0x4003
+                 && value.propId != 0x4004
+                 && value.propId != 0x400e 
+                 && value.propId != 0x4012 
+                 && value.propId != 0x407d 
+                 && value.propId != 0x4013
+                 && value.propId != 0x4014 
+                 && value.propId != 0x402f 
+                 && value.propId != 0x403a 
+                 && value.propId != 0x403b
+                 && value.propId != 0x4074 
+                 && value.propId != 0x4075 
+                 && value.propId != 0x4015
+                 && value.propId != 0x407b 
+                 && value.propId != 0x4018
+                 && modifyPropType(value.propId)) propInfo;
+
+    optional ([|propType is VarPropType && propInfo.propId != 0x4017 && propInfo.propId != 0x6796 && propInfo.propId != 0x67DA && propInfo.propId != 0x67D2
+              && propInfo.propId != 0x67E5 && propInfo.propId != 0x4021 && propInfo.propId != 0x6793 && propInfo.propId != 0x402D && propInfo.propId != 0x402E
+              && propInfo.propId != 0x65E3  && propInfo.propId != 0x65E0  && propInfo.propId != 0x65E1  && propInfo.propId != 0x65E2|] VarSizeValue[propType]   |
+              [|propType is VarPropType && (propInfo.propId == 0x4017 | propInfo.propId == 0x6796 | propInfo.propId == 0x67DA 
+			  | propInfo.propId == 0x67D2)|] IDSET_REPLGUID_Array[4]                                                                               |
+              [|propType is VarPropType && (propInfo.propId == 0x67E5 | propInfo.propId == 0x4021 | propInfo.propId == 0x6793 
+			  | propInfo.propId == 0x402D | propInfo.propId == 0x402E) |] IDSET_REPLGUID_Array[4]                                                              |
+              [|propType is VarPropType && propInfo.propId == 0x65E3|] PredecessorChangeList[4]                                                      |
+              [|propType is VarPropType && propInfo.propId == 0x65E0 || propInfo.propId == 0x65E1 || propInfo.propId == 0x65E2|] XID_InPropValue[4]  |
+              [|propType is FixedPropType && propInfo.propId == 0x67A4|] CN                                                                          |
+              [|propType is FixedPropType && propInfo.propId == 0x674A|] MessageID                                                                   |
+              [|propType is FixedPropType && (propInfo.propId == 0x6748 || propInfo.propId == 0x6749)|] FolderID                                     |
+              [|propType is FixedPropType && propInfo.propId != 0x67A4 && propInfo.propId != 0x674A && propInfo.propId != 0x6748 && propInfo.propId != 0x6749|] FixedSizeValue[propType]) propValue;
+
+    optional [|propType is MvPropType|] uint length;
+    optional [|propType is MvPropType|] ([|propType != 0x101F && propType != 0x101E && propType != 0x1102|] array<FixedSizeValue[(propType & 0xFFF) as ushort]> 
+                                        | [|(propType == 0x101F || propType == 0x101E || propType == 0x1102)|] array<VarSizeValue[(propType & 0xFFF) as ushort]>) mvSizeValue with BinaryEncoding{Length = length as long};
+    
+    // Modify property type of MetaTagIdsetGiven from PtypInteger32 to PtypBinary
+    // MS-OXCFXICS section 3.1.5.2.1, the property tag for this property suggests that it is of type PtypInteger32, but the data MUST be handled as PtypBinary data by both clients and servers.
+    bool modifyPropType(ushort propId)
+    {
+        if (propId == 0x4017 && propType == FixedPropType.PtypInteger32)
+        {
+            propType = VarPropType.PtypBinary;
+        }
+        return true;
+    }
+}
+
+// 2.2.4.1 fixedSizeValue
+type FixedSizeValue[ushort dataType]
+{
+    ([|dataType == FixedPropType.PtypInteger16|]    PtypInteger16       |
+    [|dataType == FixedPropType.PtypInteger32|]     PtypInteger32       |
+    [|dataType == FixedPropType.PtypFloating32|]    PtypFloating32      |
+    [|dataType == FixedPropType.PtypFloating64|]    PtypFloating64      |
+    [|dataType == FixedPropType.PtypCurrency|]      PtypCurrency        |
+    [|dataType == FixedPropType.PtypFloatingTime|]  PtypFloatingTime    |
+    [|dataType == FixedPropType.PtypErrorCode|]     PtypErrorCode       |
+    [|dataType == FixedPropType.PtypBoolean|]       PtypInteger16       |
+    [|dataType == FixedPropType.PtypInteger64|]     PtypInteger64       |
+    [|dataType == FixedPropType.PtypTime|]          PtypTime            |
+    [|dataType == FixedPropType.PtypGuid|]          PtypGuid            |
+    [|dataType == FixedPropType.PtypUnspecified|]   PtypUnspecified     |
+    [|dataType == FixedPropType.PtypNull|]          PtypNull) fixedSizeValue;
+}
+
+// 2.2.4.1  varSizeValue
+// According to MS-OXCDATA section 2.11.1, byte counts for PtypBinary property values are 16 bits wide or 32 bits wide, and in MS-OXCFXICS it is 32 bits wide
+type VarSizeValue[ushort dataType]
+{
+    ([|dataType == VarPropType.PtypString|]                     PtypStringInFixcs    |
+    [|dataType == VarPropType.PtypString8|]                     PtypString8InFixcs   |
+    [|dataType == VarPropType.ptypCodePageUnicode|]             PtypStringInFixcs    |
+    [|dataType == VarPropType.ptypCodePageUnicodeBigendian|]    PtypString8InFixcs   |
+    [|dataType == VarPropType.ptypCodePageWesternEuropean|]     PtypString8InFixcs   |
+    [|dataType == VarPropType.PtypServerId|]                    PtypServerId[2]         |
+    [|dataType == VarPropType.PtypBinary|]                      PtypBinary[4]        |
+    [|dataType == VarPropType.PtypObject|]                      PtypObject_Or_PtypEmbeddedTable) varSizeValue;
+}
+
+// 2.2.4.1  propInfo
+type PropInfo[ushort propType]
+{
+    ushort propId with DisplayInfo{ToText = (any data) => GetPropNameByTag(data as ushort, propType)};
+    optional [|propId >= 0x8000|] NamedPropInfo namedPropInfo;
+}
+
+// 2.2.4.1  namedPropInfo
+type NamedPropInfo
+{
+    guid propertySet;
+    byte Flag;
+    optional [|Flag == 0x00|] uint dispid;
+    optional [|Flag == 0x01|] string name;
+}
+
+// This type is defined for parser Meta-Properties value
+type MetaPropValue
+{
+    ushort propType;
+    (PropInfo where value.propId == 0x4016 || value.propId == 0x400f || value.propId == 0x4011 || value.propId == 0x407c || value.propId == 0x407a || value.propId == 0x4008) propInfo;
+    ([|propInfo.propId == 0x4011|] FolderReplicaInfo  | 
+     [|propInfo.propId == 0x4008|] PtypString8InFixcs | 
+     [|propInfo.propId != 0x4011 && propInfo.propId != 0x4008|] PtypInteger32) propValue;
+}
+
+// 2.2.4.1.4 Markers
+pattern Marker = enum uint
+{
+    StartTopFld                   =0x40090003,
+    EndFolder                     =0x400B0003,
+    StartSubFld                   =0x400A0003,      
+    StartMessage                  =0x400C0003,
+    EndMessage                    =0x400D0003,
+    StartFAIMsg                   =0x40100003,
+    StartEmbed                    =0x40010003,
+    EndEmbed                      =0x40020003,
+    StartRecip                    =0x40030003,
+    EndToRecip                    =0x40040003,
+    NewAttach                     =0x40000003,
+    EndAttach                     =0x400E0003,
+    IncrSyncChg                   =0x40120003,
+    IncrSyncChgPartial            =0x407D0003,
+    IncrSyncDel                   =0x40130003,
+    IncrSyncEnd                   =0x40140003,
+    IncrSyncRead                  =0x402F0003,
+    IncrSyncStateBegin            =0x403A0003,
+    IncrSyncStateEnd              =0x403B0003,
+    IncrSyncProgressMode          =0x4074000B,
+    IncrSyncProgressPerMsg        =0x4075000B,
+    IncrSyncMessage               =0x40150003,
+    IncrSyncGroupInfo             =0x407B0102,
+    FXErrorInfo                   =0x40180003
+};
+
+// 2.2.4.2 recipient
+type Recipient
+{
+    Marker startRecip where value == Marker.StartRecip;
+    array<PropValue> propList where isPidTagRowidFirst(value); 
+    Marker endToRecip where value == Marker.EndToRecip;
+
+    bool isPidTagRowidFirst(array<PropValue> propList)
+    {
+        bool ret = false;
+        if (propList.Count != 0)
+        {
+            if (propList[0].propType == 0x0003 && propList[0].propInfo.propId== 0x3000)
+                ret = true;
+        }
+        return ret;
+    }
+}
+
+// 2.2.4.2 embeddedMessage
+type EmbeddedMessage
+{
+    Marker startEmbed where value == Marker.StartEmbed;
+    MessageContent messageContent; 
+    Marker endEmbed where value == Marker.EndEmbed;
+}
+
+// 2.2.4.2 attachmentContent
+type AttachmentContent
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4008) metaTagDnPrefix;
+    optional (array<PropValue> where value.Count > 0) propList ;
+    optional EmbeddedMessage embeddedMessage;
+}
+
+// 2.2.4.2 attachment
+type Attachment
+{
+    Marker newAttach where value == Marker.NewAttach; 
+    PropValue pidTagAttachNumber; 
+    AttachmentContent attachmentContent;
+    Marker endAttach where value == Marker.EndAttach;
+}
+
+// 2.2.4.2 messageChildren
+type MessageChildren
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4016 && value.propType == 0x0003) metaTagFXDelProp1;
+    optional (array<Recipient> where value.Count > 0) recipients;
+    optional (MetaPropValue where value.propInfo.propId == 0x4016 && value.propType == 0x0003) metaTagFXDelProp2;
+    optional (array<Attachment> where value.Count > 0) attachments;
+}
+
+// 2.2.4.2 messageContent
+type MessageContent
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4008) metaTagDnPrefix;
+    array<PropValue> propList where value.Count > 0;
+    MessageChildren messageChildren;
+}
+
+// 2.2.4.2 message
+type Message
+{
+    Marker startMessage where value == Marker.StartMessage || value == Marker.StartFAIMsg;
+    MessageContent messageContent; 
+    Marker endMessage  where value == Marker.EndMessage;
+}
+
+type MetaTagEcWarningMessage
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x400F && value.propType == 0x0003) metaTagEcWarning;
+    optional Message mess;
+}
+
+// 2.2.4.2 messageList
+type MessageList
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4008) metaTagDnPrefix;
+    array<MetaTagEcWarningMessage> messages where value.Count > 0;  
+}
+
+// 2.2.4.2 folderMessagesNoDelProps
+type FolderMessagesNoDelProps
+{
+    array<MessageList> messageLists where value.Count > 0 && value.Count <= 2;
+}
+
+// 2.2.4.2 subFolderNoDelProps
+type SubFolderNoDelProps
+{
+    Marker startSubFld  where value == Marker.StartSubFld;
+    FolderContentNoDelProps folderContentNoDelProps;
+    Marker endSubFolder where value == Marker.EndFolder;
+}
+
+// 2.2.4.2 folderContentNoDelProps
+type FolderContentNoDelProps
+{
+    array<PropValue> propList where value.Count > 0;
+    ([|value != nothing && value != null|] ([|BinaryToUInt(stream.PeekBytes(0, 4),0) == 0x40110102|] MetaPropValue) | FolderMessagesNoDelProps) folderMessagesNoDelProps;
+    optional (array<SubFolderNoDelProps> where value.Count > 0) arraySubFolderNoDelProps;
+}
+
+// 2.2.4.2 topFolder
+type TopFolder
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4008) metaTagDnPrefix;
+    Marker startTopFld where value == Marker.StartTopFld;
+    FolderContentNoDelProps folderContentNoDelProps;
+    Marker endFolder where value == Marker.EndFolder;
+}
+
+type MetaTagFXDelPropMessageList
+{
+    MetaPropValue metaTagFXDelProp where value.propInfo.propId == 0x4016 && value.propType == 0x0003;
+    MessageList messageList;
+}
+
+// 2.2.4.2 folderMessages
+type FolderMessages
+{
+    (array<MetaTagFXDelPropMessageList> where value.Count > 0 && value.Count <= 2) folderMessages;
+}
+
+// 2.2.4.2 SubFolder
+type SubFolder
+{
+    Marker startSubFld where value == Marker.StartSubFld;
+    FolderContent folderContent;
+    Marker endFolder where value == Marker.EndFolder;
+}
+
+type MetaTagFXDelPropSubFolder
+{
+    MetaPropValue metaTagFXDelProp where value.propInfo.propId == 0x4016 && value.propType == 0x0003;
+    (array<SubFolder> where value.Count > 0) subFolders;
+}
+
+// 2.2.4.2 folderContent
+type FolderContent
+{
+    optional (MetaPropValue where value.propInfo.propId == 0x4008) metaTagDnPrefix;
+    array<PropValue> propList where value.Count > 0;
+    optional ([|value != nothing && value != null|] ([|BinaryToUInt(stream.PeekBytes(0, 4),0) == 0x40110102|] MetaPropValue) | FolderMessages) folderMessages;
+    optional (array<MetaTagFXDelPropSubFolder> where value.Count > 0) arraySubFolder;
+}
+
+// 2.2.4.2 progressPerMessageChange
+type ProgressPerMessageChange
+{
+    optional ProgressPerMessage progressPerMessage;
+    MessageChange messageChange;
+}
+
+// 2.2.4.2 contentsSync
+type ContentsSync
+{
+    optional ProgressTotal progressTotal;
+    optional (array<ProgressPerMessageChange> where value.Count > 0) messageChanges;
+    optional Deletions deletions;
+    optional ReadStateChanges readStateChanges;
+    State state;
+    Marker incrSyncEnd where value == Marker.IncrSyncEnd;
+}
+
+// 2.2.4.2 progressTotal
+type ProgressTotal
+{
+    Marker incrSyncProgressMode where value == Marker.IncrSyncProgressMode;
+    
+    // Although accoring to the definition of ProgressTotal structure in section 2.2.4.2, here should be a proplist field which is array<propValue> type, 
+    // section 2.2.4.3.19 specifies that this array only contains one property, and property value is a serialized ProgressInformation structure.
+    uint propertyTag where value == 0x00000102;
+    uint count;
+    ProgressInformation propList with BinaryEncoding{WidthForComposedType = count * 8};
+}
+
+// 2.2.4.2 progressPerMessage
+type ProgressPerMessage
+{
+    Marker incrSyncProgressPerMsg where value == Marker.IncrSyncProgressPerMsg;
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 messageChange
+type MessageChange
+{
+    (MessageChangeFull | MessageChangePartial) messageChange;
+}
+
+// 2.2.4.2 messageChangeFull
+type MessageChangeFull
+{
+    Marker incrSyncChg where value == Marker.IncrSyncChg;
+    MessageChangeHeader messageChangeHeader;
+    Marker incrSyncMessage where value == Marker.IncrSyncMessage;
+    array<PropValue> propList where value.Count > 0;
+    MessageChildren messageChildren;
+}
+
+// 2.2.4.2 messageChangeHeader
+type MessageChangeHeader
+{
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 metaTagIncreSyncMesPartialPropList
+type MetaTagIncreSyncMesPartialPropList
+{
+    (MetaPropValue where value.propInfo.propId == 0x407A && value.propType == 0x0003) metaTagIncreSyncMesPartial;
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 messageChangePartial
+type MessageChangePartial
+{
+    GroupInfo groupInfo;
+    MetaPropValue metaTagIncrSyncGroupId where value.propInfo.propId == 0x407C && value.propType == 0x0003;
+    Marker incrSyncChgPartial where value == Marker.IncrSyncChgPartial;
+    MessageChangeHeader messageChangeHeader;
+    array<MetaTagIncreSyncMesPartialPropList> propLists where value.Count > 0;
+    MessageChildren messageChildren;
+}
+
+// 2.2.4.2 readStateChanges
+type ReadStateChanges
+{
+    Marker incrSyncRead where value == Marker.IncrSyncRead;
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 state
+type State
+{
+    Marker incrSyncStateBegin where value == Marker.IncrSyncStateBegin;
+    array<PropValue> propList where value.Count > 0;
+    Marker incrSyncStateEnd where value == Marker.IncrSyncStateEnd;
+}
+
+// 2.2.4.2 groupInfo
+type GroupInfo
+{
+    Marker incrSyncGroupInfo where value == Marker.IncrSyncGroupInfo;
+
+    // Although accoring to the definition of GroupInfo structure in section 2.2.4.2, here should be a proplist field which is array<propValue> type, 
+    // section 2.2.4.3.8 specifies that this array only contains one property, and property value is a serialized PropertyGroupInfo structure.
+    uint propertyTag where value == 0x00000102;
+    uint count;
+    PropertyGroupInfo propList with BinaryEncoding{WidthForComposedType = count * 8};
+}
+
+// 2.2.4.2 folderChange
+type FolderChange
+{
+    Marker incrSyncChg where value == Marker.IncrSyncChg;
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 deletions
+type Deletions
+{
+    Marker incrSyncDel where value == Marker.IncrSyncDel;
+    array<PropValue> propList where value.Count > 0;
+}
+
+// 2.2.4.2 hierarchySync
+type HierarchySync
+{
+    optional (array<FolderChange> where value.Count > 0) folderChanges; 
+    optional Deletions deletions;
+    State state; 
+    Marker incrSyncEnd where value == Marker.IncrSyncEnd;
+}
+
+// FastTransfer Stream root type
+pattern FastTransferRootType = enum byte 
+{
+ ContentsSync                       = 0x00,
+ HierarchySync                      = 0x01,
+ State                              = 0x02,
+ FolderContent                      = 0x03,
+ MessageList                        = 0x04,
+ TopFolder                          = 0x05,
+ MessageContent                     = 0x06,
+ AttachmentContent                  = 0x07,
+};
+
+// 2.2.4.2 FastTransfer Stream
+type FastTransferStream[byte rootType]
+{
+  ([|rootType == FastTransferRootType.ContentsSync|] ContentsSync                                                               |
+  [|rootType == FastTransferRootType.HierarchySync|] HierarchySync                                                              |
+  [|rootType == FastTransferRootType.State|] State                                                                              |
+  [|rootType == FastTransferRootType.MessageList|] MessageList                                                                  |
+  [|rootType == FastTransferRootType.TopFolder|] TopFolder                                                                      |
+  [|rootType == FastTransferRootType.MessageContent|] MessageContent                                                            |
+  [|rootType == FastTransferRootType.FolderContent|] FolderContent                                                              |
+  [|rootType == FastTransferRootType.AttachmentContent|] AttachmentContent 
+  ) root;
+}
+
+// This method is used to clear the global variable CommonStackLength.
+bool CommonStackLengthClear()
+{
+    CommonStackLength = 0;
+    return true;
+}

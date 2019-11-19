@@ -1,0 +1,520 @@
+protocol DVRE with
+XmlEncodingDefaults{Namespace = TnsNamespace},
+Documentation
+{
+    ProtocolName = "Device Registration Enrollment Protocol",
+    ShortName = "DVRE",
+    DocumentName = "MS-DVRE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "DVRE", Version = "1.0", Date = "09/22/2013", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "375466", Date = "03/13/2015"}
+    ],
+};
+
+using Standard;
+using X509;
+using SOAP;
+using HTTP;
+using SAMLCore;
+using WSFederation;
+using JWT;
+using XMLEnc;
+using Utility;
+using IdentityAndSecurityResources;
+using Technologies.SOAP;
+using XSD;
+using WSTEP;
+
+const string TnsNamespace = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment";
+const string WsseNamespace = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd";
+const string Wst13Namespace = "http://docs.oasis-open.org/ws-sx/ws-trust/200512";
+
+const string DvreUri = "/EnrollmentServer/DeviceEnrollmentWebService.svc";
+const string InputMessageAction = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment/RST/wstep";
+const string OutputMessageAction = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment/RSTRC/wstep";
+const string FaultMessageAction = "DeviceCapReached";
+
+const string RequestTypeValueInInputMessage = "http://docs.oasis-open.org/ws-sx/ws-trust/200512/Issue";
+const string TokenTypeValueInInputMessage = "http://schemas.microsoft.com/5.0.0.0/ConfigurationManager/Enrollment/DeviceEnrollmentToken";
+const string BinarySecurityTokenValueTypeInInputMessage = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment#PKCS10";
+const string TokenTypeValueInOutputMessage = "http://schemas.microsoft.com/5.0.0.0/ConfigurationManager/Enrollment/DeviceEnrollmentToken";
+const string BinarySecurityTokenValueTypeInOutputMessage = "http://schemas.microsoft.com/5.0.0.0/ConfigurationManager/Enrollment/DeviceEnrollmentProvisionDoc";
+const string Base64BinaryEncodedType = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd#base64binary";
+const string JWTValueType = "urn:ietf:params:oauth:token-type:jwt";
+
+//------------------------------------- Endpoint & Actor---------------------------------------//
+// Endpoint: Server
+endpoint Server 
+    over SOAP.Server
+    provides IWindowsDeviceEnrollmentService
+    provides IWindowsDeviceEnrollmentServiceMessage;
+
+client endpoint Client connected to Server;
+
+autostart actor DVREServerOverSOAP(SOAP.Server server) precedes WSTEPServerOverSOAP
+{
+    InputMessage cachedInputMessage = null;
+
+    process server accepts soapMessage:SoapMessage where IsDVRERequestMessage(soapMessage)
+    {
+        var v = XmlDecoder<InputMessage>(soapMessage.Body);
+        if (v == nothing)
+        {
+            ThrowDecodingException("DVRE", "IWindowsDeviceEnrollmentService_RequestSecurityToken_InputMessage");
+        }
+        InputMessage inputMessage = v as InputMessage;
+
+        // manual decode Security in SOAP Header
+        if (TryDecodeSecurityFromSoapHeader(soapMessage) is security:DVRE.SecurityType)
+        {
+            inputMessage.Security = security;
+        }
+
+        dispatch (endpoint DVRE.Server over server) accepts inputMessage;
+
+        // cache the input message
+        cachedInputMessage = inputMessage;
+    }
+
+    process server issues soapMessage:SoapMessage where IsDVREResponseMessage(soapMessage)
+    {
+        if (soapMessage.WsaAction == OutputMessageAction)
+        {
+            var v = XmlDecoder<OutputMessage>(soapMessage.Body);
+            if (v == nothing)
+            {
+                ThrowDecodingException("DVRE", "IWindowsDeviceEnrollmentService_RequestSecurityToken_OutputMessage");
+            }
+
+            OutputMessage outputMessage = v as OutputMessage;
+            
+            // dispatch output message
+            DVRE.Server dvreServer = (endpoint DVRE.Server over server);
+            dispatch dvreServer issues outputMessage;
+
+            // dispatch operatoin
+            DispatchOperation(cachedInputMessage, outputMessage, dvreServer);
+            cachedInputMessage = null;
+        }
+        else if (soapMessage.WsaAction == FaultMessageAction)
+        {
+            if (soapMessage.FaultDetail is detail:xml && detail != null)
+            {
+                var v = XmlDecoder<FaultMessage>(detail);
+                if (v == nothing)
+                {
+                    ThrowDecodingException("DVRE",
+                        "IWindowsDeviceEnrollmentService_RequestSecurityToken_WindowsDeviceEnrollmentServiceErrorFault_FaultMessage");
+                }
+                FaultMessage faultMessage = v as FaultMessage;
+                
+                // dispatch fault message
+                DVRE.Server dvreServer = (endpoint DVRE.Server over server);
+                dispatch dvreServer issues faultMessage;
+
+                // dispatch operatoin
+                DispatchOperation(cachedInputMessage, faultMessage, dvreServer);
+                cachedInputMessage = null;
+            }
+            else
+            {
+                ValidationCheck(false, soapMessage, DiagnosisLevel.Error, DVRE_FAULT_MISSING);
+                release soapMessage;
+                return;
+            }
+        }
+        else
+        {
+            ThrowDecodingException("DVRE", "IWindowsDeviceEnrollmentService_RequestSecurityToken_OutputMessage");
+        }
+    }
+}
+
+// -------------------------------------- Constracts -------------------------------------------//
+contract IWindowsDeviceEnrollmentService
+{
+    operation RequestSecurityToken
+    {
+        in DVRE.SecurityType Security;
+        in DVRE.RequestSecurityTokenType RequestSecurityToken;
+
+        out optional DVRE.RequestSecurityTokenResponseCollectionType RequestSecurityTokenResponseCollection;
+        out optional WindowsDeviceEnrollmentServiceError WindowsDeviceEnrollmentServiceError;
+
+        override string ToString()
+        {
+            return "RequestSecurityToken";
+        }
+    } with SoapMessageInfo{Action = InputMessageAction, ReplyAction = OutputMessageAction};
+}
+
+contract IWindowsDeviceEnrollmentServiceMessage
+{
+    accepts message IWindowsDeviceEnrollmentService_RequestSecurityToken_InputMessage 
+    {
+        // decoded from SOAP header and manual decode
+        DVRE.SecurityType Security with Encoding{Ignore = true};
+        // decode from SOAP body
+        DVRE.RequestSecurityTokenType RequestSecurityToken with XmlEncoding{Namespace = Wst13Namespace};
+
+        override string ToString()
+        {
+            return "InputMessage";
+        }
+    }
+
+    issues message IWindowsDeviceEnrollmentService_RequestSecurityToken_OutputMessage
+    {
+        DVRE.RequestSecurityTokenResponseCollectionType RequestSecurityTokenResponseCollection with XmlEncoding{Namespace = Wst13Namespace};
+
+        override string ToString()
+        {
+            return "OutputMessage";
+        }
+    }
+
+    issues message IWindowsDeviceEnrollmentService_RequestSecurityToken_WindowsDeviceEnrollmentServiceErrorFault_FaultMessage
+    {
+        WindowsDeviceEnrollmentServiceError WindowsDeviceEnrollmentServiceError;
+
+        override string ToString()
+        {
+            return "FaultMessage";
+        }
+    }
+}
+
+// ----------------------------------------- Types ---------------------------------------------//
+typedef InputMessage = IWindowsDeviceEnrollmentServiceMessage.IWindowsDeviceEnrollmentService_RequestSecurityToken_InputMessage;
+typedef OutputMessage = IWindowsDeviceEnrollmentServiceMessage.IWindowsDeviceEnrollmentService_RequestSecurityToken_OutputMessage;
+typedef FaultMessage = IWindowsDeviceEnrollmentServiceMessage.IWindowsDeviceEnrollmentService_RequestSecurityToken_WindowsDeviceEnrollmentServiceErrorFault_FaultMessage;
+
+// 3.1.4.1.2.12   Provisioning Document Schema
+type CharacteristicType
+{
+    string $"type" with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional array<ParmType> parm with XmlEncoding{Namespace = ""};
+    optional array<CharacteristicType> characteristic with XmlEncoding{Namespace = ""};
+}
+
+type ParmType
+{
+    string name with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string $"value" with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type WapProvisioningdocType
+{
+    string version with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional array<CharacteristicType> characteristic with XmlEncoding{Namespace = ""};
+}
+
+// section 3.1.4.1.3.1   WindowsDeviceEnrollmentServiceError
+type WindowsDeviceEnrollmentServiceError
+{
+    optional WinDeviceEnrollmentServiceErrorType ErrorType;
+    optional string Message;
+}
+
+// 3.1.4.1.4.1   WinDeviceEnrollmentServiceErrorType
+type WinDeviceEnrollmentServiceErrorType
+{
+    WinDeviceEnrollmentServiceErrorEnum Value 
+        where ValidationCheckEnumValue(InRange<WinDeviceEnrollmentServiceErrorEnum>(value), null, true, ReferenceType.Type,
+           "DVRE", "Value", "WinDeviceEnrollmentServiceErrorType",
+           ["InvalidParameter", "SqlError", "CertificateAuthorityError", "DirectoryAccountError", "AuthenticationError", "AuthorizationError", "UnknownError"], 
+           value)
+        with XmlEncoding{Kind = XmlKind.Text};
+
+    override string ToString()
+    {
+        return EnumToString(Value, "DVRE.WinDeviceEnrollmentServiceErrorEnum");
+    }
+}
+
+// Extended: WSS Security Header -------------------------
+type SecurityType
+{
+    optional string $"actor" with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string $"role" with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string mustUnderstand with XmlEncoding{Kind = XmlKind.Attribute, Namespace = Soap12Namespace};
+    BinarySecurityTokenType_Security BinarySecurityToken with XmlEncoding{Namespace = WsseNamespace};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+}
+
+// WSS BinarySecurityToken in Security
+type BinarySecurityTokenType_Security
+{
+    optional XSDId Id with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional XSAnyURI ValueType
+        where ValidationCheck(value == nothing || (value as XSAnyURI) == JWTValueType, null, DiagnosisLevel.Error, DVRE_INPUT_SECURITY_VALUETYPE)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSAnyURI EncodingType
+        // Not check EncodingType because of TDI 
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional (JSONWebToken | string) Value with XmlEncoding{Kind = XmlKind.Text},
+        Encoding{Decoder = DecodeJWTForDVRE<JWS_Header, JWT_Claims, JWE_Header>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+}
+
+optional (JSONWebToken | string) DecodeJWTForDVRE<JWS_Header, JWT_Claims, JWE_Header>(optional binary bin)
+{
+    var result = nothing;
+    if (bin is b:binary)
+    {
+        if(BinaryStringDecoder(b, TextEncoding.ASCII) is str:string)
+        {
+            result = DecodeJWT<JWS_Header, JWT_Claims, JWE_Header>(str);
+        }
+    }
+    return result;
+}
+
+// Extended WSTrust RequestSecurityTokenType -------------------------
+type RequestSecurityTokenType
+{
+    optional XSAnyURI Context with XmlEncoding{Kind = XmlKind.Attribute, Namespace = Wst13Namespace};
+    XSAnyURI TokenType
+        where ValidationCheck(value == TokenTypeValueInInputMessage, null, DiagnosisLevel.Error, DVRE_INPUT_TOKENTYPE_VALUE)
+        with XmlEncoding{Namespace = Wst13Namespace};
+    XSAnyURI RequestType
+        where ValidationCheck(value == RequestTypeValueInInputMessage, null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTTYPE_VALUE)
+        with XmlEncoding{Namespace = Wst13Namespace};
+    BinarySecurityTokenType_RequestSecurityTokenType BinarySecurityToken with XmlEncoding{Namespace = WsseNamespace};
+    WSFederation.AdditionalContextType AdditionalContext
+        where ValidateContextItemsInRequestSecurityTokenType(value) 
+        with XmlEncoding{Namespace = WSFederation.AuthNamespace};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type BinarySecurityTokenType_RequestSecurityTokenType
+{
+    optional XSDId Id with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional XSAnyURI ValueType 
+        where ValidationCheck(value == nothing || (value as XSAnyURI) == BinarySecurityTokenValueTypeInInputMessage,
+                         null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTSECURITYTOKEN_VALUETYPE)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSAnyURI EncodingType 
+        where ValidationCheck(value == Base64BinaryEncodedType, null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTSECURITYTOKEN_ENCODINGTYPE)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    (CertReqMsg | binary) Value with XmlEncoding{Kind = XmlKind.Text},
+        Encoding{Decoder = CertReqDecoder,
+            SourceConverter = Base64StringToBinary,
+            SourcePattern = TypeOf<string>()};
+
+    optional (CertReqMsg | binary) CertReqDecoder(binary data)
+    {
+        if (Asn1BerDecoder<CertReqMsg>(data) is certReq:CertReqMsg)
+        {
+            return certReq;
+        }
+        return data;
+    }
+}
+
+// Extended WSTrust RequestSecurityTokenResponseCollectionType -------------------------
+type RequestSecurityTokenResponseCollectionType
+{
+    array<DVRE.RequestSecurityTokenResponseType> RequestSecurityTokenResponse with XmlEncoding{Namespace = Wst13Namespace};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+}
+
+// Extended WSTrust RequestSecurityTokenResponse type
+type RequestSecurityTokenResponseType
+{
+    optional XSAnyURI Context with XmlEncoding{Kind = XmlKind.Attribute, Namespace = Wst13Namespace};
+    XSAnyURI TokenType
+        where ValidationCheck(value == TokenTypeValueInOutputMessage, null, DiagnosisLevel.Error, DVRE_OUTPUT_TOKENTYPE_VALUE)
+        with XmlEncoding{Namespace = Wst13Namespace};
+    optional XSAnyURI RequestType with XmlEncoding{Namespace = Wst13Namespace};
+    DVRE.RequestedSecurityTokenType RequestedSecurityToken with XmlEncoding{Namespace = Wst13Namespace};
+    WSFederation.AdditionalContextType AdditionalContext
+        where ValidateContextItemsInRequestSecurityTokenResponseType(value) 
+        with XmlEncoding{Namespace = WSFederation.AuthNamespace};
+    optional array<xml> AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+    optional array<xml> AnyAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{ Order = XmlOrderIndicator.All};
+
+// Extended WSTrust RequestedSecurityTokenType
+type RequestedSecurityTokenType
+{
+    optional string EncryptedKey with XmlEncoding{Namespace = XencNamespace};
+    optional SAMLCore.AssertionType Assertion with XmlEncoding{Namespace = SamlNamespace};
+    optional XMLEnc.EncryptedDataType EncryptedData with XmlEncoding{Namespace = XencNamespace};
+    optional BinarySecurityTokenType_RequestedSecurityTokenType BinarySecurityToken with XmlEncoding{Namespace = DVRE.WsseNamespace};
+    optional xml AnyElement with XmlEncoding{IsAny = true, Kind = XmlKind.Element, Namespace = XmlNamespaceIndicator.Any};
+} 
+
+// WSS BinarySecurityToken in Extended WSTrust RequestedSecurityTokenType
+type BinarySecurityTokenType_RequestedSecurityTokenType
+{                               
+    optional XSDId Id with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional XSAnyURI ValueType 
+        where ValidationCheck(value == nothing || (value as XSAnyURI) == BinarySecurityTokenValueTypeInOutputMessage, null, DiagnosisLevel.Error, DVRE_OUTPUT_VALUETYPE_VALUE)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSAnyURI EncodingType 
+        where ValidationCheck(value == Base64BinaryEncodedType, null, DiagnosisLevel.Error, DVRE_OUTPUT_ENCODINGTYPE_VALUE)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional (WapProvisioningdocType | CharacteristicType) Value 
+        with XmlEncoding{Kind = XmlKind.Text},
+             Encoding{Decoder = XmlDecoderFromStream<WapProvisioningdocType | CharacteristicType>, SourceConverter = Base64StringToBinary, SourcePattern = TypeOf<string>()};
+}
+
+pattern WinDeviceEnrollmentServiceErrorEnum = enum string
+{
+    InvalidParameter = "InvalidParameter",
+    SqlError = "SqlError",
+    CertificateAuthorityError = "CertificateAuthorityError",
+    DirectoryAccountError = "DirectoryAccountError",
+    AuthenticationError = "AuthenticationError",
+    AuthorizationError = "AuthorizationError",
+    UnknownError = "UnknownError",
+    ...
+};
+
+// ------------------------------------- Utilities ---------------------------------------------//
+bool IsDVRERequestMessage(SoapMessage m)
+{
+    array<any message> origins = m.Origins;
+    if (origins.Count == 0 || !(origins[0] is HttpContract.Request))
+    {
+        // So far, SOAP only listen on HTTP, UDP and MIME.
+        // And according to the TD, DVRE transport over SOAP1.2 which is over HTTPS
+        return false;
+    }
+
+    HttpContract.Request httpRequest = origins[0] as HttpContract.Request;
+    return httpRequest.Uri.AbsPath != nothing && (httpRequest.Uri.AbsPath as string) == DvreUri && m.WsaAction == InputMessageAction;
+}
+
+bool IsDVREResponseMessage(SoapMessage m)
+{
+    array<any message> origins = m.Origins;
+    if (origins.Count == 0 || !(origins[0] is HttpContract.Response))
+    {
+        // So far, SOAP only listen on HTTP, UDP and MIME.
+        // And according to the TD, DVRE transport over SOAP1.2 which is over HTTPS
+        return false;
+    }
+
+    HttpContract.Response httpResponse = origins[0] as HttpContract.Response;
+    if (httpResponse#Uri == null || httpResponse#Uri == nothing)
+    {
+        return m.WsaAction == OutputMessageAction;
+    }
+    UriType uri = httpResponse#Uri as UriType;
+    return uri.AbsPath != nothing && uri.AbsPath is path:string && path == DvreUri &&
+        (m.WsaAction == OutputMessageAction || m.WsaAction == FaultMessageAction);
+}
+
+// construct & dispatch operation RequestSecurityToken
+void DispatchOperation(InputMessage inputMessage, 
+    (OutputMessage | FaultMessage) responseMessage,
+    DVRE.Server server)
+{
+    if (inputMessage == null)
+    {
+        ReportInsufficientData(responseMessage as any message, DiagnosisLevel.Error, DVRE_INCOMPLETE_OPERATION_REQUEST);
+        if (responseMessage is outputMsg:OutputMessage)
+        {
+            dispatch server issues outputMsg;
+        }
+        else if (responseMessage is faultMsg:FaultMessage)
+        {
+            dispatch server issues faultMsg;
+        }
+        return;
+    }
+
+    var requestSecurityTokenOperation = new IWindowsDeviceEnrollmentService.RequestSecurityToken
+                                        {
+                                            Security = inputMessage.Security,
+                                            RequestSecurityToken = inputMessage.RequestSecurityToken,
+                                            RequestSecurityTokenResponseCollection = 
+                                                responseMessage is outputMessage:OutputMessage ?
+                                                outputMessage.RequestSecurityTokenResponseCollection : nothing,
+                                            WindowsDeviceEnrollmentServiceError = 
+                                                responseMessage is faultMessage:FaultMessage ?
+                                                faultMessage.WindowsDeviceEnrollmentServiceError : nothing
+                                        };
+
+    // dispatch operation
+    requestSecurityTokenOperation.Origins = [inputMessage as any message, responseMessage as any message];
+    dispatch server accepts requestSecurityTokenOperation;
+}
+
+// Validate Context Items in RequestSecurityTokenType
+bool ValidateContextItemsInRequestSecurityTokenType(AdditionalContextType additionalContext)
+{
+    // Context Items
+    bool containsDeviceType = false;
+    bool containsApplicationVersion = false;
+    bool containsDeviceDisplayName = false;
+
+    foreach (var item in additionalContext.ContextItem)
+    {
+        if (item.Name == "DeviceType")
+        {
+            containsDeviceType = true;
+        }
+        if (item.Name == "ApplicationVersion")
+        {
+            containsApplicationVersion = true;
+        }
+        if (item.Name == "DeviceDisplayName")
+        {
+            containsDeviceDisplayName = true;
+        }
+    }
+
+    ValidationCheck(containsDeviceType, null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTSECURITYTOKEN_ADDITIONALCONTEXT);
+    ValidationCheck(containsApplicationVersion, null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTSECURITYTOKEN_CONTEXT_ITEM_APPLICATIONVERSION);
+    ValidationCheck(containsDeviceDisplayName, null, DiagnosisLevel.Error, DVRE_INPUT_REQUESTSECURITYTOKEN_CONTEXT_ITEM_DISPLAYNAME);
+    
+    return containsDeviceType && containsApplicationVersion && containsDeviceDisplayName;
+}
+
+// Validate Context Items in RequestSecurityTokenResponseType
+bool ValidateContextItemsInRequestSecurityTokenResponseType(AdditionalContextType additionalContext)
+{
+    bool containsUserPrincipalName = false;
+
+    foreach (var item in additionalContext.ContextItem)
+    {
+        if (item.Name == "UserPrincipalName")
+        {
+            containsUserPrincipalName = true;
+        }
+    }
+
+    return ValidationCheck(containsUserPrincipalName, null, DiagnosisLevel.Error, DVRE_OUTPUT_CONTEXT_ITEM_USERPRINCIPALNAME);
+}
+
+// Decode content in SOAP header to Security Type
+optional DVRE.SecurityType TryDecodeSecurityFromSoapHeader(SoapMessage m)
+{
+    if (m.Header == nothing)
+    {
+        return nothing;
+    }
+
+    xml headerXml = m.Header as xml;
+    var securityXml = headerXml.GetChild(new XmlName{LocalName = "Security", NamespaceUri = WsseNamespace});
+    if(securityXml == nothing)
+    {
+        return nothing;
+    }
+
+    optional DVRE.SecurityType v = XmlDecoder<DVRE.SecurityType>(securityXml as xml);
+    return v;
+}

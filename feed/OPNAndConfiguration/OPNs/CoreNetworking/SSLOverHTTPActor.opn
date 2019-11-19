@@ -1,0 +1,80 @@
+module SSLOverHTTPActor with 
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Utility;
+using Standard;
+using HTTP;
+using SSL;
+using TLS;
+using TCP;
+
+autostart actor SSLOverHTTP(HTTP.Server server)
+{
+    SSLOverHTTPDecodingCache RequestCache = null;
+    SSLOverHTTPDecodingCache ResponseCache = null;
+    TLS.Server EPT;
+    
+    process server accepts s:HttpContract.HTTPPayload where RequestCache != null && RequestCache.BufferCount() > 0
+        || (s#UpperProtocol == UpperProtocolType.Tunnel || s#UpperProtocol == UpperProtocolType.Unknown) && IsSSLHeader(s.Payload)
+    {
+        if (RequestCache == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            InitializeSSLOverHTTPDecodingCachePair(ref RequestCache, ref ResponseCache, EPT, GetHttpPayloadLength);
+            if (s.Origins[0] is seg:TCP.Segment)
+            {
+                InitializeTLSServerFromTCP(seg, MessageDirection.Accepts, DispathDecrytedMessageBack, EPT);
+            }
+        }
+        RequestCache.AddHttpPayload(s);
+        RequestCache.TryDecodeAndDispatchMessage();
+    }
+    
+    process server issues s:HttpContract.HTTPPayload where ResponseCache != null && ResponseCache.BufferCount() > 0 
+        || (s#UpperProtocol == UpperProtocolType.Tunnel || s#UpperProtocol == UpperProtocolType.Unknown) && IsSSLHeader(s.Payload)
+    {
+        if (ResponseCache == null)
+        {
+            EPT = endpoint TLS.Server over server;
+            InitializeSSLOverHTTPDecodingCachePair(ref RequestCache, ref ResponseCache, EPT, GetHttpPayloadLength);
+            if (s.Origins[0] is seg:TCP.Segment)
+            {
+                InitializeTLSServerFromTCP(seg, MessageDirection.Issues, DispathDecrytedMessageBack, EPT);
+            }
+        }
+        ResponseCache.AddHttpPayload(s);
+        ResponseCache.TryDecodeAndDispatchMessage();
+    }
+    
+    ~endpoint(HTTP.Server e)
+    {
+        if (RequestCache != null)
+        {
+            RequestCache.ClearInDestructor();
+        }
+        if (ResponseCache != null)
+        {
+            ResponseCache.ClearInDestructor();
+        }
+    }
+    
+    void DispathDecrytedMessageBack(binary bin, TLS.RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        int lastOriginsIndex = rls.Origins.Count - 1;
+        if (rls.Origins[0].Origins[0] is segfirst:TCP.Segment &&
+            GetLastDataSegment(rls.Origins[lastOriginsIndex].Origins) is seglast:TCP.Segment)
+        {
+            DispathBackToTCP(bin, server, direction, segfirst, seglast);
+        }
+    }
+}

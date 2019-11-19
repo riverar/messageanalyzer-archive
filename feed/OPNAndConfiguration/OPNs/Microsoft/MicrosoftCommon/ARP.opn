@@ -1,0 +1,181 @@
+protocol ARP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Address Resolution Protocol",
+    ShortName = "ARP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2625"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "361425", Date = "03/26/2014"}
+        ]
+};
+
+using Standard;
+using Ethernet;
+using IPv4;
+using IANA;
+using IPv6;
+using SNAP;
+using Utility;
+using LinuxCookedMode;
+using GRE;
+
+endpoint Node[binary DestinationAddress]
+    accepts Packet;
+    
+endpoint NodeOverSNAP
+    over SNAP.Node
+    accepts Packet;
+
+IPv4Address get Source(this Packet packet)
+{
+    return packet.ProtocolAddrOfSender;
+}
+
+IPv4Address get Destination(this Packet packet)
+{
+    return packet.ProtocolAddrOfTarget;
+}
+
+// RFC 2625, 4.2 ARP Packet Format, page 13
+message Packet
+{
+    HardwareType HWType;
+    ushort Protocol with DisplayInfo{ToText = (any x) => IANA.GetEtherTypeName(x as ushort)};
+    byte HWAddrLength where ValidationCheck(value == 6, null, "The Packet.HWAddrLength field must be set to 6.");
+    byte ProtocolAddrLength where ValidationCheck(value == 4, null, "The Packet.ProtocolAddrLength field must be set to 4.");
+    OperationCodes OpCode;
+    MacAddress HWAddrOfSender;
+    IPv4Address ProtocolAddrOfSender;
+    MacAddress HWAddrOfTarget;
+    IPv4Address ProtocolAddrOfTarget;
+    
+    override string ToString()
+    {
+        string summary = "";
+        summary = summary + EnumToString(OpCode, "IANA.OperationCodes");
+        summary = summary + ", SenderIP: ";
+        summary = summary + ProtocolAddrOfSender.ToString();
+        summary = summary + ", TargetIP: ";
+        summary = summary + ProtocolAddrOfTarget.ToString();
+        return summary;
+    }
+}
+
+autostart actor ARPOverIPv4(IPv4.Node node)
+{
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.LARP
+    {            
+        switch (d.Payload)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+               dispatch endpoint Node[d.DestinationAddress.FlatAddress] accepts p;
+            
+            default => 
+                ThrowDecodingException("ARP", "Packet");
+        }
+    }
+}
+
+autostart actor ARPOverIPv6(IPv6.Node node)
+{
+    process node accepts d:IPv6.Datagram where d.NextProtocol == ProtocolType.LARP
+    {            
+        switch (d.Payload)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+                dispatch endpoint Node[d.DestinationAddress.FlatAddress] accepts p;
+            
+            default => 
+                ThrowDecodingException("ARP", "Packet");
+        }
+    }
+}
+
+autostart actor ARPOverEthernet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType == 2054
+    {            
+        switch (f.MacClientData)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+                dispatch (endpoint Node[f.DestinationAddress.FlatAddress] over node) accepts p;
+            default => 
+                ThrowDecodingException("ARP", "Packet");
+        }
+    }
+}
+
+// Since Bug 36618, change all the "binding" to actor temporarily.
+//binding ARPOverSNAP: NodeOverSNAP over node:SNAP.Node
+//{
+    //rule node accepts SNAP.Segment{EtherType is $2054, Payload is m:Packet from BinaryDecoder<Packet>}
+        //=>NodeOverSNAP accepts m;
+//}
+//
+
+autostart actor ARPOverSNAP(SNAP.Node node) //follows ATMARPOverSNAP
+{
+    process node accepts s:SNAP.Segment where ((s.EtherType == 2054) 
+    // WORKAROUND:$[0013] is the signature of protocol ATMARP.
+    // This should be removed after ATMARP is implemented and use "follows" above
+        && (s.Payload.Count >= 2 && s.Payload.Segment(0, 2) != $[0013]))
+    {
+        switch (s.Payload)
+        {
+            case p:Packet from BinaryDecoder<Packet> =>
+                dispatch (endpoint NodeOverSNAP over node) accepts p;
+            default => 
+                ThrowDecodingException("ARP", "Packet");
+        }
+    }
+}
+
+autostart actor ARPOverLinuxCookedMode(LinuxCookedMode.Node node)
+{
+    process node accepts lcm:LinuxCookedMode.Datagram{EthernetType is LinuxProtocolType.ARP} 
+    {
+        switch (lcm.Payload)
+        {
+            case d:ARP.Packet from BinaryDecoder<ARP.Packet> =>
+            if (lcm.Address is MacAddr)
+            {
+                dispatch (endpoint ARP.Node[(lcm.Address as MacAddr).Address.Octets]) accepts d;
+            }
+            else if (lcm.Address is IPv4Addr)
+            {
+                dispatch (endpoint ARP.Node[(lcm.Address as IPv4Addr).Address.Octets]) accepts d;
+            }
+            else
+            {
+                ThrowDecodingException("LinuxCookedMode");
+            }
+            default =>
+            ThrowDecodingException("LinuxCookedMode");
+        }        
+    }
+}
+
+autostart actor ARPOverGRE(GRE.Node node)
+{
+    process node accepts p:GRE.Packet where ((p.ProtocolType == GREProtocolType.ARP || p.ProtocolType == GREProtocolType.FrameRelayARP) && p.Payload.Count > 0)
+    {
+        switch (p.Payload)
+        {
+            case d:Packet from BinaryDecoder<Packet> =>
+                dispatch endpoint Node[p#DestinationAddress as binary] accepts d;
+                
+            default =>
+                ThrowDecodingException("ARP", "Packet");
+        }
+    }
+}

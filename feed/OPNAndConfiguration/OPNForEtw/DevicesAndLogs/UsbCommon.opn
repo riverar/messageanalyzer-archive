@@ -1,0 +1,1403 @@
+// Define USB parsing mechanisms (used in common by other OPN files)
+protocol UsbCommon;
+using Etw;
+using EtwEvent;
+using Standard;
+using Diagnostics;
+
+using NtStatusModule;
+using UsbSpec;
+using UsbStateMachineValues;
+using UsbMessageProt;
+
+const string PortPathForRootHub = "-";
+const string DeviceDescriptionForRootHub = "Root Hub";
+const ushort Usb30 = 0x0300;
+const string ControllerTypeXhci = "xHCI";
+const string ControllerTypeEhci = "EHCI";
+const string ControllerTypeUsb1 = "USB1";
+
+message EmptyMessage { } // to allow declaring a dummy endpoint
+endpoint UsbCommonGlobals accepts EmptyMessage {
+
+    int g_NextUnusedDeviceInstance = 1;
+    int g_NextUnusedControllerInstance = 1;
+
+    //
+    // Save information about dispatched URBs. The completion URB will include this data.
+    //
+    map<ulong, any message> DispatchMessageFromUrbPtr = {};
+    map<ulong, uint> DispatchBytesFromUrbPtr = {};
+
+    set<int> IsHubSet = {};
+    map<int, string> DeviceDescriptionMap = {};
+    map<int, ushort> DeviceBcdUsbMap = {};
+    map<int, map<byte, UsbStringDescriptorName>> DeviceStringDescriptorNameMap = {};
+
+    ~endpoint(UsbCommonGlobals globals)
+    {
+        foreach(any message msg in globals.DispatchMessageFromUrbPtr.Values)
+        {
+            ValidationCheck(false, msg, "Missing URB information, releasing dispatch message from endpoint USBCommonGlobals");
+            release msg;
+        }
+    }
+}
+
+//
+// Clarified name so as not to conflict with the "UsbDevice" property
+//
+endpoint UsbDeviceOpnEndpoint[int deviceInstance]
+    consumes UsbStandardRequest
+    accepts Usbhub3DeviceStateMachineTransition
+    accepts Usbhub3DeviceIdleStateMachineTransition
+{
+    // TODO: see if we want to use endpoint state
+    bool IsHub = false;
+    bool IsCurrentlyUsb3 = false;
+}
+
+// Disambiguation: type "endpoint" is an OPN endpoint (sink and source of OPN messages);
+//                 name "UsbEndpoint" is a USB endpoint (sink and source for USB traffic).
+endpoint UsbEndpoint[ulong PipeHandle]
+// TODO: should be over device, i guess
+    accepts UcxEndpointStateMachineTransition
+    accepts UcxEndpointStateMachineTransitionEventOnly
+    accepts XhciEndpointStateMachineTransition
+    // TODO: UCX/GenericTransfer transfer events? exclude control?
+    // TODO: or, this endpoint may be temporary. EPSM events can't figure out what device they're on yet
+{
+}
+
+endpoint UsbHubPort[ulong PortObject] // TODO: this endpoint may be temporary. PSM events can't figure out what hub they're on yet
+    accepts Port20StateMachineTransition
+    accepts Port30StateMachineTransition
+{
+}
+
+endpoint UsbControllerOpnEndpoint[ulong UcxController]
+    accepts UcxControllerResetStateMachineTransition
+    accepts UcxControllerResetStateMachineTransitionEventOnly
+{
+}
+
+endpoint UsbHub[int deivceInstance]
+    consumes UsbHubRequest
+    accepts HubStateMachineTransition
+{
+}
+
+map<byte, UsbStringDescriptorName> GetDeviceStringDescriptorNameMap(int deviceInstance)
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    if (!(deviceInstance in usbCommonGlobals.DeviceStringDescriptorNameMap)) {
+        usbCommonGlobals.DeviceStringDescriptorNameMap[deviceInstance] = {};
+    }
+    return usbCommonGlobals.DeviceStringDescriptorNameMap[deviceInstance];
+}
+
+void UpdateControllerMap(int controllerInstance)
+{
+    string controllerType = "";
+    string controllerId = "";
+
+    if (controllerInstance in (endpoint UsbPropertyMapsEndpoint).UsbControllerTypeMap) {
+
+        controllerType = (endpoint UsbPropertyMapsEndpoint).UsbControllerTypeMap[controllerInstance];
+    }
+
+    if (controllerInstance in (endpoint UsbPropertyMapsEndpoint).UsbControllerIdMap) {
+
+        controllerId = (endpoint UsbPropertyMapsEndpoint).UsbControllerIdMap[controllerInstance];
+    }
+
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint; // #bug: (known) OPN must use separate endpoint variable for map assignment
+    usbPropertyMapsEndpoint.UsbControllerMap[controllerInstance] =
+        Format("{0} {1} {2}", controllerInstance, controllerType, controllerId);
+}
+
+void SaveControllerType(int controllerInstance, string controllerType)
+{
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbControllerTypeMap[controllerInstance] = controllerType;
+    UpdateControllerMap(controllerInstance);
+}
+
+void SaveControllerId(int controllerInstance, string ven, string dev)
+{
+    // TODO: Look up known PCI vendors, replace ven with friendly string
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbControllerIdMap[controllerInstance] =
+        Format("VEN_{0}&DEV_{1}", ven, dev);
+    UpdateControllerMap(controllerInstance);
+}
+
+string PortPathToString(array<uint> portPath)
+{
+    string ret = "";
+    foreach(var port in portPath) {
+        if (port == 0) {
+            break;
+        }
+        ret += Format(",{0}", port as string);
+    }
+    if (ret == "") {
+        ret = PortPathForRootHub;
+    } else {
+        ret = ret.Segment(1); // remove initial ","
+    }
+
+    return ret;
+}
+
+bool IsRootHub(int deviceInstance)
+{
+    if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDevicePortPathMap) {
+        return ((endpoint UsbPropertyMapsEndpoint).UsbDevicePortPathMap[deviceInstance] == PortPathForRootHub);
+    } else {
+        return false;
+    }
+}
+
+bool IsBcdUsb3Device(int deviceInstance)
+{
+    if (deviceInstance in (endpoint UsbCommonGlobals).DeviceBcdUsbMap) {
+        return (endpoint UsbCommonGlobals).DeviceBcdUsbMap[deviceInstance] == Usb30;
+    } else {
+        return false;
+    }
+}
+
+void UpdateDeviceMap(int deviceInstance)
+{
+    string deviceDescription = "";
+
+    if (deviceInstance in (endpoint UsbCommonGlobals).DeviceDescriptionMap) {
+
+        deviceDescription = (endpoint UsbCommonGlobals).DeviceDescriptionMap[deviceInstance];
+
+    } else if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDeviceIdMap) {
+
+        deviceDescription = (endpoint UsbPropertyMapsEndpoint).UsbDeviceIdMap[deviceInstance];
+    }
+
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbDeviceMap[deviceInstance] =
+        Format("{0} {1}", deviceInstance, deviceDescription);
+}
+
+void SaveDeviceDescription(int deviceInstance, string deviceDescription)
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    usbCommonGlobals.DeviceDescriptionMap[deviceInstance] = deviceDescription;
+    UpdateDeviceMap(deviceInstance);
+}
+
+void SaveDevicePortPath(int deviceInstance, array<uint> portPath)
+{
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbDevicePortPathMap[deviceInstance] = PortPathToString(portPath);
+}
+
+void SaveRootHub(int deviceInstance, ushort bcdUsb)
+{
+    SaveDevicePortPath(deviceInstance, [0,0,0,0,0,0] as array<uint>);
+    SaveDeviceDescription(deviceInstance, DeviceDescriptionForRootHub);
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    usbCommonGlobals.IsHubSet += deviceInstance;
+    usbCommonGlobals.DeviceBcdUsbMap[deviceInstance] = bcdUsb;
+}
+
+void SaveDeviceInstanceAsHub(int deviceInstance)
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    usbCommonGlobals.IsHubSet += deviceInstance;
+}
+
+//
+// DeviceBcdUsbMap, UsbDeviceIdMap, UsbDeviceClassMap
+//
+void SaveUsbDeviceId(
+    int deviceInstance,
+    ushort idVendor,
+    ushort idProduct,
+    ushort bcdUsb,
+    byte iProduct,
+    byte iManufacturer,
+    byte iSerialNumber
+    )
+{
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbDeviceIdMap[deviceInstance] =
+        Format("VID_{0}&PID_{1}", ToHex(idVendor), ToHex(idProduct));
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    usbCommonGlobals.DeviceBcdUsbMap[deviceInstance] = bcdUsb;
+
+    if (iProduct != 0) {
+        GetDeviceStringDescriptorNameMap(deviceInstance)[iProduct] =
+            UsbStringDescriptorName.iProduct;
+    }
+    if (iManufacturer != 0) {
+        GetDeviceStringDescriptorNameMap(deviceInstance)[iManufacturer] =
+            UsbStringDescriptorName.iManufacturer;
+    }
+    if (iSerialNumber != 0) {
+        GetDeviceStringDescriptorNameMap(deviceInstance)[iSerialNumber] =
+            UsbStringDescriptorName.iSerialNumber;
+    }
+    UpdateDeviceMap(deviceInstance);
+}
+void SaveUsbDeviceClass(
+    int deviceInstance,
+    byte classCode,
+    byte subclassCode,
+    byte protocolCode
+    )
+{
+    var usbPropertyMapsEndpoint = endpoint UsbPropertyMapsEndpoint;
+    usbPropertyMapsEndpoint.UsbDeviceClassMap[deviceInstance] =
+        Format("Class_{0}&SubClass{1}&Protocol{2}",
+               ToHex(classCode),
+               ToHex(subclassCode),
+               ToHex(protocolCode));
+}
+void SaveUsbDeviceClass(
+    int deviceInstance,
+    UsbMultipleDescriptors descriptorSet
+    )
+{
+    foreach(var descriptor in descriptorSet.Descriptors) {
+        //
+        // Only USBCCGP reads the USB_INTERFACE_ASSOCIATION_DESCRIPTOR (it is used for compat IDs
+        // of functions but not devices). The parser doesn't parse functions and bucketize the
+        // device's endpoints into functions, so the best we can do is get the device-wide
+        // compat ID, which comes from the first interface descriptor only.
+        //
+        if (descriptor is USB_INTERFACE_DESCRIPTOR) {
+            
+            var ifaceDesc = descriptor as USB_INTERFACE_DESCRIPTOR;
+            if (ifaceDesc.iInterface != nothing) {
+
+                SaveUsbDeviceClass(deviceInstance,
+                                   ifaceDesc.bInterfaceClass as byte,
+                                   ifaceDesc.bInterfaceSubClass as byte,
+                                   ifaceDesc.bInterfaceProtocol as byte);
+                break;
+            }
+        }
+    }
+}
+public autostart actor ObserveDescriptorDataOverWire (UsbDeviceOpnEndpoint node)
+{
+    observe node accepts m:UsbStandardRequest.GetDeviceDescriptor where
+        (m.DeviceDescriptor != null &&
+         m.DeviceDescriptor.bNumConfigurations != nothing)
+    {
+        SaveUsbDeviceId(m.DeviceInstance,
+                        m.DeviceDescriptor.idVendor as ushort,
+                        m.DeviceDescriptor.idProduct as ushort,
+                        m.DeviceDescriptor.bcdUSB as ushort,
+                        m.DeviceDescriptor.iProduct as byte,
+                        m.DeviceDescriptor.iManufacturer as byte,
+                        m.DeviceDescriptor.iSerialNumber as byte);
+    }
+    observe node accepts m:UsbStandardRequest.GetConfigDescriptor where
+         (m.DescriptorSet != null &&
+          m.DescriptorSet.Descriptors.Count >= 1 &&
+          m.DescriptorSet.Descriptors[0] is USB_CONFIGURATION_DESCRIPTOR &&
+          (m.DescriptorSet.Descriptors[0] as USB_CONFIGURATION_DESCRIPTOR).wTotalLength as ushort == m.LengthRequested)
+    {
+        SaveUsbDeviceClass(m.DeviceInstance, m.DescriptorSet);
+     }
+}
+
+type TransferUrb
+{
+    ushort Fid_URB_Hdr_Length with DisplayInfo{ToText = ToHex};
+
+    ushort Fid_URB_Hdr_Function with DisplayInfo{ToText = ToHex};
+
+    uint Fid_URB_Hdr_Status with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_Hdr_UsbdDeviceHandle
+        with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_Hdr_UsbdFlags
+        with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_PipeHandle
+        with DisplayInfo{ToText = ToHex};
+
+    uint Fid_URB_TransferFlags with DisplayInfo{ToText = ToHex};
+
+    uint Fid_URB_TransferBufferLength with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_TransferBuffer
+        with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_TransferBufferMDL
+        with DisplayInfo{ToText = ToHex};
+
+    ulong Fid_URB_TimeoutOrReserved
+        with DisplayInfo{ToText = ToHex};
+
+    array<ulong> Fid_URB_ReservedHcd
+        with DisplayInfo{ToText = ToHex},
+             Standard.BinaryEncoding{Length = 8};
+}
+
+type TransferUrbControl : TransferUrb
+{
+    byte Fid_URB_Setup_bmRequestType;
+
+    byte Fid_URB_Setup_bRequest;
+
+    ushort Fid_URB_Setup_wValue with DisplayInfo{ToText = ToHex};
+
+    ushort Fid_URB_Setup_wIndex with DisplayInfo{ToText = ToHex};
+
+    ushort Fid_URB_Setup_wLength with DisplayInfo{ToText = ToHex};
+}
+
+type TransferUrbBulkOrInterrupt : TransferUrb
+{
+}
+
+type TransferUrbIsoch : TransferUrb
+{
+    uint Fid_URB_StartFrame with DisplayInfo{ToText = ToHex};
+    
+    uint Fid_URB_NumberOfPackets with DisplayInfo{ToText = ToHex};
+    
+    uint Fid_URB_ErrorCount with DisplayInfo{ToText = ToHex};
+}
+
+void ProcessUrbDispatch(
+    any message m,
+    ulong urbPtr,
+    uint requestedTransferBufferLength
+    )
+// Don't dispatch any message. When the URB completes, we will include it.
+{
+    var usbCommonGlobals = endpoint UsbCommonGlobals;
+    usbCommonGlobals.DispatchMessageFromUrbPtr[urbPtr] = m;
+    usbCommonGlobals.DispatchBytesFromUrbPtr[urbPtr] = requestedTransferBufferLength;
+}
+
+void ProcessUrbCompletion(
+    UsbStandardRequest.GenericTransfer toDispatch,
+    any message originCompletionMessage
+    )
+{
+    ulong urbPtr = toDispatch.UrbPtr;
+
+    if (urbPtr in (endpoint UsbCommonGlobals).DispatchMessageFromUrbPtr) {
+
+        //
+        // Group the dispatch and complete ETW messages under this one message. Complete is already
+        // in the Origins. Also populate the original bytes requested.
+        //
+        var usbCommonGlobals = endpoint UsbCommonGlobals;
+        toDispatch.Origins += [usbCommonGlobals.DispatchMessageFromUrbPtr[urbPtr], originCompletionMessage];
+        toDispatch.LengthRequested = usbCommonGlobals.DispatchBytesFromUrbPtr[urbPtr];
+        usbCommonGlobals.DispatchMessageFromUrbPtr.Remove(urbPtr);
+        usbCommonGlobals.DispatchBytesFromUrbPtr.Remove(urbPtr);
+
+    } else {
+
+        //
+        // This is a completion of an URB for which we saw no dispatch event.
+        //
+        toDispatch.LengthRequested = 0;
+        //
+        // All messages dispatched to UsbDeviceOpnEndpoint must have explicit origins to avoid
+        // implicitly dispatching a message we've processed without dispatching.
+        //
+        toDispatch.Origins += [originCompletionMessage];
+    }
+
+    dispatch (endpoint UsbDeviceOpnEndpoint[toDispatch.DeviceInstance]) accepts toDispatch;
+}
+
+void ProcessControlTransfer(
+    int ControllerInstance,
+    int DeviceInstance,
+    ulong PipeHandle,
+    ulong UrbPtr,
+    TransferUrbControl Urb,
+    binary TransferData,
+    any message OriginCompletionMessage,
+    uint? NtStatus,
+    byte EndpointAddress
+    )
+{
+    UsbStandardRequest.GenericTransfer genericMsg = null;
+
+    // TODO: Add ValidationCheck everywhere where fields must be 0
+    if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+        Urb.Fid_URB_Setup_wValue >> 8 == UsbDescriptorType.DEVICE &&
+        true) {
+
+        //
+        // Get Device Descriptor
+        //
+        ValidationCheck((Urb.Fid_URB_Setup_wValue & 0xff) == 0, null, "Index must be 0");
+        UsbStandardRequest.GetDeviceDescriptor decoded = new UsbStandardRequest.GetDeviceDescriptor { };
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var desc = BinaryDecoder<USB_DEVICE_DESCRIPTOR>(TransferData);
+            if (desc == nothing) {
+                //
+                // This could happen if the structure has any mandatory fields, indicating the data is corrupted/wrong/etc.
+                //
+                throw "BinaryDecoder failed on USB_DEVICE_DESCRIPTOR, this is never expected";
+            } else {
+                decoded.DeviceDescriptor = desc as USB_DEVICE_DESCRIPTOR;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+        (Urb.Fid_URB_Setup_wValue >> 8 == UsbDescriptorType.CONFIGURATION ||
+         Urb.Fid_URB_Setup_wValue >> 8 == UsbDescriptorType.OTHER_SPEED_CONFIGURATION) &&
+        true) {
+
+        //
+        // Get Configuration Descriptor
+        //
+        // TODO: will need to parse each descriptor in a while loop in order to hold state (pass info from one descriptor to the next)
+        UsbStandardRequest.GetConfigDescriptor decoded = new UsbStandardRequest.GetConfigDescriptor { };
+        decoded.ConfigurationIndex = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+        //if (TransferData != nothing)
+        if (TransferData != null  && TransferData.Count > 0) { // TODO: change to match device descriptor
+            var desc = BinaryDecoder<UsbMultipleDescriptors>(TransferData);
+            if (desc == nothing) {
+                throw "BinaryDecoder failed on partial or full USB configuration descriptor when it is more than 0 bytes. This is never expected";
+            } else {
+                decoded.DescriptorSet = desc as UsbMultipleDescriptors;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+        Urb.Fid_URB_Setup_wValue >> 8 == UsbDescriptorType.STRING &&
+        true) {
+
+        //
+        // Get String Descriptor -- language IDs or specific string
+        //
+        if ((Urb.Fid_URB_Setup_wValue & 0xff) == 0) {
+
+            UsbStandardRequest.GetLanguages decoded = new UsbStandardRequest.GetLanguages { };
+            //if (TransferData != nothing)
+            if (TransferData != null && TransferData.Count > 0) {
+                var desc = BinaryDecoder<USB_STRING_DESCRIPTOR_LANGIDS>(TransferData);
+                if (desc == nothing) {
+                    throw "BinaryDecoder failed on string lang IDs string descriptor. Is it too short to be decoded?";
+                } else {
+                    decoded.StringDescriptor = desc as USB_STRING_DESCRIPTOR_LANGIDS;
+                }
+            }
+            genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+        } else {
+
+            UsbStandardRequest.GetStringDescriptor decoded = new UsbStandardRequest.GetStringDescriptor { };
+            decoded.Index = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+            //
+            // Decodes as language ID if possible, if not then as ushort
+            //
+            decoded.Language = Urb.Fid_URB_Setup_wIndex;
+            if (decoded.Index == 0xee && Urb.Fid_URB_Setup_wIndex == 0) {
+                decoded.StringName = UsbStringDescriptorName.MsOs;
+            } else if (decoded.Index in GetDeviceStringDescriptorNameMap(DeviceInstance)) {
+                decoded.StringName = GetDeviceStringDescriptorNameMap(DeviceInstance)[decoded.Index];
+            } else {
+                decoded.StringName = UsbStringDescriptorName.Other;
+            }
+            //if (TransferData != nothing)
+            if (TransferData != null && TransferData.Count > 2) { // 2 == sizeof(USB_COMMON_DESCRIPTOR)
+                var desc = BinaryDecoder<USB_STRING_DESCRIPTOR>(TransferData);
+                if (desc == nothing) {
+                    throw "Binary decoder failed on string descriptor. Is it too short to be decoded?";
+                } else {
+                    decoded.StringDescriptor = desc as USB_STRING_DESCRIPTOR;
+                }
+            }
+            // TODO: Save off this message if it's just getting 2 bytes (i.e. getting string length). make it an origin of the message that retrieves the whole string
+            genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+        }
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_DESCRIPTOR &&
+        Urb.Fid_URB_Setup_wValue >> 8 == UsbDescriptorType.BOS &&
+        true) {
+
+        //
+        // Get BOS Descriptor
+        //
+        UsbStandardRequest.GetBosDescriptor decoded = new UsbStandardRequest.GetBosDescriptor { };
+        //if (TransferData != nothing)
+        if (TransferData != null  && TransferData.Count > 0) { // TODO: change to match device descriptor
+            var desc = BinaryDecoder<UsbMultipleDescriptors>(TransferData);
+            if (desc == nothing) {
+                throw "BinaryDecoder failed on partial or full USB BOS descriptor when it is more than 0 bytes. This is never expected";
+            } else {
+                decoded.BosDescriptorSet = desc as UsbMultipleDescriptors;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x00 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_DESCRIPTOR &&
+        true) {
+
+        //
+        // Set Descriptor
+        //
+        UsbStandardRequest.SetDescriptor decoded = new UsbStandardRequest.SetDescriptor { };
+        decoded.DescriptorType  = (Urb.Fid_URB_Setup_wValue >> 8) as UsbDescriptorType;
+        decoded.DescriptorIndex = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+        decoded.Descriptor = TransferData;
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x00 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_ADDRESS &&
+        true) {
+
+        //
+        // Set Address
+        //
+        UsbStandardRequest.SetAddress decoded = new UsbStandardRequest.SetAddress { };
+        decoded.DeviceAddress  = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_CONFIGURATION &&
+        true) {
+
+        //
+        // Get Configuration Value (current configuration value)
+        //
+        UsbStandardRequest.GetConfiguration decoded = new UsbStandardRequest.GetConfiguration { };
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var dataPacket = BinaryDecoder<GetConfigurationDataPacket>(TransferData);
+            if (dataPacket == nothing) {
+                throw "Binary decoder failed on Get Configuration Value. Is it too short to be decoded?";
+            } else {
+                decoded.ConfigurationValuePacket = dataPacket as GetConfigurationDataPacket;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x00 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_CONFIGURATION &&
+        true) {
+
+        //
+        // Set Configuration
+        //
+        UsbStandardRequest.SetConfiguration decoded = new UsbStandardRequest.SetConfiguration { };
+        decoded.ConfigurationValue = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x81 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_INTERFACE &&
+        true) {
+
+        //
+        // Get Interface Setting (current alternate interface setting)
+        //
+        UsbStandardRequest.GetInterface decoded = new UsbStandardRequest.GetInterface { };
+        decoded.InterfaceNumber = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var dataPacket = BinaryDecoder<GetInterfaceDataPacket>(TransferData);
+            if (dataPacket == nothing) {
+                throw "Binary decoder failed on Get Interface Value. Is it too short to be decoded?";
+            } else {
+                decoded.AlternateInterfaceSettingPacket = dataPacket as GetInterfaceDataPacket;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x01 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_INTERFACE &&
+        true) {
+
+        //
+        // Set Interface
+        //
+        UsbStandardRequest.SetInterface decoded = new UsbStandardRequest.SetInterface { };
+        decoded.InterfaceNumber           = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+        decoded.AlternateInterfaceSetting = (Urb.Fid_URB_Setup_wValue & 0xff) as byte;
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x80 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_STATUS &&
+        true) {
+
+        //
+        // Get Device Status
+        //
+        UsbStandardRequest.GetDeviceStatus decoded = new UsbStandardRequest.GetDeviceStatus { };
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var desc = BinaryDecoder<UsbDeviceStatus>(TransferData);
+            if (desc == nothing) {
+                throw "Binary decoder failed on standard GET_STATUS (device). Is it too short to be decoded?";
+            } else {
+                decoded.DeviceStatus = desc as UsbDeviceStatus;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x81 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_STATUS &&
+        true) {
+
+        //
+        // Get Interface Status
+        //
+        UsbStandardRequest.GetInterfaceStatus decoded = new UsbStandardRequest.GetInterfaceStatus { };
+        decoded.InterfaceIndex = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+        if (TransferData != null && TransferData.Count > 0) {
+            var desc = BinaryDecoder<UsbInterfaceStatus>(TransferData);
+            if (desc == nothing) {
+                throw "Binary decoder failed on standard GET_STATUS (interface). Is it too short to be decoded?";
+            } else {
+                decoded.InterfaceStatus = desc as UsbInterfaceStatus;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x82 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.GET_STATUS &&
+        true) {
+
+        //
+        // Get Endpoint Status
+        //
+        UsbStandardRequest.GetEndpointStatus decoded = new UsbStandardRequest.GetEndpointStatus { };
+        decoded.EndpointAddress = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var desc = BinaryDecoder<UsbEndpointStatus>(TransferData);
+            if (desc == nothing) {
+                throw "Binary decoder failed on standard GET_STATUS (endpoint). Is it too short to be decoded?";
+            } else {
+                decoded.EndpointStatus = desc as UsbEndpointStatus;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x00 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_ISOCH_DELAY &&
+        true) {
+
+        //
+        // Set Isoch Delay
+        //
+        UsbStandardRequest.SetIsochDelay decoded = new UsbStandardRequest.SetIsochDelay { };
+        decoded.HostToDeviceDelayNsec = Urb.Fid_URB_Setup_wValue;
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x0 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_SEL &&
+        true) {
+
+        //
+        // Set SEL Latency (System Exit Latency)
+        //
+        UsbStandardRequest.SetSel decoded = new UsbStandardRequest.SetSel { };
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var dataPacket = BinaryDecoder<SetSelDataPacket>(TransferData);
+            if (dataPacket == nothing) {
+                throw "Binary decoder failed on standard SET_SEL. Is it too short to be decoded?";
+            } else {
+                decoded.LatencyValues = dataPacket as SetSelDataPacket;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        Urb.Fid_URB_Setup_bmRequestType == 0x82 &&
+        Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SYNCH_FRAME &&
+        true) {
+
+        //
+        // Get Endpoint Synchronization Frame Number (SYNCH_FRAME)
+        //
+        UsbStandardRequest.SynchFrame decoded = new UsbStandardRequest.SynchFrame { };
+        decoded.EndpointAddressToSynch = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            var dataPacket = BinaryDecoder<SynchFrameDataPacket>(TransferData);
+            if (dataPacket == nothing) {
+                throw "Binary decoder failed on standard GET_STATUS (endpoint). Is it too short to be decoded?";
+            } else {
+                decoded.SynchronizationFrameNumberPacket = dataPacket as SynchFrameDataPacket;
+            }
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else if (
+        (Urb.Fid_URB_Setup_bmRequestType == 0x00 ||
+         Urb.Fid_URB_Setup_bmRequestType == 0x01 ||
+         Urb.Fid_URB_Setup_bmRequestType == 0x02) &&
+        (Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.SET_FEATURE ||
+         Urb.Fid_URB_Setup_bRequest == UsbStandardSetupRequest.CLEAR_FEATURE) &&
+        true) {
+
+        //
+        // Set or Clear Feature
+        // TODO: validate against speed of device because certain features are valid only for USB 2.0 or USB 3.0
+        //
+        UsbStandardRequest.SetOrClearFeature decoded = new UsbStandardRequest.SetOrClearFeature { };
+        decoded.Request = (Urb.Fid_URB_Setup_bRequest) as UsbStandardSetupRequest;
+        decoded.Recipient = (Urb.Fid_URB_Setup_bmRequestType & 0x03) as UsbRequestTypeRecipient;
+
+        if (decoded.Recipient == UsbRequestTypeRecipient.Device) {
+
+            //
+            // Must store the feature as its proper type
+            //
+            decoded.Feature = Urb.Fid_URB_Setup_wValue as UsbDeviceFeature;
+
+        } else if (decoded.Recipient == UsbRequestTypeRecipient.Interface) {
+
+            decoded.Feature = Urb.Fid_URB_Setup_wValue as UsbInterfaceFeature;
+            decoded.RecipientInterfaceNumber = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+
+            if (decoded.Feature as UsbInterfaceFeature == UsbInterfaceFeature.FUNCTION_SUSPEND) {
+
+                //
+                // FUNCTION_SUSPEND feature inserts options into high byte of wIndex
+                //
+                decoded.SuspendOptions = BinaryDecoder<UsbFunctionSuspendOptions>([(Urb.Fid_URB_Setup_wIndex >> 8) as byte] as binary) as UsbFunctionSuspendOptions;
+            }
+
+        } else if (decoded.Recipient == UsbRequestTypeRecipient.Endpoint) {
+
+            decoded.Feature = Urb.Fid_URB_Setup_wValue as UsbEndpointFeature;
+            decoded.RecipientEndpointAddress = (Urb.Fid_URB_Setup_wIndex & 0xff) as byte;
+
+        } else {
+
+            decoded.Feature = Urb.Fid_URB_Setup_wValue; // plain ushort
+        }
+
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+
+    } else {
+
+        //
+        // Unknown control transfer.
+        // TODO: Add ValidationCheck that this is not a standard transfer
+        //
+        UsbStandardRequest.ControlTransfer decoded = new UsbStandardRequest.ControlTransfer { };
+        decoded.SetupPacket = new USB_SETUP_PACKET{ };
+        
+        decoded.SetupPacket.bmRequestType = Urb.Fid_URB_Setup_bmRequestType;
+        decoded.SetupPacket.bRequest = Urb.Fid_URB_Setup_bRequest;
+        decoded.SetupPacket.wValue = Urb.Fid_URB_Setup_wValue;
+        decoded.SetupPacket.wIndex = Urb.Fid_URB_Setup_wIndex;
+        decoded.SetupPacket.wLength = Urb.Fid_URB_Setup_wLength;
+        //if (TransferData != nothing)
+        if (TransferData != null && TransferData.Count > 0) {
+            decoded.TransferData = TransferData;
+        } else {
+            //decoded.TransferData = nothing;
+            decoded.TransferData = null;
+        }
+        genericMsg = decoded as UsbStandardRequest.GenericTransfer;
+    }
+
+    if (genericMsg != null) {
+
+        //
+        // Fill in control transfer info to the GenericTransfer
+        //
+        genericMsg.Status = Urb.Fid_URB_Hdr_Status as UsbdStatus;
+        if (NtStatus != null) {
+            genericMsg.NtStatus = NtStatus as NTSTATUS;
+        }
+        genericMsg.LengthCompleted = Urb.Fid_URB_TransferBufferLength;
+        genericMsg.Type = UsbTransferType.Control;
+        genericMsg.DeviceInstance = DeviceInstance;
+        genericMsg.UrbPtr = UrbPtr;
+        genericMsg.EndpointAddress = EndpointAddress;
+
+        //
+        // Bit 7 == 0 indicates Host-to-device, OUT.
+        //
+        genericMsg.Direction = ((Urb.Fid_URB_Setup_bmRequestType & 0x80) == 0) ? UsbDirection.Out : UsbDirection.In;
+
+        ProcessUrbCompletion(genericMsg, OriginCompletionMessage);
+    }
+}
+
+void ProcessBulkOrInterruptTransfer(
+    int ControllerInstance,
+    int DeviceInstance,
+    ulong PipeHandle,
+    ulong UrbPtr,
+    TransferUrbBulkOrInterrupt Urb,
+    binary TransferData,
+    any message OriginCompletionMessage,
+    uint? NtStatus,
+    UsbTransferType EndpointType,
+    byte EndpointAddress
+    )
+{
+    UsbStandardRequest.BulkOrInterruptTransfer msg = new UsbStandardRequest.BulkOrInterruptTransfer{ };
+
+    msg.Status = Urb.Fid_URB_Hdr_Status as UsbdStatus;
+    if (NtStatus == null) {
+        msg.NtStatus = NTSTATUS.STATUS_SUCCESS; // would prefer to not show it
+    } else {
+        msg.NtStatus = NtStatus as NTSTATUS;
+    }
+    msg.LengthCompleted = Urb.Fid_URB_TransferBufferLength;
+    msg.DeviceInstance = DeviceInstance;
+    msg.UrbPtr = UrbPtr;
+    msg.Type = EndpointType;
+    msg.EndpointAddress = EndpointAddress;
+    msg.TransferData = TransferData;
+    //
+    // Bit 7 of endpoint address == 0 indicates OUT.
+    //
+    msg.Direction = ((msg.EndpointAddress & 0x80) == 0) ? UsbDirection.Out : UsbDirection.In;
+
+    ProcessUrbCompletion(msg as UsbStandardRequest.GenericTransfer, OriginCompletionMessage);
+}
+
+void ProcessIsochTransfer(
+    int ControllerInstance,
+    int DeviceInstance,
+    ulong PipeHandle,
+    ulong UrbPtr,
+    TransferUrbIsoch Urb,
+    any message OriginCompletionMessage,
+    uint? NtStatus,
+    byte EndpointAddress
+    )
+{
+    UsbStandardRequest.IsochTransfer msg = new UsbStandardRequest.IsochTransfer{ };
+
+    msg.Status = Urb.Fid_URB_Hdr_Status as UsbdStatus;
+	// would prefer to not show it
+    msg.NtStatus = NtStatus == null ? NTSTATUS.STATUS_SUCCESS : NtStatus as NTSTATUS;
+    msg.LengthCompleted = Urb.Fid_URB_TransferBufferLength;
+    msg.Type = UsbTransferType.Isochronous;
+    msg.DeviceInstance = DeviceInstance;
+    msg.UrbPtr = UrbPtr;
+    msg.EndpointAddress = EndpointAddress;
+    //
+    // Bit 7 of endpoint address == 0 indicates OUT.
+    //
+    msg.Direction = ((msg.EndpointAddress & 0x80) == 0) ? UsbDirection.Out : UsbDirection.In;
+
+    ProcessUrbCompletion(msg as UsbStandardRequest.GenericTransfer, OriginCompletionMessage);
+}
+
+public autostart actor MarkUsbTransferErrors (UsbDeviceOpnEndpoint node)
+{
+    observe node accepts m:UsbStandardRequest.GenericTransfer
+    {
+        string statusPair;
+
+        if (m.NtStatus == NTSTATUS.STATUS_SUCCESS) {
+
+            //
+            // If there is an error with STATUS_SUCCESS, most likely the real NTSTATUS is not
+            // available, so show the UsbdStatus error only.
+            //
+            statusPair = Format("status {0}", EnumToString(m.Status, "UsbSpec.UsbdStatus"));
+
+        } else {
+
+            statusPair = Format("status pair {0} and {1}",
+                                EnumToString(m.Status, "UsbSpec.UsbdStatus"),
+                                EnumToString(m.NtStatus, "NtStatusModule.NTSTATUS"));
+        }
+
+        if (m.Type == UsbTransferType.Control) {
+
+            //
+            // On control transfers, mark USBD_STATUS_CANCELED as an error.
+            //
+            ErrorCodeIf(m.TransferFailed(),
+                        m,
+                        DiagnosisLevel.Error,
+                        Format("USB: Control transfer failed with {0}", statusPair));
+
+        } else {
+
+            bool isNonCancelError = ((USBD_ERROR(m.Status) && m.Status != UsbdStatus.USBD_STATUS_CANCELED) ||
+                                     (!NT_SUCCESS(m.NtStatus) && m.NtStatus != NTSTATUS.STATUS_CANCELLED));
+            ErrorCodeIf(isNonCancelError,
+                        m,
+                        DiagnosisLevel.Error,
+                        Format("USB: Transfer failed with status pair {0}", statusPair));
+        }
+    }
+}
+
+// EP SM
+message UcxEndpointStateMachineTransition
+{
+    ulong PipeHandle;
+    byte EndpointAddress with DisplayInfo{ToText=ByteToHex};
+    UcxEndpointStateMachineEvent Event;
+    UcxEndpointStateMachineState NewState;
+    bool Rundown;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown UCX Endpoint State Machine event {0}, entered state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxEndpointStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.UcxEndpointStateMachineState"));
+        } else {
+            return Format("UCX Endpoint State Machine event {0}, entering state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxEndpointStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.UcxEndpointStateMachineState"));
+        }
+    }
+}
+
+message UcxEndpointStateMachineTransitionEventOnly
+{
+    ulong PipeHandle;
+    byte EndpointAddress with DisplayInfo{ToText=ByteToHex};
+    UcxEndpointStateMachineEvent Event;
+    bool Rundown;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown UCX Endpoint State Machine event {0}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxEndpointStateMachineEvent"));
+        } else {
+            return Format("UCX Endpoint State Machine event {0} queued",
+                          EnumToString(Event, "UsbStateMachineValues.UcxEndpointStateMachineEvent"));
+        }
+    }
+}
+
+//CR SM
+message UcxControllerResetStateMachineTransition
+{
+    ulong UcxController;
+    UcxControllerResetStateMachineEvent Event;
+    UcxControllerResetStateMachineState NewState;
+    bool Rundown;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown UCX Controller Reset State Machine event {0}, entered state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxControllerResetStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.UcxControllerResetStateMachineState"));
+        } else {
+            return Format("UCX Controller Reset State Machine event {0}, entering state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxControllerResetStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.UcxControllerResetStateMachineState"));
+        }
+    }
+}
+
+message UcxControllerResetStateMachineTransitionEventOnly
+{
+    ulong UcxController;
+    UcxControllerResetStateMachineEvent Event;
+    bool Rundown;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown UCX Controller Reset State Machine event {0}",
+                          EnumToString(Event, "UsbStateMachineValues.UcxControllerResetStateMachineEvent"));
+        } else {
+            return Format("UCX Controller Reset State Machine event {0} queued",
+                          EnumToString(Event, "UsbStateMachineValues.UcxControllerResetStateMachineEvent"));
+        }
+    }
+}
+
+//hsm
+message HubStateMachineTransition
+{
+    ulong DevicePtr;
+    HubStateMachineEvent Event;
+    HubStateMachineState NewState;
+    bool Rundown;
+    uint Depth;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown USB Hub State Machine event {0}, entered state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.HubStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.HubStateMachineState"),
+                          Depth as string);
+        } else {
+            return Format("USB Hub State Machine event {0}, entering state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.HubStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.HubStateMachineState"),
+                          Depth as string);
+        }
+    }
+}
+
+//psm2
+message Port20StateMachineTransition
+{
+    ulong PortObject;
+    Port20StateMachineEvent Event;
+    Port20StateMachineState NewState;
+    bool Rundown;
+    uint Depth;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown USB2 Port State Machine event {0}, entered state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.Port20StateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.Port20StateMachineState"),
+                          Depth as string);
+        } else {
+            return Format("USB2 Port State Machine event {0}, entering state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.Port20StateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.Port20StateMachineState"),
+                          Depth as string);
+        }
+    }
+}
+
+//psm3
+message Port30StateMachineTransition
+{
+    ulong PortObject;
+    Port30StateMachineEvent Event;
+    Port30StateMachineState NewState;
+    bool Rundown;
+    uint Depth;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown USB3 Port State Machine event {0}, entered state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.Port30StateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.Port30StateMachineState"),
+                          Depth as string);
+        } else {
+            return Format("USB3 Port State Machine event {0}, entering state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.Port30StateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.Port30StateMachineState"),
+                          Depth as string);
+        }
+    }
+}
+
+//dsm
+message Usbhub3DeviceStateMachineTransition
+{
+    ulong DevicePtr;
+    DeviceStateMachineEvent Event;
+    DeviceStateMachineState NewState;
+    bool Rundown;
+    uint Depth;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown USB Device State Machine event {0}, entered state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.DeviceStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.DeviceStateMachineState"),
+                          Depth as string);
+        } else {
+            return Format("USB Device State Machine event {0}, entering state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.DeviceStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.DeviceStateMachineState"),
+                          Depth as string);
+        }
+    }
+}
+
+//ism
+message Usbhub3DeviceIdleStateMachineTransition
+{
+    ulong DevicePtr;
+    IdleStateMachineEvent Event;
+    IdleStateMachineState NewState;
+    bool Rundown;
+    uint Depth;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown Idle State Machine event {0}, entered state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.IdleStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.IdleStateMachineState"),
+                          Depth as string);
+        } else {
+            return Format("Idle State Machine event {0}, entering state {1} depth {2}",
+                          EnumToString(Event, "UsbStateMachineValues.IdleStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.IdleStateMachineState"),
+                          Depth as string);
+        }
+    }
+}
+
+//esm
+message XhciEndpointStateMachineTransition
+{ // NOTE: This is not used yet becaues ETW events don't exist for the XHCI state machine
+    ulong PipeHandle;
+    XhciEndpointStateMachineEvent Event;
+    XhciEndpointStateMachineState NewState;
+    bool Rundown;
+
+    override string ToString()
+    {
+        if (Rundown) {
+            return Format("Rundown XHCI Endpoint State Machine event {0}, entered state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.XhciEndpointStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.XhciEndpointStateMachineState"));
+        } else {
+            return Format("XHCI Endpoint State Machine event {0}, entering state {1}",
+                          EnumToString(Event, "UsbStateMachineValues.XhciEndpointStateMachineEvent"),
+                          EnumToString(NewState, "UsbStateMachineValues.XhciEndpointStateMachineState"));
+        }
+    }
+}
+
+// !!!!GENERATED CODE - DO NOT MODIFY BELOW THIS POINT!!!!
+
+annotation int UsbDeviceInstanceAnnotation;
+int get UsbDeviceInstance(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbDeviceInstanceAnnotation != nothing) {
+        return msg#UsbDeviceInstanceAnnotation  as int;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbDeviceInstanceAnnotation != nothing) {
+                return origins[0]#UsbDeviceInstanceAnnotation  as int;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return -1;
+}
+annotation int UsbControllerInstanceAnnotation;
+int get UsbControllerInstance(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbControllerInstanceAnnotation != nothing) {
+        return msg#UsbControllerInstanceAnnotation  as int;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbControllerInstanceAnnotation != nothing) {
+                return origins[0]#UsbControllerInstanceAnnotation  as int;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return -1;
+}
+endpoint UsbPropertyMapsEndpoint accepts EmptyMessage {
+    map<int, string> UsbDeviceMap = {};
+    map<int, string> UsbDevicePortPathMap = {};
+    map<int, string> UsbDeviceIdMap = {};
+    map<int, string> UsbDeviceClassMap = {};
+    map<int, string> UsbControllerMap = {};
+    map<int, string> UsbControllerIdMap = {};
+    map<int, string> UsbControllerTypeMap = {};
+}
+annotation string UsbDeviceAnnotation;
+string get UsbDevice(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbDeviceAnnotation != nothing) {
+        return msg#UsbDeviceAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbDeviceAnnotation != nothing) {
+                return origins[0]#UsbDeviceAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbDevicePortPathAnnotation;
+string get UsbDevicePortPath(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbDevicePortPathAnnotation != nothing) {
+        return msg#UsbDevicePortPathAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbDevicePortPathAnnotation != nothing) {
+                return origins[0]#UsbDevicePortPathAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbDeviceIdAnnotation;
+string get UsbDeviceId(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbDeviceIdAnnotation != nothing) {
+        return msg#UsbDeviceIdAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbDeviceIdAnnotation != nothing) {
+                return origins[0]#UsbDeviceIdAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbDeviceClassAnnotation;
+string get UsbDeviceClass(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbDeviceClassAnnotation != nothing) {
+        return msg#UsbDeviceClassAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbDeviceClassAnnotation != nothing) {
+                return origins[0]#UsbDeviceClassAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbControllerAnnotation;
+string get UsbController(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbControllerAnnotation != nothing) {
+        return msg#UsbControllerAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbControllerAnnotation != nothing) {
+                return origins[0]#UsbControllerAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbControllerIdAnnotation;
+string get UsbControllerId(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbControllerIdAnnotation != nothing) {
+        return msg#UsbControllerIdAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbControllerIdAnnotation != nothing) {
+                return origins[0]#UsbControllerIdAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+annotation string UsbControllerTypeAnnotation;
+string get UsbControllerType(this any message msg) // TODO: any message ->
+{
+    // Propagate annotation to a property. If annotation is not found on current message, try lower
+    // level messages (origins) and propagate from them.
+    if (msg#UsbControllerTypeAnnotation != nothing) {
+        return msg#UsbControllerTypeAnnotation  as string;
+    } else {
+        array<any message> origins = msg.Origins;
+        while (origins.Count != 0) {
+            if (origins[0]#UsbControllerTypeAnnotation != nothing) {
+                return origins[0]#UsbControllerTypeAnnotation  as string;
+            }
+            origins = origins[0].Origins;
+        }
+    }
+
+    return "";
+}
+void AnnotateDeviceMessage(any message m, int deviceInstance) {
+    if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDeviceMap) {
+        m#UsbDeviceAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbDeviceMap[deviceInstance];
+    }
+    if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDevicePortPathMap) {
+        m#UsbDevicePortPathAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbDevicePortPathMap[deviceInstance];
+    }
+    if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDeviceIdMap) {
+        m#UsbDeviceIdAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbDeviceIdMap[deviceInstance];
+    }
+    if (deviceInstance in (endpoint UsbPropertyMapsEndpoint).UsbDeviceClassMap) {
+        m#UsbDeviceClassAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbDeviceClassMap[deviceInstance];
+    }
+}
+
+void AnnotateControllerMessage(any message m, int controllerInstance) {
+    if (controllerInstance in (endpoint UsbPropertyMapsEndpoint).UsbControllerMap) {
+        m#UsbControllerAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbControllerMap[controllerInstance];
+    }
+    if (controllerInstance in (endpoint UsbPropertyMapsEndpoint).UsbControllerIdMap) {
+        m#UsbControllerIdAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbControllerIdMap[controllerInstance];
+    }
+    if (controllerInstance in (endpoint UsbPropertyMapsEndpoint).UsbControllerTypeMap) {
+        m#UsbControllerTypeAnnotation = (endpoint UsbPropertyMapsEndpoint).UsbControllerTypeMap[controllerInstance];
+    }
+}

@@ -1,0 +1,214 @@
+protocol SQOS with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    DocumentName = "MS-SQOS",
+    ProtocolName = "Storage Quality of Service Protocol",
+    ShortName = "SQOS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-SQOS", Version = "2.0", Date = "03/30/2016"}
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "375271", Date = "03/09/2015"}
+    ]
+};
+
+using SMB2;
+using Utility;
+
+endpoint Server
+over SMB2.FileServer
+provides Message provides VirtualOperation;
+
+client endpoint Client connected to Server;
+
+// --------------------------actors-------------------------------------------//
+autostart actor SQOSOverSMB2FileServer(SMB2.FileServer fileServer)
+{
+    process fileServer accepts ioctlReq:SMB2.Messages.IoctlRequest where ioctlReq.Request.CtlCode == SMB2IoctlCtlCode.FSCTL_STORAGE_QOS_CONTROL && ioctlReq.Request.Buffer is payload:binary && payload.Count > 0
+    {
+        if (BinaryDecoder<Message.STORAGE_QOS_CONTROL_REQUEST>(payload) is req:Message.STORAGE_QOS_CONTROL_REQUEST)
+        {
+            dispatch (endpoint Server over fileServer) accepts req;
+        }
+        else
+        {
+            ThrowDecodingException("SQOS", "STORAGE_QOS_CONTROL_REQUEST");
+        }
+    }
+    
+    process fileServer issues ioctlRes:SMB2.Messages.IoctlResponse where ioctlRes.Response.CtlCode == SMB2IoctlCtlCode.FSCTL_STORAGE_QOS_CONTROL && ioctlRes.Response.Buffer is payload:binary && payload.Count > 0
+    {
+        if (BinaryDecoder<Message.STORAGE_QOS_CONTROL_RESPONSE>(payload) is res:Message.STORAGE_QOS_CONTROL_RESPONSE)
+        {
+            dispatch (endpoint Server over fileServer) issues res;
+        }
+        else
+        {
+            ThrowDecodingException("SQOS", "STORAGE_QOS_CONTROL_RESPONSE");
+        }
+    }
+}
+
+// --------------------------messages and types-----------------------------------------//
+contract VirtualOperation
+{
+    issues virtual operation STORAGE_QOS_CONTROL
+    {
+        in ProtocolVersion ProtocolVersion = version;
+        in STORAGE_QOS_CONTROL_REQUEST_Options Options = options;
+        in ulong IoCountIncrement = ioCountIncrement;
+        in ulong NormalizedIoCountIncrement = normalizedIoCountIncrement;
+        in ulong LatencyIncrement = latencyIncrement;
+        in ulong LowerLatencyIncrement = lowerLatencyIncrement;
+        in optional ulong BandwidthLimit = bandwidthLimit;
+        in optional ulong KilobyteCountIncrement = kilobyteCountIncrement;
+
+        out LogicalFlowStatusCodes Status = status;
+        out ulong MaximumIoRate = maximumIoRate;
+        out ulong MinimumIoRate = minimumIoRate;
+        out optional ulong MaximumBandwidth = maximumBandwidth;
+
+        override string ToString()
+        {
+            return "STORAGE_QOS_CONTROL, Version: " + (ProtocolVersion == 0x0100 ? "1.0" : "1.1") +
+                ", Status: " + EnumToStringInSummary<LogicalFlowStatusCodes>(Status) +
+                ", Options: " + EnumToStringInSummary<STORAGE_QOS_CONTROL_REQUEST_Options>(Options);
+        }
+    }
+    =
+    accepts Message.STORAGE_QOS_CONTROL_REQUEST
+    {
+        ProtocolVersion is var version, LogicalFlowID is var flowID, Options is var options, IoCountIncrement is var ioCountIncrement,
+        NormalizedIoCountIncrement is var normalizedIoCountIncrement, LatencyIncrement is var latencyIncrement, 
+        LowerLatencyIncrement is var lowerLatencyIncrement, BandwidthLimit is var bandwidthLimit, KilobyteCountIncrement is var kilobyteCountIncrement
+    }
+    issues Message.STORAGE_QOS_CONTROL_RESPONSE
+    {
+        LogicalFlowID == flowID, Status is var status, MaximumIoRate is var maximumIoRate, 
+        MinimumIoRate is var minimumIoRate, MaximumBandwidth is var maximumBandwidth
+    };
+}
+
+contract Message
+{
+    // 2.2.2.2 STORAGE_QOS_CONTROL_REQUEST Structure
+    message STORAGE_QOS_CONTROL_REQUEST
+    {
+        ProtocolVersion ProtocolVersion where ValidationCheckValue(value in {0x0100, 0x0101}, this, true, ReferenceType.Message, "SQOS", "ProtocolVersion", "STORAGE_QOS_CONTROL_REQUEST", "0x0100, 0x0101", value);
+        ushort Reserved where ValidationCheckReservedZero(value == 0, this, true, ReferenceType.Message, "SQOS", "Reserved", "STORAGE_QOS_CONTROL_REQUEST", value);
+        STORAGE_QOS_CONTROL_REQUEST_Options Options where ValidationCheckCombinationValueTooManyItems(InRange<STORAGE_QOS_CONTROL_REQUEST_Options>(value), this, true, ReferenceType.Message, 
+            "SQOS", "Options", "STORAGE_QOS_CONTROL_REQUEST", "STORAGE_QOS_CONTROL_REQUEST", "[MS-SQOS]");
+        guid LogicalFlowID;
+        guid PolicyID;
+        guid InitiatorID;
+        ulong Limit;
+        ulong Reservation;
+        ushort InitiatorNameOffset;
+        ushort InitiatorNameLength;
+        ushort InitiatorNodeNameOffset;
+        ushort InitiatorNodeNameLength;
+        ulong IoCountIncrement;
+        ulong NormalizedIoCountIncrement;
+        ulong LatencyIncrement;
+        ulong LowerLatencyIncrement;
+        optional [|ProtocolVersion != 0x0100|] ulong BandwidthLimit;
+        optional [|ProtocolVersion != 0x0100|] ulong KilobyteCountIncrement;
+        // According to InitiatorNameOffset's definition, there should be a Padding1 field if InitiatorNameOffset > 112
+        optional [|(ProtocolVersion == 0x0100 && InitiatorNameOffset > 112) || 
+                   (ProtocolVersion == 0x0101 && InitiatorNameOffset > 128)
+                 |] binary Padding1 
+             with BinaryEncoding{Length = ProtocolVersion == 0x0100 ? InitiatorNameOffset - 112 : InitiatorNameOffset - 128}; // 112/128 is the byte lengh of the previous fields
+        // According to section 4 Protocols Examples, the InitiatorName field is optional
+        optional [|InitiatorNameLength > 0|] string InitiatorName 
+            with BinaryEncoding
+            {
+                Length = (((InitiatorNameLength <= STORAGE_QOS_INITIATOR_NAME_SIZE) ? InitiatorNameLength : STORAGE_QOS_INITIATOR_NAME_SIZE) / 2),
+                TextEncoding = TextEncoding.Unicode
+            };
+        // According to InitiatorNodeNameOffset's definition, there should be a Padding2 field if InitiatorNodeNameOffset > InitiatorNameOffset + InitiatorNameLength
+        optional [|InitiatorNodeNameOffset > InitiatorNameOffset + InitiatorNameLength|] binary Padding2 with BinaryEncoding{Length = InitiatorNodeNameOffset - InitiatorNameOffset - InitiatorNameLength};
+        // According to section 4 Protocols Examples, the InitiatorNodeName field is optional
+        optional [|InitiatorNodeNameLength > 0|] string InitiatorNodeName 
+            with BinaryEncoding
+            {
+                Length = (((InitiatorNodeNameLength <= STORAGE_QOS_INITIATOR_NAME_SIZE) ? InitiatorNodeNameLength : STORAGE_QOS_INITIATOR_NAME_SIZE) / 2), 
+                TextEncoding = TextEncoding.Unicode
+            };
+
+        override string ToString()
+        {
+            return "STORAGE_QOS_CONTROL_REQUEST, Version: " + (ProtocolVersion == 0x0100 ? "1.0" : "1.1") +
+                ", Options: " + EnumToStringInSummary<STORAGE_QOS_CONTROL_REQUEST_Options>(Options) +
+                ", IoCountIncrement: " + (IoCountIncrement as string) +
+                ", NormalizedIoCountIncrement: " + (NormalizedIoCountIncrement as string) +
+                ", LatencyIncrement: " + (LatencyIncrement as string);
+        }
+    };
+
+    // 2.2.2.3 STORAGE_QOS_CONTROL_RESPONSE Structure
+    message STORAGE_QOS_CONTROL_RESPONSE
+    {
+        ProtocolVersion ProtocolVersion where ValidationCheckValue(value in {0x0100, 0x0101}, this, true, ReferenceType.Message, "SQOS", "ProtocolVersion", "STORAGE_QOS_CONTROL_RESPONSE", "0x0100, 0x0101", value);
+        ushort Reserved1 where ValidationCheckReservedZero(value == 0, this, true, ReferenceType.Message, "SQOS", "Reserved1", "STORAGE_QOS_CONTROL_RESPONSE", value);
+        uint Options where ValidationCheckZero(value == 0, this, true, ReferenceType.Message, "SQOS", "Options", "STORAGE_QOS_CONTROL_RESPONSE", value);
+        guid LogicalFlowID;
+        guid PolicyID;
+        guid InitiatorID;
+        uint TimeToLive;
+        LogicalFlowStatusCodes Status where ValidationCheckEnumValueTooManyItems(InRange<LogicalFlowStatusCodes>(value), this, true, ReferenceType.Message, 
+            "SQOS", "Status", "STORAGE_QOS_CONTROL_RESPONSE", "Logical Flow Status Codes", "[MS-SQOS]");
+        ulong MaximumIoRate;
+        ulong MinimumIoRate;
+        optional [|ProtocolVersion != 0x0100|] ulong MaximumBandwidth;
+        uint BaseIoSize;
+        uint Reserved2 where ValidationCheckReservedZero(value == 0, this, true, ReferenceType.Message, "SQOS", "Reserved2", "STORAGE_QOS_CONTROL_RESPONSE", value);
+
+        override string ToString()
+        {
+            return "STORAGE_QOS_CONTROL_RESPONSE, Version: " + (ProtocolVersion == 0x0100 ? "1.0" : "1.1") +
+                ", Status: " + EnumToStringInSummary<LogicalFlowStatusCodes>(Status) +
+                ", MaximumIoRate: " + (MaximumIoRate as string) +
+                ", MinimumIoRate: " + (MinimumIoRate as string);
+        }
+    };
+}
+// 2.2.1 Constants
+const uint FSCTL_STORAGE_QOS_CONTROL = 0x00090350;
+const ushort STORAGE_QOS_INITIATOR_NAME_SIZE = 0x200;
+
+pattern ProtocolVersion = enum ushort
+{
+    $"Storage QoS Protocol Version 1.0" = 0x0100,
+    $"Storage QoS Protocol Version 1.1" = 0x0101,
+    ...
+};
+
+// 2.2.2.1 Logical Flow Status Codes
+pattern LogicalFlowStatusCodes = enum uint
+{
+    StorageQoSStatusOk                     = 0x00000000,
+    StorageQoSStatusInsufficientThroughput = 0x00000001,
+    StorageQoSUnknownPolicyId              = 0x00000002,
+    StorageQoSStatusConfigurationMismatch  = 0x00000004,
+    StorageQoSStatusNotAvailable           = 0x00000005,
+    ...
+};
+
+// 2.2.2.2 STORAGE_QOS_CONTROL_REQUEST Structure
+pattern STORAGE_QOS_CONTROL_REQUEST_Options = flags uint
+{
+    STORAGE_QOS_CONTROL_FLAG_SET_LOGICAL_FLOW_ID = 0x00000001,
+    STORAGE_QOS_CONTROL_FLAG_SET_POLICY          = 0x00000002,
+    STORAGE_QOS_CONTROL_FLAG_PROBE_POLICY        = 0x00000004,
+    STORAGE_QOS_CONTROL_FLAG_GET_STATUS          = 0x00000008,
+    STORAGE_QOS_CONTROL_FLAG_UPDATE_COUNTERS     = 0x00000010,
+    ...
+};

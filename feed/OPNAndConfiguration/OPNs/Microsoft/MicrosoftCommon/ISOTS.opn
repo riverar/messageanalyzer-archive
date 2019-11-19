@@ -1,0 +1,166 @@
+protocol ISOTS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "ISO Transport service Protocol",
+    ShortName = "ISOTS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 1006"},
+            new Reference{Name = "RFC 2126"},
+        ],
+    RevisionSummary = 
+        [
+             new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Standard;
+using IANA;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using Utility;
+
+annotation ushort TPKT#SourcePort;
+annotation ushort TPKT#DestinationPort;
+
+endpoint Server 
+    over TCP.Server
+    accepts TPKT issues TPKT;
+
+client endpoint Client connected to Server;
+
+const set<ulong> ValidPorts = {Port.Netmeeting, Port.Q931};
+
+// Future Reference: After ASN codec finished, need add negotiate dynamic port
+autostart actor ISOTSOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper decodingHelper = null;
+
+    process server accepts s:TCP.Segment where ValidPorts[s.DestinationPort]
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server issues s:TCP.Segment where ValidPorts[s.SourcePort]
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && ValidPorts[s.DestinationPort]
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && ValidPorts[s.SourcePort]
+    {
+        InitializeDecodingHelperIfNot();
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    void InitializeDecodingHelperIfNot()
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new ISOTSDecodingCache(), new ISOTSDecodingCache(), 
+                    "ISOTS", endpoint Server over server, IsTPKT, IsCompleteISOTS, 
+                    (stream s) => BinaryDecoder<TPKT>(s) as optional any message, 
+                    (binary b) => BinaryDecoder<IncompleteTPKT>(b) as optional any message);
+        }
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+// used for DecodingHelper initialization
+bool? IsTPKT(binary bin)
+{
+    return IsTPKTStream(bin);
+}
+
+bool? IsTPKTStream(stream s)
+{
+    if (s.RemainingByteLength < 2)
+    {
+        return null;
+    }
+    return s.PeekBytes(s.BitPosition, 2) == $[0300];
+}
+
+message TPKT
+{
+    byte Version where value == 3;
+    byte Reserved where value == 0;
+    ushort PacketLength;
+    binary TPDU with BinaryEncoding{Length = (PacketLength - 4)};
+    
+    override string ToString()
+    {
+        string summary = "TPKT, Version: " + Version.ToString();
+        summary += ", Length: " + PacketLength.ToString();
+        return summary;
+    }
+};
+
+// Only define to handle partial message parsing.
+message IncompleteTPKT
+{
+    byte Version where value == 3;
+    byte Reserved where value == 0;
+    ushort PacketLength;
+    binary TPDU;
+    
+    override string ToString()
+    {
+        string summary = "[Incomplete TPKT] Version: " + Version.ToString();
+        summary += ", Length: " + PacketLength.ToString();
+        return summary;
+    }
+};
+
+uint? IsCompleteISOTS(binary data)
+{
+    if (data.Count < 4)
+        return null;
+    int length = GetTPKTLength(data);
+    return length <= data.Count ? 0 : length as uint;
+}
+
+int GetTPKTLength(binary bin)
+{
+    if (bin.Count < 4)
+    {
+        return -1;
+    }
+    return (bin[2] << 8) + bin[3];
+}
+
+type ISOTSDecodingCache : TCPDecodingCache
+{
+    override void DispatchMessage(any message msg)
+    {
+        TPKT tpkt = msg as TPKT;
+        if (Origins.Count > 0 && Origins[0] is s:TCP.Segment)
+        {
+            tpkt#SourcePort = s.SourcePort;
+            tpkt#DestinationPort = s.DestinationPort;
+        }
+        base.DispatchMessage(tpkt);
+    }
+}

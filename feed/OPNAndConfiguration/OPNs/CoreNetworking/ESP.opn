@@ -1,0 +1,390 @@
+protocol ESP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "IP Encapsulating Security Payload",
+    ShortName = "ESP",
+    Description = "Encapsulating Security Payload (ESP) is a member of the IPsec protocol suite.In IPsec it provides origin authenticity, integrity, and confidentiality protection of packets."
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 4303"},
+            new Reference{Name = "RFC 2403"},
+            new Reference{Name = "RFC 2404"},
+            new Reference{Name = "RFC 2104"},
+            new Reference{Name = "RFC 2857"},
+            new Reference{Name = "RFC 4543"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "377030", Date = "04/17/2015"}
+        ]
+};
+
+using IPv4;
+using IPv6;
+using IANA;
+using Standard;
+using Utility;
+using UDP;
+using TCP;
+using ICMP;
+
+annotation binary ESP.Packet#SourceAddress;
+annotation binary ESP.Packet#DestinationAddress;
+
+// Endpoint: Node
+// Description: This endpoint accepts or issues normal message.
+endpoint Node
+    over IPv4.Node | over IPv6.Node | over UDP.Host
+    accepts ESP.Packet
+    accepts ESP.EncryptedPacket;
+
+// Same actor logic for ESP messages
+autostart actor TCPOverESP(ESP.Node node)
+{
+    TcpEndpointHelper eptHelper = new TcpEndpointHelper{};
+
+    process node accepts p:ESP.Packet where p.Trailer.NextHeader == ProtocolType.TCP
+    {
+        TCP.DecodeAndDispatchSegment(eptHelper, p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload);
+    }
+}
+
+autostart actor ICMPOverESP(ESP.Node node)
+{
+    process node accepts p:ESP.Packet where p.Trailer.NextHeader == IANA.ProtocolType.ICMP
+    {
+        //Esp to Icmp
+        ICMP.DecodeDatagram(p#SourceAddress as binary, p#DestinationAddress as binary, p.Payload, false);
+    }
+}
+
+autostart actor UDPOverESP(ESP.Node node)
+{
+    process node accepts e:ESP.Packet where e.Trailer.NextHeader == ProtocolType.UDP
+    {
+        DecodeDatagram(e#SourceAddress as binary, e#DestinationAddress as binary, e.Payload);
+    }
+}
+
+autostart actor IPv4OverESP(ESP.Node node)
+{
+    process node accepts p:ESP.Packet where p.Trailer.NextHeader == IANA.ProtocolType.IPv4
+    {
+        switch (p.Payload)
+        {
+            case d:IPv4.Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPv4");
+        }
+    }
+}
+
+autostart actor IPv6OverESP(ESP.Node node)
+{
+    process node accepts p:ESP.Packet where p.Trailer.NextHeader == IANA.ProtocolType.IPv6
+    {
+        switch (p.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv6");
+        }
+    }
+}
+
+// Actor: ESPOverIPv4
+// Description: Listen to IPv4.Node process messages if match successfully. 
+autostart actor ESPOverIPv4(IPv4.Node node)
+{
+    process node accepts p:IPv4.Datagram {Protocol is ProtocolType.ESP}
+    {   
+        var espnode = endpoint ESP.Node over node;
+        DecodeAndDispatchPacket(p.Payload, espnode, p.SourceAddress.FlatAddress, p.DestinationAddress.FlatAddress);
+    }
+}
+// Actor: ESPOverIPv6
+// Description: Listen to IPv6.Node process messages if match successfully. 
+autostart actor ESPOverIPv6(IPv6.Node node)
+{
+    process node accepts d:IPv6.Datagram where d.NextProtocol == ProtocolType.ESP
+    {         
+        var espnode = endpoint ESP.Node over node;
+        DecodeAndDispatchPacket(d.Payload, espnode, d.SourceAddress.FlatAddress, d.DestinationAddress.FlatAddress);
+    }
+}
+
+autostart actor ESPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram where ((d.SourcePort == Port.NATT || d.DestinationPort == Port.NATT) && (d.Payload.Segment(0,4) != $[00000000]) && d.Length > 12)
+    {   
+        var espnode = endpoint ESP.Node over host;
+        DecodeAndDispatchPacket(d.Payload, espnode, d#SourceAddress as binary, d#DestinationAddress as binary);
+    }
+}
+
+void DecodeAndDispatchPacket(stream payload, ESP.Node node, binary sourAddr, binary destAddr)
+{
+    // ESPDecoder() return null if decoder failed.
+    (ESP.EncryptedPacket | ESP.Packet) m = ESPDecoder(payload);
+    if (m == null)
+    {
+        throw "Decode error";
+    }
+    
+    if (m is msgEP:ESP.EncryptedPacket)
+    {
+        dispatch node accepts msgEP;
+    }
+    else if (m is msgP:ESP.Packet)
+    {
+        msgP#SourceAddress = sourAddr;
+        msgP#DestinationAddress = destAddr;
+        dispatch node accepts msgP;
+    }
+    else 
+    {
+        ThrowDecodingException("ESP");
+    }
+}
+
+(ESP.EncryptedPacket | ESP.Packet) ESPDecoder(stream payload)
+{
+    // Get Integrity Check Value-ICV length. RFC2104.
+    // Known Algorithms and their ICV length:
+        
+    /////////////////////////////////////////////////
+    // Authentication   ICV Length      Reference  //
+    //  Algorithms        (bytes)                  //
+    //---------------------------------------------//
+    //  HMAC-MD5-96         12           RFC2403   //
+    //  HMAC-SHA1-96        12           RFC2404   //
+    //  HMAC-RIPEMD-160-96  16           RFC2857   //
+    //  AES-GMAC            16           RRC4543   //
+    /////////////////////////////////////////////////
+
+    // There is no direct way to detect the ICV length or ICV presence. 
+    // We use approximate algorithm as following:
+    // Try ICVLength = 12
+    // Try ICVLength = 16, ICV present
+    // ICVLength = 16, ICV not present, skip the ICV.
+    int totalLength = payload.ByteLength;
+    byte ICVLength = 12;
+    if (totalLength < 13)
+    {
+        return null;
+    }
+    var nextHeader = payload.PeekByte((totalLength - 13) * 8);
+    // skip SecurityParametersIndex and SequenceNumber
+    var firstByte = payload.PeekByte(8 * 8);
+    // re-calculate ICVLength
+    ICVLength = GetICVLength(nextHeader, firstByte);
+    // retrieve nextHeader according to new ICV Length
+    if (totalLength < ICVLength + 1)
+    {
+        return null;
+    }
+    // Check if the Packet has a IV. (We assume that the IV field is equal to SequenceNumber if it contained in Packet, which is the Microsoft implementation. Otherwise, the Packet does not has IV field)
+    int IVLength = 0;
+    if (totalLength >= 16)
+    {
+        binary seq_IV_Bin = payload.PeekBytes(4 * 8, 8);
+        if (seq_IV_Bin[0] == seq_IV_Bin[7] &&
+            seq_IV_Bin[1] == seq_IV_Bin[6] &&
+            seq_IV_Bin[2] == seq_IV_Bin[5] &&
+            seq_IV_Bin[3] == seq_IV_Bin[4] &&
+            payload.PeekBytes(12 * 8, 4) == $[00000000])
+        {
+            IVLength = 8;
+        }  
+    }
+    
+    nextHeader = payload.PeekByte((totalLength - (ICVLength + 1)) * 8);
+    int padLength = payload.PeekByte((totalLength - (ICVLength + 2)) * 8);
+    int packetPayloadLength = totalLength - (10 + IVLength + ICVLength + padLength);
+    
+    int startPos = IVLength + 8;
+    
+    if ((nextHeader ==  ProtocolType.ICMP && packetPayloadLength > 0 && ((payload.PeekByte(payload.BitPosition + startPos * 8) <= 41 && (payload.PeekByte(payload.BitPosition + (startPos + 1) * 8) <= 11 || payload.PeekByte(payload.BitPosition + (startPos + 1) * 8) in {137, 138, 139})) || payload.PeekByte(payload.BitPosition + startPos * 8) >= 42))
+        || (nextHeader ==  ProtocolType.UDP && (packetPayloadLength >= ((payload.PeekByte(payload.BitPosition + (startPos + 4) * 8) << 8) + payload.PeekByte(payload.BitPosition + (startPos + 5) * 8))))
+        || (nextHeader ==  ProtocolType.IGMP && IsIGMPMessages(payload.PeekBytes((8 + IVLength) * 8, 10), packetPayloadLength))
+        || (nextHeader ==  ProtocolType.IPv4 && ((payload.PeekByte(payload.BitPosition + startPos * 8) >> 4) == 4) && (packetPayloadLength >= ((payload.PeekByte(payload.BitPosition + (startPos + 2) * 8) << 8) + payload.PeekByte(payload.BitPosition + (startPos + 3) * 8))))
+        || (nextHeader ==  ProtocolType.TCP && (payload.PeekByte(payload.BitPosition + (startPos + 12) * 8) & 0x0E) == 0)
+        || (nextHeader ==  ProtocolType.IPv6 && ((payload.PeekByte(payload.BitPosition + startPos * 8) >> 4) == 6) && ((packetPayloadLength - 48) >= ((payload.PeekByte(payload.BitPosition + (startPos + 4) * 8) << 8) + payload.PeekByte(payload.BitPosition + (startPos + 5) * 8)))))
+    {
+        if (packetPayloadLength > 0)
+        {
+            var p = BinaryDecoder<Packet[IVLength != 0, packetPayloadLength as uint, padLength as uint, ICVLength as uint]>(payload);
+            if (p != nothing)
+            {
+                return p as Packet;
+            }
+        }
+    }
+    // ICV not present
+    switch (payload)
+    {
+        case msg:EncryptedPacket from BinaryDecoder<EncryptedPacket> =>
+            return msg;
+    }
+    
+    ThrowDecodingException("ESP");
+    return null;
+}
+
+// Message
+message Packet[bool HasIV, uint PayloadLength, uint PadLength, uint ICVLength]
+{
+    uint SecurityParametersIndex where ValidationCheck(value > 255, this, "Value of SPI less than or equal to 255 is reversed.");
+    uint SequenceNumber;
+    // RFC 4543
+    optional [|HasIV|] ulong IV with BinaryEncoding{Endian = Endian.Little};
+    binary Payload with BinaryEncoding{Length = PayloadLength};
+    Trailer[PadLength, ICVLength] Trailer;
+    
+    override string ToString()
+    {
+        return "Next Protocol = " + Trailer.NextHeader.Name + ", SPI = " + Utility.DecToHexFormat(SecurityParametersIndex) 
+            + ", Seq = " + Utility.DecToHexFormat(SequenceNumber);
+    }
+}
+
+message EncryptedPacket
+{
+    uint SecurityParametersIndex where ValidationCheck(value > 255, this, "Value of SPI less than or equal to 255 is reversed.");
+    uint SequenceNumber;
+    binary EncryptedData;
+    
+    override string ToString()
+    {
+        return "SPI = " + Utility.DecToHexFormat(SecurityParametersIndex) + ", Seq = " + Utility.DecToHexFormat(SequenceNumber);
+    }
+}
+
+type Trailer[uint PaddingLength, uint ICVLength]
+{
+    binary Pad with BinaryEncoding{Length = PaddingLength};
+    byte PadLength;
+    ProtocolType NextHeader;
+    binary ICV with BinaryEncoding{Length = ICVLength};
+}
+
+// According to NextHeader field, return ICVLength, default value is 16.
+byte GetICVLength(byte nextHeader, byte firstByte)
+{
+    byte ICVLength;
+    switch (nextHeader)
+        {
+            case ProtocolType.TCP =>
+                ICVLength = 12;
+            case ProtocolType.UDP =>
+                ICVLength = 12;
+            case ProtocolType.ICMP =>
+                if (firstByte <= 40)
+                {
+                    ICVLength = 12;
+                }
+                else
+                {
+                    ICVLength = 16;
+                }
+            case ProtocolType.IGMP =>
+                if (firstByte <= 0x42)
+                {
+                    ICVLength = 12;
+                }
+                else
+                {
+                    ICVLength = 16;
+                }
+            case ProtocolType.IPv4 =>
+                if ((firstByte & 0xF0) == 0x40)
+                {
+                    ICVLength = 12;
+                }
+                else
+                {
+                    ICVLength = 16;
+                }
+            case ProtocolType.IPv6 =>
+                if ((firstByte & 0xF0) == 0x60)
+                {
+                    ICVLength = 12;
+                }
+                else
+                {
+                    ICVLength = 16;
+                }
+            default =>
+                ICVLength = 16;
+        }
+    return ICVLength;
+}
+
+// Lookahead the payload field in ESP Packet. Certain fields in the IGMP messages can be used for more accurate judgement
+bool IsIGMPMessages(binary bin, int payloadLength)
+{
+    switch (bin[0])
+    {
+        case 0x01 =>
+            return (payloadLength == 20 && bin[1] in {0x00, 0x01});
+        case 0x02 =>
+            return (payloadLength == 20 && bin[1] in {0x01, 0x02, 0x03, 0x04});
+        case 0x03 =>
+            return payloadLength == 20 && bin[1] == 0x00;
+        case 0x04 => 
+            return (payloadLength == 20 && bin[1] in {0x01, 0x02, 0x03, 0x04});
+        case 0x05 =>
+            return payloadLength == 20 && bin[1] == 0x00;
+        case 0x06 =>
+            return (payloadLength == 20 && bin[1] in {0x01, 0x02, 0x03, 0x04});
+        case 0x07 =>
+            return payloadLength == 20 && bin[1] == 0x00;
+        case 0x08 =>
+            return (payloadLength == 20 && bin[1] in {0x01, 0x02, 0x03, 0x04});
+        case 0x11 =>
+            return payloadLength == 8 || (bin.Count >= 12 && (bin[8] & 0xF0) == 0x00);
+        case 0x12 =>
+            return payloadLength == 8 && bin[1] == 0x00;
+        case 0x13 =>
+            return payloadLength >= 4 && bin[1] in {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09};
+        case 0x14 =>
+            return payloadLength >= 8 && bin[5] == 0x00;
+        case 0x16 =>
+            return payloadLength == 8;
+        case 0x17 =>
+            return payloadLength == 8;
+        case 0x1E =>
+            return payloadLength == 56;
+        case 0x1F =>
+            return payloadLength == 22;
+        case 0x22 =>
+            return payloadLength >= 8 && bin[1] == 0x00;
+        case 0x23 =>
+            return payloadLength == (8 + bin[1] * 8);
+        case 0x24 =>
+            return payloadLength == 8;
+        case 0x25 =>
+            return payloadLength == (4 + bin[1] * 8);
+        case 0x30 =>
+            return payloadLength == 8;
+        case 0x31 =>
+            return payloadLength == 4 && bin[1] == 0;
+        case 0x32 =>
+            return payloadLength == 4 && bin[1] == 0;
+        case 0x40 =>
+            return payloadLength >= 16 && bin[8] == 16;
+        case 0x41 =>
+            return payloadLength >= 16 && bin[8] == 16;
+        case 0x42 =>
+            return payloadLength >= 16 && bin[8] == 16;
+        default =>
+            return false;
+    }
+}

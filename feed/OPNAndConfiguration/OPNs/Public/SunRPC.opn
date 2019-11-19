@@ -1,0 +1,846 @@
+protocol SunRPC with 
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "RPC: Remote Procedure Call Protocol Specification Version 2",
+    ShortName = "SunRPC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 5531"},
+            new Reference{Name = "RFC 4506"},
+            new Reference{Name = "RFC 2203"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "370484", Date = "11/06/2014"}
+        ]
+};
+
+using Utility;
+using UDP;
+using TCP;
+
+endpoint Node over RecordMarking | over SunRpcOverTcp accepts RpcMsg issues RpcMsg;
+
+endpoint SunRpcOverTcp over RecordMarking accepts SunRpcOverTcpHeader issues SunRpcOverTcpHeader
+{
+    map<uint, RpcGssProcT> ProcMapping = {};
+    map<uint, RpcGssServiceT> ServiceMapping = {};
+    
+    SunRPCOverTCPCache AcceptsCache = new SunRPCOverTCPCache{Node = (endpoint Node over this), IsAccepts = true};
+    SunRPCOverTCPCache IssuesCache = new SunRPCOverTCPCache{Node = (endpoint Node over this), IsAccepts = false};
+    
+    process this accepts s:SunRpcOverTcpHeader
+    {
+        AcceptsCache.Add(s);
+        if (s.LastFragment)
+        {
+            SunRPCOverTCPMessageProcessing(AcceptsCache, ref ProcMapping, ref ServiceMapping);
+        }
+    }
+    
+    process this issues s:SunRpcOverTcpHeader
+    {
+        IssuesCache.Add(s);
+        if (s.LastFragment)
+        {
+            SunRPCOverTCPMessageProcessing(IssuesCache, ref ProcMapping, ref ServiceMapping);
+        }
+    }
+}
+
+type SunRPCOverTCPCache
+{
+    array<any message> Origins = [];
+    binary Buffer = $[];
+    Node Node = null;
+    bool IsAccepts = false;
+    
+    void Add(SunRpcOverTcpHeader header)
+    {
+        Buffer += header.Payload;
+        Origins += [header];
+    }
+    
+    void DispatchOriginsToRevive()
+    {
+        foreach (var msg in Origins)
+        {
+            DisplayTopLevelMessage(msg);
+        }
+        Origins = [];
+    }
+
+    void Clear()
+    {
+        DispatchOriginsToRevive();
+        Buffer = $[];
+    }
+}
+
+autostart actor SunRpcOverTcpDestructor(SunRpcOverTcp sunRpcOverTcp)
+{
+    ~endpoint(SunRpcOverTcp sunRpcOverTcp)
+    {
+        if (sunRpcOverTcp.AcceptsCache != null) 
+        {
+            sunRpcOverTcp.AcceptsCache.Clear();
+        }
+        
+        if (sunRpcOverTcp.IssuesCache != null) 
+        {
+            sunRpcOverTcp.IssuesCache.Clear();
+        }
+
+        sunRpcOverTcp.ServiceMapping = {};
+        sunRpcOverTcp.ProcMapping = {};
+    }
+}
+
+endpoint RecordMarking over TCP.Server | over UDP.Host accepts TCP.Segment issues TCP.Segment accepts UDP.Datagram
+{
+    map<uint, RpcGssProcT> ProcMapping = {};
+    map<uint, RpcGssServiceT> ServiceMapping = {};
+
+    uint? ExpectedProgram;
+    set<uint> VerSet = {};
+    set<uint> XidSet = {};
+    
+    TCPDecodingHelper decodingHelper = null;
+
+    process this accepts s:TCP.Segment
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(), "SunRPC", endpoint SunRpcOverTcp over this, 
+                                    IsSunRPCProtocol, IsCompleteSunRPC, 
+                                    (stream s) => BinaryDecoder<SunRpcOverTcpHeader>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<SunRpcOverTcpPartialHeader>(b) as optional any message);
+        }
+        AddXidSet(s.Payload, ref XidSet, true);
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    process this issues s:TCP.Segment
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(), "SunRPC", endpoint SunRpcOverTcp over this, 
+                                    IsSunRPCProtocol, IsCompleteSunRPC, 
+                                    (stream s) => BinaryDecoder<SunRpcOverTcpHeader>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<SunRpcOverTcpPartialHeader>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+        RemoveXidSet(s.Payload, ref XidSet, true);
+    }
+    process this accepts d:UDP.Datagram
+    {
+        SunRPCOverUDPMessageProcessing(this, ref ProcMapping, ref ServiceMapping, d);
+    }
+
+    ~endpoint(RecordMarking server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+        }
+        ProcMapping = {};
+        ServiceMapping = {};
+        VerSet = {};
+        XidSet = {};
+    }
+    bool? IsSunRPCProtocol(binary b)
+    {
+        if (b.Count < 12)
+        {
+            return null;
+        }
+        if (b[8] != 0 || b[9] != 0 || b[10] != 0) // b[8] ~ b[11] is MsgType (0x0000 or 0x0001)
+        {
+            return false;
+        }
+        if (b[11] == 1) // if MsgType is 0x0001, it is a response, b[4] ~ b[7] is Xid
+        {
+            return ((((b[4] << 24) + (b[5] << 16) + (b[6] << 8) + b[7]) as uint) in XidSet);
+        }
+        if (b[11] == 0) // if MsgType is 0x0000, it is a request
+        {
+            if (b.Count < 24)
+            {
+                return null;
+            }
+            if (ExpectedProgram != null) // PortMapper may not assign 'ExpectedProgram', skip comparing it
+            {
+                uint prog = ((b[16] << 24) + (b[17] << 16) + (b[18] << 8) + b[19]) as uint;
+                uint ver = ((b[20] << 24) + (b[21] << 16) + (b[22] << 8) + b[23]) as uint;
+                return (prog == ExpectedProgram) && (ver in VerSet);
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+uint? IsCompleteSunRPC(binary b)
+{
+    stream payloadStream = b;
+    if (payloadStream.ByteLength < 4)
+    {
+        return null;
+    }
+    // Calculate the expected length
+    var uintInBig = BinaryDecoder<UintInBigEndian>(payloadStream.PeekBytes(payloadStream.BitPosition, 4)) as UintInBigEndian;
+    var length = (uintInBig.Value & 0x7FFFFFFF) + 4;
+
+    return length <= payloadStream.ByteLength ? 0 : length;
+}
+
+pattern AuthFlavor = enum int
+{
+    AuthNone      = 0,
+    AuthSys       = 1,
+    AuthShort     = 2,
+    AuthDh        = 3,
+    RpcsecGss     = 6
+    /* and more to be defined */
+};
+
+pattern OpaqueAuthType = enum byte
+{
+    CallCredential   = 0,
+    CallVerifier     = 1,
+    ResponseVerifier = 2
+};
+
+type OpaqueAuth[OpaqueAuthType AuthType]
+{
+    AuthFlavor Flavor;
+    uint BodyLength where value < 400; // Opaque data associated with 'AUTH_NONE' is undefined. It is recommended that the length of the opaque data be zero.
+    //If gss_major is GssSComplete, the verifier's (the verf element in  the response) flavor field is set to RPCSEC_GSS, and the body field set to the checksum of the seq_window (in network order). 
+    ([|Flavor == AuthFlavor.AuthSys|] AuthsysParms
+    | [|Flavor == AuthFlavor.RpcsecGss && AuthType == OpaqueAuthType.CallCredential|] RpcGssCredT
+    | [|AuthType == OpaqueAuthType.CallVerifier || AuthType == OpaqueAuthType.ResponseVerifier|] Checksum[BodyLength]
+    | Blob[BodyLength]
+    ) Body with BinaryEncoding{Length = BodyLength};
+    binary BodyPadding with BinaryEncoding{Length = ((4 - (BodyLength % 4)) % 4)};
+}
+
+pattern MsgType = enum int
+{
+    Call  = 0,
+    Reply = 1
+};
+
+pattern ReplyStat = enum int
+{
+    MsgAccepted = 0,
+    MsgDenied   = 1
+};
+
+pattern AcceptStat = enum int
+{
+    Success       = 0, /* RPC executed successfully       */
+    ProgUnavail   = 1, /* remote hasn't exported program  */
+    ProgMismatch  = 2, /* remote can't support version #  */
+    ProcUnavail   = 3, /* program can't support procedure */
+    GarbageArgs   = 4,  /* procedure can't decode params   */
+    SystemErr     = 5  /* e.g. memory allocation failure  */
+};
+
+pattern RejectStat = enum int
+{
+    RpcMismatch = 0, /* RPC version number != 2          */
+    AuthError   = 1    /* remote can't authenticate caller */
+};
+
+pattern AuthStat = enum int
+{
+    AuthOk           = 0,  /* success                        */
+    /*
+    * failed at remote end
+    */
+    AuthBadcred      = 1,  /* bad credentials (seal broken) */
+    AuthRejectedcred = 2,  /* client must begin new session */
+    AuthBadverf      = 3,  /* bad verifier (seal broken)    */
+    AuthRejectedverf = 4,  /* verifier expired or replayed  */
+    AuthTooweak      = 5,  /* rejected for security reasons */
+    /*
+    * failed locally
+    */
+    AuthInvalidResp  = 6,  /* bogus response verifier        */
+    AuthFailed       = 7,  /* reason unknown                 */
+    /*
+    * AUTH_KERB errors; deprecated.  See [RFC2695]
+    */
+    AuthKerbGeneric  = 8,  /* kerberos generic error */
+    AuthTimeExpire   = 9,  /* time of credential expired */
+    AuthTktFile      = 10, /* problem with ticket file */
+    AuthDecode       = 11, /* can't decode authenticator */
+    AuthNetAddr      = 12, /* wrong net address in ticket */
+    /*
+    * RpcsecGSS GSS related errors
+    */
+    RpcsecGssCredProblem = 13, /* no credentials for user */
+    RpcsecGssCtxProblem = 14   /* problem with context */
+};
+
+message SunRpcOverTcpHeader
+{
+    bool LastFragment with BinaryEncoding{Width = 1};
+    uint FragmentLength with BinaryEncoding{Width = 31};
+    binary Payload with BinaryEncoding{Length = FragmentLength};
+    
+    override string ToString()
+    {
+        return "SunRpcOverTcp Blob" + ", Fragment Length: " + (FragmentLength.ToString());
+    }
+}
+
+message SunRpcOverTcpPartialHeader
+{
+    bool LastFragment with BinaryEncoding{Width = 1};
+    uint FragmentLength with BinaryEncoding{Width = 31};
+    binary Payload with BinaryEncoding{MaxLength = FragmentLength};
+    
+    override string ToString()
+    {
+        return "SunRpcOverTcp Partial Blob";
+    }
+}
+
+message RpcMsg
+{
+    uint Xid;
+    MsgType MType;
+    ([|MType == MsgType.Call|] CallBody | [|MType == MsgType.Reply|] ReplyBody) Body;
+    
+    override string ToString()
+    {
+        string text = null;
+        if (MType == MsgType.Call)
+        {
+            CallBody callBody = Body as CallBody;
+            text = "CALL, Program: " + GetSunRPCKnownPrograms(callBody.Prog) + ", ProgramVersion: " + (callBody.Vers as string) + ", ProcedureNumber: " + (callBody.Proc as string);
+        }
+        else
+        {
+            ReplyBody replyBody = Body as ReplyBody;
+            text = "REPLY, ReplyStatus: ";
+            if (replyBody.Stat == ReplyStat.MsgAccepted)
+            {
+                AcceptedReply acceptedReply = replyBody.Reply as AcceptedReply;
+                text += "MsgAccepted, AcceptedReply: ";
+                switch (acceptedReply.Stat)
+                {
+                    case AcceptStat.Success => text += "Success";
+                    case AcceptStat.ProgUnavail => text += "ProgUnavail";
+                    case AcceptStat.ProgMismatch => text += "ProgMismatch";
+                    case AcceptStat.ProcUnavail => text += "ProcUnavail";
+                    case AcceptStat.GarbageArgs => text += "GarbageArgs";
+                    case AcceptStat.SystemErr => text += "SystemErr";
+                    default => text += "Unknown";
+                }
+            }
+            else if (replyBody.Stat == ReplyStat.MsgDenied)
+            {
+                RejectedReply rejectedReply = replyBody.Reply as RejectedReply;
+                text += "MsgAccepted, RejectedReply: ";
+                switch (rejectedReply.Stat)
+                {
+                    case RejectStat.RpcMismatch => text += "RpcMismatch";
+                    case RejectStat.AuthError => text += "AuthError";
+                    default => text += "Unknown";
+                }
+            }
+        }
+        
+        return text;
+    }
+}
+
+type CallBody
+{
+    uint Rpcvers where ValidationCheck(value == 2, null, "SunRPC: CallBody.Rpcvers must be equal to 2.");
+    uint Prog;
+    uint Vers;
+    uint Proc;
+    OpaqueAuth[OpaqueAuthType.CallCredential] Cred;
+    OpaqueAuth[OpaqueAuthType.CallVerifier] Verf;
+    /* procedure specific parameters start here */
+    // binary CallData; // Maybe RpcGssInitArg, RpcGssNoneData, RpcGssIntegData, RpcGssPrivData when Cred.Flavor == AuthFlavor.RpcsecGss
+    ([|Cred != nothing && Cred.Flavor == AuthFlavor.RpcsecGss && (((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc == RpcGssProcT.RpcsecGssInit || ((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc == RpcGssProcT.RpcsecGssInit)|] RpcGssInitArg
+    | [|Cred != nothing && Cred.Flavor == AuthFlavor.RpcsecGss && ((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc == RpcGssProcT.RpcsecGssData && (((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service == RpcGssServiceT.RpcGssSvcNone)|] RpcGssNoneData
+    | [|Cred != nothing && Cred.Flavor == AuthFlavor.RpcsecGss && ((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc == RpcGssProcT.RpcsecGssData && (((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service == RpcGssServiceT.RpcGssSvcIntegrity)|] RpcGssIntegData
+    | [|Cred != nothing && Cred.Flavor == AuthFlavor.RpcsecGss && ((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc == RpcGssProcT.RpcsecGssData && (((Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service == RpcGssServiceT.RpcGssSvcPrivacy)|] RpcGssPrivData
+    | [|Cred != nothing && Cred.Flavor != AuthFlavor.RpcsecGss|] BinaryCallDataType // WORKAROUND: 24283, Decoder failed when the binary type is selected in OR pattern
+    ) CallData;
+}
+
+// WORKAROUND: 24283, binary used in OR pattern.
+type BinaryCallDataType
+{
+    binary Data;
+}
+
+type ReplyBody
+{
+    ReplyStat Stat;
+    ([|Stat == ReplyStat.MsgAccepted|] AcceptedReply | [|Stat == ReplyStat.MsgDenied|] RejectedReply) Reply;
+}
+
+type MismatchInfo
+{
+    uint Low;
+    uint High;
+}
+
+type AcceptedReply
+{
+    OpaqueAuth[OpaqueAuthType.ResponseVerifier] Verf; // If gss_major is GssSComplete, the verifier's (the verf element in  the response) flavor field is set to RPCSEC_GSS, and the body field set to the checksum of the seq_window (in network order). 
+    AcceptStat Stat;
+    // Ref:RFC2203:
+    // If the status of the message is SUCCESS, the format of the rest of
+    // the message depends on the service specified in the corresponding
+    // request message. Basically, what follows the verifier in this case
+    // are the procedure results, formatted in different ways depending on
+    // the requested service.
+    /*
+     * Void.  Cases include PROG_UNAVAIL, PROC_UNAVAIL,
+     * GARBAGE_ARGS, and SYSTEM_ERR.
+     */
+    optional ([|Stat == AcceptStat.Success && Verf != nothing && Verf.Flavor == AuthFlavor.RpcsecGss|] (RpcGssInitRes | RpcGssNoneData | RpcGssIntegData | RpcGssPrivData)
+    | [|Stat == AcceptStat.ProgMismatch|] MismatchInfo
+    | [|Stat == AcceptStat.Success && Verf != nothing && Verf.Flavor != AuthFlavor.RpcsecGss|] binary
+    )ReplyData with Encoding{Ignore = true};
+}
+
+type RejectedReply
+{
+    // RFC 1831 does not specify the appropriate reply status in this
+    // instance, but common implementation practice appears to be to return
+    // a rejection status of AUTH_ERROR with an auth_stat of
+    // AUTH_REJECTEDCRED.
+    RejectStat Stat;
+    ([|Stat == RejectStat.RpcMismatch|] MismatchInfo | [|Stat == RejectStat.AuthError|] AuthStat) ReplyData;
+}
+
+type AuthsysParms
+{
+    uint Stamp;
+    uint MachineNameLength where value < 255;
+    string Machinename with BinaryEncoding{Length = MachineNameLength};
+    array<byte> MachinenamePadding with BinaryEncoding{Length = ((4 - (MachineNameLength % 4)) % 4)};
+    uint Uid;
+    uint Gid;
+    uint GidsLength where value < 16;
+    array<uint> Gids with BinaryEncoding{Length = GidsLength};
+    // because bytes count in array of uint could always be devided by 4 with no remainder, so no padding here.
+}
+
+/* RpcsecGSS control procedures */
+pattern RpcGssProcT = enum int
+{
+    RpcsecGssData = 0,
+    RpcsecGssInit = 1,
+    RpcsecGssContinueInit = 2,
+    RpcsecGssDestroy = 3
+};
+
+/* RpcsecGSS services */
+pattern RpcGssServiceT = enum int
+{
+    /* Note: the enumerated value for 0 is reserved. */
+    RpcGssSvcNone = 1,
+    RpcGssSvcIntegrity = 2,
+    RpcGssSvcPrivacy = 3
+};
+
+/* Credential */
+type RpcGssCredT
+{
+    uint Version;
+    // WORDAROUND:26954 where precheck for optional fields can't work properly.
+    ([|Version == RpcSecGssVers1|] RpcGssCredVers1T | Utility.Empty) CredData;
+}
+
+/* For Data Request Verifier:  OpaqueAuth Body; and AcceptedReply Verf for create context GssSComplete*/
+type Checksum[uint DataLength]
+{
+    binary ChecksumData with BinaryEncoding{Length = DataLength};
+}
+
+type RpcGssCredVers1T
+{
+    RpcGssProcT GssProc;  /* control procedure */
+    uint SeqNum where ValidationCheck(value < MaxSeq, null, "SunRPC: The SeqNum in type RpcGssCredVers1T can start at any value below MAXSEQ (0x80000000), and must be incremented (by one or more) for successive requests.");  /* sequence number */
+    RpcGssServiceT Service;  /* service used */
+    uint HandleLength;
+    binary Handle with BinaryEncoding{Length = HandleLength};  /* context handle */
+    binary HandlePadding with BinaryEncoding{Length = ((4 - (HandleLength % 4)) % 4)};
+}
+
+/*
+ * Note: version 0 is reserved for possible future
+ * definition of a version negotiation protocol
+ *
+ */
+const uint RpcSecGssVers1 = 1;
+
+/* Maximum sequence number value */
+const uint MaxSeq = 0x80000000;
+
+type RpcGssInitArg
+{
+    uint GssTokenLength;
+    binary GssToken with BinaryEncoding{Length = GssTokenLength};
+    binary GssTokenPadding with BinaryEncoding{Length = ((4 - (GssTokenLength % 4)) % 4)};
+}
+
+type RpcGssInitRes
+{
+    uint HandleLength where ValidationCheck(value > 0, null, "SunRPC: The Handle in type RpcGssInitRes is non-NULL opaque data that serves as the context identifier.");
+    binary Handle with BinaryEncoding{Length = HandleLength};
+    binary HandlePadding with BinaryEncoding{Length = ((4 - (HandleLength % 4)) % 4)};
+    RpcGssMajor GssMajor; // If gss_major is not one of GssSComplete or GssSContinueNeeded, the context setup has failed;
+    uint GssMinor; // The values for the gss_minor field are GSS-API mechanism specific and are defined in the mechanism's specification.
+    uint SeqWindow; // If the last sequence number seen is N, the server is prepared to receive requests with sequence numbers in the range N through (N - seq_window + 1), both inclusive.
+    uint GssTokenLength; // The gss_token field contains any token returned by the GSS_Accept_sec_context() call executed by the server.
+    binary GssToken with BinaryEncoding{Length = GssTokenLength};
+    binary GssTokenPadding with BinaryEncoding{Length = ((4 - (GssTokenLength % 4)) % 4)};
+}
+
+type RpcGssNoneData
+{
+    binary Data;
+}
+
+type RpcGssIntegData
+{
+    // opaque databody_integ<>;
+    uint DatabodyIntegLength;
+    RpcGssDataT[DatabodyIntegLength - 4] DatabodyInteg; // with BinaryEncoding{Length = DatabodyIntegLength};
+    binary DatabodyIntegPadding with BinaryEncoding{Length = ((4 - (DatabodyIntegLength % 4)) % 4)};
+    uint ChecksumLength;
+    // Represents the XDR encoded rpc_gss_data_t structure (note, this is not the checksum of the databody_integ field).
+    // This is obtained using the GSS_GetMIC() call, with the same QOP as was used to compute the header checksum (in the verifier).
+    binary Checksum with BinaryEncoding{Length = ChecksumLength};
+    binary ChecksumPadding with BinaryEncoding{Length = ((4 - (ChecksumLength % 4)) % 4)};
+}
+      
+type RpcGssDataT[uint ArgLength]
+{
+    uint SeqNum; // Here, seq_num must have the same value as in the credential.
+
+    // The type proc_req_arg_t is the procedure specific XDR type describing the procedure arguments (and so is not specified here).
+    // When Server Request Accepted, the proc_res_arg_t - must be substituted in place of the request argument structure proc_req_arg_t.
+    binary ProcArg with BinaryEncoding{Length = ArgLength};
+}
+
+type RpcGssPrivData
+{
+    // opaque databody_priv<>
+    // The GSS_Wrap() call returns an opaque octet stream (representing the encrypted rpc_gss_data_t structure) and its length, and this is encoded as the databody_priv field.
+    uint DatabodyPrivLength;
+    binary DatabodyPriv with BinaryEncoding{Length = DatabodyPrivLength};
+    binary DatabodyPrivPadding with BinaryEncoding{Length = ((4 - (DatabodyPrivLength % 4)) % 4)};
+}
+
+pattern RpcGssMajor = enum uint
+{
+    GssSComplete                = 0x00000000, // Major is this value, means successfully established context.
+    GssSContinueNeeded          = 0x00000001, // Major is this value, means need other information, other values means failure for creating context.
+    GssSDuplicateToken          = 0x00000002,
+    GssSOldToken                = 0x00000004,
+    GssSUnseqToken              = 0x00000008,
+    GssSGapToken                = 0x00000010,
+    GssSBadMech                 = 0x00010000,
+    GssSBadName                 = 0x00020000,
+    GssSBadNameType             = 0x00030000,
+    GssSBadBindings             = 0x00040000,
+    GssSBadStatus               = 0x00050000,
+    GssSBadMic                  = 0x00060000,
+    GssSBadSig                  = 0x00060000,
+    GssSNoCred                  = 0x00070000,
+    GssSNoContext               = 0x00080000,
+    GssSDefectiveToken          = 0x00090000,
+    GssSDefectiveCredential     = 0x000a0000,
+    GssSCredentialsExpired      = 0x000b0000,
+    GssSContextExpired          = 0x000c0000,
+    GssSFailure                 = 0x000d0000,
+    GssSBadQop                  = 0x000e0000,
+    GssSUnauthorized            = 0x000f0000,
+    GssSUnavailable             = 0x00100000,
+    GssSDuplicateElement        = 0x00110000,
+    GssSNameNotMn               = 0x00120000,
+    GssSCallInaccessibleRead    = 0x01000000,
+    GssSCallInaccessibleWrite   = 0x02000000,
+    GssSCallBadStructure        = 0x03000000
+};
+
+static string GetSunRPCKnownPrograms(uint prog)
+{
+    switch (prog)
+    {
+        case 100000 => return "pmapprog portmap rpcbind";
+        case 100003 => return "nfs";
+        case 351455 => return "mapsvr";
+        case 100005 => return "mountprog";
+        case 100021 => return "netlockprog nlockmgr";
+        case 100024 => return "statmon2";
+        default => return prog as string;
+    }
+}
+
+void SunRPCOverUDPMessageProcessing(RecordMarking recMarkingEp, ref map<uint, RpcGssProcT> procMapping, ref map<uint, RpcGssServiceT> serviceMapping, UDP.Datagram d)
+{
+    stream recordStream = d.Payload;
+    switch (recordStream)
+    {
+        case m:RpcMsg from BinaryDecoder<RpcMsg> =>
+            if (m.MType is MsgType.Call)
+            {
+                CallBody callBody = m.Body as CallBody;
+                if (callBody.Cred.Flavor == AuthFlavor.RpcsecGss)
+                {
+                    procMapping[m.Xid] = ((callBody.Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc;
+                    serviceMapping[m.Xid] = ((callBody.Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service;
+                }
+            }
+            else if (m.MType is MsgType.Reply)
+            {
+                ReplyBody replyBody = m.Body as ReplyBody;
+                if (replyBody.Stat == ReplyStat.MsgAccepted)
+                {
+                    int replyBodyBitPosition = recordStream.BitPosition;
+                    AcceptedReply acceptedReply = replyBody.Reply as AcceptedReply;
+                    if (acceptedReply.Stat == AcceptStat.Success && acceptedReply.Verf != nothing && acceptedReply.Verf.Flavor == AuthFlavor.RpcsecGss)
+                    {
+                        if (m.Xid in procMapping)
+                        {
+                            switch (procMapping[m.Xid])
+                            {
+                                case RpcGssProcT.RpcsecGssInit =>
+                                    acceptedReply.ReplyData = BinaryDecoder<RpcGssInitRes>(recordStream);
+                                case RpcGssProcT.RpcsecGssData =>
+                                    if (m.Xid in serviceMapping)
+                                    {
+                                        switch (serviceMapping[m.Xid])
+                                        {
+                                            case RpcGssServiceT.RpcGssSvcNone =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssNoneData>(recordStream) as RpcGssNoneData;
+                                            case RpcGssServiceT.RpcGssSvcIntegrity =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssIntegData>(recordStream);
+                                            case RpcGssServiceT.RpcGssSvcPrivacy =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssPrivData>(recordStream);
+                                            default =>
+                                                throw "SunRPC: Not supported ServiceType for GssData.";
+                                        }
+                                        serviceMapping = serviceMapping.Remove(m.Xid);
+                                    }
+                                    else
+                                    {
+                                        acceptedReply.ReplyData = BinaryDecoder<binary>(recordStream);
+                                    }
+                                default => // Future Reference: RpcsecGssContinueInit && RpcsecGssDestroy
+                                    throw "SunRPC: Not implemented RpcGssProcT: " + (procMapping[m.Xid] as string) + ".";
+                            }
+                            procMapping = procMapping.Remove(m.Xid);
+                        }
+                        else
+                        {
+                            acceptedReply.ReplyData = BinaryDecoder<binary>(recordStream);
+                        }
+                    }
+                    else if (acceptedReply.Stat == AcceptStat.Success && acceptedReply.Verf != nothing)
+                    {
+                        acceptedReply.ReplyData = BinaryDecoder<binary>(recordStream);
+                    }
+                    else if (acceptedReply.Stat == AcceptStat.ProgMismatch)
+                    {
+                        acceptedReply.ReplyData = BinaryDecoder<MismatchInfo>(recordStream);
+                    }
+                    AssociateFieldPosition(acceptedReply, "ReplyData", recordStream, replyBodyBitPosition);
+                }
+            }
+            dispatch (endpoint Node over recMarkingEp) accepts m;
+        default =>
+            ThrowDecodingException("SunRPC", "RpcMsg");
+    }
+}
+
+void SunRPCOverTCPMessageProcessing(SunRPCOverTCPCache overTCPCache, ref map<uint, RpcGssProcT> procMapping, ref map<uint, RpcGssProcT> serviceMapping)
+{
+    assert overTCPCache != null && overTCPCache.Node != null;
+    stream bufferStream = overTCPCache.Buffer;
+    overTCPCache.Buffer = $[];
+    switch (bufferStream)
+    {
+        case m:RpcMsg from BinaryDecoder<RpcMsg> =>
+            if (m.MType is MsgType.Call)
+            {
+                CallBody callBody = m.Body as CallBody;
+                if (callBody.Cred.Flavor == AuthFlavor.RpcsecGss)
+                {
+                    procMapping[m.Xid] = ((callBody.Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).GssProc;
+                    serviceMapping[m.Xid] = ((callBody.Cred.Body as RpcGssCredT).CredData as RpcGssCredVers1T).Service;
+                }
+            }
+            else if (m.MType is MsgType.Reply)
+            {
+                ReplyBody replyBody = m.Body as ReplyBody;
+                if (replyBody.Stat == ReplyStat.MsgAccepted)
+                {
+                    int replyBodyBitPosition = bufferStream.BitPosition;
+                    AcceptedReply acceptedReply = replyBody.Reply as AcceptedReply;
+                    if (acceptedReply.Stat == AcceptStat.Success && acceptedReply.Verf != nothing && acceptedReply.Verf.Flavor == AuthFlavor.RpcsecGss)
+                    {
+                        if (m.Xid in procMapping)
+                        {
+                            switch (procMapping[m.Xid])
+                            {
+                                case RpcGssProcT.RpcsecGssInit =>
+                                    acceptedReply.ReplyData = BinaryDecoder<RpcGssInitRes>(bufferStream);
+                                case RpcGssProcT.RpcsecGssData =>
+                                    if (m.Xid in serviceMapping)
+                                    {
+                                        switch (serviceMapping[m.Xid])
+                                        {
+                                            case RpcGssServiceT.RpcGssSvcNone =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssNoneData>(bufferStream) as RpcGssNoneData;
+                                            case RpcGssServiceT.RpcGssSvcIntegrity =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssIntegData>(bufferStream);
+                                            case RpcGssServiceT.RpcGssSvcPrivacy =>
+                                                acceptedReply.ReplyData = BinaryDecoder<RpcGssPrivData>(bufferStream);
+                                            default =>
+                                                throw "SunRPC: Not supported ServiceType for GssData.";
+                                        }
+                                        serviceMapping = serviceMapping.Remove(m.Xid);
+                                    }
+                                    else
+                                    {
+                                        acceptedReply.ReplyData = BinaryDecoder<binary>(bufferStream);
+                                    }
+                                default => // Future Reference: RpcsecGssContinueInit && RpcsecGssDestroy
+                                    throw "SunRPC: Not implemented RpcGssProcT: " + (procMapping[m.Xid] as string) + ".";
+                            }
+                            procMapping = procMapping.Remove(m.Xid);
+                        }
+                        else
+                        {
+                            acceptedReply.ReplyData = BinaryDecoder<binary>(bufferStream);
+                        }
+                    }
+                    else if (acceptedReply.Stat == AcceptStat.Success && acceptedReply.Verf != nothing)
+                    {
+                        acceptedReply.ReplyData = BinaryDecoder<binary>(bufferStream);
+                    }
+                    else if (acceptedReply.Stat == AcceptStat.ProgMismatch)
+                    {
+                        acceptedReply.ReplyData = BinaryDecoder<MismatchInfo>(bufferStream);
+                    }
+                    AssociateFieldPosition(acceptedReply, "ReplyData", bufferStream, replyBodyBitPosition);
+                }
+            }
+            m.Origins = overTCPCache.Origins;
+            if (overTCPCache.IsAccepts)
+            {
+                dispatch overTCPCache.Node accepts m;
+            }
+            else
+            {
+                dispatch overTCPCache.Node issues m;
+            }
+            overTCPCache.Origins = [];
+        default =>
+            overTCPCache.Clear();
+            ThrowDecodingException("SunRPC", "RpcMsg");
+    }
+}
+
+// Used for TCP processing rule of actor, not used by DC
+bool IsSunRPCRequest(binary b, set<uint> verSet, uint expectedProgram, ref bool isSunRPCFlag)
+{
+    if (isSunRPCFlag)
+    {
+        return true;
+    }
+    if (b.Count < 24)
+    {
+        return false;
+    }
+    isSunRPCFlag = b[8] == 0 && b[9] == 0 && b[10] == 0 && b[11] == 0 && 
+        (((b[16] << 24) + (b[17] << 16) + (b[18] << 8) + b[19]) as uint) == expectedProgram &&
+        (((b[20] << 24) + (b[21] << 16) + (b[22] << 8) + b[23]) as uint) in verSet;
+    return isSunRPCFlag;
+}
+// Used for assistant check for SunRpc to avoid port competition. Only for TCP processing rule of actor.
+bool IsSunRPC(binary payload, ref bool isSunRPCAssist)
+{
+    if (isSunRPCAssist)
+    {
+        return true;
+    }
+    if (payload.Count < 12)
+    {
+        return false;
+    }
+    isSunRPCAssist = payload[8] == 0 && payload[9] == 0 && payload[10] == 0 && (payload[11] == 0 || payload[11] == 1);
+    return isSunRPCAssist;
+}
+
+// Used for UDP
+bool IsSunRPCRequest(binary b, set<uint> verSet, uint expectedProgram)
+{
+    return ((b.Count >= 20) && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 0 &&
+        (((b[12] << 24) + (b[13] << 16) + (b[14] << 8) + b[15]) as uint) == expectedProgram &&
+        (((b[16] << 24) + (b[17] << 16) + (b[18] << 8) + b[19]) as uint) in verSet);
+}
+// Used for UDP
+bool IsSunRPCResponse(binary b, ref set<uint> xidSet)
+{
+    return ((b.Count >= 8) && b[4] == 0 && b[5] == 0 && b[6] == 0 && b[7] == 1 &&
+            (((b[0] << 24) + (b[1] << 16) + (b[2] << 8) + b[3]) as uint) in xidSet);
+}
+// used for assistant check for SunRpc to avoid port competition in UDP processing rule
+bool IsSunRPC(binary payload)
+{
+    if (payload.Count < 8)
+    {
+        return false;
+    }
+    return payload[4] == 0 && payload[5] == 0 && payload[6] == 0 && (payload[7] == 0 || payload[7] == 1);
+}
+
+void AddXidSet(binary payload, ref set<uint> xidSet, bool isTCP)
+{
+    int index = isTCP ? 4 : 0;
+    if (payload.Count < index + 4)
+        return;
+    
+    binary b = payload.Segment(index, 4);
+    uint bUint = BinaryPrimitiveTypeDecoder<uint>(b, Endian.Big) as uint;
+    if (!(bUint in xidSet))
+    {
+        xidSet[bUint] = true;
+    }
+}
+
+void RemoveXidSet(binary payload, ref set<uint> xidSet, bool isTCP)
+{
+    int index = isTCP ? 4 : 0;
+    if (payload.Count < index + 4)
+        return;
+    
+    binary b = payload.Segment(index, 4);
+    uint bUint = BinaryPrimitiveTypeDecoder<uint>(b, Endian.Big) as uint;
+    if (bUint in xidSet)
+    {
+        xidSet[bUint] = false;
+    }
+}

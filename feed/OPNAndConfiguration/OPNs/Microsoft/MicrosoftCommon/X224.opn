@@ -1,0 +1,802 @@
+protocol X224 with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Open Systems Interconnection - Protocol for providing the connection-mode transport service",
+    ShortName = "X224",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 905"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376455", Date = "04/03/2015"}
+        ]
+};
+
+using Standard;
+using IANA;
+using Utility;
+using ISOTS;
+using Configurations;
+
+annotation int TPDU#ClassType;
+annotation bool TPDU#Extended;
+annotation ushort TPDU#TpduSourcePort;
+annotation ushort TPDU#TpduDestinationPort;
+
+endpoint Server 
+    over ReassemblyServer 
+    accepts TPDU issues TPDU;
+    
+client endpoint Client connected to Server;
+
+endpoint ReassemblyServer 
+    over ISOTS.Server 
+    accepts TPDU issues TPDU
+{
+    map<byte, TPDU> DataArray = {};
+    map<byte, TPDU> DataNormalArray = {};
+    map<uint, TPDU> DataExtensionArray = {};
+    map<byte, TPDU> ExDataArray = {};
+    map<uint, TPDU> ExDataExtensionArray = {};
+    
+    process this accepts tpdu:TPDU 
+        where (tpdu is ConnectionRequest || tpdu is DisconnectRequest || tpdu is TPDUError || 
+            tpdu is DataAcknowledgement || tpdu is DataAcknowledgementExtension || tpdu is ExpeditedDataAcknowledgement)
+    {
+        dispatch (endpoint Server over this) accepts tpdu;
+    }
+    
+    process this issues tpdu:TPDU 
+        where (tpdu is ConnectionConfirm || tpdu is DisconnectConfirm || tpdu is TPDUError 
+            || tpdu is DataAcknowledgement || tpdu is DataAcknowledgementExtension || tpdu is ExpeditedDataAcknowledgement)
+    {
+        dispatch (endpoint Server over this) issues tpdu;
+    }
+    
+    process this accepts tpdu:TPDU where (tpdu is Data || tpdu is DataNormal || tpdu is EXpeditedData)
+    {
+        RessembleAndDispatchNormalData(ref DataArray, ref DataNormalArray, ref ExDataArray, AcceptsDispatch, ref tpdu, this);
+    }
+    
+    process this issues tpdu:TPDU where (tpdu is Data || tpdu is DataNormal || tpdu is EXpeditedData)
+    {
+        RessembleAndDispatchNormalData(ref DataArray, ref DataNormalArray, ref ExDataArray, IssuesDispatch, ref tpdu, this);
+    }
+    
+    process this accepts tpdu:TPDU where (tpdu is DataExtension || tpdu is EXpeditedDataExtension)
+    {
+        RessembleAndDispatchExtenData(ref DataExtensionArray, ref ExDataExtensionArray, AcceptsDispatch, ref tpdu, this);
+    }
+    
+    process this issues tpdu:TPDU where (tpdu is DataExtension || tpdu is EXpeditedDataExtension)
+    {
+        RessembleAndDispatchExtenData(ref DataExtensionArray, ref ExDataExtensionArray, IssuesDispatch, ref tpdu, this);
+    }
+    
+    void AcceptsDispatch(TPDU tpdu, ReassemblyServer node)
+    {
+        dispatch (endpoint Server over node) accepts tpdu;
+    }
+    
+    void IssuesDispatch(TPDU tpdu, ReassemblyServer node)
+    {
+        dispatch (endpoint Server over node) issues tpdu;
+    }
+}
+
+void RessembleAndDispatchNormalData(ref map<byte, TPDU> dataArray, ref map<byte, TPDU> dataNormalArray, 
+    ref map<byte, TPDU> exDataArray, void (TPDU, ReassemblyServer)dispatcher, ref TPDU tpdu, ReassemblyServer node)
+{
+    byte key = 0;
+    binary userdata = $[];
+    if (tpdu is Data)
+    {
+        Data data = tpdu as Data;
+        if (data.EOT != true)
+        {
+            dataArray[data.SequenceNumber] = data;
+        }
+        else
+        {
+            if (dataArray == {})
+            {
+                dispatcher(tpdu, node);
+            }
+            else
+            {
+                while (key < data.SequenceNumber)
+                {
+                    if (key in dataArray.Keys)
+                    {
+                        // WORKAROUND: can't user the right type in map.
+                        TPDU tempTpdu = dataArray[key];
+                        Data tempData = tempTpdu as Data;
+                        userdata = userdata + tempData.UserData;
+                        key = (key + 1) as byte;
+                    }
+                    else
+                    {
+                        dataArray = {};
+                        break;
+                    }
+                }
+                if (key == data.SequenceNumber)
+                {
+                    Data dataRessemble = new Data
+                    {
+                        LengthIndicator = data.LengthIndicator,
+                        DataTransferCode = data.DataTransferCode,
+                        EOT = true,
+                        SequenceNumber = data.SequenceNumber,
+                        UserData = userdata + data.UserData,
+                    };
+                    dispatcher(dataRessemble, node);
+                    dataArray = {};
+                }
+            }
+        }
+    }
+    
+    else if (tpdu is DataNormal)
+    {
+        DataNormal dataNormal = tpdu as DataNormal;
+        if (dataNormal.EOT != true)
+        {
+            dataNormalArray[dataNormal.SequenceNumber] = dataNormal;
+        }
+        else
+        {
+            if (dataNormalArray == {})
+            {
+                dispatcher(tpdu, node);
+            }
+            else
+            {
+                while (key < dataNormal.SequenceNumber)
+                {
+                    if (key in dataNormalArray.Keys)
+                    {
+                        // WORKAROUND: can't user the right type in map.
+                        TPDU tempTpdu = dataNormalArray[key];
+                        DataNormal tempData = tempTpdu as DataNormal;
+                        userdata = userdata + tempData.UserData;
+                        key = (key + 1) as byte;
+                    }
+                    else
+                    {
+                        dataNormalArray = {};
+                        break;
+                    }
+                }
+                if (key == dataNormal.SequenceNumber)
+                {
+                    DataNormal dataNorRessemble = new DataNormal
+                    {
+                        LengthIndicator = dataNormal.LengthIndicator,
+                        DataTransferCode = dataNormal.DataTransferCode,
+                        DestinationReference = dataNormal.DestinationReference,
+                        EOT = true,
+                        SequenceNumber = dataNormal.SequenceNumber,
+                        VariablePart = dataNormal.VariablePart,
+                        UserData = userdata + dataNormal.UserData
+                    };
+                    dispatcher(dataNorRessemble, node);
+                    dataNormalArray = {};
+                }
+            }
+        }
+    }
+    
+    else if (tpdu is EXpeditedData)
+    {
+        EXpeditedData exData = tpdu as EXpeditedData;
+        if (exData.EOT != true)
+        {
+            exDataArray[exData.SequenceNumber] = exData;
+        }
+        else
+        {
+            if (exDataArray == {})
+            {
+                dispatcher(tpdu, node);
+            }
+            else
+            {
+                while (key < exData.SequenceNumber)
+                {
+                    if (key in exDataArray.Keys)
+                    {
+                        // WORKAROUND: can't user the right type in map.
+                        TPDU tempTpdu = exDataArray[key];
+                        EXpeditedData tempData = tempTpdu as EXpeditedData;
+                        userdata = userdata + tempData.UserData;
+                        key = (key + 1) as byte;
+                    }
+                    else
+                    {
+                        exDataArray = {};
+                        break;
+                    }
+                }
+                if (key == exData.SequenceNumber)
+                {
+                    EXpeditedData exDataRessemble = new EXpeditedData
+                    {
+                        LengthIndicator = exData.LengthIndicator,
+                        ExpeditedDataCode = exData.ExpeditedDataCode,
+                        DestinationReference = exData.DestinationReference,
+                        EOT = true,
+                        SequenceNumber = exData.SequenceNumber,
+                        VariablePart = exData.VariablePart,
+                        UserData = userdata + exData.UserData
+                    };
+                    dispatcher(exDataRessemble, node);
+                    exDataArray = {};
+                }
+            }
+        }
+    }
+}
+
+void RessembleAndDispatchExtenData(ref map<uint, TPDU> dataExtensionArray, ref map<uint, TPDU> exDataExtensionArray, 
+    void (TPDU, ReassemblyServer)dispatcher, ref TPDU tpdu, ReassemblyServer node)
+{
+    uint key = 0;
+    binary userdata = $[];
+    if (tpdu is DataExtension)
+    {
+        DataExtension dataExten = tpdu as DataExtension;
+        if (dataExten.EOT != true)
+        {
+            dataExtensionArray[dataExten.SequenceNumber] = dataExten;
+        }
+        else
+        {
+            if (dataExtensionArray == {})
+            {
+                dispatcher(tpdu, node);
+            }
+            else
+            {
+                while (key < dataExten.SequenceNumber)
+                {
+                    if (key in dataExtensionArray.Keys)
+                    {
+                        // WORKAROUND: can't user the right type in map.
+                        TPDU tempTpdu = dataExtensionArray[key];
+                        DataExtension tempData = tempTpdu as DataExtension;
+                        userdata = userdata + tempData.UserData;
+                        key++;
+                    }
+                    else
+                    {
+                        dataExtensionArray = {};
+                        break;
+                    }
+                }
+                if (key == dataExten.SequenceNumber)
+                {
+                    DataExtension dataExtenRessemble = new DataExtension
+                    {
+                        LengthIndicator = dataExten.LengthIndicator,
+                        DataTransferCode = dataExten.DataTransferCode,
+                        DestinationReference = dataExten.DestinationReference,
+                        EOT = true,
+                        SequenceNumber = dataExten.SequenceNumber,
+                        VariablePart = dataExten.VariablePart,
+                        UserData = userdata + dataExten.UserData
+                    };
+                    dispatcher(dataExtenRessemble, node);
+                    dataExtensionArray = {};
+                }
+            }
+        }
+    }
+    else
+    {
+        EXpeditedDataExtension exdataExten = tpdu as EXpeditedDataExtension;
+        if (exdataExten.EOT != true)
+        {
+            exDataExtensionArray[exdataExten.SequenceNumber] = exdataExten;
+        }
+        else
+        {
+            if (exDataExtensionArray == {})
+            {
+                dispatcher(tpdu, node);
+            }
+            else
+            {
+                while (key < exdataExten.SequenceNumber)
+                {
+                    if (key in exDataExtensionArray.Keys)
+                    {
+                        // WORKAROUND: can't user the right type in map.
+                        TPDU tempTpdu = exDataExtensionArray[key];
+                        EXpeditedDataExtension tempData = tempTpdu as EXpeditedDataExtension;
+                        userdata = userdata + tempData.UserData;
+                        key++;
+                    }
+                    else
+                    {
+                        exDataExtensionArray = {};
+                        break;
+                    }
+                }
+                if (key == exdataExten.SequenceNumber)
+                {
+                    EXpeditedDataExtension exdataExtenRessemble = new EXpeditedDataExtension
+                    {
+                        LengthIndicator = exdataExten.LengthIndicator,
+                        ExpeditedDataCode = exdataExten.ExpeditedDataCode,
+                        DestinationReference = exdataExten.DestinationReference,
+                        EOT = true,
+                        SequenceNumber = exdataExten.SequenceNumber,
+                        VariablePart = exdataExten.VariablePart,
+                        UserData = userdata + exdataExten.UserData
+                    };
+                    dispatcher(exdataExtenRessemble, node);
+                    exDataExtensionArray = {};
+                }
+            }
+        }
+    }
+}
+
+autostart actor ReassemblyServerActor(ReassemblyServer reassemblyServer)
+{
+    ~endpoint(ReassemblyServer reassemblyServer)
+    {
+        // map<byte, TPDU> DataArray
+        DispatchOriginsToRevive<byte>(ref reassemblyServer.DataArray);
+        
+        // map<byte, TPDU> DataNormalArray
+        DispatchOriginsToRevive<byte>(ref reassemblyServer.DataNormalArray);
+        
+        // map<uint, TPDU> DataExtensionArray
+        DispatchOriginsToRevive<uint>(ref reassemblyServer.DataExtensionArray);
+        
+        // map<byte, TPDU> ExDataArray
+        DispatchOriginsToRevive<byte>(ref reassemblyServer.ExDataArray);
+        
+        // map<uint, TPDU> ExDataExtensionArray
+        DispatchOriginsToRevive<uint>(ref reassemblyServer.ExDataExtensionArray);
+    }
+}
+
+void DispatchOriginsToRevive<T>(ref map<T, TPDU> origins)
+{
+    if ((origins.Values).Count > 0)
+    {
+        foreach (var msg in origins.Values)
+        {
+            ReportInsufficientData(null, DiagnosisLevel.Error, "X224: Insufficient fragments for full reassembly.");
+            DisplayTopLevelMessage(msg);
+        }
+        origins = {};
+    }
+}
+
+const set<ushort> X224Port = {Port.Netmeeting, Port.RDP};
+
+autostart actor X224OverISOTS(ISOTS.Server server)
+{
+    int ClassType = -1;
+    bool Extended = false;
+    bool FlowControl = false;
+    RDPConfiguration config = GetConfigurableValue<RDPConfiguration>();
+    
+    process server accepts tpkt:ISOTS.TPKT 
+        where tpkt#DestinationPort is desPort:ushort && tpkt#SourcePort is srcPort:ushort && 
+            (X224Port[desPort] || desPort in config.Ports || X224Port[srcPort] || srcPort in config.Ports)
+    {
+        if (TPDUDecoder(tpkt.TPDU, ref ClassType, ref Extended) is tpdu:TPDU)
+        {
+            tpdu#TpduDestinationPort = desPort;
+            tpdu#TpduSourcePort = srcPort;
+            dispatch (endpoint ReassemblyServer over server) accepts tpdu;
+        }
+        else
+        {
+            ThrowDecodingException("X224", "TPDU");
+        }
+    }
+    
+    process server issues tpkt:ISOTS.TPKT 
+        where tpkt#SourcePort is srcPort:ushort && tpkt#DestinationPort is desPort:ushort &&
+            (X224Port[srcPort] || srcPort in config.Ports || X224Port[desPort] || desPort in config.Ports)
+    {
+        if (TPDUDecoder(tpkt.TPDU, ref ClassType, ref Extended) is tpdu:TPDU)
+        {
+            tpdu#TpduDestinationPort = desPort;
+            tpdu#TpduSourcePort = srcPort;
+            dispatch (endpoint ReassemblyServer over server) issues tpdu;
+        }
+        else
+        {
+            ThrowDecodingException("X224", "TPDU");
+        }
+    }
+}
+
+optional TPDU TPDUDecoder(binary binaryValue, ref int classType, ref bool extended)
+{
+    if (binaryValue.Count <= 2)
+    {
+        ThrowDecodingException("TPDU");
+    }
+    
+    stream s = binaryValue;
+    optional any tpduAny = nothing;
+    switch (binaryValue[1] & 0xF0)
+    {
+        // Connection Request TPDU
+        case 0xE0 =>
+            if (BinaryDecoder<ConnectionRequest>(s) is cr:ConnectionRequest)
+            {
+                switch (cr.ClassOption & 0xF0)
+                {
+                    // 0000 Class 0
+                    // 0001 Class 1
+                    // 0010 Class 2
+                    // 0011 Class 3
+                    // 0100 Class 4
+                    case 0x00 => classType = 0;
+                    case 0x10 => classType = 1;
+                    case 0x20 => classType = 2;
+                    case 0x30 => classType = 3;
+                    case 0x40 => classType = 4;
+                    default =>;
+                }
+                extended = (cr.ClassOption & 0x02) > 0;
+                tpduAny = cr;
+            }
+        // Connection Confirm
+        case 0xD0 =>
+            if (BinaryDecoder<ConnectionConfirm>(s) is cc:ConnectionConfirm)
+            {
+                switch (cc.ClassOption & 0xF0)
+                {
+                    // 0000 Class 0
+                    // 0001 Class 1
+                    // 0010 Class 2
+                    // 0011 Class 3
+                    // 0100 Class 4
+                    case 0x00 => classType = 0;
+                    case 0x10 => classType = 1;
+                    case 0x20 => classType = 2;
+                    case 0x30 => classType = 3;
+                    case 0x40 => classType = 4;
+                    default =>;
+                }
+                extended = (cc.ClassOption & 0x02) > 0;
+                tpduAny = cc;
+            }
+        // Reject (RJ) TPDU
+        case 0x50 => tpduAny = extended ? BinaryDecoder<RejectExtension>(s) : BinaryDecoder<RejectNormal>(s);
+        // Data Acknowledgement (AK)
+        case 0x60 => tpduAny = extended ? BinaryDecoder<DataAcknowledgementExtension>(s) : BinaryDecoder<DataAcknowledgement>(s);
+        // Disconnect Request
+        case 0x80 => tpduAny = BinaryDecoder<DisconnectRequest>(s);
+        // Disconnect Confirm
+        case 0xC0 => tpduAny = BinaryDecoder<DisconnectConfirm>(s);
+        // User Data
+        case 0xF0 => tpduAny = classType <= 1 ? BinaryDecoder<Data>(s) : (extended ? BinaryDecoder<DataExtension>(s) : BinaryDecoder<DataNormal>(s));
+        // Expedited Data
+        case 0x10 => tpduAny = extended ? BinaryDecoder<EXpeditedDataExtension>(s) : BinaryDecoder<EXpeditedData>(s);
+        // Expedited Data Acknowledgement 
+        case 0x20 => tpduAny = extended ? BinaryDecoder<ExpeditedDataAcknowledgementExtension>(s) : BinaryDecoder<ExpeditedDataAcknowledgement>(s);
+        // TPDU Error
+        case 0x70 => tpduAny = BinaryDecoder<TPDUError>(s);
+        default =>;
+    }
+    
+    return tpduAny != nothing ? (tpduAny as TPDU) : nothing;
+}
+
+array<ParameterEntry> VariablePartDecode(stream binaryValue, int len)
+{
+    array<ParameterEntry> parameterEntries = [];
+    if (len <= 0)
+    {
+        return parameterEntries;
+    }
+    else
+    {
+        while (len > 0)
+        {
+            var oentry = BinaryDecoder<ParameterEntry>(binaryValue);
+            if (oentry != nothing)
+            {
+                ParameterEntry entry = oentry as ParameterEntry;
+                len = len - entry.ParameterLength - 2;
+                parameterEntries += [entry];
+            }
+            else
+            {
+                break;
+            }
+        }
+        return parameterEntries;
+    }
+}
+
+message TPDU
+{}
+
+// 13.3  Connection Request (CR) TPDU
+message ConnectionRequest : TPDU
+{
+    byte LengthIndicator;
+    byte ConnectionRequestCode with BinaryEncoding{Width = 4};
+    byte CDT with BinaryEncoding{Width = 4};
+    ushort DestinationReference where ValidationCheck(value == 0, this, "Set to zero.");
+    ushort SourceReference;
+    byte ClassOption;
+    optional [|RemainingBitLength(stream) >= 8 && CurrentByte(stream) >= 0x80 && LengthIndicator - 6 > 0|] VariablePart[LengthIndicator - 6] VariablePart;
+    optional [|RemainingBitLength(stream) >= 8|] binary UserData;
+    
+    override string ToString()
+    {
+        return "Connection Request";
+    }
+}
+
+// 13.4  Connection Confirm (CC) TPDU
+message ConnectionConfirm : TPDU
+{
+    byte LengthIndicator;
+    byte ConnectionConfirmCode with BinaryEncoding{Width = 4};
+    byte CDT with BinaryEncoding{Width = 4};
+    ushort DestinationReference;
+    ushort SourceReference;
+    byte ClassOption;
+    optional [|RemainingBitLength(stream) >= 8 && CurrentByte(stream) >= 0x80 && LengthIndicator - 6 > 0|] VariablePart[LengthIndicator - 6] VariablePart;
+    optional [|RemainingBitLength(stream) >= 8|] binary UserData;
+    
+    override string ToString()
+    {
+        return "Connection Confirm";
+    }
+}
+
+// 13.5  Disonnect Request (DR) TPDU
+message DisconnectRequest : TPDU
+{
+    byte LengthIndicator;
+    byte DisconnectRequestCode;
+    ushort DestinationReference;
+    ushort SourceReference;
+    byte Reason;
+    optional [|LengthIndicator - 6 > 0|] VariablePart[LengthIndicator - 6] VariablePart;
+    optional [|RemainingBitLength(stream) >= 8|] binary UserData;
+    
+    override string ToString()
+    {
+        return "Disonnect Request";
+    }
+}
+
+// 13.6  Disconnect Confirm (DC) TPDU
+message DisconnectConfirm : TPDU
+{
+    byte LengthIndicator;
+    byte DisconnectRequestCode;
+    ushort DestinationReference;
+    ushort SourceReference;
+    optional [|LengthIndicator - 5 > 0|] VariablePart[LengthIndicator - 5] VariablePart;
+    
+    override string ToString()
+    {
+        return "Disonnect Confirm";
+    }
+}
+
+// 13.7  Data (DT) TPDU
+message Data : TPDU
+{
+    byte LengthIndicator;
+    byte DataTransferCode;
+    bool EOT with BinaryEncoding{Width = 1};
+    byte SequenceNumber with BinaryEncoding{Width = 7};
+    binary UserData;
+    
+    override string ToString()
+    {
+        return "Data";
+    }
+}
+
+message DataNormal : TPDU
+{
+    byte LengthIndicator;
+    byte DataTransferCode;
+    ushort DestinationReference;
+    bool EOT with BinaryEncoding{Width = 1};
+    byte SequenceNumber with BinaryEncoding{Width = 7};
+    optional [|LengthIndicator - 4 > 0|] VariablePart[LengthIndicator - 4] VariablePart;
+    binary UserData;
+    
+    override string ToString()
+    {
+        return "Data Normal";
+    }
+}
+
+message DataExtension : TPDU
+{
+    byte LengthIndicator;
+    byte DataTransferCode;
+    ushort DestinationReference;
+    bool EOT with BinaryEncoding{Width = 1};
+    uint SequenceNumber with BinaryEncoding{Width = 31};
+    optional [|LengthIndicator - 7 > 0|] VariablePart[LengthIndicator - 7] VariablePart;
+    binary UserData;
+    
+    override string ToString()
+    {
+        return "Data Extension";
+    }
+}
+
+// 13.8  Expedited Data (ED) TPDU
+message EXpeditedData : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedDataCode;
+    ushort DestinationReference;
+    bool EOT with BinaryEncoding{Width = 1};
+    byte SequenceNumber with BinaryEncoding{Width = 7};
+    optional [|LengthIndicator - 4 > 0|] VariablePart[LengthIndicator - 4] VariablePart;
+    binary UserData;
+    
+    override string ToString()
+    {
+        return "EXpedited Data";
+    }
+}
+
+message EXpeditedDataExtension : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedDataCode;
+    ushort DestinationReference;
+    bool EOT with BinaryEncoding{Width = 1};
+    uint SequenceNumber with BinaryEncoding{Width = 31};
+    optional [|LengthIndicator - 7 > 0|] VariablePart[LengthIndicator - 7] VariablePart;
+    binary UserData;
+    
+    override string ToString()
+    {
+        return "EXpedited Data Extension";
+    }
+}
+
+// 13.9  Data Acknowledgement (AK) TPDU
+message DataAcknowledgementExtension : TPDU
+{
+    byte LengthIndicator;
+    byte AcknowledgementCode;
+    ushort DestinationReference;
+    uint SequenceNumberACK where ValidationCheck((value & 0x80000000) == 0, this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+    ushort CDT;
+    optional [|LengthIndicator - 9 > 0|] VariablePart[LengthIndicator - 9] VariablePart;
+    
+    override string ToString()
+    {
+        return "Data Acknowledgement Extension";
+    }
+}
+
+message DataAcknowledgement : TPDU
+{
+    byte LengthIndicator;
+    byte AcknowledgementCode with BinaryEncoding{Width = 4};
+    byte CDT with BinaryEncoding{Width = 4};
+    ushort DestinationReference;
+    byte SequenceNumberACK where ValidationCheck(value < 128, this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+    optional [|LengthIndicator - 4 > 0|] VariablePart[LengthIndicator - 4] VariablePart;
+    
+    override string ToString()
+    {
+        return "Data Acknowledgement";
+    }
+}
+
+// 13.10  Expedited Data Acknowledgement (EA) TPDU
+message ExpeditedDataAcknowledgement : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedAcknowledgementCode;
+    ushort DestinationReference;
+    byte SequenceNumberACK where ValidationCheck(value < 128, this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+    optional [|LengthIndicator - 4 > 0|] VariablePart[LengthIndicator - 4] VariablePart;
+    
+    override string ToString()
+    {
+        return "Expedited Data Acknowledgement";
+    }
+}
+
+message ExpeditedDataAcknowledgementExtension : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedAcknowledgementCode;
+    ushort DestinationReference;
+    uint SequenceNumberACK where ValidationCheck((value & 0x80000000) == 0, this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+    optional [|LengthIndicator - 7 > 0|] VariablePart[LengthIndicator - 7] VariablePart;
+    
+    override string ToString()
+    {
+        return "Expedited Data Acknowledgement Extension";
+    }
+}
+
+// 13.11  Reject (RJ) TPDU
+message RejectNormal : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedAcknowledgementCode with BinaryEncoding{Width = 4};
+    byte CDT with BinaryEncoding{Width = 4};
+    ushort DestinationReference;
+    byte SequenceNumberACK where ValidationCheck(value < 128, this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+        
+    override string ToString()
+    {
+        return "Reject Normal";
+    }
+}
+
+message RejectExtension : TPDU
+{
+    byte LengthIndicator;
+    byte ExpeditedAcknowledgementCode;
+    ushort DestinationReference;
+    uint SequenceNumberACK where ValidationCheck((value & 0x80000000) == 0 , this, 
+        "Bit 8 of octet 5 is not significant and should take the value zero.");
+    ushort CDT;
+        
+    override string ToString()
+    {
+        return "Reject Extension";
+    }
+}
+
+// 13.12  TPDU Error (ER) TPDU
+message TPDUError : TPDU
+{
+    byte LengthIndicator;
+    byte TPDUErrorCode;
+    ushort DestinationReference;
+    byte RejectCause;
+    optional [|LengthIndicator - 4 > 0|] VariablePart[LengthIndicator - 4] VariablePart;
+        
+    override string ToString()
+    {
+        return "TPDU Error";
+    }
+}
+
+type VariablePart[int Length]
+{
+    array<ParameterEntry> ParameterEntries with BinaryEncoding{WidthForComposedType = Length * 8};
+}
+
+type ParameterEntry
+{
+    byte ParameterCode;
+    byte ParameterLength;
+    array<byte> ParameterValue with BinaryEncoding {Length = ParameterLength};
+}

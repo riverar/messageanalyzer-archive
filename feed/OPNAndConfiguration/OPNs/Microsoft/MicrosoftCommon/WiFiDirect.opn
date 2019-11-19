@@ -1,0 +1,1230 @@
+protocol WiFiDirect with 
+BinaryEncodingDefaults {Endian = Endian.Little, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "WiFi Peer-to-Peer Protocol",
+    ShortName = "WiFiDirect",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "IEEE Std 802.11", Version = "2007 Edition", Link = "http://standards.ieee.org/getieee802/download/802.11-2007.pdf"},
+        new Reference{Name = "Wi-Fi Peer-to-Peer(P2P)", Version = "1.1"},
+        new Reference{Name = "Wi-Fi Protected Setup Specification", Version = "1.0"}
+    ],
+    RevisionSummary = 
+    [
+        new Revision{Class = RevisionClass.Major, Version="381817", Date="09/23/2015"}
+    ]
+};
+
+using Standard;
+using Utility;
+using WiFi;
+using MicrosoftCommonResources;
+using WPS;
+
+endpoint Node over WiFi.Node
+    accepts mutable NoticeOfAbsence
+    accepts mutable P2PPresenceRequest
+    accepts mutable P2PPresenceResponse
+    accepts mutable GODiscoverabilityRequest
+    accepts mutable GONegotiationRequest
+    accepts mutable GONegotiationResponse
+    accepts mutable GONegotiationConfirmation
+    accepts mutable P2PInvitationRequest
+    accepts mutable P2PInvitationResponse
+    accepts mutable DeviceDiscoverabilityRequest
+    accepts mutable DeviceDiscoverabilityResponse
+    accepts mutable ProvisionDiscoveryRequest
+    accepts mutable ProvisionDiscoveryResponse;
+
+const binary P2PIEOUI = $[506F9A];
+const byte P2POUIType = 0x09;
+
+// Decode the P2PIE contained in an array of WiFi.InformationField, will perform reassembly if needed. 
+void ExtendP2PIEInIEArray(ref array<WiFi.InformationField> elements)
+{
+    array<WiFi.InformationField> newInformationElement = [];
+    binary p2pIEData = $[];
+    foreach (WiFi.InformationField e in elements)
+    {
+        if (e is vsi:WiFi.VendorSpecificInformation && vsi.OUI == P2PIEOUI &&
+            vsi.VendorSpecificContent is data:binary && data[0] == P2POUIType)
+        {
+            // reassemble the data in multiple IEs.
+            p2pIEData += data.Segment(1);
+        }
+        else
+        {
+            newInformationElement += [e];
+        }
+    }
+    
+    if (p2pIEData.Count > 0)
+    {
+        // add Element information before the binary
+        p2pIEData = $[DD] + (p2pIEData.Count as ushort).ToBinary(true) +
+            P2PIEOUI + P2POUIType.ToBinary() + p2pIEData;
+
+        switch (p2pIEData)
+        {
+            case p2pIE:P2PIE from BinaryDecoder<P2PIE> =>
+                newInformationElement += [p2pIE];
+            default =>
+                ThrowDecodingException("WiFiDirect", "P2PAttributeArray");
+        }
+        
+        // update information element
+        elements = newInformationElement;
+    }
+}
+
+// Pef can't deal with shadow actor correctly, will file a bug later.
+// "follows WPSOverWiFiNode" is a workaround, remove "follows WPSOverWiFiNode" after pef bug fix
+autostart actor WiFiDirectOverWiFi(WiFi.Node node) follows WPSOverWiFiNode
+{
+    // Parse Management Frames
+    observe node accepts m:WiFiMessage
+    {
+        if (m.Body is beaconFrame:WiFi.BeaconFrame)
+        {
+            ExtendP2PIEInIEArray(ref beaconFrame.InformationElements);
+        }
+        else if (m.Body is probeRequestFrame:WiFi.ProbeRequestFrame)
+        {
+            ExtendP2PIEInIEArray(ref probeRequestFrame.InformationElements);
+        }
+        else if (m.Body is probeResponseFrame:WiFi.ProbeResponseFrame)
+        {
+            ExtendP2PIEInIEArray(ref probeResponseFrame.InformationElements);
+        }
+        else if (m.Body is associationRequestFrame:WiFi.AssociationRequestFrame)
+        {
+            ExtendP2PIEInIEArray(ref associationRequestFrame.InformationElements);
+        }
+        else if (m.Body is reassociationRequestFrame:WiFi.ReassociationRequestFrame)
+        {
+            ExtendP2PIEInIEArray(ref reassociationRequestFrame.InformationElements);
+        }
+        else if (m.Body is associationResponseFrame:WiFi.AssociationResponseFrame)
+        {
+            ExtendP2PIEInIEArray(ref associationResponseFrame.InformationElements);
+        }
+        else if (m.Body is reassociationResponseFrame:WiFi.ReassociationResponseFrame)
+        {
+            ExtendP2PIEInIEArray(ref reassociationResponseFrame.InformationElements);
+        }
+        else if (m.Body is deauthentication:WiFi.Deauthentication)
+        {
+            ExtendP2PIEInIEArray(ref deauthentication.InformationElements);
+        }
+        else if (m.Body is disassociationFrame:WiFi.DisassociationFrame)
+        {
+            ExtendP2PIEInIEArray(ref disassociationFrame.InformationElements);
+        }
+    }
+    
+    // P2P public action frames
+    process node accepts m:WiFiMessage where (m.Body is pub:WiFi.PublicActionFrame && pub.Action is vspf:WiFi.VendorSpecificForPublic &&
+        vspf.OUI == P2PIEOUI && vspf.Content.Count >= 3 && vspf.Content[0] == P2POUIType)
+    {
+        var frame = m.Body as WiFi.PublicActionFrame;
+        var action = frame.Action as WiFi.VendorSpecificForPublic;
+        GeneralP2PPublicActionBase p2pActionMessage = null;
+        switch (action.Content[1]) // subtype
+        {
+            case P2PPublicAtcionFrameType.GONegotiationRequest => 
+                if (BinaryDecoder<GONegotiationRequest>(action.Content) is goNegotiationRequest:GONegotiationRequest)
+                {
+                    p2pActionMessage = goNegotiationRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "GONegotiationRequest");
+                }
+            case P2PPublicAtcionFrameType.GONegotiationResponse => 
+                if (BinaryDecoder<GONegotiationResponse>(action.Content) is goNegotiationResponse:GONegotiationResponse)
+                {
+                    p2pActionMessage = goNegotiationResponse;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "GONegotiationResponse");
+                }
+            case P2PPublicAtcionFrameType.GONegotiationConfirmation => 
+                if (BinaryDecoder<GONegotiationConfirmation>(action.Content) is goNegotiationConfirmation:GONegotiationConfirmation)
+                {
+                    p2pActionMessage = goNegotiationConfirmation;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "GONegotiationConfirmation");
+                }
+            case P2PPublicAtcionFrameType.P2PInvitationRequest => 
+                if (BinaryDecoder<P2PInvitationRequest>(action.Content) is p2pInvitationRequest:P2PInvitationRequest)
+                {
+                    p2pActionMessage = p2pInvitationRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "P2PInvitationRequest");
+                }
+            case P2PPublicAtcionFrameType.P2PInvitationResponse => 
+                if (BinaryDecoder<P2PInvitationResponse>(action.Content) is p2PInvitationResponse:P2PInvitationResponse)
+                {
+                    p2pActionMessage = p2PInvitationResponse;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "P2PInvitationResponse");
+                }
+            case P2PPublicAtcionFrameType.DeviceDiscoverabilityRequest => 
+                if (BinaryDecoder<DeviceDiscoverabilityRequest>(action.Content) is deviceDiscoverabilityRequest:DeviceDiscoverabilityRequest)
+                {
+                    p2pActionMessage = deviceDiscoverabilityRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "DeviceDiscoverabilityRequest");
+                }
+            case P2PPublicAtcionFrameType.DeviceDiscoverabilityResponse => 
+                if (BinaryDecoder<DeviceDiscoverabilityResponse>(action.Content) is deviceDiscoverabilityResponse:DeviceDiscoverabilityResponse)
+                {
+                    p2pActionMessage = deviceDiscoverabilityResponse;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "DeviceDiscoverabilityResponse");
+                }
+            case P2PPublicAtcionFrameType.ProvisionDiscoveryRequest => 
+                if (BinaryDecoder<ProvisionDiscoveryRequest>(action.Content) is provisionDiscoveryRequest:ProvisionDiscoveryRequest)
+                {
+                    p2pActionMessage = provisionDiscoveryRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "ProvisionDiscoveryRequest");
+                }
+            case P2PPublicAtcionFrameType.ProvisionDiscoveryResponse => 
+                if (BinaryDecoder<ProvisionDiscoveryResponse>(action.Content) is provisionDiscoveryResponse:ProvisionDiscoveryResponse)
+                {
+                    p2pActionMessage = provisionDiscoveryResponse;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "ProvisionDiscoveryResponse");
+                }
+            default =>
+                ThrowDecodingException("WiFiDirect", "P2PPublicAtcionFrame");
+        }
+
+        p2pActionMessage.Category = action.Category;
+        p2pActionMessage.Action = action.Action;
+        p2pActionMessage.OUI = action.OUI;
+        // extend information element
+        ExtendP2PIEInIEArray(ref p2pActionMessage.Elements);
+        dispatch (endpoint Node over node) accepts p2pActionMessage;
+    }
+    
+    // P2P action frames
+    process node accepts m:WiFiMessage where (m.Body is vsa:WiFi.VendorSpecificActionFrame && vsa.Action.OUI == P2PIEOUI &&
+        vsa.Action.Content.Count > 3 && vsa.Action.Content[0] == P2POUIType)
+    {
+        var frame = m.Body as WiFi.VendorSpecificActionFrame;
+        GeneralP2PActionBase p2pActionMessage = null;
+        switch (frame.Action.Content[0])
+        {
+            case P2PActionFrameType.NoticeOfAbsence =>
+                if (BinaryDecoder<NoticeOfAbsence>(frame.Action.Content) is noticeOfAbsence:NoticeOfAbsence)
+                {
+                    p2pActionMessage = noticeOfAbsence;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "NoticeOfAbsence");
+                }
+            case P2PActionFrameType.P2PPresenceRequest =>
+                if (BinaryDecoder<P2PPresenceRequest>(frame.Action.Content) is p2PPresenceRequest:P2PPresenceRequest)
+                {
+                    p2pActionMessage = p2PPresenceRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "P2PPresenceRequest");
+                }
+            case P2PActionFrameType.P2PPresenceResponse =>
+                if (BinaryDecoder<P2PPresenceResponse>(frame.Action.Content) is p2PPresenceResponse:P2PPresenceResponse)
+                {
+                    p2pActionMessage = p2PPresenceResponse;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "P2PPresenceResponse");
+                }
+            case P2PActionFrameType.GODiscoverabilityRequest =>
+                if (BinaryDecoder<GODiscoverabilityRequest>(frame.Action.Content) is goDiscoverabilityRequest:GODiscoverabilityRequest)
+                {
+                    p2pActionMessage = goDiscoverabilityRequest;
+                }
+                else
+                {
+                    ThrowDecodingException("WiFiDirect", "GODiscoverabilityRequest");
+                }
+            default =>
+                ThrowDecodingException("WiFiDirect", "P2PActionFrame");
+        }
+
+        p2pActionMessage.Category = frame.Action.Category;
+        p2pActionMessage.OUI = frame.Action.OUI;
+
+        // extend information element
+        ExtendP2PIEInIEArray(ref p2pActionMessage.Elements);
+        dispatch (endpoint Node over node) accepts p2pActionMessage;
+    }
+}
+
+// 4.1.1 P2P IE Format
+type P2PIE : VendorSpecificInformation
+{
+    new ushort Length;
+    new optional binary VendorSpecificContent with Encoding{Ignore = true};
+    byte OUIType;
+    array<P2PAttribute> P2PAttributes;
+}
+
+pattern AttributeID = enum byte
+{
+    Status = 0,
+    MinorReasonCode = 1,
+    P2PCapability = 2,
+    P2PDeviceID = 3,
+    GroupOwnerIntent = 4,
+    ConfigurationTimeout = 5,
+    ListenChannel = 6,
+    P2PGroupBSSID = 7,
+    ExtendedListenTiming = 8,
+    IntendedP2PInterfaceAddress = 9,
+    P2PManageability = 10,
+    ChannelList = 11,
+    NoticeOfAbsence = 12,
+    P2PDeviceInfo = 13,
+    P2PGroupInfo = 14,
+    P2PGroupID = 15,
+    P2PGroupInterface = 16,
+    OperatingChannel = 17,
+    InvitationFlags = 18,
+    VendorSpecific = 221,
+    ...
+};
+
+type AttributeBase
+{
+    AttributeID AttributeID;
+    ushort Length;
+}
+
+type GeneralP2PAttribute : AttributeBase
+{
+    binary Body with BinaryEncoding{Length = Length};
+}
+
+// 4.1.2 Status attribute
+pattern StatusCode = enum byte
+{
+    Success = 0,
+    CurrentlyUnavailable = 1,
+    IncompatibleParameters = 2,
+    LimitReached = 3,
+    InvalidParameters = 4,
+    UnableToAccommodateRequest = 5,
+    ProtocolErrorOrDiscruptiveBehavior = 6,
+    NoCommonChannels = 7,
+    UnknownP2PGroup = 8,
+    ErrorInGroupOwnerNegotiation = 9,
+    IncompatibleProvisioningMethod = 10,
+    RejectedByUser = 11,
+    ...
+};
+
+type Status : AttributeBase
+{
+    StatusCode StatusCode;
+    invariant AttributeID == 0;
+    
+    string GetSummary()
+    {
+        switch (StatusCode)
+        {
+            case StatusCode.Success => return "Status: Success";
+            case StatusCode.CurrentlyUnavailable => return "Status: Fail(CurrentlyUnavailable)";
+            case StatusCode.IncompatibleParameters => return "Status: Fail(IncompatibleParameters)";
+            case StatusCode.LimitReached => return "Status: Fail(LimitReached)";
+            case StatusCode.InvalidParameters => return "Status: Fail(InvalidParameters)";
+            case StatusCode.UnableToAccommodateRequest => return "Status: Fail(UnableToAccommodateRequest)";
+            case StatusCode.ProtocolErrorOrDiscruptiveBehavior => return "Status: Fail(ProtocolErrorOrDiscruptiveBehavior)";
+            case StatusCode.NoCommonChannels => return "Status: Fail(NoCommonChannels)";
+            case StatusCode.UnknownP2PGroup => return "Status: Fail(UnknownP2PGroup)";
+            case StatusCode.ErrorInGroupOwnerNegotiation => return "Status: Fail(ErrorInGroupOwnerNegotiation)";
+            case StatusCode.IncompatibleProvisioningMethod => return "Status: Fail(IncompatibleProvisioningMethod)";
+            case StatusCode.RejectedByUser => return "Status: Fail(RejectedByUser)";
+            default => return "Status: Reserved";
+        }
+    }
+}
+
+// 4.1.3 Minor Reason Code attribute
+type MinorReasonCode : AttributeBase
+{
+    byte MinorReasonCode;
+    invariant AttributeID == 1;
+}
+
+// 4.1.4 P2P Capability attribute
+pattern DeviceCapabilityBitmapDefinition = flags byte
+{
+    ServiceDiscovery = 0x01,
+    P2PClientDiscoverability = 0x02,
+    ConcurrentOperation = 0x04,
+    P2PInfrastructureManaged = 0x08,
+    P2PDeviceLimit = 0x10,
+    P2PInvitationProcedure = 0x20,
+    ...
+};
+
+pattern GroupCapabilityBitmapDefinition = flags byte
+{
+    P2PGroupOwner = 0x01,
+    PersistentP2PGroup = 0x02,
+    P2PGroupLimit = 0x04,
+    IntraBSSDistribution = 0x08,
+    CrossConnection = 0x10,
+    PersistentReconnect = 0x20,
+    GroupFormation = 0x40,
+    ...
+};
+
+type P2PCapability : AttributeBase
+{
+    DeviceCapabilityBitmapDefinition DeviceCapabilityBitmap;
+    GroupCapabilityBitmapDefinition GroupCapabilityBitmap;
+    invariant AttributeID == 2;
+}
+
+// 4.1.5 P2P Device ID attribute
+type P2PDeviceID : AttributeBase
+{
+    Utility.MacAddress P2PDeviceAddress;
+    invariant AttributeID == 3;
+    
+    string GetSummary()
+    {
+        return "P2PDeviceID: P2PDeviceAddress = " + (P2PDeviceAddress as string);
+    }
+}
+
+// 4.1.6 Group Owner Intent attribute
+type GroupOwnerIntentAttribute_GOIntent
+{
+    byte Intent with BinaryEncoding{Width = 7};
+    byte TieBreaker with BinaryEncoding{Width = 1};
+}
+
+type GroupOwnerIntent : AttributeBase
+{
+    GroupOwnerIntentAttribute_GOIntent GOIntent;
+    invariant AttributeID == 4;
+    
+    string GetSummary()
+    {
+        return "GroupOwnerIntent: TieBreaker = " + (GOIntent.TieBreaker as string) + ", Intent = " + (GOIntent.Intent as string);
+    }
+}
+
+// 4.1.7 Configuration Timeout attribute
+type ConfigurationTimeout : AttributeBase
+{
+    byte GOConfigurationTimeout;
+    byte ClientConfigurationTimeout;
+    invariant AttributeID == 5;
+}
+
+// 4.1.8 Listen Channel attribute
+// WORKAROUND: bug#57548, when using BinaryDecoder<A|B>(data) , it will report ValidationCheck 
+// error information of Type A, even if it can not be decoded as Type A actually.
+//type ListenChannel : AttributeBase
+//{
+    //binary CountryString where ValidationCheck(value[2] == 0x04, null, WiFiDirect_STR_1)
+        //with BinaryEncoding{Length = 3};
+    //byte OperatingClass;
+    //byte ChannelNumber;
+    //invariant AttributeID == 6;
+//}
+
+type ListenChannel
+{
+    (AttributeID where value == 6) AttributeID;
+    ushort Length;
+    binary CountryString where ValidationCheck(value[2] == 0x04, null, WiFiDirect_STR_1)
+        with BinaryEncoding{Length = 3};
+    byte OperatingClass;
+    byte ChannelNumber;
+}
+
+// 4.1.9 P2P Group BSSID attribute
+type P2PGroupBSSID : AttributeBase
+{
+    Utility.MacAddress P2PGroupBSSID;
+    invariant AttributeID == 7;
+    
+    string GetSummary()
+    {
+        return "P2PGroupBSSID: " + P2PGroupBSSID.ToString();
+    }
+}
+
+// 4.1.10 Extended Listen Timing attribute
+type ExtendedListenTiming : AttributeBase
+{
+    ushort AvailabilityPeriod;
+    ushort AvailabilityInterval;
+    invariant AttributeID == 8;
+}
+
+// 4.1.11 Intended P2P Interface Address attribute
+type IntendedP2PInterfaceAddress : AttributeBase
+{
+    Utility.MacAddress P2PInterfaceAddress;
+    invariant AttributeID == 9;
+}
+
+// 4.1.12 P2P Manageability attribute
+pattern P2PManageability_ManageabilityBitmap = flags byte
+{
+    P2PDeviceManagement = 0x01, // The WLAN AP supports Managed P2P Device
+    CrossConnectionPermitted = 0x02, // The WLAN AP permits P2P Concurrent Devices to offer cross connection
+    CoexistenceOptional = 0x04, // The Primary P2P Coexistence Parameters and recommended secondary P2P Coexistence Parameters advertised by the WLAN AP are not required.
+    ...
+};
+
+type P2PManageability : AttributeBase
+{
+    P2PManageability_ManageabilityBitmap ManageabilityBitmap;
+    invariant AttributeID == 10;
+}
+
+// 4.1.13 Channel List attribute
+type ChannelEntry
+{
+    byte OperatingClass;
+    byte NumberOfChannels;
+    array<byte> ChannelList with BinaryEncoding{Length = NumberOfChannels};
+}
+
+// WORKAROUND: bug#57548, when using BinaryDecoder<A|B>(data) , it will report ValidationCheck 
+// error information of Type A, even if it can not be decoded as Type A actually.
+type ChannelList
+{
+    (AttributeID where value == 11) AttributeID;
+    ushort Length;
+    binary CountryString where ValidationCheck(value[2] == 0x04, null, WiFiDirect_STR_1)
+        with BinaryEncoding{Length = 3};
+    array<ChannelEntry> ChannelEntryList with BinaryEncoding{WidthForComposedType = (Length - 3) * 8};
+}
+
+// 4.1.14 Notice of Absence attribute
+type NoticeOfAbsence_CTWindowAndOppPSParameters
+{
+    byte CTWindow with BinaryEncoding{Width = 7};
+    byte OppPS with BinaryEncoding{Width =1};
+}
+
+type NoticeOfAbsence_NoticeOfAbsenceDescriptor
+{
+    byte CountType;
+    uint Duration;
+    uint Interval;
+    uint StartTime;
+}
+
+type NoticeOfAbsenceAttr : AttributeBase
+{
+    byte Index;
+    NoticeOfAbsence_CTWindowAndOppPSParameters CTWindowAndOppPSParameters;
+    array<NoticeOfAbsence_NoticeOfAbsenceDescriptor> NoticeOfAbsenceDescriptors with BinaryEncoding{Length = (Length - 2) / 13};
+    invariant AttributeID == 12;
+    
+    string GetSummary()
+    {
+        return "NoticeOfAbsence, Index: " + (Index as string) + ", OppPS: " + (CTWindowAndOppPSParameters.OppPS as string);
+    }
+}
+
+// B.2 Primary Device Type
+pattern PrimaryDeviceType_CategoryID = enum ushort
+{
+    Computer = 1,
+    InputDevice = 2,
+    PrintersScannersFaxesAndCopiers = 3,
+    Camera = 4,
+    Storage = 5,
+    NetworkInfrastructure = 6,
+    Displays = 7,
+    MultimediaDevices = 8,
+    GamingDevices = 9,
+    Telephone = 10,
+    AudioDevices = 11,
+    Others = 255,
+    ...
+};
+
+pattern ComputerSubCategory = enum ushort
+{
+    PC = 1,
+    Server = 2,
+    MediaCenter = 3,
+    UltramobilePC = 4,
+    Notebook = 5,
+    Desktop = 6,
+    MID = 7,
+    Netbook = 8,
+    ...
+};
+
+pattern InputDeviceSubCategory = enum ushort
+{
+    Keyboard = 1,
+    Mouse = 2,
+    Joystick = 3,
+    Trackball = 4,
+    GamingController = 5,
+    Remote = 6,
+    Touchscreen = 7,
+    BiometricReader = 8,
+    BarcodeReader = 9,
+    ...
+};
+
+pattern PrintersScannersFaxesAndCopiersSubCategory = enum ushort
+{
+    PrinterOrPrinterServer = 1,
+    Scanner = 2,
+    Fax =3,
+    Copier = 4,
+    AllInOne = 5,
+    ...
+};
+
+pattern CameraSubCategory = enum ushort
+{
+    DigitalStillCamera = 1,
+    VideoCamera = 2,
+    WebCamera = 3,
+    SecurityCamera = 4,
+    ...
+};
+
+pattern StorageSubCategory = enum ushort
+{
+    NAS = 1,
+    ...
+};
+
+pattern NetworkInfrastructureSubCategory = enum ushort
+{
+    AP = 1,
+    Router = 2,
+    Switch = 3,
+    Gateway = 4,
+    ...
+};
+
+pattern DisplaysSubCategory = enum ushort
+{
+    Television = 1,
+    ElectronicPictureFrame = 2,
+    Projector = 3,
+    Monitor = 4,
+    ...
+};
+
+pattern MultimediaDevicesSubCategory = enum ushort
+{
+    DAR = 1,
+    PVR = 2,
+    MCX = 3,
+    SetTopBox = 4,
+    MediaServerMediaAdapterMediaExtender = 5,
+    PortableVideoPlayer = 6,
+    ...
+};
+
+pattern GamingDevicesSubCategory = enum ushort
+{
+    Xbox = 1,
+    Xbox360 = 2,
+    Playstation = 3,
+    GameConsoleGameConsoleAdapter = 4,
+    PortableGamingDevice = 5,
+    ...
+};
+
+pattern TelephoneSubCategory = enum ushort
+{
+    WindowsMobile = 1,
+    PhoneSingleMode = 2,
+    PhoneDualMode = 3,
+    SmartphoneSingleMode = 4,
+    SmartphoneDualMode = 5,
+    ...
+};
+
+pattern AudioDevicesSubCategory = enum ushort
+{
+    AudioTunerReceiver = 1,
+    Speakers = 2,
+    PortableMusicPlayer = 3,
+    Headset = 4,
+    Headphones = 5,
+    Microphone = 6,
+    ...
+};
+
+type PrimaryDeviceType
+{
+    PrimaryDeviceType_CategoryID CategoryID;
+    uint OUI with DisplayInfo{ToText = UInt2Hex};
+    ([|CategoryID == PrimaryDeviceType_CategoryID.Computer|] ComputerSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.InputDevice|] InputDeviceSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.PrintersScannersFaxesAndCopiers|] PrintersScannersFaxesAndCopiersSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.Camera|] CameraSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.Storage|] StorageSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.NetworkInfrastructure|] NetworkInfrastructureSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.Displays|] DisplaysSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.MultimediaDevices|] MultimediaDevicesSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.GamingDevices|] GamingDevicesSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.Telephone|] TelephoneSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.AudioDevices|] AudioDevicesSubCategory | 
+    [|CategoryID == PrimaryDeviceType_CategoryID.Others|] ushort
+    ) SubCategoryID;
+}
+with BinaryEncodingDefaults {Endian = Endian.Big};
+
+// Wi-Fi Protected Setup Specification Version 1.0h, section 11. Data Element Definitions
+// Secondary Device Type List
+typedef SecondaryDeviceType = PrimaryDeviceType;
+
+// Config Methods
+pattern ConfigMethods = flags ushort
+{
+    USBA = 0x0001,
+    Ethernet = 0x0002,
+    Label = 0x0004,
+    Display = 0x0008,
+    ExternalNFCToken = 0x0010,
+    IntegratedNFCToken = 0x0020,
+    NFCInterface = 0x0040,
+    PushButton = 0x0080,
+    Keypad = 0x0100
+} with BinaryEncoding{Endian = Endian.Big};
+
+// Wi-Fi Protected Setup Specification Version 1.0h, section 7.1. Wi-Fi Protected Setup TLV Data Format
+type WiFiProtectedSetupTLV
+{
+    ushort AttributeType with DisplayInfo{ToText = UShort2Hex};
+    ushort DataLength;
+    string Data with BinaryEncoding{Length = DataLength};
+}
+with BinaryEncodingDefaults {Endian = Endian.Big};
+ 
+// 4.1.15 P2P Device Info attribute
+type P2PDeviceInfo : AttributeBase
+{
+    Utility.MacAddress P2PDeviceAddress;
+    ConfigMethods ConfigMethods
+        with DisplayInfo{ToText = UShort2Hex};
+    PrimaryDeviceType PrimaryDeviceType;
+    byte NumberOfSecondaryDeviceTypes;
+    optional [|NumberOfSecondaryDeviceTypes > 0|] array<SecondaryDeviceType> SecondaryDeviceTypeList with BinaryEncoding{Length = NumberOfSecondaryDeviceTypes, Endian = Endian.Big};
+    WiFiProtectedSetupTLV DeviceName with BinaryEncoding{WidthForComposedType = (Length - 17 - 8 * NumberOfSecondaryDeviceTypes) * 8};
+    invariant AttributeID == 13;
+    
+    string GetSummary()
+    {
+        return "P2PDeviceAddress: " + P2PDeviceAddress.ToString();
+    }
+}
+
+// 4.1.16 P2P Group Info attribute
+type P2PClientInfoDescriptor
+{
+    byte Length;
+    Utility.MacAddress P2PDeviceAddress;
+    Utility.MacAddress P2PInterfaceAddress;
+    DeviceCapabilityBitmapDefinition DeviceCapabilityBitmap;
+    ConfigMethods ConfigMethods with BinaryEncoding{Endian = Endian.Big}
+        with DisplayInfo{ToText = UShort2Hex};
+    PrimaryDeviceType PrimaryDeviceType;
+    byte NumberOfSecondaryDeviceTypes;
+    optional [|NumberOfSecondaryDeviceTypes > 0|] array<SecondaryDeviceType> SecondaryDeviceTypeList with BinaryEncoding{Length = NumberOfSecondaryDeviceTypes, Endian = Endian.Big};
+    WiFiProtectedSetupTLV DeviceName with BinaryEncoding{WidthForComposedType = (Length - 24 - 8 * NumberOfSecondaryDeviceTypes) * 8};
+}
+
+type P2PGroupInfo : AttributeBase
+{
+    Utility.MacAddress P2PDeviceAddress;
+    array<P2PClientInfoDescriptor> P2PClientInfoDescriptors with BinaryEncoding{Length = Length};
+    invariant AttributeID == 14;
+}
+
+// 4.1.17 P2P Group ID attribute
+type P2PGroupID : AttributeBase
+{
+    Utility.MacAddress P2PDeviceAddress;
+    optional [|Length - 6 > 0|]string SSID with BinaryEncoding{Length = (Length - 6)};
+    invariant AttributeID == 15;
+    
+    string GetSummary()
+    {
+        return "P2PGroupID: " + P2PDeviceAddress.ToString();
+    }
+}
+
+// 4.1.18 P2P Interface attribute
+type P2PInterface : AttributeBase
+{
+    Utility.MacAddress P2PDeviceAddress;
+    byte P2PInterfaceAddressCount;
+    array<Utility.MacAddress> P2PDeviceAddressList with BinaryEncoding{Length = P2PInterfaceAddressCount};
+    invariant AttributeID == 16;
+}
+
+// 4.1.19 Operating Channel attribute
+// WORKAROUND: bug#57548, when using BinaryDecoder<A|B>(data) , it will report ValidationCheck 
+// error information of Type A, even if it can not be decoded as Type A actually.
+type OperatingChannel
+{
+    (AttributeID where value == 17) AttributeID;
+    ushort Length;
+    binary CountryString where ValidationCheck(value[2] == 0x04, null, WiFiDirect_STR_1)
+        with BinaryEncoding{Length = 3};
+    byte OperatingClass;
+    byte ChannelNumber;
+}
+
+// 4.1.20 Invitation Flags attribute
+pattern InvitationFlagsBitmap = flags byte
+{
+    InvitationType = 0x01, // Set to 1 to indicate a P2P Invitation Request to re-invoke a Persistent Group, set to 0 to indicate a P2P Invitation Request to join an active P2P Group.
+    ...
+};
+
+type InvitationFlags : AttributeBase
+{
+    WiFiDirect.InvitationFlagsBitmap InvitationFlagsBitmap;
+    invariant AttributeID == 18;
+}
+
+pattern P2PAttribute = [|stream.RemainingByteLength > 1|]
+(
+    [|stream.CurrentByte == 0|] Status |
+    [|stream.CurrentByte == 1|] MinorReasonCode |
+    [|stream.CurrentByte == 2|] P2PCapability |
+    [|stream.CurrentByte == 3|] P2PDeviceID |
+    [|stream.CurrentByte == 4|] GroupOwnerIntent |
+    [|stream.CurrentByte == 5|] ConfigurationTimeout |
+    [|stream.CurrentByte == 6|] ListenChannel |
+    [|stream.CurrentByte == 7|] P2PGroupBSSID |
+    [|stream.CurrentByte == 8|] ExtendedListenTiming |
+    [|stream.CurrentByte == 9|] IntendedP2PInterfaceAddress |
+    [|stream.CurrentByte == 10|] P2PManageability |
+    [|stream.CurrentByte == 11|] ChannelList |
+    [|stream.CurrentByte == 12|] NoticeOfAbsenceAttr |
+    [|stream.CurrentByte == 13|] P2PDeviceInfo |
+    [|stream.CurrentByte == 14|] P2PGroupInfo |
+    [|stream.CurrentByte == 15|] P2PGroupID |
+    [|stream.CurrentByte == 16|] P2PInterface |
+    [|stream.CurrentByte == 17|] OperatingChannel |
+    [|stream.CurrentByte == 18|] InvitationFlags |
+    GeneralP2PAttribute);
+
+type P2PAttributeArray
+{
+    array<P2PAttribute> Attributes;
+}
+
+// 4.2.8.1 General format
+pattern P2PPublicAtcionFrameType = enum byte
+{
+    GONegotiationRequest = 0,
+    GONegotiationResponse = 1,
+    GONegotiationConfirmation = 2,
+    P2PInvitationRequest = 3,
+    P2PInvitationResponse = 4,
+    DeviceDiscoverabilityRequest = 5,
+    DeviceDiscoverabilityResponse = 6,
+    ProvisionDiscoveryRequest = 7,
+    ProvisionDiscoveryResponse = 8,
+    ...
+};
+
+message GeneralP2PPublicActionBase
+{
+    byte Category with Encoding{Ignore = true};
+    byte Action with Encoding{Ignore = true};
+    binary OUI with Encoding{Ignore = true};
+    byte OUIType;
+    P2PPublicAtcionFrameType OUISubtype;
+    byte DialogToken where ValidationCheck(value > 0, this, "WiFiDirect: DialogToken field of GeneralP2PPublicActionFrame should set to a nonzero value.");
+    array<WiFi.InformationField> Elements;
+}
+
+// This type is defined for manually decoding use.
+type P2PIEOrVendorSpecificIEArray
+{
+    array<WiFi.InformationField> Elements;
+}
+
+// 4.2.8.2 Go Negotiation Request frame
+message GONegotiationRequest : GeneralP2PPublicActionBase
+{
+    override string ToString()
+    {
+        string summary = "GoNegotiationRequest, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is P2PDeviceInfo)
+                {
+                    summary += ", Group Owner Negotiate with a P2P Device: " + (a as P2PDeviceInfo).P2PDeviceAddress.ToString();
+                }
+                else if (a is GroupOwnerIntent)
+                {
+                    summary += ", " + (a as GroupOwnerIntent).GetSummary();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8.3 Go Negotiation Response Frame
+message GONegotiationResponse : GeneralP2PPublicActionBase 
+{
+    override string ToString()
+    {
+        string summary = "GONegotiationResponse, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is Status)
+                {
+                    summary += ", " + (a as Status).GetSummary();
+                }
+                else if (a is GroupOwnerIntent)
+                {
+                    summary += ", " + (a as GroupOwnerIntent).GetSummary();
+                }
+                else if (a is P2PDeviceInfo)
+                {
+                    summary += ", " + (a as P2PDeviceInfo).GetSummary();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8.3 Go Negotiation Confirmation frame
+message GONegotiationConfirmation : GeneralP2PPublicActionBase 
+{
+    override string ToString()
+    {
+        string summary = "GONegotiationConfirmation, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is Status)
+                {
+                    summary += ", " + (a as Status).GetSummary();
+                }
+                else if (a is P2PGroupID)
+                {
+                    summary += ", " + (a as P2PGroupID).GetSummary();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8.5 P2P Invitation Request frame
+message P2PInvitationRequest : GeneralP2PPublicActionBase 
+{
+    override string ToString()
+    {
+        string summary = "P2PInvitationRequest, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is P2PDeviceInfo)
+                {
+                    summary += ", Invitate a P2P Device: " + (a as P2PDeviceInfo).P2PDeviceAddress.ToString();
+                }
+                else if (a is P2PGroupID)
+                {
+                    summary += " to join the P2P Group: " + (a as P2PGroupID).P2PDeviceAddress.ToString();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8.6 P2P Invitation Response frame
+message P2PInvitationResponse : GeneralP2PPublicActionBase 
+{
+    override string ToString()
+    {
+        string summary = "P2PInvitationResponse, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is Status)
+                {
+                    summary += ", " + (a as Status).GetSummary();
+                    break;
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8. Device Discoverability Request frame
+message DeviceDiscoverabilityRequest : GeneralP2PPublicActionBase
+{
+    override string ToString()
+    {
+        string summary = "DeviceDiscoverabilityRequest, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is P2PDeviceID)
+                {
+                    summary += ", Discover a P2P Device: " + (a as P2PDeviceID).P2PDeviceAddress.ToString();
+                }
+                else if (a is P2PGroupID)
+                {
+                    summary += " in the P2P Group: " + (a as P2PGroupID).P2PDeviceAddress.ToString();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8. Device Discoverability Response frame
+message DeviceDiscoverabilityResponse : GeneralP2PPublicActionBase
+{
+    override string ToString()
+    {
+        string summary = "DeviceDiscoverabilityResponse, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = p2pIE.P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is Status)
+                {
+                    summary += ", " + (a as Status).GetSummary();
+                    break;
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.8.9 Provision Discovery Request frame
+message ProvisionDiscoveryRequest : GeneralP2PPublicActionBase
+{
+    override string ToString()
+    {
+        string summary = "ProvisionDiscoveryRequest, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is p2pIE:P2PIE)
+            {
+                attrs = (ie as P2PIE).P2PAttributes;
+            }
+            
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is P2PDeviceInfo)
+                {
+                    summary += ", Provision for a P2P Device: " + (a as P2PDeviceInfo).P2PDeviceAddress.ToString();
+                }
+                else if (a is P2PGroupID)
+                {
+                    summary += " in the P2P Group: " + (a as P2PGroupID).P2PDeviceAddress.ToString();
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+type VendorSpecificInformationArray
+{
+    array<WiFi.VendorSpecificInformation> IEArray;
+}
+
+// 4.2.8.10 Provision Discovery Response frame
+message ProvisionDiscoveryResponse : GeneralP2PPublicActionBase
+{
+    override string ToString()
+    {
+        string summary = "ProvisionDiscoveryResponse, DialogToken: " + (DialogToken as string);
+        return summary;
+    }
+}
+
+// 4.2.9 P2P action frame
+// 4.2.9.1 General format
+message GeneralP2PActionBase
+{
+    byte Category with Encoding{Ignore = true};
+    binary OUI with Encoding{Ignore = true};
+    byte OUIType;
+    P2PActionFrameType OUISubtype;
+    byte DialogToken;
+    array<WiFi.InformationField> Elements;
+}
+
+pattern P2PActionFrameType = enum byte
+{
+    NoticeOfAbsence = 0,
+    P2PPresenceRequest = 1,
+    P2PPresenceResponse = 2,
+    GODiscoverabilityRequest = 3,
+    ...
+};
+
+// 4.2.9.2 Notice of Absence frame
+message NoticeOfAbsence : GeneralP2PActionBase
+{
+    override string ToString()
+    {
+        string summary = "NoticeOfAbsence, DialogToken: " + (DialogToken as string);
+        return summary;
+    }
+}
+
+// 4.2.9.3 P2P Presence Request frame
+message P2PPresenceRequest : GeneralP2PActionBase
+{
+    override string ToString()
+    {
+        string summary = "P2PPresenceRequest, DialogToken: " + (DialogToken as string);
+        return summary;
+    }
+}
+
+// 4.2.9.4 P2P Presence Response frame
+message P2PPresenceResponse : GeneralP2PActionBase
+{
+    override string ToString()
+    {
+        string summary = "P2PPresenceResponse, DialogToken: " + (DialogToken as string);
+        foreach (var ie in Elements)
+        {
+            array<P2PAttribute> attrs = [];
+            if (ie is P2PIE)
+            {
+                attrs = (ie as P2PIE).P2PAttributes;
+            }
+
+            foreach (P2PAttribute a in attrs)
+            {
+                if (a is NoticeOfAbsence)
+                {
+                    summary += ", " + (a as NoticeOfAbsenceAttr).GetSummary();
+                    break;
+                }
+            }
+        }
+        return summary;
+    }
+}
+
+// 4.2.9.2 GO Discoverability Request frame
+message GODiscoverabilityRequest : GeneralP2PActionBase
+{
+    override string ToString()
+    {
+        string summary = "GODiscoverabilityRequest, DialogToken: " + (DialogToken as string);
+        return summary;
+    }
+}
+
+static string UInt2Hex(any i)
+{
+    return Utility.DecToHexFormat(i);
+}
+
+static string UShort2Hex(any i)
+{
+    return Utility.DecToHexFormat(i);
+}

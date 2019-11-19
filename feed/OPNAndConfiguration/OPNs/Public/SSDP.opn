@@ -1,0 +1,369 @@
+protocol SSDP with 
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Simple Service Discovery Protocol",
+    ShortName = "SSDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "Simple Service Discovery Protocol", Link = "http://www.upnp.org/specs/arch/UPnP-arch-DeviceArchitecture-v1.0.pdf"},
+            new Reference{Name = "RFC 1035"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="361905", Date="04/09/2014"}
+        ]
+};
+
+using Standard;
+using IANA;
+using UDP;
+using HTTP;
+using Utility;
+
+string MODULE_NAME = "SSDP";
+
+endpoint Server 
+    over UDP.Host 
+    accepts SSDPContract.Request issues SSDPContract.Response;
+
+client endpoint Client connected to Server;
+
+bool CheckIPandPort(uint port, optional binary bin)
+{
+    if (bin == nothing)
+    {
+        return false;
+    }
+    if (port == IANA.Port.SSDP)
+    {
+        string Address = BinaryToIP(bin as binary);
+        return Address == "239.255.255.250" 
+            || Address == "FF02:0:0:0:0:0:0:C" || Address == "FF05:0:0:0:0:0:0:C" 
+            || Address == "FF08:0:0:0:0:0:0:C" || Address == "FF0E:0:0:0:0:0:0:C" 
+            || Address == "FF02::C" || Address == "FF05::C" 
+            || Address == "FF08::C" || Address == "FF0E::C";
+    }
+    else
+    {
+        return false;
+    }
+    
+}
+
+optional SSDPContract.Request SSDPRequestDecoder(binary binaryValue)
+{
+    stream s = binaryValue;
+    optional SSDPContract.Request orequest = SSDP.RequestHeader(s);
+    
+    if (orequest == nothing)
+    {
+        return nothing;
+    }
+    
+    SSDPContract.Request request = orequest as SSDPContract.Request;
+    request.Headers = ParseHeaderFields(request.Headers);
+    request.SourceData = binaryValue;
+    
+    // set fields offset
+    int fieldOffset = 0;
+    array<string> fieldName = ["Method", "Uri", "Version"];
+    array<int> fieldBitLength = [(request.Method.Count + 1) * 8, (request.Uri.Count() + 1) * 8, 80];
+    for (int i = 0; i < 3; i++)
+    {
+        request.AssignFieldEncodingInfo(fieldName[i], fieldOffset, fieldBitLength[i]);
+        fieldOffset += fieldBitLength[i];
+    }
+    request.AssignFieldEncodingInfo("Headers", fieldOffset, s.BitPosition - fieldOffset);
+    
+    return request;
+}
+
+optional SSDPContract.Response SSDPResponseDecoder(binary binaryValue)
+{
+    stream s = binaryValue;
+    optional SSDPContract.Response oresponse = SSDP.ResponseHeader(s);
+    
+    if (oresponse == nothing)
+    {
+        return nothing;
+    }
+    
+    SSDPContract.Response response = oresponse as SSDPContract.Response;
+    response.Headers = ParseHeaderFields(response.Headers);
+    response.SourceData = binaryValue;
+    
+    // set fields offset
+    var fieldOffset = 0;
+    array<string> fieldName = ["Version", "StatusCode", "ReasonPhrase"];
+    array<int> fieldBitLength = [72, 32, (response.ReasonPhrase.Count + 2) * 8];
+    for (int i =0; i < 3; i++)
+    {
+        response.AssignFieldEncodingInfo(fieldName[i], fieldOffset, fieldBitLength[i]);
+        fieldOffset += fieldBitLength[i];
+    }
+    response.AssignFieldEncodingInfo("Headers", fieldOffset, s.BitPosition - fieldOffset);
+    
+    return response;
+}
+
+
+autostart actor SSDPServerOverUDP(UDP.Host host)
+{
+    process host accepts datagram:UDP.Datagram where datagram.Payload.Count > 0 && CheckIPandPort(datagram.DestinationPort, datagram#DestinationAddress) // request should include multicast address
+    {
+        switch (datagram.Payload)
+        {
+            case request:SSDPContract.Request from SSDPRequestDecoder =>
+                dispatch (endpoint Server over host) accepts request;
+            default => 
+                ThrowDecodingException("SSDP");
+        };
+    }
+    
+    process host accepts datagram:UDP.Datagram where datagram.Payload.Count >= 4 && (datagram.SourcePort == IANA.Port.SSDP && datagram.Payload.Segment(0, 4) == $[48545450]) // unicast UDP response
+    {
+        switch (datagram.Payload)
+        {
+            case response:SSDPContract.Response from SSDPResponseDecoder =>
+                dispatch (endpoint Server over host) issues response;
+            default => 
+                ThrowDecodingException("SSDP");
+        };
+    }
+}
+
+map<string, any> ParseHeaderFields(map<string, any> headers)
+{
+    set<string> keys = headers.Keys;
+    
+    if (keys["NT"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "NT", ref headers, NotificationType, null);
+    }
+    if (keys["NTS"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "NTS", ref headers, NotificationSubType, null);
+    }
+    if (keys["USN"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "USN", ref headers, UniqueServiceName, null);
+    }
+    if (keys["MAN"])
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "MAN", ref headers, MAN, null);
+    }
+    if (keys["MX"]) 
+    {
+        ParseHeaderValue<uint>(MODULE_NAME, "MX", ref headers, MaximumWaitTime, null);
+    }
+    if (keys["ST"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "ST", ref headers, SearchTarget, null);
+    }
+    if (keys["CACHE-CONTROL"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "CACHE-CONTROL", ref headers, null, CacheControl);
+    }
+    if (keys["DATE"])
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "DATE", ref headers, Date, null);
+    }
+    if (keys["EXT"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "EXT", ref headers, Ext, null);
+    }
+    if (keys["LOCATION"]) 
+    {
+        ParseHeaderValue<UriType>(MODULE_NAME, "LOCATION", ref headers, Location, null);
+    }
+    if (keys["SERVER"]) 
+    {
+        ParseHeaderValue<string>(MODULE_NAME, "SERVER", ref headers, ServerHeader, null);
+    }
+    
+    return headers;
+}
+    
+    
+contract SSDPContract
+{
+    message Request
+    {
+        string Method;
+        string Uri;
+        VersionType Version;
+        HttpHeadersType Headers;
+        
+        override string ToString()
+        {
+            return "Request, Method: " + Method + ", URI: " + Uri + ", Version: " + Version.ToString();
+        }
+    }
+
+    message Response
+    {
+        VersionType Version;
+        uint StatusCode;
+        string ReasonPhrase;
+        HttpHeadersType Headers;
+        
+        override string ToString()
+        {
+            return "Response, StatusCode: " + (StatusCode.ToString()) + ", ReasonPhrase: " + ReasonPhrase + ", Version: " + Version.ToString();
+        }
+    }
+}
+
+type VersionType
+{
+    uint Major;
+    uint Minor;
+    
+    override string ToString()
+    {
+        return (Major as string) + "." + (Minor as string);
+    }
+}
+
+syntax RequestHeader    = line:RequestLine
+                            headers:(header:MessageHeader CRLF => header)*
+                            CRLF
+                            => new SSDPContract.Request
+                            {
+                                Method = line.Method, 
+                                Uri = line.Uri, 
+                                Version = line.Version, 
+                                Headers = MergeHeaders(headers)
+                            };
+
+type RequestLineType
+{
+    string Method; 
+    string Uri; 
+    VersionType Version; 
+}
+
+type StatusLineType
+{
+    VersionType Version; 
+    uint Status;
+    string Reason; 
+}
+
+type KeyValuePair
+{
+    string Key;
+    string Value;
+}
+
+map<string, any> MergeHeaders(array<KeyValuePair> headers)
+{
+    map<string, any> result = {}.ToOrdered();
+    foreach (KeyValuePair pair in headers)
+    {
+        result[pair.Key] = pair.Value;
+    }
+    return result;
+}
+
+// http://www.upnp.org/specs/arch/UPnP-arch-DeviceArchitecture-v1.0.pdf
+// These syntax definitions are also based on the real traffic, the protocol examples, and the HTTP references as there're no specific syntax definitions in this reference.
+syntax Method                = s:("NOTIFY" | "M-SEARCH") => s;
+syntax NotificationType      = s:("upnp:rootdevice" 
+                             | (u1:("uuid:")? u2:DeviceUUID => ((u1.Count == 0 ? "" : u1[0]) + u2)) 
+                             | (t0:"urn:" t1:("schemas-upnp-org" | Domain) t2:":" t3:((d1:"device:" d2:DeviceType => (d1 + d2)) | (se1:"service:" se2:ServiceType => (se1 + se2)) | (" V4:IPV6") | ("nhed:presence")) t4:":" t5:(Version0 | "LinkLocal") => (t0 + t1 + t2 + t3 + t4 + t5)))
+                             => s;
+syntax NotificationSubType   = s:("ssdp:byebye" | "ssdp:alive") => s;
+syntax ServerHeader          = s0:OS s1:SP s2:"UPnP/1.0 " s3:Product => (s0 + s1 + s2 + s3);
+syntax Product               = s0:ProductName s1:(s10:"/" s11:ProductVersion => (s10 + s11))? => (s0 + (s1.Count == 0 ? "" : s1[0]));
+syntax ProductName           = s:regex{[^()<>@,;:/?=]+} => s;
+syntax ProductVersion        = s:Token => s;
+syntax OS                    = s0:OSName s1:(s10:"/" s11:OSVersion => (s10 + s11))? => (s0 + (s1.Count == 0 ? "" : s1[0]));
+syntax OSName                = s:regex{[^()<>@,;:/?=]+} => s;
+syntax OSVersion             = s:Token => s;
+syntax UniqueServiceName     = u0:("uuid:")? u1:DeviceUUID u2:(t0:"::" t1:("upnp:rootdevice" 
+                             | (a0:"urn:" a1:("schemas-upnp-org" | Domain) a2:":" a3:((d1:"device:" d2:DeviceType => (d1 + d2)) | (se1:"service:" se2:ServiceType => (se1 + se2))) a4:":" a5:Version0 => (a0 + a1 + a2 + a3 + a4 + a5))) => (t0 + t1))?
+                             => ((u0.Count == 0 ? "" : u0[0]) + u1 + (u2.Count == 0 ? "" : u2[0]));
+syntax MAN                   = s:"\"ssdp:discover\"" => s;
+syntax MaximumWaitTime       = s:Digits => (s as uint);
+syntax SearchTarget          = s:("ssdp:all" | NotificationType) => s;
+syntax CacheControl          = LWS* t0:CacheDirective ts:(LWS* "," tn:CacheDirective =>tn)* => ([t0] + ts);
+syntax Ext                   = s:"" => s;
+syntax Location              = s:(AbsoluteUri | RelativeUri) => s;
+syntax DeviceType            = s:Token => s;
+syntax ServiceType           = s:Token => s;
+syntax DeviceUUID            = u:(regex{[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}} | "Upnp-IPMI-1_0-1234567890001" | "DIRECTV2PC-Media-Server1_0-RID-035709615740") => u; 
+syntax Version0              = s:Digits => s;
+
+// RFC 1035
+syntax Domain                = s:SubDomain => s;
+syntax SubDomain             = s0:Label s1:(s2:("." | "-" | " ") s3:Label => (s2 + s3))* => (s0 + (s1 == null ? "" : ConvertStringArrayToString(s1)));
+syntax Label                 = s0:Letter s1:LdhStr? s2:LetDig? => (s0 + (s1.Count == 0 ? "" : s1[0]) + (s2.Count == 0 ? "" : s2[0]));
+syntax LdhStr                = s:(s0:LetDigHyp => s0)+ => ConvertStringArrayToString(s);
+syntax LetDigHyp             = s:(LetDig | "-") => s;
+syntax LetDig                = s:(Letter | Digit) => s;
+syntax Letter                = s:regex{[A-Za-z]} => s;
+syntax Digit                 = s:regex{[0-9]} => s;
+
+
+//Can not reference syntax defined in HTTP, please refer to bug 28445.
+syntax RequestUri            = "*";
+syntax CRLF                  = s:"\r\n" => s;
+syntax Digits                = s:regex{[0-9]+} => s;
+syntax Version               = "HTTP" "/" major:Digits "." minor:Digits => new VersionType{Major = major as uint, Minor = minor as uint};
+syntax MessageHeader         = k:FieldName ":" v:(FieldValue?) => new KeyValuePair{Key = k, Value = (v.Count == 0 ? "" : v[0])};
+syntax FieldName             = k:regex{[A-Za-z0-9][^:]*} => k;
+syntax FieldValue            = v:regex{[^\r\n]*} => v.Trim();
+
+syntax RequestLine           = method:Method " " uri:regex{[^ ]+} SP version:Version CRLF
+                             => new RequestLineType{Method = method, Uri = uri, Version = version};
+syntax ResponseHeader        = line:StatusLine
+                             headers:(header:MessageHeader CRLF => header)*
+                             CRLF
+                             => new SSDPContract.Response { 
+                                            Version = line.Version, 
+                                            StatusCode = line.Status,
+                                            ReasonPhrase = line.Reason, 
+                                            Headers = MergeHeaders(headers),
+                                        };
+                                    
+
+
+syntax StatusLine            = version:Version Spaces status:StatusCode Spaces reason:ReasonPhrase CRLF
+                             => new StatusLineType{Version = version, Status = status, Reason = reason};
+syntax Spaces                = regex{[ ]*};
+syntax StatusCode            = code:Digit3 => (code as uint);
+syntax ReasonPhrase          = s:Line => s;
+syntax Digit3                = s:regex{[0-9]{3}} => s;
+syntax Line                  = s:regex{[^\r\n]*} => s;
+
+
+
+syntax SP                    = s:" " => s;
+syntax LWS                   = s:regex{[ ]} => s;
+syntax Token                 = s:regex{[^()<>@,;:/?= ]+} => s;
+
+syntax DeltaSeconds          = Digits;
+syntax QuotedString          = Quote ss:(s:(QDText | QuotedPair) => s)* Quote => ConvertStringArrayToString(ss); 
+syntax QDText                = s:regex{.} => s;
+syntax QuotedPair            = "\\" s:Char => s;
+syntax Char                  = s:regex{.|\n} => s;
+syntax Date                  = s:Rfc1123Date => s;
+syntax Date1                 = s1:Digit2 s2:SP s3:Month s4:SP s5:Digit4 => (s1 + s2 + s3 + s4 + s5);
+syntax Digit2                = s:regex{[0-9]{1,2}} => s;
+syntax Digit4                = s:regex{[0-9]{4}} => s;
+syntax Date2                 = s1:Digit2 s2:"-" s3:Month s4:"-" s5:Digit2 => (s1 + s2 + s3 + s4 + s5);
+syntax Time                  = s1:Digit2 s2:":" s3:Digit2 s4:":" s5:Digit2 => (s1 + s2 + s3 + s4 + s5);
+syntax Rfc1123Date           = s1:WkDay s2:"," s3:SP s4:Date1 s5:SP s6:Time s7:SP s8:"GMT" => (s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8);
+syntax WkDay                 = s:("Mon" | "Tue" | "Wed"
+                             | "Thu" | "Fri" | "Sat" | "Sun") => s;
+syntax Month                 = s:("Jan" | "Feb" | "Mar" | "Apr"
+                             | "May" | "Jun" | "Jul" | "Aug"
+                             | "Sep" | "Oct" | "Nov" | "Dec") => s;
+syntax Quote                 = s:"\u0022" => s;

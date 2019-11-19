@@ -1,0 +1,183 @@
+protocol MSTMPLDISC with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Template Discovery Web Service Protocol",
+    ShortName = "MS-TMPLDISC",
+    DocumentName = "MS-TMPLDISC",
+    ProtocolType = "XML",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2014 Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-MSTMPLDISC", Version = "1.5"},
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="05/12/2013"},
+        ]
+};
+
+using Diagnostics;
+using HTTP;
+using Standard;
+
+syntax MSQueryParameters = 
+        // "key=value" format, return map<key,vlaue>
+        (firstParameter:MSQueryParameter
+         parameters:("&" parameter:MSQueryParameter => parameter)*
+                => MSMergeQueryParameters([firstParameter] + parameters));
+syntax MSQueryParameter = k:MSQueryParameterFieldName "="? v:MSQueryParameterFieldValue
+                                    => new KeyValuePair{Key = k, Value = v};
+syntax MSQueryParameterFieldName = regex{[^=]+};
+syntax MSQueryParameterFieldValue = regex{[^&]*};
+
+endpoint Server over HTTP.Server accepts TMPLDISCContract.Request issues TMPLDISCContract.Response;
+client endpoint Client connected to Server;
+
+const string SharePointTempleateURL = "/_layouts/GetSpotlight.ashx";
+const map<uint, string> ResponseStatusMap = 
+{
+	200	->	"Success.",
+	400	->	"Invalid or missing parameters.",
+	401	->	"Security not validated. The credentials supplied by the user are not valid.",
+	500	->	"Any other error."
+};
+
+autostart actor ActorOverHttpServer(HTTP.Server node)
+{
+    process node accepts httpReq:HttpContract.Request where IsMSTMPLDISCUri(httpReq.Uri)
+        && (httpReq.Method == "GET")
+    {
+        TMPLDISCContract.Request msg = new TMPLDISCContract.Request();
+        msg.initialize(httpReq);
+        dispatch (endpoint Server over node) accepts msg;
+    }
+
+    process node issues httpRes:HttpContract.Response where IsMSTMPLDISCUri(httpRes#Uri)
+    {
+         TMPLDISCContract.Response msg = new TMPLDISCContract.Response();
+         msg.initialize(httpRes);
+         dispatch (endpoint Server over node) issues msg;
+    }
+}
+
+contract TMPLDISCContract
+{
+	message MessageBase
+	{
+	    override string ToString()
+	    {
+	        return "GetSpotlight";
+	    }
+	}
+
+    message Request : MessageBase
+    {
+		optional map<string,string> Parameters;
+        
+        void initialize(HTTP.HttpContract.Request httpRequest)
+        {
+        	map<string,string> innerParam;
+        	switch(httpRequest.Uri.Query)
+        	{
+        		case string =>
+        			any tempStr = httpRequest.Uri.Query;
+        			innerParam = MSQueryParameters(tempStr as string) as map<string, string>;
+        		case map<string, string> =>
+                    any tempMap = httpRequest.Uri.Query;
+        			innerParam = (tempMap as optional map<string, string>) as map<string, string>;
+        	}
+
+			this.Parameters = innerParam;
+        }
+
+        override string ToString()
+        {
+            return base.ToString() + " Request";
+        }
+    }
+    
+    message Response : MessageBase
+    {
+    	optional uint StatusCode;
+    	optional string StatusCodeDescription;
+
+        optional binary Body with MimeDescription{Format = GetBodyFormat()};
+
+		void initialize(HTTP.HttpContract.Response httpResponse)
+        {
+        	this.StatusCode = httpResponse.StatusCode;
+        	this.StatusCodeDescription = GenerateHttpResponseStatusMessage(httpResponse.StatusCode);
+			this.Body = httpResponse.Payload;
+        }
+
+        string GetBodyFormat()
+        {
+            HTTP.HeaderFieldType contentTypeHeader = (this.Origins[0] as HttpContract.Response).HTTPContentType;
+            
+            if (contentTypeHeader == null)
+                return "";
+                
+            string contentTypeValue = contentTypeHeader.Value;
+            
+            // WORKAROUND FIX:
+            // The actual http traffic may use the unusual http content type header.
+            // E.g, it may use text/XML but not text/xml. However, MMA may not recognize it as the right name.
+            // That is, no expected xml format show on MMA UI.
+            switch (contentTypeHeader.Value.ToLower())
+            {
+                case "text/xml" => contentTypeValue = "text/xml";
+            }
+            
+            return contentTypeValue;
+        }
+        
+        override string ToString()
+        {
+			string summery = base.ToString() + " Response" + (200 == this.StatusCode ? "" : Format(" ({0}, {1})", this.StatusCode, this.StatusCodeDescription));
+            return summery;
+        }
+    }
+}
+
+string GenerateHttpResponseStatusMessage(uint statusCode)
+{
+	var rtMsg;
+	if (statusCode in ResponseStatusMap)
+	{
+		rtMsg = ResponseStatusMap[statusCode];
+	}
+	else
+	{
+		rtMsg = "Refer to underlying protocol for details";
+	}
+
+	return rtMsg;
+}
+
+bool IsMSTMPLDISCUri(optional UriType uri)
+{
+    if (uri == nothing)
+        return false; 
+    
+    UriType tmpUriType = uri as UriType;
+    
+    if (tmpUriType.AbsPath == nothing)
+        return false;
+        
+    return (tmpUriType.AbsPath as string) == SharePointTempleateURL;
+}
+
+map<string, string> MSMergeQueryParameters(array<KeyValuePair> params)
+{
+    map<string, string> result = {};
+    foreach (KeyValuePair pair in params)
+    {
+        result[pair.Key] = pair.Value as string;
+    }
+    return result;
+}

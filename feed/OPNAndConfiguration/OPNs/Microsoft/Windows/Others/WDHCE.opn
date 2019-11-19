@@ -1,0 +1,447 @@
+protocol WDHCE
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Wi-Fi Display Protocol: Hardware Cursor Extension",
+    ShortName = "WDHCE",
+    DocumentName = "MS-WDHCE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-WDHCE", Version = "1.0", Date = "04/28/2015", ProgramName = ProgramName.WSPP}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "381944", Date = "10/08/2015"}
+        ]
+};
+
+using RTP;
+using Utility;
+using Reassembly;
+using OthersResources;
+
+annotation bool MousePointerShapeMessage#IsReassembled;
+annotation bool MousePointerShapeBaseMessage#IsRetransmission;
+
+endpoint Server over RTP.Node
+    accepts MousePointerPositionMessage
+    accepts MousePointerShapeBaseMessage
+    accepts MousePointerIncompleteShapeMessage;
+
+autostart actor WdhceOverRtp(RTP.Node node)
+{
+    WdhceReassemblyHelper wdhceReassemblyHelper = null;
+
+    process node accepts d:RTP.Datagram where IsWdhce(d)
+    {
+        binary payload = d.Payload as binary; // assert it must be binary type if IsWdhce returns true
+        switch (payload[0])
+        {
+            case MessageType.MouseCursorPositionUpdateType =>
+                if (BinaryDecoder<MousePointerPositionMessage>(payload) is mousePointerPositionMessage:MousePointerPositionMessage)
+                {
+                    dispatch (endpoint Server over node) accepts mousePointerPositionMessage;
+                }
+                else
+                {
+                    ThrowDecodingException("WDHCE", "MousePointerPositionMessage");
+                }
+            case MessageType.MouseCursorShapeUpdateType =>
+                if (BinaryDecoder<MousePointerShapeMessage>(payload) is mousePointerShapeMessage:MousePointerShapeMessage)
+                {
+                    // initialize Reassembly Helper if it is not initialized before
+                    if (wdhceReassemblyHelper == null)
+                    {
+                        wdhceReassemblyHelper = new WdhceReassemblyHelper(endpoint Server over node, mousePointerShapeMessage);
+                    }
+
+                    mousePointerShapeMessage.Origins = [d];
+                    ReassembleAndDispatchShapeMessage(wdhceReassemblyHelper, mousePointerShapeMessage);
+                }
+                else
+                {
+                    ThrowDecodingException("WDHCE", "MousePointerShapeMessage");
+                }
+            case MessageType.MouseCursorShapeContinuationType =>
+                if (BinaryDecoder<MousePointerShapeContinueMessage>(payload) is mousePointerShapeContinueMessage:MousePointerShapeContinueMessage)
+                {
+                    // initialize Reassembly Helper if it is not initialized before
+                    if (wdhceReassemblyHelper == null)
+                    {
+                        wdhceReassemblyHelper = new WdhceReassemblyHelper(endpoint Server over node, mousePointerShapeContinueMessage);
+                    }
+
+                    mousePointerShapeContinueMessage.Origins = [d];
+                    ReassembleAndDispatchShapeMessage(wdhceReassemblyHelper, mousePointerShapeContinueMessage);
+                }
+                else
+                {
+                    ThrowDecodingException("WDHCE", "MousePointerShapeContinueMessage");
+                }
+            default =>
+                ThrowDecodingException("WDHCE");
+        }
+    }
+
+    ~endpoint(RTP.Node node)
+    {
+        if (wdhceReassemblyHelper != null)
+        {
+            wdhceReassemblyHelper.ClearInDestructor();
+        }
+    }
+
+    void ReassembleAndDispatchShapeMessage(
+        WdhceReassemblyHelper wdhceReassemblyHelper,
+        MousePointerShapeBaseMessage shapeMessage)
+    {
+        if (shapeMessage.CursorImageId < wdhceReassemblyHelper.ExpectedCursorImageId)
+        {
+            // retransmitted message, add diagnosis and dispatch
+            shapeMessage#IsRetransmission = true;
+            dispatch wdhceReassemblyHelper.EPT accepts shapeMessage;
+            return;
+        }
+        else 
+        {
+            if (shapeMessage.CursorImageId > wdhceReassemblyHelper.ExpectedCursorImageId)
+            {
+                // clear previous cached messages
+                wdhceReassemblyHelper.ClearInDestructor();
+                // update Cursor Image Id
+                wdhceReassemblyHelper.ExpectedCursorImageId = shapeMessage.CursorImageId;
+            }
+
+            wdhceReassemblyHelper.Reassemble(shapeMessage);
+        }
+    }
+}
+
+bool IsWdhce(RTP.Datagram d)
+{
+    /*
+    Check RTP message according below values defined in MS-WDHCE
+    Field Name (Size)           Value
+    Version (2 bits)            2
+    P (1 bit)                   0 (No padding)
+    X (1 bit)                   0 (No extension)
+    CC (4 bits)                 0 (No CSRC)
+    M (1 bit)                   0 (No marker used)
+    PT (7 bits)                 0 (Mouse position/shape update payload for this profile)
+    Timestamp (32 bits)         0 (Not used)
+    SSRC identifier (32 bits)   0 (Not used)
+    */
+    return d.Version == 2 && !d.Padding && !d.Extension &&
+        d.CSRCCount == 0 && !d.Marker && d.PayloadType == 0 &&
+        d.TimeStamp == 0 && d.SSRC == 0 &&
+        d.Payload is bin:binary && bin.Count > 0;
+}
+
+pattern MessageType = enum byte
+{
+    MouseCursorPositionUpdateType = 0x01,
+    MouseCursorShapeUpdateType = 0x02,
+    MouseCursorShapeContinuationType = 0x03,
+    ...
+};
+
+// section 2.2.2 Mouse pointer position message 
+message MousePointerPositionMessage
+{
+    MessageType MsgType;
+    ushort PacketMsgSize where ValidationCheckValue(value == 0x0007, this, false, ReferenceType.Message,
+        "WDHCE", "PacketMsgSize", "MousePointerPositionMessage", 0x0007, value);
+    ushort XPos;
+    ushort YPos;
+
+    override string ToString()
+    {
+        return "Mouse Pointer Position, XPos: " + XPos.ToString() + ", YPos: " + YPos.ToString();
+    }
+}
+
+// section 2.2.3 Mouse Pointer shape message
+message MousePointerShapeBaseMessage : IComparable<MousePointerShapeBaseMessage>
+{
+    MessageType MsgType;
+    ushort PacketMsgSize;
+    uint TotalImageDataSize;
+    ushort CursorImageId;
+
+    int CompareTo(MousePointerShapeBaseMessage other)
+    {
+        return (GetDataOffset() - other.GetDataOffset()) as int;
+    }
+
+    virtual int GetImageDataSize()
+    {
+        return 0;
+    }
+
+    virtual uint GetDataOffset()
+    {
+        return 0;
+    }
+}
+
+message MousePointerShapeMessage : MousePointerShapeBaseMessage
+{
+    ushort XPos;
+    ushort YPos;
+    CursorImageType CursorImageType where ValidationCheckEnumValue(InRange<CursorImageType>(value), this, true, ReferenceType.Message,
+        "WDHCE", "CursorImageType", "MousePointerShapeMessage", "0x01, 0x02, 0x03", value);
+    ushort HotSpotXPos;
+    ushort HotSpotYPos;
+    binary ImageData with BinaryEncoding{Length = PacketMsgSize - 18};
+
+    override string ToString()
+    {
+        string summaryLine = "";
+        if (this#IsReassembled is true)
+        {
+            summaryLine += "[Reassembled] ";
+        }
+        else if (this#IsRetransmission is true)
+        {
+            summaryLine += "[Retransmitted] ";
+        }
+        return summaryLine +
+            "Mouse Pointer Shape, XPos: " + XPos.ToString() + ", YPos: " + YPos.ToString() +
+            ", CursorImageType: " + EnumToStringInSummary<CursorImageType>(CursorImageType) +
+            ", HotSpotXPos: " + HotSpotXPos.ToString() + ", HotSpotYPos: " + HotSpotYPos.ToString();
+    }
+
+    override int GetImageDataSize()
+    {
+        return ImageData.Count;
+    }
+
+    override uint GetDataOffset()
+    {
+        return 0;
+    }
+}
+
+message MousePointerShapeContinueMessage : MousePointerShapeBaseMessage
+{
+    uint PacketPayloadOffset;
+    binary ImageData with BinaryEncoding{Length = PacketMsgSize - 13};
+
+    override string ToString()
+    {
+        string summaryLine = "";
+        if (this#IsRetransmission is true)
+        {
+            summaryLine += "[Retransmitted] ";
+        }
+        return summaryLine + "Mouse Pointer Shape Continue, CursorImageId: " + CursorImageId.ToString() +
+            ", PacketMsgSize: " + PacketMsgSize.ToString() + ", PacketPayloadOffset: " + PacketPayloadOffset.ToString();
+    }
+
+    override int GetImageDataSize()
+    {
+        return ImageData.Count;
+    }
+
+    override uint GetDataOffset()
+    {
+        return PacketPayloadOffset;
+    }
+}
+
+message MousePointerIncompleteShapeMessage
+{
+    uint TotalImageDataSize;
+    ushort CursorImageId;
+
+    override string ToString()
+    {
+        return "[Incomplete] Mouse Pointer Shape Continue, CursorImageId: " + CursorImageId.ToString() +
+            ", TotalImageDataSize: " + TotalImageDataSize.ToString();
+    }
+}
+
+pattern CursorImageType = enum byte
+{
+    Disabled = 0x01,
+    MaskedColorImage = 0x02,
+    ColorCursorImage = 0x03,
+    ...
+};
+
+type WdhceReassemblyHelper : ReassemblyHelper<MousePointerShapeBaseMessage> // it accepts MousePointerShapeMessage or MousePointerShapeContinueMessage
+{
+    int ExpectedCursorImageId;
+    map<uint, MousePointerShapeBaseMessage> CachedMessages;
+    uint TotalSize = 0;
+    bool ContainsShapeMessage = false;
+
+    WdhceReassemblyHelper(Server ept, MousePointerShapeBaseMessage shapeBaseMessage)
+    {
+        ExpectedCursorImageId = shapeBaseMessage.CursorImageId; // initialize cursor image id
+        CachedMessages = {};
+        TotalSize = 0;
+        ContainsShapeMessage = false;
+        Direction = MessageDirection.Accepts; // only accepts direction
+        EPT = ept;
+    }
+
+    override bool IsCompleteMessage(MousePointerShapeBaseMessage msg)
+    {
+        if (msg is mousePointerShapeMessage:MousePointerShapeMessage &&
+            mousePointerShapeMessage.TotalImageDataSize == mousePointerShapeMessage.ImageData.Count)
+        {
+            ClearAndUpdateWdhceReassemblyCache(msg.CursorImageId + 1);
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    override void Add(MousePointerShapeBaseMessage msg)
+    {
+        uint offset = msg.GetDataOffset();
+        if (CachedMessages.Keys[offset])
+        {
+            // add diagnosis message dispatch message
+            msg#IsRetransmission = true;
+            dispatch EPT accepts msg;
+            return;
+        }
+        else
+        {
+            // if it is not retransmitted message then add to cached
+            CachedMessages += {offset -> msg};
+
+            TotalSize += (msg.GetImageDataSize() as uint);
+            if (msg is MousePointerShapeMessage)
+            {
+                ContainsShapeMessage = true;
+            }
+        }
+    }
+
+    override bool IsAllFragmentsArrived(MousePointerShapeBaseMessage msg)
+    {
+        return ContainsShapeMessage && TotalSize >= msg.TotalImageDataSize;
+    }
+
+    override array<MousePointerShapeBaseMessage> GetSorted(MousePointerShapeBaseMessage msg)
+    {
+        return CachedMessages.Values.Sort();
+    }
+
+    override optional MousePointerShapeBaseMessage GetMessageFromFragments(array<MousePointerShapeBaseMessage> sortedMsg)
+    {
+        if (sortedMsg[0] is mousePointerShapeMessage:MousePointerShapeMessage)
+        {
+            binary sourceData = mousePointerShapeMessage.SourceData as binary;
+            binary reassembledImageData = mousePointerShapeMessage.ImageData;
+
+            // calculate the source data and image data
+            for (int i = 1; i < sortedMsg.Count; i++)
+            {
+                binary imageData = (sortedMsg[i] as MousePointerShapeContinueMessage).ImageData; // assume following message are all continue message
+                sourceData += imageData;
+                reassembledImageData += imageData;
+            }
+            
+            // create reassembled message
+            MousePointerShapeMessage reassembledMessage = new MousePointerShapeMessage
+            {
+                MsgType = mousePointerShapeMessage.MsgType,
+                PacketMsgSize = mousePointerShapeMessage.PacketMsgSize,
+                TotalImageDataSize = mousePointerShapeMessage.TotalImageDataSize,
+                CursorImageId = mousePointerShapeMessage.CursorImageId,
+                XPos = mousePointerShapeMessage.XPos,
+                YPos = mousePointerShapeMessage.YPos,
+                CursorImageType = mousePointerShapeMessage.CursorImageType,
+                HotSpotXPos = mousePointerShapeMessage.HotSpotXPos,
+                HotSpotYPos = mousePointerShapeMessage.HotSpotYPos,
+                ImageData = reassembledImageData,
+            };
+            reassembledMessage#IsReassembled = true;
+
+            // assign association
+            reassembledMessage.SourceData = sourceData;
+            reassembledMessage.AssignFieldEncodingInfo("MsgType", 0, 8);
+            reassembledMessage.AssignFieldEncodingInfo("PacketMsgSize", 8, 16);
+            reassembledMessage.AssignFieldEncodingInfo("TotalImageDataSize", 24, 32);
+            reassembledMessage.AssignFieldEncodingInfo("CursorImageId", 56, 16);
+            reassembledMessage.AssignFieldEncodingInfo("XPos", 72, 16);
+            reassembledMessage.AssignFieldEncodingInfo("YPos", 88, 16);
+            reassembledMessage.AssignFieldEncodingInfo("CursorImageType", 104, 8);
+            reassembledMessage.AssignFieldEncodingInfo("HotSpotXPos", 112, 16);
+            reassembledMessage.AssignFieldEncodingInfo("HotSpotYPos", 128, 16);
+            reassembledMessage.AssignFieldEncodingInfo("ImageData", 144, reassembledImageData.Count * 8);
+
+            // assign origins
+            array<any message> origins = [];
+            foreach (var item in sortedMsg)
+            {
+                origins += [item];
+            }
+            reassembledMessage.Origins = origins;
+
+            return reassembledMessage;
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+
+    override void ClearAfterSuccess(MousePointerShapeBaseMessage msg)
+    {
+        // since it is invoked after reassembly success, assume that at least one element in Cached Messages
+        ExpectedCursorImageId = CachedMessages[0].CursorImageId + 1; // update received cursor image id
+        CachedMessages = {};
+        TotalSize = 0;
+        ContainsShapeMessage = false;
+    }
+
+    override void ClearInDestructor()
+    {
+        ClearAndUpdateWdhceReassemblyCache(
+            CachedMessages.Count > 0 ?
+            CachedMessages.Values[0].CursorImageId + 1 :
+            ExpectedCursorImageId + 1);
+    }
+
+    void ClearAndUpdateWdhceReassemblyCache(int newCursorImageId)
+    {
+        if (CachedMessages.Count > 0)
+        {
+            MousePointerIncompleteShapeMessage incompleteMessage = new MousePointerIncompleteShapeMessage
+            {
+                TotalImageDataSize = CachedMessages.Values[0].TotalImageDataSize,
+                CursorImageId = CachedMessages.Values[0].CursorImageId,
+            };
+            // assign origins
+            array<any message> origins = [];
+            foreach (var item in CachedMessages.Values)
+            {
+                origins += [item];
+            }
+            incompleteMessage.Origins = origins;
+
+            ValidationCheck(false, incompleteMessage, DiagnosisLevel.Warning, WDHCE_REASSEMBLE_FAILURE);
+
+            dispatch EPT accepts incompleteMessage;
+        }
+
+        // update received cursor image id
+        ExpectedCursorImageId = newCursorImageId;
+
+        CachedMessages = {};
+        TotalSize = 0;
+        ContainsShapeMessage = false;
+    }
+}

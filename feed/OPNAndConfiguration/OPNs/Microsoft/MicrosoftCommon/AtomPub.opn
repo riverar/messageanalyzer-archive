@@ -1,0 +1,709 @@
+protocol AtomPub
+with XmlEncodingDefaults
+{
+    Namespace = AtomPubAtomNamespace,
+},
+Documentation
+{
+    ProtocolName = "The Atom Publishing Protocol",
+    ShortName = "AtomPub",
+    Description = "The Atom Publishing Protocol (AtomPub) is an application-level protocol for publishing and editing Web resources. The protocol is based on HTTP transfer of Atom-formatted representations."
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+        new Reference{Name = "RFC 5023"},
+        new Reference{Name = "RFC 4287"},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class=RevisionClass.Major, Version="1.0.0", Date="09/18/2012"}
+    ]
+};
+
+using Standard;
+using Utility;
+using XSD;
+using HTTP;
+
+/* Future Reference:
+ * 1. Add operations for message grouping
+ */
+
+//----------------------------------------- Namespace -----------------------------------------//
+// The prefix for this namespace name is "app:"
+const string AtomPubAppNamespace = "http://www.w3.org/2007/app";
+// The prefix for this namespace name is "atom:"
+const string AtomPubAtomNamespace = "http://www.w3.org/2005/Atom";
+// The prefix for this namespace name is "xsd:"
+const string AtomPubXsdNamespace = "http://www.w3.org/2001/XMLSchema";
+// The prefix for this namespace name is "xhtml:"
+const string AtomPubXhtmlNamespace = "http://www.w3.org/1999/xhtml";
+
+//----------------------------------------- Endpoint / Actors -----------------------------------------//
+endpoint Server
+    over HTTP.Server
+    provides Documents consumes Documents;
+
+client endpoint Client connected to Server;
+
+autostart actor AtomPubOverHTTP(HTTP.Server server)
+{
+    // Category Document
+    process server accepts s:HttpContract.Request where s.Payload.Count > 0 && s.Headers.ContentTypeContains("application/atomcat+xml")
+    {
+        switch (s.Payload)
+        {
+            case root:Categories from XmlDecoder<Categories> =>
+                var m = new Documents.AppCategories{Categories = root};
+                m.SourceData = s.Payload;
+                m.AssignFieldEncodingInfo("Categories", 0, s.Payload.Count * 8);
+                dispatch (endpoint Server over server) accepts m;
+            default =>
+                ThrowDecodingException("AtomPub", "AppCategories");
+        }
+    }
+
+    process server issues s:HttpContract.Response where s.Payload.Count > 0 && s.Headers.ContentTypeContains("application/atomcat+xml")
+    {
+        switch (s.Payload)
+        {
+            case root:Categories from XmlDecoder<Categories> =>
+                var m = new Documents.AppCategories{Categories = root};
+                m.SourceData = s.Payload;
+                m.AssignFieldEncodingInfo("Categories", 0, s.Payload.Count * 8);
+                dispatch (endpoint Server over server) issues m;
+            default =>
+                ThrowDecodingException("AtomPub", "AppCategories");
+        }
+    }
+
+	// Service Document Retrieved
+    process server issues s:HttpContract.Response where s.Payload.Count > 0 && s.Headers.ContentTypeContains("application/atomsvc+xml")
+    {
+        switch (s.Payload)
+        {
+            case root:Service from XmlDecoder<Service> =>
+                var m = new Documents.AppService{Service = root};
+                m.SourceData = s.Payload;
+                m.AssignFieldEncodingInfo("Service", 0, s.Payload.Count * 8);
+                dispatch (endpoint Server over server) issues m;
+            default =>
+                ThrowDecodingException("AtomPub", "AppService");
+        }
+    }
+
+    // Entry Document
+    process server accepts s:HttpContract.Request where s.Payload.Count > 0 && s.Headers.ContentTypeContains("application/atom+xml")
+    {
+        var isEntryDoc = IsEntryDocument((s.HTTPContentType).Parameters, s.Payload);
+        if (isEntryDoc != nothing && isEntryDoc as bool)
+        {
+            switch (s.Payload)
+            {
+                case root:Entry from XmlDecoder<Entry> =>
+                    var m = new Documents.AppEntry{Entry = root};
+                    m.SourceData = s.Payload;
+                    m.AssignFieldEncodingInfo("Entry", 0, s.Payload.Count * 8);
+                    dispatch (endpoint Server over server) accepts m;
+                default =>
+                    ThrowDecodingException("AtomPub", "AppEntry");
+            }
+        }
+        else
+        {
+            reject;
+        }
+    }
+
+    // Feed/Entry Document
+    process server issues s:HttpContract.Response where s.Payload.Count > 0 && s.Headers.ContentTypeContains("application/atom+xml")
+    {
+        /* Feed/Entry Document is indentified by the "type" parameter of ContentType.
+         * If not specified, it will examine the root element to determine the type of Atom document.
+         */
+        var isEntryDoc = IsEntryDocument((s.HTTPContentType).Parameters, s.Payload);
+        if (isEntryDoc == nothing)
+        {
+            reject; // Reject the HTTP message if neither "feed" nor "entry" related info is found.
+        }
+        else if (isEntryDoc as bool)
+        {
+            switch (s.Payload)
+            {
+                case root:Entry from XmlDecoder<Entry> =>
+                    var m = new Documents.AppEntry{Entry = root};
+                    m.SourceData = s.Payload;
+                    m.AssignFieldEncodingInfo("Entry", 0, s.Payload.Count * 8);
+                    dispatch (endpoint Server over server) issues m;
+                default =>
+                    ThrowDecodingException("AtomPub", "AppEntry");
+            }
+        }
+        else
+        {
+            // Feed document returned for listing Collection Members
+            switch (s.Payload)
+            {
+                case root:Feed from XmlDecoder<Feed> =>
+                    var m = new Documents.AppFeed{Feed = root};
+                    m.SourceData = s.Payload;
+                    m.AssignFieldEncodingInfo("Feed", 0, s.Payload.Count * 8);
+                    dispatch (endpoint Server over server) issues m;
+                default =>
+                    ThrowDecodingException("AtomPub", "AppFeed");
+            }
+        }
+    }
+}
+
+/* Check whether the HTTP payload contains the entry document or not
+ * Mapping of return value and the document type
+ *              true - entry document;
+ *              false - feed document;
+ *              nothing - non of them matched
+ */
+optional bool IsEntryDocument(optional map<string, optional string> parameters, binary bin)
+{
+    if (parameters != nothing && "type" in (parameters as map<string, optional string>))
+    {
+        var paramType = (parameters as map<string, optional string>)["type"];
+        return paramType == "entry" || paramType != "feed";
+    }
+
+    var tempString = BinaryDecoder<String>(bin);
+    var str = (tempString as String).Value;
+    if (str.IndexOf("<") >= 0 && str.IndexOf(">") > 0)
+    {
+        if (str.LastIndexOf("entry") > 0 && str.LastIndexOf("entry") > str.LastIndexOf("feed"))
+        {
+            return true;
+        }
+
+        if (str.LastIndexOf("feed") > 0 && str.LastIndexOf("feed") > str.LastIndexOf("entry"))
+        {
+            return false;
+        }
+    }
+
+    // The HTTP payload is not in XML presentation.
+    return nothing;
+}
+
+// Defined to look-ahead the the root element
+type String
+{
+    string Value with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+//----------------------------------------- Messages -----------------------------------------//
+contract Documents
+{
+    // Category Document
+    message AppCategories
+    {
+        Categories Categories with XmlEncoding{Name = "categories", Namespace = AtomPubAppNamespace};
+
+        override string ToString()
+        {
+            return "Category Document";
+        }
+    }
+
+    // Sevice Document
+    message AppService
+    {
+        Service Service with XmlEncoding{Name = "service", Kind = XmlKind.Document, Namespace = AtomPubAppNamespace};
+
+        override string ToString()
+        {
+            var summary = "Service Document";
+            if (Service.Base != nothing)
+            {
+                summary += ", From URI: " + (Service.Base as string);
+            }
+            return summary;
+        }
+    }
+
+    // Feed Document
+    message AppFeed
+    {
+        Feed Feed with XmlEncoding{Name = "feed", Kind = XmlKind.Document, Namespace = AtomPubAppNamespace};
+
+        override string ToString()
+        {
+            var summary = "Atom Feed Document";
+            if (Feed.Base != nothing)
+            {
+                summary += ", From URI: " + (Feed.Base as string);
+            }
+            return summary;
+        }
+    }
+
+    // Entry Document
+    message AppEntry
+    {
+        Entry Entry with XmlEncoding{Name = "entry", Kind = XmlKind.Document, Namespace = AtomPubAppNamespace};
+
+        override string ToString()
+        {
+            var summary = "Atom Entry Document";
+            if (Entry.Base != nothing)
+            {
+                summary += ", URI: " + (Entry.Base as string);
+            }
+            return summary;
+        }
+    }
+}
+
+//---------------------------- start = appService ----------------------------//
+// common:attrs
+pattern AtomUri = string;
+
+type AppCommonAttributes
+    with XmlEncodingDefaults{Kind = XmlKind.Attribute, Namespace = XmlNamespace}
+{
+    optional AtomUri Base with XmlEncoding{Name = "base"};
+    optional AtomUri Lang with XmlEncoding{Name = "lang"};
+    optional string Space where value in {nothing, "default", "preserved"} with XmlEncoding{Name = "space"};
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+pattern UndefinedAttribute = string with XmlEncoding{Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+// Use inheritance type instead of pattern since the inheritance doesn't support use pattern as the base type.
+//pattern AtomCommonAttributes = appCommonAttributes
+type AtomCommonAttributes:AppCommonAttributes {}
+
+// Future Reference: Add vlaue check
+// AtomLanguageTag = xsd:string {
+//      pattern = "([A-Za-z]{1,8}(-[A-Za-z0-9]{1,8})*)?"
+//   }
+pattern AtomLanguageTag = string;
+
+type AtomDateConstruct:AppCommonAttributes
+{
+    XSDatatime DateTime with XmlEncoding{Kind = XmlKind.Text};
+}
+
+// app:service
+type Service:AppCommonAttributes
+{
+    array<Workspace> Workspace with XmlEncoding{Name = "workspace"};
+    optional array<ExtensionElement> ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncodingDefaults{Namespace = AtomPubAppNamespace, Order = XmlOrderIndicator.All};
+
+// app:workspace
+type Workspace:AppCommonAttributes
+{
+    AtomTextConstruct Title with XmlEncoding{Name = "title"};
+    optional array<Collection> Collection with XmlEncoding{Name = "collection", Namespace = AtomPubAppNamespace};
+    optional array<ExtensionSansTitleElement> ExtensionSansTitleElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncodingDefaults{Order = XmlOrderIndicator.All};
+
+// app:collection
+/* WORKAROUND:
+ * Defined this type for the attributes of collection element since if using the AppCommonAttributes,
+ * the addtional attributes defined will become the undefined attribute.
+ * And attributes don't support in all order
+ */
+type CollectionAttributes
+    with XmlEncodingDefaults{Kind = XmlKind.Attribute, Namespace = XmlNamespace}
+{
+    optional AtomUri Base with XmlEncoding{Name = "base"};
+    optional AtomUri Lang with XmlEncoding{Name = "lang"};
+    optional string Space where value in {nothing, "default", "preserved"} with XmlEncoding{Name = "space"};
+    AtomUri Href with XmlEncoding{Name = "href", Namespace = ""};
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type Collection:CollectionAttributes
+{
+    AtomTextConstruct Title with XmlEncoding{Name = "title"};
+    optional array<Accept> Accept with XmlEncoding{Name = "accept", Namespace = AtomPubAppNamespace};
+    optional array<InlineCategories | OutOfLineCategories> Categories with XmlEncoding{Name = "categories", Namespace = AtomPubAppNamespace};
+    optional array<ExtensionSansTitleElement> ExtensionSansTitleElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// app:categories
+type Category
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // Category only Attributes
+    string Term with XmlEncoding{Name = "term", Kind = XmlKind.Attribute, Namespace = ""};
+    optional AtomUri Scheme with XmlEncoding{Name = "scheme", Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Label with XmlEncoding{Name = "label", Kind = XmlKind.Attribute, Namespace = ""};
+
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    UndefinedContent UndefinedContent with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type InlineCategories
+{
+    optional string Fixed where value in {nothing, "yes", "no"}
+        with XmlEncoding{Name = "fixed ", Kind = XmlKind.Attribute, Namespace = ""};
+    optional AtomUri Scheme with XmlEncoding{Name = "scheme", Kind = XmlKind.Attribute, Namespace = ""};
+    optional array<Category> Category with XmlEncoding{Name = "Category"};
+    UndefinedContent UndefinedContent with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type OutOfLineCategories
+{
+    AtomUri Href with XmlEncoding{Name = "href", Kind = XmlKind.Attribute, Namespace = ""};
+    UndefinedContent UndefinedContent with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+pattern Categories = (InlineCategories | OutOfLineCategories);
+
+type Accept:AtomCommonAttributes
+{
+    optional string Text with XmlEncoding{Kind = XmlKind.Text};
+}
+
+// Simple Extension
+type SimpleSansTitleExtensionElement
+{
+    array<string> Element with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type SimpleExtensionElement
+{
+    array<string> Element with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+// Structured Extension
+pattern StructuredSansTitleExtensionElement = StructuredSansTitleExtensionElementType1 | StructuredSansTitleExtensionElementType2;
+
+type StructuredSansTitleExtensionElementType1
+{
+    array<string> Attribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = ""};
+    array<Text | AnyElement> Any with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+//pattern Text = string with XmlEncoding{Kind = XmlKind.Text};
+type Text
+{
+    string Text with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type StructuredSansTitleExtensionElementType2
+{
+    array<string> Attribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Text with XmlEncoding{Kind = XmlKind.Text};
+    array<AnyElement> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    array<Text | AnyElement> Any with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type StructuredExtensionElement
+{
+    array<StructuredExtensionElementType1 | StructuredExtensionElementType2> Element
+        with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type StructuredExtensionElementType1
+{
+    array<string> Attribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = ""};
+    array<Text | AnyElement> Any with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type StructuredExtensionElementType2
+{
+    array<string> Attribute with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Text with XmlEncoding{Kind = XmlKind.Text};
+    array<AnyElement> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    array<Text | AnyElement> Any with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+pattern ExtensionSansTitleElement = SimpleSansTitleExtensionElement |
+    StructuredSansTitleExtensionElement;
+
+pattern ExtensionElement = (SimpleExtensionElement |
+    StructuredExtensionElement);
+
+pattern UndefinedContent = optional array<Text | AnyForeignElementType>;
+
+type AnyElement
+{
+    // Future Reference: Use AnyElementType
+	array<xml> AnyElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+pattern AnyElementType = AnyElement | Text | TextAttribute;
+
+//pattern TextAttribute = string with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = ""};
+type TextAttribute
+{
+    // WORKAROUND: The xml selection dosen't support selecting one single attribute, so use array<string> instead of string
+    array<string> TextAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type AnyForeignElementType
+{   // Future Reference: Use AnyElementType
+	array<xml> AnyForeignElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+}
+
+type AtomPlainTextConstruct
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // AtomPlainTextConstruct only attributes
+    optional string Type where value in {nothing, "text", "html"}
+        with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    string Text with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type AtomXhtmlTextConstruct
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // AtomXhtmlTextConstruct only attributes
+    string Type where value == "xhtml"
+        with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    XhtmlDiv Div with XmlEncoding{Name = "div", Namespace = AtomPubXhtmlNamespace};
+}
+
+pattern AtomTextConstruct = AtomPlainTextConstruct | AtomXhtmlTextConstruct;
+
+// Future Reference: Pattern doesn't support in array
+//pattern AnyXhtml = array<TextAttribute | Text | AnyXhtml>;
+pattern AnyXhtml = array<TextAttribute | Text>;
+
+//pattern XhtmlDiv = array<TextAttribute | Text | AnyXhtml>;
+pattern XhtmlDiv = array<TextAttribute | Text>;
+
+//---------------------------- end = appService ----------------------------//
+type Control:AtomCommonAttributes
+{
+    optional string Draft where value in {nothing, "yes", "no"}
+        with XmlEncoding{Name = "draft", Namespace = AtomPubAppNamespace};
+    ExtensionElement ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+// RFC 4287
+//---------------------------- start = atomFeed | atomEntry ----------------------------//
+
+type AtomPersonConstruct:AtomCommonAttributes
+{
+    string Name with XmlEncoding{Name = "name"};
+    optional AtomUri Uri with XmlEncoding{Name = "uri"};
+    optional AtomEmailAddress Email with XmlEncoding{Name = "email"};
+    optional array<ExtensionElement> ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Feed:AtomCommonAttributes
+{
+	optional array<AtomPersonConstruct> Author with XmlEncoding{Name = "author"};
+	optional array<Category> Category with XmlEncoding{Name = "category"};
+	optional Generator Generator with XmlEncoding{Name = "generator"};
+	optional Icon Icon with XmlEncoding{Name = "icon"};
+	Id Id with XmlEncoding{Name = "id"};
+	optional array<Link> Link with XmlEncoding{Name = "link"};
+	optional Logo Logo with XmlEncoding{Name = "logo"};
+	optional AtomTextConstruct Rights with XmlEncoding{Name = "rights"};
+	optional AtomTextConstruct Subtitle with XmlEncoding{Name = "subtitle"};
+	AtomTextConstruct Title with XmlEncoding{Name = "title"};
+	AtomDateConstruct Updated with XmlEncoding{Name = "updated"};
+	// Extended by RFC 5023
+	optional Control Control with XmlEncoding{Name = "control", Namespace = AtomPubAppNamespace};
+	
+	// WORKAROUND: The Entry element should be placed before the ExtensionElement
+	// Related Bugs: The WORKAROUND can be removed if one of these bugs is resolved.
+	// Bug#50510 - If using the inherit type, the xmlSelector will aways be set to XmlSelectorForSequencedFields
+	// Bug#45148 - [Ndr Codec] Non-encapsulated embedded union cannot pass compiler
+	optional array<Entry> Entry with XmlEncoding{Name = "entry"};
+	
+	optional array<ExtensionElement> ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type Entry:AtomCommonAttributes
+{
+    optional array<AtomPersonConstruct> Author with XmlEncoding{Name = "author"};
+    optional array<Category> Category with XmlEncoding{Name = "category"};
+    optional Content Content with XmlEncoding{Name = "content"};
+    optional array<AtomPersonConstruct> Contributor with XmlEncoding{Name = "contributor"};
+    // WORKAROUND: Add optional as most of the captures doesn't have this Id element
+    optional Id Id where ValidationCheck(value != nothing, null, "AtomPub: Entry elements must contain exactly one atom:id element.")
+        with XmlEncoding{Name = "id"};
+    optional array<Link> Link with XmlEncoding{Name = "link"};
+    optional AtomDateConstruct Published with XmlEncoding{Name = "published"};
+    optional AtomTextConstruct Rights with XmlEncoding{Name = "rights"};
+    optional Source Source with XmlEncoding{Name = "source"};
+    optional AtomTextConstruct Summary with XmlEncoding{Name = "summary"};
+    // WORKAROUND: Add optional as most of the captures doen't have this Title element
+    optional AtomTextConstruct Title where ValidationCheck(value != nothing, null, "AtomPub: Entry elements must contain exactly one atom:title element.")
+        with XmlEncoding{Name = "title"};
+    // WORKAROUND: Add optional as most of the captures doen't have this Updated element
+    optional AtomDateConstruct Updated where ValidationCheck(value != nothing, null, "AtomPub: Entry elements must contain exactly one atom:updated element.")
+        with XmlEncoding{Name = "updated"};
+
+    // Extended by RFC 5023
+    optional Control Control with XmlEncoding{Name = "control", Namespace = AtomPubAppNamespace};
+    optional array<ExtensionElement> ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+type InlineTextContentType
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // InlineTextContentType only attribute
+    optional string Type where value in {nothing, "text", "html"}
+        with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    XhtmlDiv Div with XmlEncoding{Name = "div", Namespace = AtomPubXhtmlNamespace};
+}
+
+type InlineXhtmlContentType
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // InlineXhtmlContentType only attribute
+    string Type where value == "xhtml"
+        with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    XhtmlDiv Div with XmlEncoding{Name = "div", Namespace = AtomPubXhtmlNamespace};
+}
+
+type InlineOtherContentType
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // InlineXhtmlContentType only attribute
+    optional AtomMediaType Type with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+    //Text | AnyElement
+    optional array<xml> Any with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Any};
+}
+
+type OutOfLineContentType
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // InlineXhtmlContentType only attribute
+    optional AtomMediaType Type with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    optional AtomUri Src with XmlEncoding{Name = "src", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+}
+
+pattern Content = InlineTextContentType
+    | InlineXhtmlContentType
+    | InlineOtherContentType
+    | OutOfLineContentType;
+
+type Generator
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    // Generator only attribute
+    optional AtomUri Uri with XmlEncoding{Name = "uri", Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Version with XmlEncoding{Name = "text", Kind = XmlKind.Attribute, Namespace = ""};
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    string Text with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Icon:AtomCommonAttributes
+{
+    AtomUri Uri with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Id:AtomCommonAttributes
+{
+    AtomUri Uri with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Logo:AtomCommonAttributes
+{
+    AtomUri Uri with XmlEncoding{Kind = XmlKind.Text};
+}
+
+type Link
+{
+    // AtomCommonAttributes
+    optional AtomUri Base with XmlEncoding{Name = "base", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional AtomUri Lang with XmlEncoding{Name = "lang", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+    optional string Space where value in {nothing, "default", "preserved"}
+        with XmlEncoding{Name = "space", Kind = XmlKind.Attribute, Namespace = XmlNamespace};
+
+    // Link only Attributes
+    AtomUri Href with XmlEncoding{Name = "href", Kind = XmlKind.Attribute, Namespace = ""};
+    optional (AtomNCName | AtomUri) Rel with XmlEncoding{Name = "rel", Kind = XmlKind.Attribute, Namespace = ""};
+    optional AtomMediaType Type with XmlEncoding{Name = "type", Kind = XmlKind.Attribute, Namespace = ""};
+    optional AtomLanguageTag Hreflang with XmlEncoding{Name = "hreflang", Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Title with XmlEncoding{Name = "title", Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Length with XmlEncoding{Name = "length", Kind = XmlKind.Attribute, Namespace = ""};
+
+    // AtomCommonAttributes
+    optional array<UndefinedAttribute> UndefinedAttribute with XmlEncoding{IsAny = true, Kind = XmlKind.Attribute, Namespace = XmlNamespaceIndicator.Any};
+
+    UndefinedContent UndefinedContent with XmlEncoding{IsAny = true};
+}
+
+type Source:AtomCommonAttributes
+{
+    optional array<AtomPersonConstruct> Author with XmlEncoding{Name = "author"};
+    optional array<Category> Category with XmlEncoding{Name = "category"};
+    optional array<AtomPersonConstruct> Contributor with XmlEncoding{Name = "contributor"};
+    optional Generator Generator with XmlEncoding{Name = "generator"};
+    optional Icon Icon with XmlEncoding{Name = "icon"};
+    optional Id Id with XmlEncoding{Name = "id"};
+    optional array<Link> Link with XmlEncoding{Name = "link"};
+    optional Logo Logo with XmlEncoding{Name = "logo"};
+    optional AtomTextConstruct Rights with XmlEncoding{Name = "rights"};
+    optional AtomTextConstruct Subtitle with XmlEncoding{Name = "subtitle"};
+    optional AtomTextConstruct Title with XmlEncoding{Name = "title"};
+    optional AtomDateConstruct Updated with XmlEncoding{Name = "updated"};
+
+    optional array<ExtensionElement> ExtensionElement with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+} with XmlEncoding{Order = XmlOrderIndicator.All};
+
+pattern AtomNCName = string where value.Count >= 1; //[^:]*
+
+pattern AtomMediaType = string; //".+/.+"
+
+pattern AtomEmailAddress = string; //.+@.+
+

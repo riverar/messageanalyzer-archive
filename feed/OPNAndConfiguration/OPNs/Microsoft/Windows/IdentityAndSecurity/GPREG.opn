@@ -1,0 +1,1407 @@
+protocol GPREG with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Group Policy: Registry Extension Encoding",
+    ShortName = "GPREG",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-GPREG", Version = "24.0", Date = "05/15/2014"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "", Date = ""}
+        ]
+};
+
+using Utility;
+using FAS;
+using XSD;
+
+endpoint Server over FAS.Server
+    accepts RegistryPolicyMessage issues RegistryPolicyMessage
+    accepts ADMFile issues ADMFile
+    accepts ADMXFile issues ADMXFile
+    accepts ADMLFile issues ADMLFile
+    accepts CMTLFile issues CMTLFile
+    accepts CMTXFile issues CMTXFile;
+
+// -------------------------------- actor ---------------------------------------------
+autostart actor GPREGOverFAS(FAS.Server server)
+{
+    FASReassemblyHelper reassemblyHelper = null;
+    process server issues m:(any message) where server.FileName is fileName:string && IsGPREG(fileName) // read response
+    {
+        if (reassemblyHelper == null)
+        {
+            reassemblyHelper = new FASReassemblyHelper().
+                Initialize(server.MessageOffsetGetter, server.MessageDataGetter);
+        }
+        reassemblyHelper.AddDataMessage(m, server);
+        server.ReadResponseOffset = null;
+    }
+    
+    process server accepts m:(any message) where server.FileName is fileName:string && IsGPREG(fileName) && !server.HasCloseRequestAccepted // write request
+    {
+        if (reassemblyHelper == null)
+        {
+            reassemblyHelper = new FASReassemblyHelper().
+                Initialize(server.MessageOffsetGetter, server.MessageDataGetter);
+        }
+        reassemblyHelper.AddDataMessage(m, server);
+    }
+
+    // rule mapping to CloseRquest message of SMB/SMB2, it triggers reassembly but it can not be reassembled.
+    // if use process rule here, CloseRquest message has to be dispatched again using DisplayToTopLevel().
+    observe server accepts m:(any message) 
+            where server.FileName is fileName:string && IsGPREG(fileName) && server.HasCloseRequestAccepted &&
+                reassemblyHelper != null && reassemblyHelper.FileBuffer.Count > 0
+    {
+        bool isAccepts = server.Command == CommandType.Write ? true : false;
+        server.FileName = "";
+        server.HasCloseRequestAccepted = false;
+
+        DecodeAndDispatchMessage(isAccepts, reassemblyHelper.FileBuffer, reassemblyHelper.Origins, fileName);
+    }
+
+    void DecodeAndDispatchMessage(bool isAccepts, binary data, array<any message> origins, string fileName)
+    {
+        void(GPREG.Server, any message) dispatcher = isAccepts ? DispatchAcceptMessage : DispatchIssueMessage;
+        if (EndsWith(fileName, POLFileExtensionName))
+        {
+            DecodeAndDispatchRegistryPolicyMessage(data, origins, dispatcher, endpoint GPREG.Server over server);
+        }
+        else if (EndsWith(fileName, ADMFileExtensionName))
+        {
+            DecodeAndDispatchADMFile(data, origins, dispatcher, endpoint GPREG.Server over server);
+        }
+        else if (EndsWith(fileName, ADMXFileExtensionName))
+        {
+            DecodeAndDispatchXMLMessage<ADMXFile>(data, origins, dispatcher, endpoint GPREG.Server over server, "ADMXFile");
+        }
+        else if (EndsWith(fileName, ADMLFileExtensionName))
+        {
+            DecodeAndDispatchXMLMessage<ADMLFile>(data, origins, dispatcher, endpoint GPREG.Server over server, "ADMLFile");
+        }
+        else if (EndsWith(fileName, CMTXFileExtensionName))
+        {
+            DecodeAndDispatchXMLMessage<CMTXFile>(data, origins, dispatcher, endpoint GPREG.Server over server, "CMTXFile");
+        }
+        else if (EndsWith(fileName, CMTLFileExtensionName))
+        {
+            DecodeAndDispatchXMLMessage<CMTLFile>(data, origins, dispatcher, endpoint GPREG.Server over server, "CMTLFile");
+        }
+        else
+        {
+            ThrowDecodingException("GPREG");
+        }
+    }
+
+    void DispatchAcceptMessage(GPREG.Server server, any message msg)
+    {
+        dispatch server accepts msg;
+        if (reassemblyHelper != null)
+        {
+            reassemblyHelper.ResetAfterSucceed();
+        }
+    }
+    
+    void DispatchIssueMessage(GPREG.Server server, any message msg)
+    {
+        dispatch server issues msg;
+        if (reassemblyHelper != null)
+        {
+            reassemblyHelper.ResetAfterSucceed();
+        }
+    }
+
+    ~endpoint(FAS.Server server)
+    {
+        if (reassemblyHelper != null)
+        {
+            reassemblyHelper.ReleaseCache();
+        }
+    }
+}
+
+void DecodeAndDispatchXMLMessage<T>(binary fileData, array<any message> origins, void(GPREG.Server, T) dispatcher, GPREG.Server server, string messageName)
+{
+    switch (fileData)
+    {
+        case msg:T from XmlDecoder<T> =>
+            any message m = msg as any message;
+            m.Origins = origins;
+            dispatcher(server, msg);
+        default =>
+            ThrowDecodingException("GPREG", messageName);
+    }
+}
+
+void DecodeAndDispatchRegistryPolicyMessage(binary fileData, array<any message> origins, void(GPREG.Server, RegistryPolicyMessage) dispatcher, GPREG.Server server)
+{
+    if (PolicyFile(fileData) is msg:RegistryPolicyMessage)
+    {
+        msg.Origins = origins;
+        dispatcher(server, msg);
+    }
+    else
+    {
+        ThrowDecodingException("GPREG", "RegistryPolicyMessage");
+    }
+}
+
+void DecodeAndDispatchADMFile(binary fileData, array<any message> origins, void(GPREG.Server, ADMFile) dispatcher, GPREG.Server server)
+{
+    if (GetStringFromBinary(fileData) is str:string && AdmFile(str) is msg:ADMFile)
+    {
+        msg.Origins = origins;
+        dispatcher(server, msg);
+    }
+    else
+    {
+        ThrowDecodingException("GPREG", "ADMFile");
+    }
+}
+
+bool EndsWith(string fileName, string endStringOfFileName)
+{
+    if (fileName.Count - endStringOfFileName.Count > 0)
+    {
+        return fileName.Segment(fileName.Count - endStringOfFileName.Count, endStringOfFileName.Count) == endStringOfFileName;
+    }
+    return false;
+}
+
+// -------------------------------- strings ---------------------------------------------
+const string POLFileExtensionName = @".pol";
+const string ADMFileExtensionName = @".adm";
+const string ADMXFileExtensionName = @".admx";
+const string ADMLFileExtensionName = @".adml";
+const string CMTXFileExtensionName = @".cmtx";
+const string CMTLFileExtensionName = @".cmtl";
+// Due to TDI, use XmlNamespaceIndicator.Any instead of CommentDefinitionsNamespace and PolicyDefinitionsNamespace
+const string CommentDefinitionsNamespace = @"http://www.microsoft.com/GroupPolicy/CommentDefinitions"; // For CMTX and CMTL file
+const string PolicyDefinitionsNamespace = @"http://www.microsoft.com/GroupPolicy/PolicyDefinitions"; // For ADMX and ADML file
+
+syntax AdmStringsSyntax      = str:TokStrings statements:AdmStringStatement*
+                               => new AdmStrings
+                                  {
+                                      TokStrings = str,
+                                      AdmStringStatements = statements.Count == 0 ? nothing : statements
+                                  };
+syntax AdmStringStatement    = WhiteSpace name:AdmTokenWithoutEqual w1:WhiteSpace equal:"=" w2:WhiteSpace val:TokQuotedString => (name + w1 + equal + w2 + val);
+syntax AdmTokenWithoutEqual  = regex{[\x21\x23-\x3A\x3C\x3E-\x7E]+};
+syntax TokStrings            = WhiteSpace c:regex{(?i)\x5Bstrings\x5D} => c;
+
+// -------------------------------- ADM File Syntax ---------------------------------------------
+syntax AdmFile               = states:(state:AdmStatementSyntax => state)* str:AdmStringsSyntax?
+                               => new ADMFile
+                                 {
+                                     AdmStatements = states.Count == 0 ? nothing : states,
+                                     AdmStrings = str.Count == 0 ? nothing : str[0]
+                                 };
+
+syntax AdmStatementSyntax    = s:(AdmClass | AdmCategorySyntax | AdmPolicySyntax | AdmPartSyntax | AdmItemListSyntax | AdmActionListSyntax | string) (AdmComment)*
+                               => new AdmStatement
+                                 {
+                                    Statement = s,
+                                 };
+
+syntax AdmClass              = WhiteSpace s2:regex{(?i)CLASS} s3:WhiteSpace s4:(regex{(?i)USER} | regex{(?i)MACHINE}) => (s2 + s3 + s4);
+syntax WhiteSpace            = regex{[\x09\x0A\x0D\x20]*};
+
+syntax AdmCategorySyntax     = (AdmComment)* (AdmIfSyntax)* ca:TokCategory caName:AdmString (AdmComment)* (AdmIfSyntax)* keyName:AdmKeyName? (AdmComment)* (AdmIfSyntax)* explain:AdmExplain? (AdmComment)* (AdmIfSyntax)* elements:(element:(AdmCategorySyntax | AdmPolicySyntax) => (element as (AdmCategory | AdmPolicy)))* (AdmComment)* (AdmIfSyntax)* end:TokEnd endCa:TokCategory
+                               => new AdmCategory
+                                 {
+                                     Category = ca + caName,
+                                     AdmKeyName = keyName.Count == 0 ? nothing : keyName[0],
+                                     AdmExplain = explain.Count == 0 ? nothing : explain[0],
+                                     Elements = elements.Count == 0 ? nothing : elements,
+                                     EndCategory = end + endCa
+                                 };
+syntax TokCategory           = WhiteSpace c:regex{(?i)CATEGORY} => c;
+syntax AdmString             = w:WhiteSpace str:(AdmToken | TokQuotedString | AdmStringId) => (w + str);
+syntax AdmToken              = regex{[\x21\x23-\x3A\x3C-\x7E]+};
+syntax TokQuotedString       = "\x22" str:AdmQuotedCharacter "\x22" => ("\x22" + str + "\x22");
+syntax AdmQuotedCharacter    = regex{[\x20-\x21\x23-\x7E]+};
+syntax AdmStringId           = "!!" t:AdmToken => ("!!" + t);
+syntax AdmKeyName            = t:TokKeyName a:AdmString => (t + a);
+syntax TokKeyName            = WhiteSpace k:regex{(?i)KEYNAME} => k;
+syntax AdmExplain            = t:TokExplain a:AdmString => (t + a);
+syntax TokExplain            = WhiteSpace e:regex{(?i)EXPLAIN} => e;
+syntax TokEnd                = WhiteSpace e:regex{(?i)END} w:WhiteSpace => (e + w);
+syntax AdmComment            = WhiteSpace ";" str:regex{[\x20-\x7F]+} => (";" + str);
+syntax AdmIfSyntax           = WhiteSpace i:regex{(?i)#if} w1:WhiteSpace v:regex{(?i)version} w2:WhiteSpace o:(">=" | "<=" | ">" | "<" | "!=" | "==") d:TokDigits WhiteSpace t:regex{[\x00-\x22\x24-\xFF]*} e:regex{(?i)#endif}
+                               => new AdmIf
+                                 {
+                                     If = i + w1 + v + w2 + o + d,
+                                     Text = t,
+                                     EndIf = e
+                                 };
+
+syntax AdmPolicySyntax       = (AdmComment)* (AdmIfSyntax)* policy:TokPolicy policyName:AdmString (AdmComment)* (AdmIfSyntax)* keyName:AdmKeyName? (AdmComment)* (AdmIfSyntax)* explain:AdmExplain? (AdmComment)* (AdmIfSyntax)* valueOnOff:AdmValueOnOffSyntax? (AdmComment)* (AdmIfSyntax)*
+ listOnOff:AdmActionListOnOffSyntax? (AdmComment)* (AdmIfSyntax)* supported:AdmSupported? (AdmComment)* (AdmIfSyntax)* clientExt:AdmClientExt? (AdmComment)* (AdmIfSyntax)* parts:(part:AdmPartSyntax => (part as AdmPart))* (AdmComment)* (AdmIfSyntax)* end:TokEnd endPolicy:TokPolicy
+                               => new AdmPolicy
+                                 {
+                                     Policy = policy + policyName,
+                                     AdmKeyName = keyName.Count == 0 ? nothing : keyName[0],
+                                     AdmExplain = explain.Count == 0 ? nothing : explain[0],
+                                     AdmValueOnOff = valueOnOff.Count == 0 ? nothing : valueOnOff[0],
+                                     AdmActionListOnOff = listOnOff.Count == 0 ? nothing : listOnOff[0],
+                                     AdmSupported = supported.Count == 0 ? nothing : supported[0],
+                                     AdmClientExt = clientExt.Count == 0 ? nothing : clientExt[0],
+                                     AdmParts = parts.Count == 0 ? nothing : parts,
+                                     EndPolicy = end + endPolicy
+                                 };
+
+syntax AdmPartSyntax         = part:TokPart partName:AdmString ui:AdmUIControl end:TokEnd endPart:TokPart
+                               => new AdmPart
+                                 {
+                                     Part = part + partName,
+                                     AdmUIControl = ui,
+                                     EndPart = end + endPart
+                                 };
+
+syntax AdmUIControl          = (AdmCheckboxSyntax | AdmEditTextSyntax | AdmNumericSyntax | AdmComboboxSyntax | AdmDropdownlistSyntax | AdmListboxSyntax | TokText);
+syntax AdmListboxSyntax      = box:TokListbox arguments:AdmListBoxArguments
+                                => new AdmListbox
+                                 {
+                                     TokListbox = box,
+                                     AdmListBoxArguments = arguments.Count == 0 ? nothing : arguments,
+                                 };
+syntax AdmListBoxArguments   = arguments:(argument:(AdmKeyName | AdmAdditive | AdmExplicitValue | AdmValuePrefix | AdmClientExt | AdmNoSort | AdmExpandableText) => (argument as string))* => arguments;
+syntax AdmAdditive           = WhiteSpace n:regex{(?i)additive} => n;
+syntax AdmExplicitValue      = WhiteSpace n:regex{(?i)explicitvalue} => n;
+syntax AdmValuePrefix        = WhiteSpace prefix:regex{(?i)valueprefix} w:WhiteSpace alpha:regex{[A-Za-z]*} => (prefix + w + alpha);
+syntax TokListbox            = WhiteSpace n:regex{(?i)listbox} => n;
+syntax TokText               = WhiteSpace n:regex{(?i)text} => n;
+
+syntax AdmDropdownlistSyntax = list:TokDropdownlist arguments:AdmDropdownListArguments
+                                => new AdmDropdownlist
+                                 {
+                                     TokDropdownlist = list,
+                                     AdmDropdownListArguments = arguments.Count == 0 ? nothing : arguments,
+                                 };
+syntax AdmDropdownListArguments = arguments:(argument:(AdmKeyName | AdmValueName | AdmItemListSyntax | AdmRequired | AdmClientExt | AdmNoSort) => (argument as (AdmItemList | string)))* => arguments;
+syntax AdmItemListSyntax     = item:TokItemList strs:(AdmItemSyntax)* end:TokEnd endItem:TokItemList
+                               => new AdmItemList
+                                 {
+                                     ItemList = item,
+                                     AdmItems = strs.Count == 0 ? nothing : strs,
+                                     EndItemList = end + endItem
+                                 };
+
+syntax AdmItemSyntax         = name:TokName str:AdmString val:AdmValueData def:TokDefault? actionList:AdmActionListSyntax?
+                               => new AdmItem
+                                 {
+                                     Name = name + str,
+                                     AdmValueData = val,
+                                     Default = def.Count == 0 ? nothing : def[0],
+                                     AdmActionList = actionList.Count == 0 ? nothing : actionList[0]
+                                 };
+
+syntax AdmActionListSyntax   = list:TokActionList pairs:(AdmKeyValuePairSyntax)* end:TokEnd endList:TokActionList
+                               => new AdmActionList
+                                 {
+                                     ActionList = list,
+                                     AdmKeyValuePair = pairs.Count == 0 ? nothing : pairs,
+                                     EndActionList = end + endList
+                                 };
+
+syntax TokActionList         = WhiteSpace n:regex{(?i)ActionList} => n;
+
+syntax TokName               = WhiteSpace n:regex{(?i)name} => n;
+
+syntax TokItemList           = WhiteSpace n:regex{(?i)ItemList} => n;
+syntax TokDropdownlist       = WhiteSpace n:regex{(?i)dropdownlist} => n;
+
+syntax AdmComboboxSyntax     = n:TokCombobox arguments:AdmComboBoxArguments
+                               => new AdmCombobox
+                                 {
+                                     TokCombobox = n,
+                                     AdmComboBoxArguments = arguments.Count == 0 ? nothing : arguments
+                                 };
+
+syntax AdmComboBoxArguments  = arguments:(argument:(AdmKeyName | AdmValueName | AdmDefaultString | AdmMaxLen | AdmRequired | AdmOemConvert | AdmClientExt | AdmExpandableText | AdmSuggestionsSyntax | AdmNoSort) => (argument as (AdmSuggestions | string)))* => arguments;
+
+syntax AdmSuggestionsSyntax  = sug:TokSuggestions strs:(WhiteSpace str:(AdmTokenWithoutEnd | TokQuotedString | AdmStringId))* end:TokEnd endSug:TokSuggestions
+                               => new AdmSuggestions
+                                 {
+                                     Suggestions = sug,
+                                     AdmString = strs.Count == 0 ? nothing : strs,
+                                     EndSuggestions = end + endSug
+                                 };
+
+syntax AdmTokenWithoutEnd    = regex{[\x21\x23-\x3A\x3C-\x44\x46-\x7E]+};
+syntax AdmNoSort             = WhiteSpace n:regex{(?i)nosort} => n;
+
+syntax TokSuggestions        = WhiteSpace n:regex{(?i)suggestions} => n;
+syntax TokCombobox           = WhiteSpace n:regex{(?i)combobox} => n;
+
+syntax AdmNumericSyntax      = n:TokNumericWithoutSpace arguments:AdmNumericArguments
+                               => new AdmNumeric
+                                 {
+                                     TokNumeric = n,
+                                     AdmNumericArguments = arguments.Count == 0 ? nothing : arguments
+                                 };
+syntax TokNumericWithoutSpace= WhiteSpace n:regex{(?i)NUMERIC} => n;
+syntax AdmNumericArguments   = arguments:(argument:(AdmKeyName | AdmValueName | AdmDefaultNumeric | AdmMax | AdmMin | AdmRequired | AdmSpin | AdmClientExt | AdmTextConvert) => (argument as string))* => arguments;
+syntax AdmDefaultNumeric     = t:TokDefault d:TokDigits => (t + d);
+syntax AdmMax                = m:TokMax d:TokDigits => (m + d);
+syntax TokMax                = WhiteSpace s:regex{(?i)MAX} => s;
+syntax AdmMin                = m:TokMin d:TokDigits => (m + d);
+syntax TokMin                = WhiteSpace s:regex{(?i)MIN} => s;
+syntax AdmSpin               = m:TokSpin d:TokDigits => (m + d);
+syntax TokSpin               = WhiteSpace s:regex{(?i)SPIN} => s;
+syntax AdmTextConvert        = WhiteSpace s:regex{(?i)TXTConvert} => s;
+
+syntax AdmEditTextSyntax     = t:TokEditText arguments:AdmEditTextArguments
+                               => new AdmEditText
+                                 {
+                                     TokEditText = t,
+                                     AdmEditTextArguments = arguments.Count == 0 ? nothing : arguments
+                                 };
+syntax TokEditText           = WhiteSpace s:regex{(?i)EDITTEXT} => s;
+
+syntax AdmEditTextArguments  = arguments:(argument:(AdmKeyName | AdmValueName | AdmDefaultString | AdmMaxLen | AdmRequired | AdmOemConvert | AdmClientExt | AdmExpandableText) => (argument as string))* => arguments;
+syntax AdmRequired           = WhiteSpace s:regex{(?i)REQUIRED} => s;
+syntax AdmOemConvert         = WhiteSpace s:regex{(?i)OEMCONVERT} => s;
+syntax AdmExpandableText     = WhiteSpace s:regex{(?i)EXPANDABLETEXT} => s;
+syntax AdmMaxLen             = l:TokMaxlen d:TokDigits => (l + d);
+syntax TokMaxlen             = WhiteSpace s:regex{(?i)MAXLEN} => s;
+syntax AdmDefaultString      = s:TokDefault str:AdmString => (s + str);
+syntax TokDefault            = WhiteSpace s:regex{(?i)DEFAULT} => s;
+
+syntax AdmCheckboxSyntax     = c:TokCheckbox arguments:AdmCheckBoxArguments
+                               => new AdmCheckbox
+                                 {
+                                     TokCheckbox = c,
+                                     AdmCheckBoxArguments = arguments.Count == 0 ? nothing : arguments
+                                 };
+
+syntax AdmCheckBoxArguments  = arguments:(argument:(AdmKeyName | AdmValueOnOffSyntax | AdmDefChecked | AdmActionListOnOffSyntax | AdmClientExt) => (argument as (AdmValueOnOff | AdmActionListOnOff | string)))* => arguments;
+syntax AdmDefChecked         = WhiteSpace s:regex{(?i)DEFCHECKED} => s;
+
+syntax TokCheckbox           = WhiteSpace s:regex{(?i)CHECKBOX} => s;
+syntax TokPart               = WhiteSpace s:regex{(?i)PART} => s;
+syntax AdmClientExt          = c:TokClientExt id:AdmGuid => (c + id);
+syntax AdmGuid               = w1:WhiteSpace "{" w2:WhiteSpace hex1:HEXDIG "-" hex2:HEXDIG "-" hex3:HEXDIG "-" hex4:HEXDIG "-" hex5:HEXDIG w3:WhiteSpace "}" w4:WhiteSpace => (w1 + "{" + w2 + hex1 + "-" + hex2 + "-" + hex3 + "-" + hex4 + "-" + hex5 + w3 + "}" + w4);
+pattern HEXDIG               = regex{[0-9A-Fa-f]*};
+syntax TokClientExt          = WhiteSpace s:regex{(?i)CLIENTEXT} => s;
+syntax AdmSupported          = s:TokSupported str:AdmString => (s + str);
+syntax TokSupported          = WhiteSpace s:regex{(?i)SUPPORTED} => s;
+syntax TokPolicy             = WhiteSpace p:regex{(?i)POLICY} => p;
+syntax AdmValueOnOffSyntax   = name:AdmValueName on:AdmValueOn? off:AdmValueOff?
+                               => new AdmValueOnOff
+                                 {
+                                     AdmValueName = name,
+                                     AdmValueOn = on.Count == 0 ? nothing : on[0],
+                                     AdmValueOff = off.Count == 0 ? nothing : off[0],
+                                 };
+syntax AdmValueName          = v:TokValueName str:AdmString => (v + str);
+syntax TokValueName          = WhiteSpace v:regex{(?i)VALUENAME} => v;
+syntax AdmValueOn            = on:TokValueOn v:(AdmNumericValue | AdmString) => (on + v);
+syntax AdmValueOff           = off:TokValueOff v:(AdmNumericValue | AdmString) => (off + v);
+syntax TokValueOn            = WhiteSpace on:regex{(?i)VALUEON} => on;
+syntax TokValueOff           = WhiteSpace off:regex{(?i)VALUEOFF} => off;
+syntax AdmNumericValue       = n:TokNumeric d:TokDigits => (n + d);
+syntax TokNumeric            = w:WhiteSpace n:regex{(?i)NUMERIC} => (w + n);
+syntax TokDigits             = w:WhiteSpace d:regex{[0-9]+} => (w + d);
+
+syntax AdmActionListOnOffSyntax = on:AdmActionListOnSyntax? off:AdmActionListOffSyntax?
+                               => (((on.Count == 0) && (off.Count == 0)) ? nothing : new AdmActionListOnOff
+                                 {
+                                    AdmActionListOn = on.Count == 0 ? nothing : on[0],
+                                    AdmActionListOff = off.Count == 0 ? nothing : off[0],
+                                 });
+syntax AdmActionListOffSyntax = listOff:TokActionListOff pairs:(pair:AdmKeyValuePairSyntax => (pair as AdmKeyValuePair))* end:TokEnd endListOff:TokActionListOff
+                               => new AdmActionListOff
+                                 {
+                                     TokActionListOff = listOff,
+                                     AdmKeyValuePair = pairs.Count == 0 ? nothing : pairs,
+                                     EndTokActionListOff = end + endListOff
+                                 };
+syntax AdmActionListOnSyntax = listOn:TokActionListOn pairs:(pair:AdmKeyValuePairSyntax => (pair as AdmKeyValuePair))* end:TokEnd endListOn:TokActionListOn
+                               => new AdmActionListOn
+                                 {
+                                     TokActionListOn = listOn,
+                                     AdmKeyValuePair = pairs.Count == 0 ? nothing : pairs,
+                                     EndTokActionListOn = end + endListOn
+                                 };
+syntax TokActionListOn       = WhiteSpace a:regex{(?i)ACTIONLISTON} => a;
+syntax TokActionListOff      = WhiteSpace a:regex{(?i)ACTIONLISTOFF} => a;
+syntax AdmKeyValuePairSyntax = key:AdmKeyName? name:AdmValueName data:AdmValueData?
+                               => new AdmKeyValuePair
+                                 {
+                                     AdmKeyName = key.Count == 0 ? nothing : key[0],
+                                     AdmValueName = name,
+                                     AdmValueData = data.Count == 0 ? nothing : data[0]
+                                 };
+syntax AdmValueData          = v:TokValue str:(TokDelete | AdmNumericValue | AdmString) => (v + str);
+syntax TokValue              = WhiteSpace n:regex{(?i)VALUE} => n;
+syntax TokDelete             = w:WhiteSpace n:regex{(?i)DELETE} => (w + n);
+
+// ADM file
+message ADMFile
+{
+    optional array<AdmStatement> AdmStatements;
+    optional AdmStrings AdmStrings;
+
+    override string ToString()
+    {
+        return "ADMFile";
+    }
+}
+
+type AdmStatement
+{
+    (string | AdmCategory) Statement;
+}
+
+type AdmCategory
+{
+    string Category;
+    optional string AdmKeyName;
+    optional string AdmExplain;
+    optional array<AdmCategory | AdmPolicy> Elements;
+    string EndCategory;
+}
+
+type AdmPolicy
+{
+    string Policy;
+    optional string AdmKeyName;
+    optional string AdmExplain;
+    optional AdmValueOnOff AdmValueOnOff;
+    optional AdmActionListOnOff AdmActionListOnOff;
+    optional string AdmSupported;
+    optional string AdmClientExt;
+    optional array<AdmPart> AdmParts;
+    string EndPolicy;
+}
+
+type AdmValueOnOff
+{
+    string AdmValueName;
+    optional string AdmValueOn;
+    optional string AdmValueOff;
+}
+
+type AdmActionListOnOff 
+{
+    optional AdmActionListOn AdmActionListOn;
+    optional AdmActionListOff AdmActionListOff;
+}
+
+type AdmActionListOff
+{
+    string TokActionListOff;
+    optional array<AdmKeyValuePair> AdmKeyValuePair;
+    string EndTokActionListOff;
+}
+
+type AdmActionListOn
+{
+    string TokActionListOn;
+    optional array<AdmKeyValuePair> AdmKeyValuePair;
+    string EndTokActionListOn;
+}
+
+type AdmKeyValuePair
+{
+    optional string AdmKeyName;
+    string AdmValueName;
+    optional string AdmValueData;
+}
+
+type AdmIf
+{
+    string If;
+    string Text;
+    string EndIf;
+}
+
+type AdmPart
+{
+    string Part;
+    (AdmCheckbox | AdmEditText | AdmNumeric | AdmCombobox | AdmDropdownlist | AdmListbox | string) AdmUIControl;
+    string EndPart;
+}
+
+type AdmListbox
+{
+    string TokListbox;
+    optional array<string> AdmListBoxArguments;
+}
+
+type AdmActionList
+{
+    string ActionList;
+    optional array<AdmKeyValuePair> AdmKeyValuePair;
+    string EndActionList;
+}
+
+type AdmStrings
+{
+    string TokStrings;
+    optional array<string> AdmStringStatements;
+}
+
+type AdmDropdownlist
+{
+    string TokDropdownlist;
+    optional array<AdmItemList | string> AdmDropdownListArguments;
+}
+
+type AdmItemList
+{
+    string ItemList;
+    optional array<AdmItem> AdmItems;
+    string EndItemList;
+}
+
+type AdmItem
+{
+    string Name;
+    string AdmValueData;
+    optional string Default;
+    optional AdmActionList AdmActionList;
+}
+
+type AdmSuggestions
+{
+    string Suggestions;
+    optional array<string> AdmString;
+    string EndSuggestions;
+}
+
+type AdmCheckbox
+{
+    string TokCheckbox;
+    optional array<AdmValueOnOff | AdmActionListOnOff | string> AdmCheckBoxArguments;
+}
+
+type AdmEditText
+{
+    string TokEditText;
+    optional array<string> AdmEditTextArguments;
+}
+
+type AdmNumeric
+{
+    string TokNumeric;
+    optional array<string> AdmNumericArguments;
+}
+
+type AdmCombobox
+{
+    string TokCombobox;
+    optional array<AdmSuggestions | string> AdmComboBoxArguments;
+}
+
+// -------------------------------- Policy File Syntax ---------------------------------------------
+syntax PolicyFile     = h:HeaderSyntax b:BodySyntax
+                        => new RegistryPolicyMessage
+                            {
+                                Header = h,
+                                Body = b
+                            };
+
+syntax HeaderSyntax     = "\x50\x52\x65\x67" regex{[\x01]} "\x00\x00\x00"
+                        => new Header
+                           {
+                               Signature = "Preg",
+                               Version = "1"
+                           };
+
+syntax BodySyntax       = ss:(s:InstructionSyntax => s)*
+                        => new Body
+                           {
+                               Instructions = ss
+                           };
+
+syntax InstructionSyntax = "[" "\x00" k:(UTF16String from BinaryDecoder) "\x3B\x00" v:(UTF16String from BinaryDecoder) "\x3B\x00" t:(uint from BinaryDecoder) "\x3B\x00" s:(uint from BinaryDecoder) "\x3B\x00" d:(Data[t, s] from BinaryDecoder) "\x5D\x00"
+                        => new Instruction
+                           {
+                               Key = k.String,
+                               Value = v.String,
+                               Type = t,
+                               Size = s,
+                               Data = d.Data
+                           };
+type UTF16String
+{
+    string String with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    ushort Terminal where value == 0;
+}
+
+type UTF16StringWrapper
+{
+    string Value with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+};
+
+type UTF16StringArrayWrapper
+{
+    array<string> Value with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+};
+
+type Data[uint Type, uint Length]
+{
+    optional (uint | ulong | string | binary) Data with Encoding{Decoder = DecodeData, SourcePattern = TypeOf<binary>()},
+         BinaryEncoding{Length = Length};
+
+    optional (uint | ulong | string | binary) DecodeData(any a)
+    {
+        binary bin = a as binary;
+
+        if ((0x01 == Type || 0x02 == Type) && BinaryStringDecoder(bin, TextEncoding.UTF16) is utf16String:string)
+        {
+            return utf16String;
+        }
+        else if (0x04 == Type && BinaryDecoder<uint>(bin) is number:uint)
+        {
+            return number;
+        }
+        else if (0x05 == Type && BinaryPrimitiveTypeDecoder<uint>(bin, Endian.Big) is numberInBigEndian:uint)
+        {
+            return numberInBigEndian;
+        }
+        else if (0x07 == Type && BinaryDecoder<UTF16StringArrayWrapper>(bin) is stringArray:UTF16StringArrayWrapper)
+        {
+            return stringArray.Value;
+        }
+        else if (0x0B == Type && BinaryDecoder<ulong>(bin) is bit64Number:ulong)
+        {
+            return bit64Number;
+        }
+        else
+        {
+            return bin;
+        }
+
+        /*
+        if ((0x01 == Type || 0x02 == Type) && BinaryDecoder<UTF16StringWrapper>(bin) is utf16String:UTF16StringWrapper)
+        {
+            return utf16String.Value;
+        }
+        else if (0x04 == Type && BinaryDecoder<uint>(bin) is number:uint)
+        {
+            return number;
+        }
+        else if (0x05 == Type && BinaryDecoder<Utility.UintInBigEndian>(bin) is numberInBigEndian:Utility.UintInBigEndian)
+        {
+            return numberInBigEndian.Value;
+        }
+        else if (0x07 == Type && BinaryDecoder<UTF16StringArrayWrapper>(bin) is stringArray:UTF16StringArrayWrapper)
+        {
+            return stringArray.Value;
+        }
+        else if (0x0B == Type && BinaryDecoder<ulong>(bin) is bit64Number:ulong)
+        {
+            return bit64Number;
+        }
+        else
+        {
+            return bin;
+        }
+        */
+    }
+}
+
+// -------------------------------- message & types ---------------------------------------------
+// Registry Policy Message
+message RegistryPolicyMessage
+{
+    Header Header;
+    Body Body;
+    
+    override string ToString()
+    {
+        return "RegistryPolicyMessage";
+    }
+}
+
+type Header
+{
+    string Signature;
+    string Version;
+}
+
+type Body
+{
+    array<Instruction> Instructions;
+}
+
+type Instruction
+{
+    string Key;
+    string Value;
+    uint Type;
+    uint Size;
+    optional (uint | ulong | string | binary) Data;
+}
+
+// ADMX file
+message ADMXFile
+{
+    PolicyNamespaces policyNamespaces;
+    optional array<FileReference> supersededAdm;
+    optional array<Annotation> $"annotation";
+    LocalizationResourceReference resources;
+    optional SupportedOnTable supportedOn;
+    optional CategoryList categories;
+    optional PolicyList policies;
+    versionString revision
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    versionString schemaVersion
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "ADMXFile";
+    }
+} with XmlEncoding{Name = "policyDefinitions"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type PolicyNamespaces
+{
+    PolicyNamespaceAssociation target;
+    optional array<PolicyNamespaceAssociation> $"using";
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type PolicyNamespaceAssociation
+{
+    itemName prefix with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    XSAnyURI namespace with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+// Not Covered by UT
+type FileReference
+{
+    fileName fileName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+// Not Covered by UT
+pattern fileName = string;
+
+type LocalizationResourceReference
+{
+    versionString minRequiredRevision with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string fallbackCulture with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOnTable
+{
+    optional SupportedProducts products;
+    optional SupportedOnDefinitions definitions;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedProducts
+{
+    array<SupportedProduct> product;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedProduct
+{
+    optional array<SupportedMajorVersion> majorVersion;
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedMajorVersion
+{
+    optional array<SupportedMinorVersion> minorVersion;
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    uint versionIndex with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+// Not Covered by UT
+type SupportedMinorVersion
+{
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    uint versionIndex with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern stringReference = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"\$\(string\.(\p{L}|\p{N}|_)+\)"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern itemName = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"(\p{L}|\p{N}|_)+"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOnDefinitions
+{
+    array<SupportedOnDefinition> definition;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOnDefinition
+{
+    // Pef don't support Choice. workaround for pef feature 76572
+    // optional SupportedOnDefinitionChoice SupportedOnDefinitionChoice;
+    optional SupportedOrCondition or;
+    optional SupportedAndCondition and;
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with Standard.XmlEncoding{Order = XmlOrderIndicator.Sequence, IsWrapped = false}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Pef don't support Choice. workaround for pef feature 76572
+//type SupportedOnDefinitionChoice
+//{
+    //SupportedOrCondition or;
+    //SupportedAndCondition and;
+//} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOrCondition
+{
+    // Workaround for pef feature 76572, remove "XmlOrderIndicator.All" after feature 76572 done
+    //array<SupportedOrConditionChoice> SupportedOrConditionChoice;
+    optional array<SupportedOnRange> range;
+    optional array<SupportedOnReference> reference;
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Workaround for pef feature 76572
+//type SupportedOrConditionChoice
+//{
+    //SupportedOnRange range;
+    //SupportedOnReference reference;
+//} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOnRange
+{
+    itemReference $"ref" with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    uint minVersionIndex with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    uint maxVersionIndex with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedOnReference
+{
+    itemReference $"ref" with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern itemReference = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"((\p{L}|\p{N}|_)+)|((\p{L}|\p{N}|_)+:(\p{L}|\p{N}|_)+)"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type SupportedAndCondition
+{
+    // Workaround for pef feature 76572, remove "XmlOrderIndicator.All" after feature 76572 done
+    //array<SupportedAndConditionChoice> SupportedAndConditionChoice;
+    optional array<SupportedOnRange> range;
+    optional array<SupportedOnReference> reference;
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Workaround for pef feature 76572
+//type SupportedAndConditionChoice
+//{
+    //SupportedOnRange range;
+    //SupportedOnReference reference;
+//} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CategoryList
+{
+    array<Category> category;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type Category
+{
+    // Pef don't support group. will file bug later
+    // BaseDescriptiveGroup BaseDescriptiveGroup;
+    optional array<Annotation> $"annotation";
+    optional CategoryReference parentCategory;
+    optional array<string> seeAlso;
+    optional string keywords;
+
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    // BaseDescriptiveAttributeGroup BaseDescriptiveAttributeGroup;
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional stringReference explainText with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Pef don't support group. will file bug later
+//type BaseDescriptiveGroup
+//{
+    //optional array<Annotation> $"annotation";
+    //optional CategoryReference parentCategory;
+    //optional array<string> seeAlso;
+    //optional string keywords;
+//} with XmlEncoding{Kind = XmlKind.Group}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CategoryReference
+{
+    itemReference $"ref" with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Pef don't support group. will file bug later
+//type BaseDescriptiveAttributeGroup
+//{
+    //stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    //optional stringReference explainText with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+//} with XmlEncoding{Kind = XmlKind.AttributeGroup}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+//
+
+type PolicyList
+{
+    array<PolicyDefinition> policy;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type PolicyDefinition
+{
+    //BaseDescriptiveGroup BaseDescriptiveGroup;
+    optional array<Annotation> $"annotation";
+    optional CategoryReference parentCategory;
+    optional array<string> seeAlso;
+    optional string keywords;
+
+    SupportedOnReference supportedOn;
+    optional Value enabledValue;
+    optional Value disabledValue;
+    optional ValueList enabledList;
+    optional ValueList disabledList;
+    optional PolicyElements elements;
+
+    itemName name with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    PolicyClass class with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    // BaseDescriptiveAttributeGroup BaseDescriptiveAttributeGroup;
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional stringReference explainText with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    optional presentationReference presentation with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type Value
+{
+    optional Delete $"delete";
+    optional Decimal $"decimal";
+    optional longDecimal longDecimal;
+    optional typeOfString $"string";
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type Delete
+{
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type Decimal
+{
+    uint $"value" with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type longDecimal
+{
+    ulong $"value" with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern typeOfString = string with Standard.XmlEncoding{AnonymousType=true}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type ValueList
+{
+    array<ValueItem> item;
+    optional registryKey defaultKey with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type ValueItem
+{
+    Value $"value";
+    registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type PolicyElements
+{
+    // Workaround for pef feature 76572, remove "XmlOrderIndicator.All" after feature 76572 done
+    //array<PolicyElementsChoice> PolicyElementsChoice;
+    optional array<BooleanElement> boolean;
+    optional array<DecimalElement> $"decimal";
+    optional array<TextElement> text;
+    optional array<EnumerationElement> $"enum";
+    optional array<ListElement> list;
+    optional array<LongDecimalElement> longDecimal;
+    optional array<multiTextElement> multiText;
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Workaround for pef feature 76572
+//type PolicyElementsChoice
+//{
+    //BooleanElement boolean;
+    //DecimalElement $"decimal";
+    //TextElement text;
+    //EnumerationElement $"enum";
+    //ListElement list;
+    //LongDecimalElement longDecimal;
+    //multiTextElement multiText;
+//} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type BooleanElement
+{
+    optional Value trueValue;
+    optional Value falseValue;
+    optional ValueList trueList;
+    optional ValueList falseList;
+
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Pef don't support group. will file bug later
+//type PolicyElementAttributeGroup
+//{
+    //string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    //optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    //optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    //optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+//} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern GUID = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type DecimalElement
+{
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    optional bool required with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint minValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint maxValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool storeAsText with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool soft with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type TextElement
+{
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    optional bool required with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint maxLength with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool expandable with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool soft with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type EnumerationElement
+{
+    optional array<EnumerationElementItem> item;
+
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    bool required with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type EnumerationElementItem
+{
+    Value $"value";
+    optional ValueList valueList;
+    stringReference displayName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type ListElement
+{
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string valuePrefix with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool additive with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool expandable with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool explicitValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type LongDecimalElement
+{
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    optional bool required with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional ulong minValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional ulong maxValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool storeAsText with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool soft with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type multiTextElement
+{
+    //PolicyElementAttributeGroup PolicyElementAttributeGroup with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional GUID clientExtension with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryKey key with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional registryValueName valueName with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    optional bool required with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint maxLength with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint maxStrings with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool soft with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern PolicyClass = enum Token
+{
+    User = "User",
+    Machine = "Machine",
+    Both = "Both",
+    ...
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern presentationReference = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"\$\(presentation\.(\p{L}|\p{N}|_)+\)"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern registryKey = string;
+
+pattern registryValueName = string;
+
+// ADML file
+message ADMLFile
+{
+    string displayName;
+    string description;
+    optional array<Annotation> $"annotation";
+    Localization resources;
+    versionString revision
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    versionString schemaVersion
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "ADMLFile";
+    }
+} with XmlEncoding{Name = "policyDefinitionResources"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Not Covered by UT
+type Annotation
+{
+    xml skip with XmlEncoding{IsAny = true, Namespace = XmlNamespaceIndicator.Other};
+    string application with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type Localization
+{
+    optional stringTableType stringTable;
+    optional presentationTable presentationTable;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type stringTableType
+{
+    array<LocalizedString> $"string";
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type LocalizedString
+{
+    resourceID id
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    string Value with Standard.XmlEncoding{Kind = XmlKind.Text};
+} with Standard.XmlEncoding{Kind = XmlKind.SimpleTypeExtension}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern resourceID = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"(\p{L}|\p{N}|_)+"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type presentationTable
+{
+    array<PolicyPresentation> presentation;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type PolicyPresentation
+{
+    // Workaround for pef feature 76572, remove "XmlOrderIndicator.All" after feature 76572 done
+    // optional array<PolicyPresentationChoice> PolicyPresentationChoice;
+    optional array<string> text;
+    optional array<DecimalTextBox> decimalTextBox;
+    optional array<TextBox> textBox;
+    optional array<CheckBox> checkBox;
+    optional array<ComboBox> comboBox;
+    optional array<DropdownList> dropdownList;
+    optional array<ListBox> listBox;
+    optional array<LongDecimalTextBox> longDecimalTextBox;
+    optional array<MultiTextBox> multiTextBox;
+    resourceID id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncoding{Order = XmlOrderIndicator.All}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// Workaround for pef feature 76572
+//type PolicyPresentationChoice
+//{
+    //string text;
+    //DecimalTextBox decimalTextBox;
+    //TextBox textBox;
+    //CheckBox checkBox;
+    //ComboBox comboBox;
+    //DropdownList dropdownList;
+    //ListBox listBox;
+    //LongDecimalTextBox longDecimalTextBox;
+    //MultiTextBox multiTextBox;
+    //resourceID id
+        //with Standard.XmlEncoding
+                 //{Kind = XmlKind.Attribute, Namespace = ""};
+//} with XmlEncoding{IsWrapped = false, Order = XmlOrderIndicator.Choice}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type DecimalTextBox : DataElementContent
+{
+    optional uint defaultValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool spin with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint spinStep with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type DataElementContent
+{
+    string refId with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Value with Standard.XmlEncoding{Kind = XmlKind.Text};
+} with Standard.XmlEncoding{Kind = XmlKind.SimpleTypeExtension}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type TextBox : DataElement
+{
+    string label;
+    optional string defaultValue;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type DataElement
+{
+    string refId with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CheckBox : DataElementContent
+{
+    optional bool defaultChecked with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type ComboBox : DataElement
+{
+    string label;
+    optional string $"default";
+    optional array<string> suggestion;
+    optional bool noSort with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type DropdownList : DataElementContent
+{
+    optional bool noSort with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    uint defaultItem with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type ListBox : DataElementContent
+{
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type LongDecimalTextBox : DataElementContent
+{
+    optional uint defaultValue with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional bool spin with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint spinStep with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type MultiTextBox : DataElementContent
+{
+    optional bool showAsDialog with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional uint defaultHeight with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+pattern versionString = string with Standard.XmlPrimitiveValueEncoding{Pattern = @"[0-9]{1,4}\.[0-9]{1,5}"}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// CMTX file
+message CMTXFile
+{
+    policyNamespaces policyNamespaces;
+    comments comments;
+    CMTXResources resources;
+    decimal revision
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    decimal schemaVersion
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "CMTXFile";
+    }
+} with XmlEncoding{Name = "policyComments"} , XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type policyNamespaces
+{
+    $"using" $"using";
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type $"using"
+{
+    string prefix
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    string namespace
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type comments
+{
+    admTemplate admTemplate;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type admTemplate
+{
+    optional array<comment> comment;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type comment
+{
+    string policyRef
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    string commentText
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CMTXResources
+{
+    decimal minRequiredRevision
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    optional array<stringTable> stringTable;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+// CMTL file
+message CMTLFile
+{
+    CMTLResources resources;
+    decimal revision
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+    decimal schemaVersion
+        with Standard.XmlEncoding
+                 {Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "CMTLFile";
+    }
+} with XmlEncoding{Name = "commentDefinitionResources"} , XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CMTLResources
+{
+    stringTable stringTable;
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type stringTable
+{
+    optional array<CMTLTypeOfString> $"string";
+} with XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};
+
+type CMTLTypeOfString
+{
+    string id with Standard.XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Value with Standard.XmlEncoding{Kind = XmlKind.Text};
+}
+with Standard.XmlEncoding{Kind = XmlKind.SimpleTypeExtension}, XmlEncodingDefaults{Namespace = XmlNamespaceIndicator.Any};

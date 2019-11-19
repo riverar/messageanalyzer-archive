@@ -1,0 +1,182 @@
+protocol BKRP with
+Documentation
+{
+    ProtocolName = "BackupKey Remote Protocol",
+    DocumentName = "MS-BKRP",
+    ProtocolType = "rpc",
+    ShortName = "BKRP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-BKRP", Version = "19.0", Date = "05/15/2014", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary = 
+    [
+        new Revision{Class = RevisionClass.Major, Version = "", Date = ""}
+    ]
+};
+
+using Technologies.IDL;
+using DTYP;
+using MSRPCE;
+using X509;
+using Utility;
+
+const GUID BACKUPKEY_BACKUP_GUID = {7F752B10-178E-11D1-AB8F-00805F14DB40};
+const GUID BACKUPKEY_RESTORE_GUID_WIN2K = {7FE94D50-178E-11D1-AB8F-00805F14DB40};
+const GUID BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID = {018FF48A-EABA-40C6-8F6D-72370240E967};
+const GUID BACKUPKEY_RESTORE_GUID = {47270C64-2FC7-499B-AC5B-0E37CDCE899A};
+const map<GUID, string> ActionAgentGUIDStringMap = 
+{
+    BACKUPKEY_BACKUP_GUID -> "BACKUPKEY_BACKUP_GUID",
+    BACKUPKEY_RESTORE_GUID_WIN2K -> "BACKUPKEY_RESTORE_GUID_WIN2K",
+    BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID -> "BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID",
+    BACKUPKEY_RESTORE_GUID -> "BACKUPKEY_RESTORE_GUID",
+};
+
+endpoint BackupKeyService over MSRPCE.Server provides BackupKey;
+
+contract BackupKey
+{
+    accepts operation BackuprKey
+    {
+        in optional handle_t h;
+        in GUID pguidActionAgent with IDL{IndirectionLevel = 1}, DisplayInfo{ToText = DisplayActionAgentGuid};
+        in BkrpDataIn[pguidActionAgent] pDataIn with IDL{Size_is = [cbDataIn], IndirectionLevel = 1},
+            Encoding{Decoder = BinaryDecoder<BkrpDataIn[pguidActionAgent]>, SourcePattern = TypeOf<array<byte>>()};
+        in DWORD cbDataIn;
+        out BkrpDataOut[pguidActionAgent] ppDataOut with IDL{Size_is = [null, pcbDataOut], IndirectionLevel = 2},
+            Encoding{Decoder = BinaryDecoder<BkrpDataOut[pguidActionAgent]>, SourcePattern = TypeOf<array<byte>>()};
+        out DWORD pcbDataOut with IDL{IndirectionLevel = 1};
+        in DWORD dwParam;
+        result NET_API_STATUS ReturnValue;
+        
+        override string ToString()
+        {
+            return "BackuprKey, ReturnValue: " + ReturnValue.ToString() +
+                ", pguidActionAgent: " + DisplayActionAgentGuid(pguidActionAgent);
+        }
+    }
+    with Technologies.IDL.IDL{Opnum = 0};
+}
+with Technologies.IDL.IDL{Uuid = {3dde7c30-165d-11d1-ab8f-00805f14db40}, Version = "1.0", Pointer_default = PointerKind.UniquePtr};
+
+// ------------------------------------------- Binary Encoded Types -----------------------------------------------
+// For pDataIn
+// BACKUPKEY_BACKUP_GUID: BLOB
+// BACKUPKEY_RESTORE_GUID_WIN2K: 2.2.4 SecretWrappedWithSymmetricKey or 2.2.2 ClientSideWrappedSecret
+// BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID: binary (ignored by server and not defined in the TD)
+// BACKUPKEY_RESTORE_GUID: 2.2.4 SecretWrappedWithSymmetricKey or 2.2.2 ClientSideWrappedSecret
+
+const array<byte> SecretWrapped_BYTEARRAY = [0x01, 0x00, 0x00, 0x00];
+
+type BkrpDataIn[guid GuidActionAgent]
+{
+    ([|GuidActionAgent == BACKUPKEY_BACKUP_GUID || GuidActionAgent == BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID|] binary |
+    [|GuidActionAgent == BACKUPKEY_RESTORE_GUID || GuidActionAgent == BACKUPKEY_RESTORE_GUID_WIN2K|]
+        ([|PeekByteCompare(stream, stream.BitPosition, SecretWrapped_BYTEARRAY)|] SecretWrappedWithSymmetricKey | ClientSideWrappedSecret | binary /* handle invalid pDataIn*/) |
+        binary /* handle invalid pDataIn*/) data;
+
+    override string ToString()
+    {
+        return data.ToString();
+    }
+}
+
+// For pDataOut
+// BACKUPKEY_BACKUP_GUID: 2.2.4 SecretWrappedWithSymmetricKey
+// BACKUPKEY_RESTORE_GUID_WIN2K: 2.2.6 UnwrappedSecret or BLOB (Secret)
+// BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID: 2.2.1 Certificate
+// BACKUPKEY_RESTORE_GUID: 2.2.3 UnwrappedSecretClientSubprotocol or BLOB (Secret)
+
+const array<byte> UnwrappedSecretClientSubprotocol_BYTEARRAY = [0x00, 0x00, 0x00, 0x00];
+
+type BkrpDataOut[guid GuidActionAgent]
+{
+    ([|GuidActionAgent == BACKUPKEY_BACKUP_GUID|] (SecretWrappedWithSymmetricKey | binary /* handle invalid pDataOut*/) |
+        [|GuidActionAgent == BACKUPKEY_RESTORE_GUID_WIN2K|] ([|PeekByteCompare(stream, stream.BitPosition, [0x01, 0x00, 0x00, 0x00])|] UnwrappedSecret | binary /*Secret*/)|
+        [|GuidActionAgent == BACKUPKEY_RETRIEVE_BACKUP_KEY_GUID|] (CertificateType | binary /* handle invalid pDataOut*/) |
+        [|GuidActionAgent == BACKUPKEY_RESTORE_GUID|]
+            ([|PeekByteCompare(stream, stream.BitPosition, UnwrappedSecretClientSubprotocol_BYTEARRAY)|] UnwrappedSecretClientSubprotocol | binary) |
+            binary /* handle invalid pDataOut*/) data;
+
+    override string ToString()
+    {
+        return data.ToString();
+    }
+}
+
+// For ASN.1 Ber Mix-Encoding
+// Only can use type, since pattern does not work
+type CertificateType
+{
+    X509.Certificate Value with Encoding{Decoder = Asn1BerDecoder<X509.Certificate>, SourcePattern = TypeOf<binary>()};
+}
+
+// 2.2.2 Client-Side-Wrapped Secret
+type ClientSideWrappedSecret
+{
+    DwVersionPattern dwVersion where ValidationCheckEnumValue(InRange<DwVersionPattern>(value), null, true, ReferenceType.Type,
+        "BKRP", "dwVersion", "ClientSideWrappedSecret", "0x00000002, 0x00000003", value);
+    uint cbEncryptedSecret;
+    uint cbAccessSecret;
+    guid guidKey;
+    binary EncryptedSecret with BinaryEncoding{Length = cbEncryptedSecret};
+    binary AccessCheck with BinaryEncoding{Length = cbAccessSecret};
+}
+
+pattern DwVersionPattern = enum uint
+{
+    Version2 = 0x00000002,
+    Version3 = 0x00000003,
+    ...
+};
+
+// 2.2.3   Unwrapped Secret (ClientWrap Subprotocol Only)
+type UnwrappedSecretClientSubprotocol
+{
+    uint UnwrappedSecretClientSubprotocolHeader;
+    binary Secret;
+}
+
+// 2.2.4   Secret Wrapped with Symmetric Key
+type SecretWrappedWithSymmetricKey
+{
+    uint SecretWrappedWithSymmetricKeyHeader where ValidationCheckValue(value == 0x00000001, null, true, ReferenceType.Type,
+        "BKRP", "SecretWrappedWithSymmetricKeyHeader", "SecretWrappedWithSymmetricKey", "0x00000001", value);
+    uint Payload_Length;
+    uint Ciphertext_Length;
+    guid GUID_of_Wrapping_Key;
+    binary R2 with BinaryEncoding{Length = 68};
+    binary Rc4EncryptedPayload with BinaryEncoding{Length = Ciphertext_Length};
+}
+
+// 2.2.6   Unwrapped Secret
+type UnwrappedSecret
+{
+    uint UnwrappedSecretHeader;
+    binary EncSalt with BinaryEncoding{Length = 16};
+    binary RecoveredSecret;
+}
+
+// ------------------------------------------- Utility Function ------------------------------------------------------
+string DisplayActionAgentGuid(any input)
+{
+    if (input is g:GUID)
+    {
+        if (ActionAgentGUIDStringMap.Keys[g])
+        {
+            return ActionAgentGUIDStringMap[g];
+        }
+        else
+        {
+            return "Unknown GUID(" + g.ToString() + ")";
+        }
+    }
+    return "Invalid Guid";
+}
+

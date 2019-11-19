@@ -1,0 +1,1394 @@
+protocol MSOXCRPC with 
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Wire Format Protocol",
+    ShortName = "MS-OXCRPC",
+    DocumentName = "MS-OXCRPC",
+    ProtocolType = "RPC",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-OXCRPC", Version = "17.0"},
+    ],
+    RevisionSummary =    
+    [
+        new Revision{Class=RevisionClass.Major, Version="1.3.1", Date="08/31/2015"},
+    ]
+};
+
+using Technologies.IDL;
+using MSRPCE;
+using Utility;
+using Diagnostics;
+
+const guid EMSMDBUuid = {A4F1DB00-CA47-1067-B31F-00DD010662DA};
+const guid AsyncEMSMDBUuid = {5261574a-4572-206e-b268-6b199213b4e4};
+
+/* Major Design:
+ *  1) Use custom message/actor to parse MS-OXCRPC traffic but not leverage the auto-generated code by PEF/IDL
+ *    [MS-OXCRPC] is based on MS-RPCE and also owns a complete idl, so it should be a good approach to keep 
+ *    consistent with other MS-RPCE based windows OPN design. However, it's not easy to do upper protocol development
+ *    if we use the auto-generated RPC operation. It will enforce the RPC request and response must be in pairs
+ *  2) The (virtual) operations won't provided since we are not sure how to determine the RPC request/response sequence
+ *  3) The message,type,field summary refer to RPX design but also give our enhancement
+ *
+ * IN FUTURE:
+ *  1) If possible, we can re-add the operations feature back
+ *  2) Add the reserved RPC operation if TD update.
+ */
+ 
+// ------------ Actor,Endpoint,Processing rule logic here ---------------
+endpoint MailboxServer over MSRPCE.Server 
+                       accepts EncryptedRPCEMessage
+                       issues EncryptedRPCEMessage
+                       provides EMSMDB
+                       provides AsyncEMSMDB;
+
+client endpoint Client connected to MailboxServer;
+annotation guid RpcconnCommonHdrT#OXCRPCObjectUID;
+
+autostart actor ActorOverMSRPCE(MSRPCE.Server host)
+{
+    optional guid cachedObjectUID = nothing;
+
+    observe host accepts rpcMsg:RpcconnRequestHdrT
+    {
+        cachedObjectUID = rpcMsg.Object;
+        rpcMsg#OXCRPCObjectUID = cachedObjectUID;
+    }
+    
+    observe host issues rpcMsg:RpcconnResponseHdrT
+    {
+        rpcMsg#OXCRPCObjectUID = cachedObjectUID;
+    }
+    
+    process host accepts rpcMsg:RpcconnRequestHdrT where IsMSOXCRPCMessage(rpcMsg, EMSMDBUuid)
+    {
+        IMessage requestMessage = OxcrpcMessageProcessing(host, rpcMsg, false);
+        dispatch (endpoint MailboxServer over host) accepts requestMessage;
+    }
+     
+    process host issues rpcMsg:RpcconnResponseHdrT where IsMSOXCRPCMessage(rpcMsg, EMSMDBUuid)
+    {
+        IMessage responseMessage =  OxcrpcMessageProcessing(host, rpcMsg, false);
+        dispatch (endpoint MailboxServer over host) issues responseMessage;
+    }
+    
+    process host accepts rpcMsg:RpcconnRequestHdrT where IsMSOXCRPCMessage(rpcMsg, AsyncEMSMDBUuid)
+    {
+        IMessage requestMessage = OxcrpcMessageProcessing(host, rpcMsg, true);
+        dispatch (endpoint MailboxServer over host) accepts requestMessage;
+    }
+     
+    process host issues rpcMsg:RpcconnResponseHdrT where IsMSOXCRPCMessage(rpcMsg, AsyncEMSMDBUuid)
+    {
+        IMessage responseMessage =  OxcrpcMessageProcessing(host, rpcMsg, true);
+        dispatch (endpoint MailboxServer over host) issues responseMessage;
+    }
+}
+
+IMessage OxcrpcMessageProcessing(MSRPCE.Server server, (RpcconnRequestHdrT | RpcconnResponseHdrT)rpcMsg, bool isAsync)
+{
+    IMessage result = null;
+    bool isRequest = rpcMsg is RpcconnRequestHdrT;
+    binary payload = null;
+    bool isEncrypted = false;
+    optional ushort rpcOpnum = nothing;
+    NdrInfo ndrInfo = null;
+
+    if (isRequest)
+    {
+        RpcconnRequestHdrT requestMsg = rpcMsg as RpcconnRequestHdrT;
+        isEncrypted = requestMsg.IsEncrypted;
+        rpcOpnum = requestMsg.Opnum;
+        payload = requestMsg.StubData;
+
+        ndrInfo = new NdrInfo {isBigEndian = requestMsg.IsBigEndian,
+                               isNdr64 = server.IsNdr64(requestMsg.PContId),
+                               isMsUnion = false,
+                               defaultPointerKind = 2};
+    }
+    else
+    {
+        RpcconnResponseHdrT responseMsg = rpcMsg as RpcconnResponseHdrT;
+        isEncrypted = responseMsg.IsEncrypted;
+        rpcOpnum = responseMsg#RpcOpnum;
+        payload = responseMsg.StubData;
+
+        ndrInfo = new NdrInfo {isBigEndian = responseMsg.IsBigEndian,
+                               isNdr64 = server.IsNdr64(responseMsg.PContId),
+                               isMsUnion = false,
+                               defaultPointerKind = 2};
+    }
+
+    if (rpcOpnum == nothing)
+        ThrowDecodingException("MS-OXCRPC", "Can't get the opnum in the MSRPCE message");
+
+    if (isEncrypted) {
+        return BinaryDecoder<EncryptedRPCEMessage>(payload) as EncryptedRPCEMessage;
+    }
+
+    ushort opnum = rpcOpnum as ushort;
+
+    if (!isAsync)
+    {
+        switch (opnum)
+        {
+            case EMSMDBOpnumTable.EcDoConnectEx => 
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcDoConnectExRequest>(payload, ndrInfo, "EcDoConnectEx Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcDoConnectExResponse>(payload, ndrInfo, "EcDoConnectEx Response");
+            case EMSMDBOpnumTable.EcDoRpcExt2 => 
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcDoRpcExt2Request>(payload, ndrInfo, "EcDoRpcExt2 Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcDoRpcExt2Response>(payload, ndrInfo, "EcDoRpcExt2 Response");
+            case EMSMDBOpnumTable.EcDoDisconnect =>
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcDoDisconnectRequest>(payload, ndrInfo, "EcDoDisconnect Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcDoDisconnectResponse>(payload, ndrInfo, "EcDoDisconnect Response");
+            case EMSMDBOpnumTable.EcRRegisterPushNotification =>
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcRRegisterPushNotificationRequest>(payload, ndrInfo, "EcRRegisterPushNotification Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcRRegisterPushNotificationResponse>(payload, ndrInfo, "EcRRegisterPushNotification Response");
+            case EMSMDBOpnumTable.EcDummyRpc => 
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcDummyRpcRequest>(payload, ndrInfo, "EcDummyRpc Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcDummyRpcResponse>(payload, ndrInfo, "EcDummyRpc Response");
+            case EMSMDBOpnumTable.EcDoAsyncConnectEx =>
+                if (isRequest)
+                    result = DecodeMessage<EMSMDB.EcDoAsyncConnectExRequest>(payload, ndrInfo, "EcDoAsyncConnectEx Request");
+                else
+                    result = DecodeMessage<EMSMDB.EcDoAsyncConnectExResponse>(payload, ndrInfo, "EcDoAsyncConnectEx Response");
+        }
+    }
+    else
+    {
+        switch (opnum)
+        {
+            case AsyncEMSMDBOpnumTable.EcDoAsyncWaitEx => 
+                if (isRequest)
+                    result = DecodeMessage<AsyncEMSMDB.EcDoAsyncWaitExRequest>(payload, ndrInfo, "EcDoConnectEx Request");
+                else
+                    result = DecodeMessage<AsyncEMSMDB.EcDoAsyncWaitExResponse>(payload, ndrInfo, "EcDoConnectEx Response");
+        }
+    }
+
+    return result;
+}
+
+IMessage DecodeMessage<T>(binary payload, NdrInfo ndrInfo, string messageInfo)
+{
+    optional T m = NdrDecoder<T>(payload, ndrInfo);
+
+    if (m == nothing)
+        ThrowDecodingException("MSOXCRPC", messageInfo);
+        
+    return (m as T) as IMessage;
+}
+
+message IMessage
+{
+}
+
+message EncryptedRPCEMessage : IMessage
+{
+    binary Payload;
+    
+    override string ToString()
+    {
+        return Format("Encrypted MSRPCE payload - {0} byte(s).", Payload.Count);
+    }
+}
+
+contract EMSMDB
+{
+    // RPC Opnum 10 
+    accepts message EcDoConnectExRequest : IMessage
+    {
+        optional handle_t hBinding;
+        string szUserDN with IDL{BaseStringType = TypeOf<char>(), IndirectionLevel = 1};
+        IDLUlong ulFlags with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong ulConMod with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong cbLimit with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong ulCpid with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong ulLcidString with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong ulLcidSort with DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong ulIcxrLink with DisplayInfo{ToText = IDLIntegerToText};
+        ushort usFCanConvertCodePages with DisplayInfo{ToText = IDLIntegerToText};
+        Version rgwClientVersion;
+        IDLUlong pulTimeStamp with IDL{IndirectionLevel = 1},
+                                   DisplayInfo{ToText = IDLIntegerToText};        
+        optional ExtendedBuffer rgbAuxIn with IDL {Size_is = [cbAuxIn], Dimensions = [null]},
+                         Encoding{
+                            Decoder = BinaryDecoder<ExtendedBuffer[true]>,
+                            SourcePattern = TypeOf<array<byte>>()
+                         };
+        IDLUlong cbAuxIn with DisplayInfo{ToText = IDLIntegerToText};
+        SMALL_RANGE_ULONG pcbAuxOut with IDL{IndirectionLevel = 1},
+                                         DisplayInfo{ToText = IDLIntegerToText};
+
+        override string ToString()
+        {
+            return "EcDoConnectEx Request, szUserDN: " + szUserDN;
+        }
+    }
+    
+    // RPC Opnum 10 
+    issues message EcDoConnectExResponse : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong pcmsPollsMax with IDL{IndirectionLevel = 1},
+                                   DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong pcRetry with IDL{IndirectionLevel = 1},
+                              DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong pcmsRetryDelay with IDL{IndirectionLevel = 1},
+                                     DisplayInfo{ToText = IDLIntegerToText};
+        ushort picxr with IDL{IndirectionLevel = 1},
+                          DisplayInfo{ToText = IDLIntegerToText};
+        string szDNPrefix with IDL{BaseStringType = TypeOf<char>(), IndirectionLevel = 2};
+        string szDisplayName with IDL{BaseStringType = TypeOf<char>(), IndirectionLevel = 2};
+        Version rgwServerVersion;
+        Version rgwBestVersion;
+        IDLUlong pulTimeStamp with IDL{IndirectionLevel = 1},
+                                   DisplayInfo{ToText = IDLIntegerToText};
+
+        optional ExtendedBuffer rgbAuxOut with IDL{Size_is = [pcbAuxOut],Length_is = [pcbAuxOut],Dimensions = [null]},
+                         Encoding{
+                            Decoder = BinaryDecoder<ExtendedBuffer[true]>,
+                            SourcePattern = TypeOf<array<byte>>()
+                         };
+
+        SMALL_RANGE_ULONG pcbAuxOut with IDL{IndirectionLevel = 1},
+                                         DisplayInfo{ToText = IDLIntegerToText};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcDoConnectEx Response, ReturnValue: 0x{0:X8} ({1})", 
+                           ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+
+    // RPC Opnum 11
+    accepts message EcDoRpcExt2Request : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong pulFlags with IDL{IndirectionLevel = 1},
+                               DisplayInfo{ToText = PayloadFlagToText};
+        optional ExtendedBuffer rgbIn with IDL {Size_is = [cbIn], Dimensions = [null]},
+                         Encoding{
+                            Decoder = BinaryDecoder<ExtendedBuffer[false]>,
+                            SourcePattern = TypeOf<array<byte>>()
+                         };
+        IDLUlong cbIn with DisplayInfo{ToText = IDLIntegerToText};
+
+        BIG_RANGE_ULONG pcbOut with IDL{IndirectionLevel = 1},
+                                    DisplayInfo{ToText = IDLIntegerToText};
+
+        optional ExtendedBuffer rgbAuxIn 
+                    with Technologies.IDL.IDL{Size_is = [cbAuxIn], Dimensions = [null]},
+                         Encoding{
+                            Decoder = BinaryDecoder<ExtendedBuffer[true]>,
+                            SourcePattern = TypeOf<array<byte>>()
+                         };
+
+        IDLUlong cbAuxIn with DisplayInfo{ToText = IDLIntegerToText};
+
+        SMALL_RANGE_ULONG pcbAuxOut with IDL{IndirectionLevel = 1},
+                                         DisplayInfo{ToText = IDLIntegerToText};
+                   
+        override string ToString()
+        {
+            return "EcDoRpcExt2 Request";
+        }
+    }
+
+    // RPC Opnum 11
+    issues message EcDoRpcExt2Response : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong pulFlags with IDL{IndirectionLevel = 1},
+                               DisplayInfo{ToText = PayloadFlagToText};
+        optional array<ExtendedBuffer> rgbOut with IDL{Size_is = [pcbOut],Length_is = [pcbOut],Dimensions = [null]},
+                        Encoding{
+                            Decoder = BinaryDecoder<array<ExtendedBuffer[false]>>,
+                            SourcePattern = TypeOf<array<byte>>()
+                        },
+                        DisplayInfo{ToText = EcDoRpcExt2RgbOutToText};
+        BIG_RANGE_ULONG pcbOut with IDL{IndirectionLevel = 1},
+                                    DisplayInfo{ToText = IDLIntegerToText};
+        optional ExtendedBuffer rgbAuxOut with IDL{Size_is = [pcbAuxOut],Length_is = [pcbAuxOut],Dimensions = [null]},
+                          Encoding{
+                             Decoder = BinaryDecoder<ExtendedBuffer[true]>,
+                             SourcePattern = TypeOf<array<byte>>()
+                          };
+        SMALL_RANGE_ULONG pcbAuxOut with IDL{IndirectionLevel = 1},
+                                         DisplayInfo{ToText = IDLIntegerToText};
+        IDLUlong pulTransTime with IDL{IndirectionLevel = 1};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+
+        override string ToString()
+        {
+            return Format("EcDoRpcExt2 Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+
+    // RPC Opnum 1
+    accepts message EcDoDisconnectRequest : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+                            
+        override string ToString()
+        {
+            return "EcDoDisconnect Request";
+        }
+    }
+
+    // RPC Opnum 1
+    issues message EcDoDisconnectResponse : IMessage
+    {
+        CXH pcxh with IDL {PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcDoDisconnect Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+
+    // RPC Opnum 4
+    accepts message EcRRegisterPushNotificationRequest : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong iRpc;
+        array<char> rgbContext with IDL{Size_is = [cbContext], Dimensions = [null]};
+        ushort cbContext;
+        IDLUlong grbitAdviseBits;
+        array<char> rgbCallbackAddress with IDL{Size_is = [cbCallbackAddress], Dimensions = [null]};
+        ushort cbCallbackAddress;
+
+        override string ToString()
+        {
+            return "EcRRegisterPushNotification Request, rgbCallbackAddress: " + rgbCallbackAddress.ToString();
+        }
+    }
+    
+    // RPC Opnum 4
+    issues message EcRRegisterPushNotificationResponse : IMessage
+    {
+        CXH pcxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                      DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong hNotification with IDL{IndirectionLevel = 1};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcRRegisterPushNotification Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+
+    // RPC Opnum 6
+    accepts message EcDummyRpcRequest : IMessage
+    {
+        optional handle_t hBinding;
+        
+        override string ToString()
+        {
+            return "EcDummyRpc Request";
+        }
+    }
+    
+    // RPC Opnum 6
+    issues message EcDummyRpcResponse : IMessage
+    {
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcDummyRpc Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+
+    // RPC Opnum 14
+    accepts message EcDoAsyncConnectExRequest : IMessage
+    {
+        CXH cxh with DisplayInfo{ToText = ContextHandleToText};
+
+        override string ToString()
+        {
+            return "EcDoAsyncConnectEx Request";
+        }
+    }
+
+    // RPC Opnum 14
+    issues message EcDoAsyncConnectExResponse : IMessage
+    {
+        ACXH pacxh with IDL{PointerType = PointerKind.RefPtr, IndirectionLevel = 1},
+                        DisplayInfo{ToText = ContextHandleToText};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcDoAsyncConnectEx Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+    
+    //
+    // MARK:
+    // The operations specified by 0,2,3,5,7,8,9,12,13 are reserved and won't be used on wire.
+    // More details refer to Section [3.1   EMSMDB Server Details  ]
+    //
+}
+
+contract EMSMDBVirtualOperations
+{
+    // IN FUTURE:
+    // Add the virtual operations for EMSMDB interface
+}
+
+contract AsyncEMSMDB
+{
+    // RPC Opnum 0
+    accepts message EcDoAsyncWaitExRequest : IMessage
+    {
+        ACXH acxh with DisplayInfo{ToText = ContextHandleToText};
+        IDLUlong ulFlagsIn;
+        
+        override string ToString()
+        {
+            return "EcDoAsyncWaitEx Request";
+        }
+    }
+
+    // RPC Opnum 0
+    issues message EcDoAsyncWaitExResponse : IMessage
+    {
+        IDLUlong pulFlagsOut with Technologies.IDL.IDL{IndirectionLevel = 1};
+        IDLLong ReturnValue with DisplayInfo{ToText = ReturnValueToText};
+        
+        override string ToString()
+        {
+            return Format("EcDoAsyncWaitEx Response, ReturnValue: 0x{0:X8} ({1})", 
+               ReturnValue, GetReturnValueMeaning(ReturnValue as uint));
+        }
+    }
+}
+
+contract AsyncEMSMDBVirtualOperations
+{
+    // IN FUTURE:
+    // Add the virtual operations for AsyncEMSMDB interface
+}
+
+pattern EMSMDBOpnumTable = enum ushort
+{
+    EcDoConnectEx               = 10,
+    EcDoRpcExt2                 = 11,
+    EcDoDisconnect              = 1,
+    EcRRegisterPushNotification = 4,
+    EcDummyRpc                  = 6,
+    EcDoAsyncConnectEx          = 14
+};
+
+pattern AsyncEMSMDBOpnumTable = enum ushort
+{
+    EcDoAsyncWaitEx = 0
+};
+
+bool IsMSOXCRPCMessage(RpcconnCommonHdrT rpcMsg, guid oxcrpcUuid)
+{
+    guid rpcMsgUuid = {00000000-0000-0000-0000-000000000000};
+
+    if (rpcMsg#PContextUuid != nothing)
+        rpcMsgUuid = rpcMsg#PContextUuid as guid;
+    else if(rpcMsg#OXCRPCObjectUID != nothing)
+        rpcMsgUuid = rpcMsg#OXCRPCObjectUID as guid;
+
+    return rpcMsgUuid == oxcrpcUuid;
+}
+
+// ------------------2.2.1   Simple Data Types ------------------
+// Section 2.2.1.1 CXH Data Type
+typedef CXH = ContextHandle;
+
+// Section 2.2.1.2 ACXH Data Type
+typedef ACXH = ContextHandle;
+
+// Section 2.2.1.3 BIG_RANGE_ULONG Data Type
+typedef BIG_RANGE_ULONG = uint with IDL {Range = new RangePattern {Low = 0, High = 0x40000}};
+
+// Section 2.2.1.4 SMALL_RANGE_ULONG Data Type
+typedef SMALL_RANGE_ULONG = uint with IDL {Range = new RangePattern {Low = 0, High = 0x1008}};
+
+// ------------------ 2.2.2.1 RPC_HEADER_EXT Structure ------------------
+type RPC_HEADER_EXT
+{
+    ushort Version;
+    RpcHeaderFlags Flags;
+    ushort Size;
+    ushort SizeActual;
+
+    override string ToString()
+    {
+        return Format("Version = {0}, Flags = {1}, ", this.Version, EnumToString(this.Flags, "MSOXCRPC.RpcHeaderFlags"))
+             + Format("Size = {0}, SizeActual = {1}", this.Size, this.SizeActual);
+    }
+}
+
+pattern RpcHeaderFlags = flags ushort
+{
+    Compressed = 0x0001,
+    XorMagic = 0x0002,
+    Last = 0x0004
+};
+
+// ------------------2.2.2.2   AUX_HEADER Structure ------------------
+// Section 2.2.2.2 AUX_HEADER Structure
+type AUX_HEADER
+{
+    ushort Size;
+    AuxHeaderVersion Version;
+    ([|Version == AuxHeaderVersion.AUX_VERSION_1|] AUX_VERSION_1_Type |
+     [|Version == AuxHeaderVersion.AUX_VERSION_2|] AUX_VERSION_2_Type) Type with DisplayInfo{ToText = AuxHeaderTypeToText};
+     
+    override string ToString()
+    {
+        return Format("Size = {0}, Version = {1}, Type = {2}", this.Size, this.Version, this.Type);
+    }
+}
+
+pattern AuxHeaderVersion = enum byte
+{
+    AUX_VERSION_1 = 0x01,
+    AUX_VERSION_2 = 0x02
+};
+
+pattern AUX_VERSION_1_Type = enum byte
+{
+    AUX_TYPE_PERF_REQUESTID            = 0x01,
+    AUX_TYPE_PERF_CLIENTINFO           = 0x02,
+    AUX_TYPE_PERF_SERVERINFO           = 0x03,
+    AUX_TYPE_PERF_SESSIONINFO          = 0x04,
+    AUX_TYPE_PERF_DEFMDB_SUCCESS       = 0x05,
+    AUX_TYPE_PERF_DEFGC_SUCCESS        = 0x06,
+    AUX_TYPE_PERF_MDB_SUCCESS          = 0x07,
+    AUX_TYPE_PERF_GC_SUCCESS           = 0x08,
+    AUX_TYPE_PERF_FAILURE              = 0x09,
+    AUX_TYPE_CLIENT_CONTROL            = 0x0A,
+    AUX_TYPE_PERF_PROCESSINFO          = 0x0B,
+    AUX_TYPE_PERF_BG_DEFMDB_SUCCESS    = 0x0C,
+    AUX_TYPE_PERF_BG_DEFGC_SUCCESS     = 0x0D,
+    AUX_TYPE_PERF_BG_MDB_SUCCESS       = 0x0E,
+    AUX_TYPE_PERF_BG_GC_SUCCESS        = 0x0F,
+    AUX_TYPE_PERF_BG_FAILURE           = 0x10,
+    AUX_TYPE_PERF_FG_DEFMDB_SUCCESS    = 0x11,
+    AUX_TYPE_PERF_FG_DEFGC_SUCCESS     = 0x12,
+    AUX_TYPE_PERF_FG_MDB_SUCCESS       = 0x13,
+    AUX_TYPE_PERF_FG_GC_SUCCESS        = 0x14,
+    AUX_TYPE_PERF_FG_FAILURE           = 0x15,
+    AUX_TYPE_OSVERSIONINFO             = 0x16,
+    AUX_TYPE_EXORGINFO                 = 0x17,
+    AUX_TYPE_PERF_ACCOUNTINFO          = 0x18,
+    AUX_TYPE_ENDPOINT_CAPABILITIES     = 0x48,
+    AUX_CLIENT_CONNECTION_INFO         = 0x4A,
+    AUX_SERVER_SESSION_INFO            = 0x4B,
+    AUX_PROTOCOL_DEVICE_IDENTIFICATION = 0x4E,
+    ...
+};
+
+pattern AUX_VERSION_2_Type = enum byte
+{
+    AUX_TYPE_PERF_SESSIONINFO    = 0x04,
+    AUX_TYPE_PERF_MDB_SUCCESS    = 0x07,
+    AUX_TYPE_PERF_GC_SUCCESS     = 0x08,
+    AUX_TYPE_PERF_FAILURE        = 0x09,
+    AUX_TYPE_PERF_PROCESSINFO    = 0x0B,
+    AUX_TYPE_PERF_BG_MDB_SUCCESS = 0x0E,
+    AUX_TYPE_PERF_BG_GC_SUCCESS  = 0x0F,
+    AUX_TYPE_PERF_BG_FAILURE     = 0x10,
+    AUX_TYPE_PERF_FG_MDB_SUCCESS = 0x13,
+    AUX_TYPE_PERF_FG_GC_SUCCESS  = 0x14,
+    AUX_TYPE_PERF_FG_FAILURE     = 0x15,
+    ...
+};
+
+// Section 2.2.2.2.1   AUX_PERF_REQUESTID Auxiliary Block Structure
+type AUX_PERF_REQUESTID
+{
+    ushort SessionID;
+    ushort RequestID;
+}
+
+// Section 2.2.2.2.2   AUX_PERF_SESSIONINFO Auxiliary Block Structure
+type AUX_PERF_SESSIONINFO
+{
+    ushort SessionID;
+    ushort Reserved;
+    guid SessionGuid;
+}
+
+// Section 2.2.2.2.3   AUX_PERF_SESSIONINFO_V2 Auxiliary Block Structure
+type AUX_PERF_SESSIONINFO_V2 : AUX_PERF_SESSIONINFO
+{
+    uint ConnectionID;
+}
+
+// Section 2.2.2.2.4   AUX_PERF_CLIENTINFO Auxiliary Block Structure
+type AUX_PERF_CLIENTINFO
+{
+    uint AdapterSpeed;
+    ushort ClientID;
+    ushort MachineNameOffset;
+    ushort UserNameOffset;
+    ushort ClientIPSize;
+    ushort ClientIPOffset;
+    ushort ClientIPMaskSize;
+    ushort ClientIPMaskOffset;
+    ushort AdapterNameOffset;
+    ushort MacAddressSize;
+    ushort MacAddressOffset;
+    ClientModeFlag ClientMode;
+    ushort Reserved;
+    optional [|MachineNameOffset != 0|] string MachineName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|UserNameOffset != 0|] string UserName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|ClientIPSize > 0 && ClientIPOffset != 0|] binary ClientIP with BinaryEncoding{Length = ClientIPSize};
+    optional [|ClientIPMaskSize > 0 && ClientIPMaskOffset != 0|] binary ClientIPMask with BinaryEncoding{Length = ClientIPMaskSize};
+    optional [|AdapterNameOffset != 0|] string AdapterName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|MacAddressSize > 0 && MacAddressOffset != 0|] binary MacAddress with BinaryEncoding{Length = MacAddressSize};
+}
+
+pattern ClientModeFlag = flags ushort
+{
+    CLIENTMODE_UNKNOWN = 0x00,
+    CLIENTMODE_CLASSIC = 0x01,
+    CLIENTMODE_CACHED  = 0x02
+};
+
+// Section 2.2.2.2.5   AUX_PERF_SERVERINFO Auxiliary Block Structure
+type AUX_PERF_SERVERINFO
+{
+    ushort ServerID;
+    ServerType ServerType;
+    ushort ServerDNOffset;
+    ushort ServerNameOffset;
+    optional [|ServerDNOffset != 0|] string ServerDN with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|ServerNameOffset != 0|] string ServerName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+}
+
+pattern ServerType = enum ushort
+{
+   SERVERTYPE_UNKNOWN   = 0x00,
+   SERVERTYPE_PRIVATE   = 0x01,
+   SERVERTYPE_PUBLIC    = 0x02,
+   SERVERTYPE_DIRECTORY = 0x03,
+   SERVERTYPE_REFERRAL  = 0x04
+};
+
+// Section 2.2.2.2.6   AUX_PERF_PROCESSINFO Auxiliary Block Structure
+type AUX_PERF_PROCESSINFO
+{
+    ushort ProcessID;
+    ushort Reserved_1;
+    guid ProcessGuid;
+    ushort ProcessNameOffset;
+    ushort Reserved_2;
+    optional [|ProcessNameOffset != 0|] string ProcessName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+}
+
+// Section 2.2.2.2.7   AUX_PERF_DEFMDB_SUCCESS Auxiliary Block Structure
+type AUX_PERF_DEFMDB_SUCCESS
+{
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+    ushort RequestID;
+    ushort Reserved;
+}
+
+// Section 2.2.2.2.8   AUX_PERF_DEFGC_SUCCESS Auxiliary Block Structure
+type AUX_PERF_DEFGC_SUCCESS
+{
+    ushort ServerID;
+    ushort SessionID;
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+    byte RequestOperation;
+    binary Reserved with BinaryEncoding{Length = 3};
+}
+
+// Section 2.2.2.2.9   AUX_PERF_MDB_SUCCESS Auxiliary Block Structure
+type AUX_PERF_MDB_SUCCESS
+{
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    ushort RequestID;
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+}
+
+// Section 2.2.2.2.10   AUX_PERF_MDB_SUCCESS_V2 Auxiliary Block Structure
+type AUX_PERF_MDB_SUCCESS_V2
+{
+    ushort ProcessID;
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    ushort RequestID;
+    ushort Reserved;
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+}
+
+// Section 2.2.2.2.11   AUX_PERF_GC_SUCCESS Auxiliary Block Structure
+type AUX_PERF_GC_SUCCESS
+{
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    ushort Reserved_1;
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+    byte RequestOperation;
+    binary Reserved_2 with BinaryEncoding{Length = 3};
+}
+
+// Section 2.2.2.2.12   AUX_PERF_GC_SUCCESS_V2 Auxiliary Block Structure
+type AUX_PERF_GC_SUCCESS_V2
+{
+    ushort ProcessID;
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    uint TimeSinceRequest;
+    uint TimeToCompleteRequest;
+    byte RequestOperation;
+    binary Reserved with BinaryEncoding{Length = 3};
+}
+
+// Section 2.2.2.2.13   AUX_PERF_FAILURE Auxiliary Block Structure
+type AUX_PERF_FAILURE
+{
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    ushort RequestID;
+    uint TimeSinceRequest;
+    uint TimeToFailRequest;
+    uint ResultCode;
+    byte RequestOperation;
+    binary Reserved with BinaryEncoding{Length = 3};
+}
+
+// Section 2.2.2.2.14   AUX_PERF_FAILURE_V2 Auxiliary Block Structure
+type AUX_PERF_FAILURE_V2
+{
+    ushort ProcessID;
+    ushort ClientID;
+    ushort ServerID;
+    ushort SessionID;
+    ushort RequestID;
+    ushort Reserved_1;
+    uint TimeSinceRequest;
+    uint TimeToFailRequest;
+    uint ResultCode;
+    byte RequestOperation;
+    binary Reserved_2 with BinaryEncoding{Length = 3};
+}
+
+// Section 2.2.2.2.15   AUX_CLIENT_CONTROL Auxiliary Block Structure
+type AUX_CLIENT_CONTROL
+{
+    EnableFlags EnableFlags;
+    uint ExpiryTime;
+};
+
+pattern EnableFlags = flags uint
+{
+    ENABLE_PERF_SENDTOSERVER = 0x00000001,
+    ENABLE_COMPRESSION       = 0x00000004,
+    ENABLE_HTTP_TUNNELING    = 0x00000008,
+    ENABLE_PERF_SENDGCDATA   = 0x00000010
+};
+
+// Section 2.2.2.2.16   AUX_OSVERSIONINFO Auxiliary Block Structure
+type AUX_OSVERSIONINFO
+{
+    uint OSVersionInfoSize;
+    uint MajorVersion;
+    uint MinorVersion;
+    uint BuildNumber;
+    binary Reserved1 with BinaryEncoding{Length = 132};
+    ushort ServicePackMajor;
+    ushort ServicePackMinor;
+    uint Reserved2;
+}
+
+// Section 2.2.2.2.17   AUX_EXORGINFO Auxiliary Block Structure
+type AUX_EXORGINFO
+{
+    OrgFlags OrgFlags;
+}
+
+pattern OrgFlags = flags uint
+{
+    PUBLIC_FOLDERS_ENABLED                           = 0x00000001,
+    USE_AUTODISCOVER_FOR_PUBLIC_FOLDER_CONFIGURATION = 0x0000002
+};
+
+// Section 2.2.2.2.18   AUX_PERF_ACCOUNTINFO Auxiliary Block Structure
+type AUX_PERF_ACCOUNTINFO
+{
+    ushort ClientID;
+    ushort Reserved;
+    guid Account;
+}
+
+// Section 2.2.2.2.19   AUX_ENDPOINT_CAPABILITIES Auxiliary Block Structure
+type AUX_ENDPOINT_CAPABILITIES
+{
+    EndpointCapabilityFlag EndpointCapabilityFlag;
+}
+
+pattern EndpointCapabilityFlag = flags uint
+{
+    ENDPOINT_CAPABILITIES_SINGLE_ENDPOINT = 0x00000001
+};
+
+// Section 2.2.2.2.20   AUX_CLIENT_CONNECTION_INFO Auxiliary Block Structure
+type AUX_CLIENT_CONNECTION_INFO
+{
+    guid ConnectionGUID;
+    ushort OffsetConnectionContextInfo;
+    ushort Reserved;
+    uint ConnectionAttempts;
+    ConnectionFlags ConnectionFlags;
+    optional [|OffsetConnectionContextInfo != 0|] string ConnectionContextInfo with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+}
+
+pattern ConnectionFlags = flags uint
+{
+    $"client is running in cached mode" = 0x0001,
+    $"client is not designating a mode of operation" = 0x0000,
+    ...
+};
+
+// Section 2.2.2.2.21   AUX_SERVER_SESSION_INFO Auxiliary Block Structure
+type AUX_SERVER_SESSION_INFO
+{
+    ushort OffsetServerSessionContextInfo;
+    optional [|OffsetServerSessionContextInfo != 0|] string ServerSessionContextInfo with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+}
+
+// Section 2.2.2.2.22   AUX_PROTOCOL_DEVICE_IDENTIFICATION Auxiliary Block Structure
+type AUX_PROTOCOL_DEVICE_IDENTIFICATION
+{
+    ushort DeviceManufacturerOffset;
+    ushort DeviceModelOffset;
+    ushort DeviceSerialNumberOffset;
+    ushort DeviceVersionOffset;
+    ushort DeviceFirmwareVersionOffset;
+    optional [|DeviceManufacturerOffset != 0|] string DeviceManufacturer with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|DeviceModelOffset != 0|] string DeviceModel with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|DeviceSerialNumberOffset != 0|] string DeviceSerialNumber with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|DeviceVersionOffset != 0|] string DeviceVersion with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    optional [|DeviceFirmwareVersionOffset != 0|] string DeviceFirmwareVersion with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+}
+
+// ------------------ Complex Type/Pattern used by EMSMDB/AsyncEMSMDB interface Method ------------------
+interface IByteCountable
+{
+    int ByteCount();
+} 
+
+type ExtendedBuffer[bool isAuxiliaryBuffer] : IByteCountable
+{
+    RPC_HEADER_EXT RPC_HEADER_EXT;
+    (binary | array<AuxiliaryBuffer>) Payload with Encoding{Decoder = PayloadDecoder},
+                                          BinaryEncoding{WidthForComposedType = RPC_HEADER_EXT.Size * 8},
+                                          DisplayInfo{ToText = PayloadToText};
+
+    override string ToString()
+    {
+        string summary = "";
+        
+        string feature = "";
+        string seperator = ",";
+        
+        if (CheckBit(this.RPC_HEADER_EXT.Flags, RpcHeaderFlags.Compressed))
+            feature += "Compressed";
+        
+        if (CheckBit(this.RPC_HEADER_EXT.Flags, RpcHeaderFlags.XorMagic))
+            feature += seperator + "Obfuscated";
+        
+        if (Payload is auxs:array<AuxiliaryBuffer>)
+            feature = Format("{0}{1} Auxiliary Block(s)", seperator, auxs.Count);
+
+        if (feature.IndexOf(seperator) == 0)
+            feature = feature.Segment(seperator.Count);
+
+        if (feature != "")
+            feature = "(" + feature + ")";
+
+        return Format("{0}{1} byte(s)", feature, this.ByteCount());
+    }
+    
+    optional (binary | array<AuxiliaryBuffer>) PayloadDecoder(stream s)
+    {
+        binary outputBuffer = BinaryDecoder<binary>(s) as binary;
+
+        if (CheckBit(this.RPC_HEADER_EXT.Flags, RpcHeaderFlags.XorMagic))
+        {
+            outputBuffer = RevertObfuscatedData(outputBuffer);
+        }
+
+        if (CheckBit(this.RPC_HEADER_EXT.Flags, RpcHeaderFlags.Compressed))
+        {
+            outputBuffer = LZ77Decompress(outputBuffer, 0);
+        }
+
+        if (isAuxiliaryBuffer)
+        {
+            stream auxs = outputBuffer as stream;
+            array<AuxiliaryBuffer> buffers = [];
+            while (auxs.RemainingByteLength > 0) 
+            {
+                optional AuxiliaryBuffer auxBuffer = BinaryDecoder<AuxiliaryBuffer[false]>(auxs);
+                
+                if (auxBuffer == nothing)
+                {
+                    auxBuffer = BinaryDecoder<AuxiliaryBuffer[true]>(auxs);
+                }
+                
+                buffers += [auxBuffer as AuxiliaryBuffer];
+            }
+
+            return buffers;
+        }
+        
+        return outputBuffer;
+    }
+ 
+    bool CheckBit(uint data, uint flag)
+    {
+        uint f = data & flag;
+        return f == flag;
+    }
+    
+    string PayloadToText(any data)
+    {
+        if (Payload is auxs:array<AuxiliaryBuffer>)
+            return Format("{0} Auxiliary Block(s)", auxs.Count);
+            
+        return data as string;
+    }
+    
+    int ByteCount()
+    {
+        // Header itself + actual payload size
+        return 8 + this.RPC_HEADER_EXT.Size;
+    }
+}with Encoding{EncodingKind = EncodingKind.Binary}, IDL{DoNotGenerate = true};
+
+// WORKAROUND: Use a type wrapper to solve the issue - BinaryDecoder cannot decode array<T> directly
+type AuxiliaryBufferPackage
+{
+    array<AuxiliaryBuffer> Buffers;
+}with Encoding{EncodingKind = EncodingKind.Binary}, IDL{DoNotGenerate = true};
+
+// If hasException == true, it indicates the caller have known the traffic can't parsed correctly 
+// according to AUX_HEADER. Also AuxiliaryBuffer will use the raw bytes to fill the AuxiliaryBlock part.
+type AuxiliaryBuffer[bool hasException] : IByteCountable
+{
+    AUX_HEADER AUX_HEADER;
+    ([|hasException == true|] binary |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_REQUESTID|]            AUX_PERF_REQUESTID                 |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_CLIENTINFO|]           AUX_PERF_CLIENTINFO                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_SERVERINFO|]           AUX_PERF_SERVERINFO                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_SESSIONINFO|]          AUX_PERF_SESSIONINFO               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_DEFMDB_SUCCESS|]       AUX_PERF_DEFMDB_SUCCESS            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_DEFGC_SUCCESS|]        AUX_PERF_DEFGC_SUCCESS             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_MDB_SUCCESS|]          AUX_PERF_MDB_SUCCESS               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_GC_SUCCESS|]           AUX_PERF_GC_SUCCESS                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FAILURE|]              AUX_PERF_FAILURE                   |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_CLIENT_CONTROL|]            AUX_CLIENT_CONTROL                 |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_PROCESSINFO|]          AUX_PERF_PROCESSINFO               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_BG_DEFMDB_SUCCESS|]    AUX_PERF_DEFMDB_SUCCESS            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_BG_DEFGC_SUCCESS|]     AUX_PERF_DEFGC_SUCCESS             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_BG_MDB_SUCCESS|]       AUX_PERF_MDB_SUCCESS               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_BG_GC_SUCCESS|]        AUX_PERF_GC_SUCCESS                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_BG_FAILURE|]           AUX_PERF_FAILURE                   |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FG_DEFMDB_SUCCESS|]    AUX_PERF_DEFMDB_SUCCESS            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FG_DEFGC_SUCCESS|]     AUX_PERF_DEFGC_SUCCESS             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FG_MDB_SUCCESS|]       AUX_PERF_MDB_SUCCESS               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FG_GC_SUCCESS|]        AUX_PERF_GC_SUCCESS                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_FG_FAILURE|]           AUX_PERF_FAILURE                   |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_OSVERSIONINFO|]             AUX_OSVERSIONINFO                  |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_EXORGINFO|]                 AUX_EXORGINFO                      |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_PERF_ACCOUNTINFO|]          AUX_PERF_ACCOUNTINFO               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_TYPE_ENDPOINT_CAPABILITIES|]     AUX_ENDPOINT_CAPABILITIES          |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_CLIENT_CONNECTION_INFO|]         AUX_CLIENT_CONNECTION_INFO         |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_SERVER_SESSION_INFO|]            AUX_SERVER_SESSION_INFO            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_1 && AUX_HEADER.Type == AUX_VERSION_1_Type.AUX_PROTOCOL_DEVICE_IDENTIFICATION|] AUX_PROTOCOL_DEVICE_IDENTIFICATION |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_SESSIONINFO|]          AUX_PERF_SESSIONINFO_V2            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_MDB_SUCCESS|]          AUX_PERF_MDB_SUCCESS_V2            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_GC_SUCCESS|]           AUX_PERF_GC_SUCCESS_V2             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_FAILURE|]              AUX_PERF_FAILURE_V2                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_PROCESSINFO|]          AUX_PERF_PROCESSINFO               |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_BG_MDB_SUCCESS|]       AUX_PERF_MDB_SUCCESS_V2            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_BG_GC_SUCCESS|]        AUX_PERF_GC_SUCCESS_V2             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_BG_FAILURE|]           AUX_PERF_FAILURE_V2                |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_FG_MDB_SUCCESS|]       AUX_PERF_MDB_SUCCESS_V2            |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_FG_GC_SUCCESS|]        AUX_PERF_GC_SUCCESS_V2             |
+     [|AUX_HEADER.Version == AuxHeaderVersion.AUX_VERSION_2 && AUX_HEADER.Type == AUX_VERSION_2_Type.AUX_TYPE_PERF_FG_FAILURE|]           AUX_PERF_FAILURE_V2                |
+       binary) AuxiliaryBlock where ValidationCheck(hasException == false, 
+                                                    null, DiagnosisLevel.Warning, 
+                                                    "Failing to parse " + GetBlockTypeName(AUX_HEADER) + " Auxiliary Block")
+                              with BinaryEncoding {Length = AUX_HEADER.Size - 4 as uint};
+
+ 
+    int ByteCount()
+    {
+        return this.AUX_HEADER.Size;
+    }
+
+    string GetBlockTypeName(AUX_HEADER header)
+    {
+        string blockTypeName = "";
+        
+        if (header.Version == AuxHeaderVersion.AUX_VERSION_1 && InRange<MSOXCRPC.AUX_VERSION_1_Type>(header.Type))
+            blockTypeName = EnumToString(header.Type, "MSOXCRPC.AUX_VERSION_1_Type");
+        else if (header.Version == AuxHeaderVersion.AUX_VERSION_2 && InRange<MSOXCRPC.AUX_VERSION_2_Type>(header.Type))
+            blockTypeName = EnumToString(header.Type, "MSOXCRPC.AUX_VERSION_2_Type");
+        
+        return blockTypeName;
+    }
+    
+    override string ToString()
+    {
+        string blockTypeName = GetBlockTypeName(AUX_HEADER);
+        
+        if (blockTypeName == "")
+            return Format("Unrecognized Auxiliary Block, {0} byte(s)", this.ByteCount());
+
+        if (hasException)
+            return Format("{0} Auxiliary Block (parse fail), {1} byte(s)", blockTypeName, this.ByteCount());
+
+        return Format("{0} Auxiliary Block, {1} byte(s)", blockTypeName, this.ByteCount());
+    }
+}
+
+type Version
+{
+    ushort Version0;
+    ushort Version1;
+    ushort Version2;
+    
+    override string ToString()
+    {
+        if (Version1 >> 15 == 1)
+            return Format("{0}.{1:D2}.", Version0 >> 8, Version0 & 0x00FF) +
+                   Format("{0:D4}.{1:D3}", Version1 & 0x7FFF, Version2);
+        else
+            return Format("{0}.00.{1:D4}.{2:D3}", Version0, Version1, Version2);
+    }
+}
+
+pattern EcDoConnectExReturnValueType = enum uint
+{
+    Success               = 0x0,
+    ecAccessDenied        = 0x80070005,
+    ecNotEncrypted        = 0x00000970,
+    ecClientVerDisallowed = 0x000004DF,
+    ecLoginFailure        = 0x80040111,
+    ecUnknownUser         = 0x000003EB,
+    ecLoginPerm           = 0x000003F2,
+    ecVersionMismatch     = 0x80040110,
+    ecCachedModeRequired  = 0x000004E1,
+    ecRpcHttpDisallowed   = 0x000004E0,
+    ecProtocolDisabled    = 0x000007D8,
+    ...
+};
+
+pattern PayloadTypeFlag = flags uint
+{
+    NoCompression = 0x00000001,
+    NoXorMagic    = 0x00000002,
+    Chain         = 0x00000004
+};
+
+// ----------------- Utility functions ----------------------
+string AuxHeaderTypeToText(any data)
+{
+    if (data is AUX_VERSION_1_Type)
+        return EnumToString<AUX_VERSION_1_Type>(data as AUX_VERSION_1_Type, true);
+        
+    if (data is AUX_VERSION_2_Type)
+        return EnumToString<AUX_VERSION_2_Type>(data as AUX_VERSION_2_Type, true);
+        
+    return (data as byte).ToString();
+}
+
+string ContextHandleToText(any data)
+{
+    ContextHandle handle = data as ContextHandle;
+    return Format("{0}-{{{1}}}", 
+                   Utility.DecToHexFormat(handle.contextType),
+                   handle.contextUuid.ToString());
+}
+
+string IDLIntegerToText(any data)
+{
+   return Format("{0} ({1})", Utility.DecToHexFormat(data), data);
+}
+
+string PayloadFlagToText(any data)
+{
+    string summary = EnumToString(data, "MSOXCRPC.PayloadTypeFlag");
+    return summary == "" ? data as string : summary;
+}
+
+string ReturnValueToText(any data)
+{
+    IDLLong idlValue = data as IDLLong;
+    return GetReturnValueMeaning(idlValue as uint);
+}
+
+string GetReturnValueMeaning(uint returnValue)
+{
+    string meaning = "";
+    
+    switch (returnValue as uint)
+    {
+       // EcDoConnectEx
+       case 0x00000000 => meaning = "ecNone";
+       case 0x80070005 => meaning = "ecAccessDenied";  
+       case 0x00000970 => meaning = "ecNotEncrypted";  
+       case 0x000004DF => meaning = "ecClientVerDisallowed";  
+       case 0x80040111 => meaning = "ecLoginFailure";  
+       case 0x000003EB => meaning = "ecUnknownUser";  
+       case 0x000003F2 => meaning = "ecLoginPerm";  
+       case 0x80040110 => meaning = "ecVersionMismatch";  
+       case 0x000004E1 => meaning = "ecCachedModeRequired";  
+       case 0x000004E0 => meaning = "ecRpcHttpDisallowed";  
+       case 0x000007D8 => meaning = "ecProtocolDisabled"; 
+
+       // EcDoRpcExt2 or EcDoAsyncWaitEx
+       case 0x000004B6 => meaning = "ecRpcFormat"; 
+
+       // EcDoAsyncConnectEx
+       case 0x000007EE => meaning = "ecRejected";
+       
+       // EcRRegisterPushNotification
+       case 0x80070057 => meaning = "ecInvalidParam";
+       case 0x80040102 => meaning = "ecNotSupported";
+       case 0x80040305 => meaning = "ecTooBig";
+
+       // EcDoAsyncWaitEx 
+       case 0x000003ED => meaning = "ecExiting";
+       
+       // EcDoConnectEx or EcDoRpcExt2
+       case 0x80040115 => meaning = "ecRpcFailed";
+    }
+
+    return meaning == "" ? returnValue as string : meaning;
+}
+
+string EcDoRpcExt2RgbOutToText(any data)
+{
+    if (data is opt:optional array<ExtendedBuffer>)
+    {
+        var buffers = opt as array<ExtendedBuffer>;
+        int totalCount = 0;
+
+        for (int i = 0;  i < buffers.Count; i++)
+            totalCount += buffers[i].ByteCount();
+            
+        return Format("{0} Extended Buffer(s), {1} byte(s) in total", buffers.Count, totalCount);
+    }
+    
+    return data as string;
+}
+
+// 3.1.4.1.1.2   Compression Algorithm 
+binary LZ77Decompress(binary inputBuffer, int startOffset)
+{
+    SharedByte shareByteCache = null;
+    int bitMaskIndex = 0;
+    uint bitMask = 0x00000000;
+    int inputPosition = startOffset;
+    int outputPosition = 0;
+    array<byte> outputBuffer = [];
+
+    while (inputPosition < inputBuffer.Count)
+    {
+        // If the bitMaskIndex = 0, it represents the entire "bitMask" has been
+        // consumed or we are just starting to do the decompress.
+        if (bitMaskIndex == 0)
+        {
+            bitMask = BinaryToUInt(inputBuffer, inputPosition);
+            inputPosition += 4;
+            bitMaskIndex = 32;
+            continue;
+        }
+
+        bool hasMetaData = (bitMask & 0x80000000) != 0;
+        bitMask = bitMask << 1;
+        bitMaskIndex--;
+
+        // If it's data, just copy.
+        if (!hasMetaData)
+        {
+            outputBuffer += [inputBuffer[inputPosition]];
+            outputPosition++;
+            inputPosition++;
+        }
+        // Otherwise copy the data specified by metadata (offset, length) pair
+        else
+        {
+            int offset = 0;
+            int length = 0;
+            GetMetaDataValue(inputBuffer, ref inputPosition, ref shareByteCache, out offset, out length);
+            while (length != 0)
+            {
+                outputBuffer += [outputBuffer[outputPosition + offset]];
+                outputPosition++;
+                length--;
+            }
+        }
+    }
+
+    return outputBuffer.Segment(0, outputPosition) as binary;
+}
+
+void GetMetaDataValue(
+      binary encodedBuffer,
+      ref int decodingPosition,
+      ref SharedByte shareByteCache,
+      out int offset,
+      out int length)
+{
+    // Initialize: To encode a length between 3 and 9, we use the 3 bits that are "in-line" in the 2-byte metadata.
+    ushort inlineMetadata = BinaryToUShort(encodedBuffer, decodingPosition);
+    decodingPosition += 2;
+    offset = ~(inlineMetadata >> 3);
+    length = inlineMetadata & 0x0007;
+   
+    // Add the minimum match - 3 bytes
+    length += 3;
+   
+    // Every other time that the length is greater than 9, 
+    // an additional byte follows the initial 2-byte metadata
+    if (length > 9)
+    {
+        int additiveLength = 0;
+        if (shareByteCache != null)
+        {
+            additiveLength = shareByteCache.HighNibble;
+            shareByteCache = null;
+        }
+        else
+        {
+            shareByteCache = new SharedByte(encodedBuffer[decodingPosition]);
+            decodingPosition++;
+            additiveLength = shareByteCache.LowNibble;
+        }
+   
+        length += additiveLength;
+    }
+   
+    // If the length is more than 24, the next byte is also used in the length calculation
+    if (length > 24)
+    {
+        length += encodedBuffer[decodingPosition];
+        decodingPosition++;
+    }
+ 
+    // For lengths that are equal to 280 or greater, the length is calculated only 
+    // from these last 2 bytes and is not added to the previous length bits.
+    if (length > 279)
+    {
+        length = BinaryToUShort(encodedBuffer, decodingPosition) + 3;
+        decodingPosition += 2;
+    }
+}
+
+type SharedByte
+{
+    byte Data;
+    
+    SharedByte(byte data)
+    {
+        this.Data = data;
+    }
+}
+
+int get LowNibble(this SharedByte sharedByte)
+{
+    return sharedByte.Data & 0x0F;
+}
+
+int get HighNibble(this SharedByte sharedByte)
+{
+    return (sharedByte.Data >> 4) & 0x0F;
+}
+                   
+uint BinaryToUInt(binary raw, int startIndex)
+{
+    uint result = 0x0;
+    int uintSize = 4;
+    
+    for (int i = 0; i < uintSize; i++)
+    {
+        uint byteOfi = raw[startIndex + i] as uint;
+        result = result | (byteOfi << (8 * i));
+    }
+
+    return result;
+}
+
+ushort BinaryToUShort(binary raw, int startIndex)
+{
+    uint result = 0x0;
+    int ushortSize = 2;
+    
+    for (int i = 0; i < ushortSize; i++)
+    {
+        uint byteOfi = raw[startIndex + i] as uint;
+        result = result | (byteOfi << (8 * i));
+    }
+
+    return result as ushort;
+}
+
+// 3.1.4.1.1.3   Obfuscation Algorithm
+binary RevertObfuscatedData(binary buffer)
+{
+    array<byte> result = [];
+    
+    foreach (byte currentByte in buffer)
+    {
+        result += [((currentByte as int) ^ (0xA5 as int)) as byte];
+    }
+    
+    return result as binary;
+}

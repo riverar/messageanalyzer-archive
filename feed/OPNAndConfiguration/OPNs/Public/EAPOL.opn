@@ -1,0 +1,163 @@
+protocol EAPOL with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Extensible Authentication Protocol over LAN",
+    ShortName = "EAPOL",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3580"},
+            new Reference{Name = "IEEE Std 802.1X-2001", Link = "http://standards.ieee.org/getieee802/download/802.1X-2001.pdf"},
+            new Reference{Name = "IEEE Std 802.11i-2004", Link = "http://standards.ieee.org/getieee802/download/802.11i-2004.pdf"},
+            new Reference{Name = "DSP0114", Link = "http://www.dmtf.org/standards/asf/"},
+            new Reference{Name = "DSP0136", Link = "http://www.dmtf.org/standards/asf/"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376689", Date = "04/10/2015"}
+        ]
+};
+
+using Standard; 
+using Ethernet;
+using Utility;
+using SNAP;
+
+endpoint Node accepts Frame;
+
+autostart actor EapolOverEthernet(Ethernet.Node node)
+{
+    process node accepts frame:Ethernet.Frame where frame.LengthOrType == EtherType.PAE || frame.LengthOrType == EtherType.Eapol80211
+    {
+        switch (frame.MacClientData)
+        {
+            case eapol:Frame from BinaryDecoder<Frame> =>
+                dispatch endpoint Node accepts eapol;
+            default =>
+                ThrowDecodingException("EAPOL");
+        }
+    }
+}
+
+autostart actor EapolOverSnap(SNAP.Node node)
+{
+    process node accepts segment:SNAP.Segment where segment.EtherType == 34958
+    {
+        switch (segment.Payload)
+        {
+            case eapol:Frame from BinaryDecoder<Frame> =>
+                dispatch endpoint Node accepts eapol;
+            default =>
+                ThrowDecodingException("EAPOL");
+        }
+    }
+}
+
+// 802.1X section 7. EAP encapsulation over LANs (EAPOL)
+// RFC 3580 4 Eapol-Key Frame
+message Frame
+{
+    byte Version;
+    PacketTypeEnum PacketType;
+    ushort PacketBodyLength;
+    optional [|PacketBodyLength > 0|] ([|PacketType == PacketTypeEnum.EapPacket|] binary
+        | [|PacketType == PacketTypeEnum.EapolKey|] EapolKey[PacketBodyLength as uint]
+        | [|PacketType == PacketTypeEnum.EapolEncapsulatedAsfAlert|] EapolEncapsulatedAsfAlert
+        | binary) PacketBody with BinaryEncoding{Length = PacketBodyLength};
+    
+    override string ToString()
+    {
+        switch (PacketType)
+        {
+            case PacketTypeEnum.EapPacket  => return ("Eapol: EAP-Packet , Length = " + (PacketBodyLength as string));
+            case PacketTypeEnum.EapolStart  => return ("Eapol: Eapol-Start , Length = " + (PacketBodyLength as string));
+            case PacketTypeEnum.EapolLogoff  => return ("Eapol: Eapol-Logoff , Length = " + (PacketBodyLength as string));
+            case PacketTypeEnum.EapolKey  => return ("Eapol: Eapol-Key (4-Way Handshake Message 4) , Length = " + (PacketBodyLength as string));
+            case PacketTypeEnum.EapolEncapsulatedAsfAlert  => return ("Eapol: Eapol-Encapsulated-Asf-Alert , Length = " + (PacketBodyLength as string));
+            default => return "Unknown Message Type: "+ (PacketType as string);
+        }
+    }
+}
+
+pattern EtherType = enum ushort
+{
+    Eapol80211   = 0x88C7,    // IEEE Std 802.11i-2004 8.4.6.1 Preauthentication and RSNA key management
+    PAE          = 0x888E,    // IEEE Std 802.1X-2001 7.8 Eapol addressing
+};
+
+// IEEE Std 802.1X-2001 7.5.4 Packet type
+pattern PacketTypeEnum = enum byte
+{
+    EapPacket                   = 0x00,
+    EapolStart                  = 0x01,
+    EapolLogoff                 = 0x02,
+    EapolKey                    = 0x03,
+    EapolEncapsulatedAsfAlert   = 0x04,
+    ...
+};
+
+// RFC 3580 4 Eapol-Key Frame
+type RC4KeyDescriptor[uint Length]
+{
+    byte Type; 
+    ushort KeyLength;
+    binary ReplayCounter with BinaryEncoding{Length = 8};
+    binary KeyIV with BinaryEncoding{Length = 16};
+    byte F with BinaryEncoding{Width = 1};
+    byte KeyIndex  with BinaryEncoding{Width = 7};
+    binary KeySignature with BinaryEncoding{Length = 16};
+    optional ([|Length > 44|] binary) Key;
+}
+
+type RSNWPAKeyDescriptor
+{
+    byte DescriptorType;
+    ushort KeyInformation;
+    ushort KeyLength;
+    binary KeyReplayCounter with BinaryEncoding{Length = 8};
+    binary KeyNonce with BinaryEncoding{Length = 32};
+    binary KeyIV with BinaryEncoding{Length = 16};
+    binary KeyRSC with BinaryEncoding{Length = 8};
+    binary Reserved with BinaryEncoding{Length = 8};
+    binary KeyMIC with BinaryEncoding{Length = 16};
+    ushort KeyDataLength;
+    binary KeyData with BinaryEncoding{Length = KeyDataLength};
+}
+
+// IEEE Std 802.11i-2004 8.5.2 Eapol-Key frames
+type EapolKey[uint Length]
+{
+    ([|stream.RemainingByteLength() > 0 && stream.CurrentByte == 1|] RC4KeyDescriptor[Length] |
+        [|stream.RemainingByteLength() > 0 && stream.CurrentByte == 2|] RSNWPAKeyDescriptor |
+        binary) RC4KeyDescriptor;
+}
+
+// DSP0136 3.1.4.1 PET Frame Content Sources
+type EapolEncapsulatedAsfAlert
+{
+    byte Reserved;
+    byte EventSensorType;
+    byte EventType;
+    byte EventOffset;
+    guid Guid;
+    ushort SequenceOrCookie;
+    uint LocalTimestamp;
+    ushort Utcoffset;
+    byte TrapSourceType;
+    byte EventSourceType;
+    byte EventSeverity;
+    byte SensorDeice;
+    byte SensorNumber;
+    byte Entity;
+    byte EntityInstance;
+    string EventData with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 8};
+    byte LanguageCode;
+    uint ManufacturerID;
+    ushort SystemID;
+    string OEMCustomFields;
+}

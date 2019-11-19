@@ -1,0 +1,225 @@
+protocol MSICE with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Interactive Connectivity Establishment (ICE) Extensions",
+    ShortName = "MS-ICE",
+    DocumentName = "MS-ICE",
+    ProtocolType = "Block",
+},
+OPNAuthoring
+{
+    Copyright = "(c) 2015 Microsoft Corporation",
+    References = 
+        [
+           new Reference{Name = "MS-ICE", Version = "5.0"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "1.0.0", Date = "05/19/2015"}
+        ]
+};
+
+using Utility;
+using TURN;
+using MSTURN;
+using TCP;
+using UDP;
+using SkypeforBusinessShared;
+using MSICE2;
+
+endpoint Server
+    over TURN.Server | over TCP.Server
+    accepts Message issues Message;
+
+client endpoint Client connected to Server;
+
+autostart actor ActorOverTURN(TURN.Server node) follows MSICE2.ActorOverTURN
+{
+    process node accepts turnMsg:TURN.Message where IsMsIceReqMsg(turnMsg)
+    { 		
+		optional Message msg = new Message(turnMsg);	
+		dispatch (endpoint Server over node) accepts msg as Message;		
+    } 
+	
+	process node issues turnMsg:TURN.Message where IsMsIceRspMsg(turnMsg)
+    {
+        optional Message msg = new Message(turnMsg);	
+		dispatch (endpoint Server over node) issues msg as Message;
+    }    
+}
+
+autostart actor ActorOverTCP(TCP.Server node) follows MSICE2.ActorOverTCP
+{
+	process node accepts s:TCP.Segment where IsMsIceOverTcp(s)
+    {
+		optional Message msg = new Message(s);
+		dispatch (endpoint Server over node) accepts msg as Message;		
+	}
+
+	process node issues s:TCP.Segment where IsMsIceOverTcp(s)
+    {
+		optional Message msg = new Message(s);
+		dispatch (endpoint Server over node) issues msg as Message;
+	}
+}
+
+bool IsMsIceReqMsg(TURN.Message turnMsg)
+{
+    ushort messageType = turnMsg.MessageHeader.MessageType;
+
+	if ((messageType == 0x0001) || (messageType == 0x0101) || (messageType == 0x0111)) // binding messages
+	{
+		if (ContainsTurnAtts(turnMsg, [0x0006, 0x0008])) // checking for UserName and MessageIntegrity attributes
+		{
+			return true; // STUN message
+		}
+
+		if (ContainsTurnAtts(turnMsg, [0x0008]) && turnMsg.Attributes.Count == 1) // checking for only MessageIntegrity attribute exists
+		{
+			return true; // ICE Keep Alive Message
+		}		
+		else
+		{
+			return false;
+		}
+	}
+	else
+	{
+		return false;
+	}
+}
+
+bool IsMsIceRspMsg(TURN.Message turnMsg)
+{
+    ushort messageType = turnMsg.MessageHeader.MessageType;
+
+	if ((messageType == 0x0001) || (messageType == 0x0101) || (messageType == 0x0111)) // binding messages
+	{	
+		if (ContainsTurnAtts(turnMsg, [0x0006, 0x0008, 0x0020]) || ContainsTurnAtts(turnMsg, [0x0006, 0x0008, 0x8020])) // checking for UserName, MessageIntegrity, and XorMappedAddress attributes
+		{
+			return true; // STUN Message
+		}
+
+		if (ContainsTurnAtts(turnMsg, [0x0008]) && turnMsg.Attributes.Count == 1) // checking for only MessageIntegrity attribute exists
+		{
+			return true; // ICE Keep Alive Message
+		}
+		else
+		{
+			return false;
+		}
+	}
+	else
+	{
+		return false;
+	}
+}
+
+bool IsMsIceOverTcp(TCP.Segment s)
+{
+	binary payload = s.Payload;
+
+	if ((payload == null) || (payload.Count < 6)) // minimum size of TURN message header
+	{
+		return false;
+	}
+
+	ushort tcpHeaderType = ((payload[0] << 8) + payload[1]) as ushort;
+	ushort messageType = ((payload[4] << 8) + payload[5]) as ushort;
+    
+	if (((tcpHeaderType == 0x0200) || (tcpHeaderType == 0x0300)) && 
+	((messageType == 0x0001) || (messageType == 0x0101) || (messageType == 0x0111)))
+	{
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+message Message: MSTURN.Message
+{
+	new Message(TURN.Message turnMsg)
+	{	
+		optional Message iceMsg;
+		array<any message> tempMsgs = turnMsg.Origins;
+	
+		if (tempMsgs == null || tempMsgs.Count != 1)
+		{
+			ThrowDecodingException("MSICE", "The TURN frame MUST have only one origin message.", null);
+		}
+		else if (tempMsgs[0] is s:TCP.Segment)
+		{
+			iceMsg = BinaryDecoder<Message[true]>(s.Payload);
+		}
+		else if (tempMsgs[0] is d:UDP.Datagram)
+		{
+			iceMsg = BinaryDecoder<Message[false]>(d.Payload);
+		}
+		else
+		{
+			ThrowDecodingException("MSICE", "The origin of TURN frame is neither UDP nor TCP.", null);
+		}		
+		
+		if ((iceMsg != nothing) && (iceMsg != null))
+		{
+			Message parsedMessage = iceMsg as Message;
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSICE");
+		}
+	}
+
+	new Message(TCP.Segment s)
+    {
+		optional Message iceMsg = BinaryDecoder<Message[true]>(s.Payload);
+
+		if ((iceMsg != nothing) && (iceMsg != null))
+		{
+			Message parsedMessage = iceMsg as Message;
+			this.TCPFramingHeader = parsedMessage.TCPFramingHeader;
+			this.MessageHeader = parsedMessage.MessageHeader;
+			this.Attributes = parsedMessage.Attributes;
+		}
+		else
+		{
+			ThrowDecodingException("MSICE");
+		}
+	}
+	
+    override string ToString()
+    {
+        ushort messageType  = this.MessageHeader.MessageType;
+        string summary = "Binding ";
+        
+        ushort turnClass = (messageType & 0x0110) as ushort;
+		
+        if (turnClass in MsTurnMessageClasses)
+        {
+            summary += MsTurnMessageClasses[turnClass];
+        }
+		else
+        {
+            summary = "Unknown Message Type(" + DecToHexFormat(messageType) + ")";
+        }
+
+		guid transactionID = this.MessageHeader.TransactionID;
+
+		if (transactionID != null)
+		{
+			summary += ", Transaction ID: " + transactionID.ToString();
+		}
+		else
+		{
+			summary += ", Invalid Message Format: Missing Transaction ID Field in Message Header.";
+		}
+
+        return summary;
+    }
+}

@@ -1,0 +1,691 @@
+protocol MIME with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Multi-purpose Internet Mail Extensions",
+    ShortName = "MIME",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 822"},
+            new Reference{Name = "RFC 2822"},
+            new Reference{Name = "RFC 1341"},
+            new Reference{Name = "RFC 2045"},
+            new Reference{Name = "RFC 2046"},
+            new Reference{Name = "RFC 2047"},
+            new Reference{Name = "RFC 2048"},
+            new Reference{Name = "RFC 2049"},
+            new Reference{Name = "RFC 2183"},
+            new Reference{Name = "RFC 2387"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376371", Date = "04/01/2015"}
+        ]
+};
+
+using HTTP;
+using Utility;
+using IMAP;
+using POP3;
+using SMTP;
+using CoreNetworkingResources;
+
+string MODULE_NAME = "MIME";
+
+//-------------------- Endpoints and Actors -------------------
+endpoint Server over IMAP.Server
+    | over POP3.Server
+    | over SMTP.Server
+    accepts Mime issues Mime;
+        
+client endpoint Client connected to Server;
+
+autostart actor MIMEOverPOP3(POP3.Server server)
+{
+    process server issues p:POP3.ResponseMsg where p.Payload != nothing
+    {
+        var mime = MIME.MimeDecoder(p.Payload as binary);
+        dispatch (endpoint MIME.Server over server) issues mime;
+    }
+}
+
+autostart actor MIMEOverSMTP(SMTP.Server server)
+{
+    // SMTP has reassembled segments if necessary. 
+    process server accepts p:SMTP.MailPacket where p.Payload is payload:binary && 
+                                                    /* Verify if the first received Payload contains the MIME data
+                                                     * 1. It should contain "MIME-Version" if having the MIME headers;
+                                                     * 2. It should contain "--" if the MIME headers is removed
+                                                     */
+                                                    ((HasMimeVersion(payload) is hasMimeVersion:bool && hasMimeVersion) || payload.IndexOf($[2D2D]) >= 0)
+    {
+        Mime mime;
+        // Has MIME header
+        if (hasMimeVersion)
+        {
+            mime = MimeDecoder(payload);
+            hasMimeVersion = false;
+        }
+        // The MIME header is removed
+        else
+        {
+            if (MimeBodyDecoder(payload, {}) is body:array<MultipartBodyType>)
+            {
+                mime = new Mime
+                {
+                    Headers = nothing,
+                    Bodies = body
+                };
+            }
+        }
+        if (mime != null)
+        {
+            mime.SourceData = payload;
+            dispatch (endpoint MIME.Server over server) accepts mime;
+        }
+        else
+        {
+            ThrowDecodingException("MIME");
+        }
+    }
+}
+
+autostart actor MIMEOverIMAP(IMAP.Server server)
+{
+    process server accepts p:IMAP.RequestMsg where p#Payload is payload:binary && HasMimeVersion(payload)
+    {
+        var mime = MIME.MimeDecoder(payload);
+        dispatch (endpoint MIME.Server over server) accepts mime;
+        p#Payload = nothing;
+    }
+
+    process server issues p:IMAP.ResponseMsg where p#Payloads is payloads:array<binary> && HasMimeVersion(payloads)
+    {
+        foreach (var payload in payloads)
+        {
+            if (HasMimeVersion(payload))
+            {
+                var mime = MIME.MimeDecoder(payload);
+                dispatch (endpoint MIME.Server over server) issues mime;
+            }
+        }
+        p#Payloads = nothing;
+    }
+}
+
+autostart actor MIMEExtendingHTTP(HTTP.Server server)
+{
+    observe server accepts req:HttpContract.Request where req.Payload.Count > 0 && req.Headers.ContentTypeContains("multipart")
+    {
+        if (MimeBodyDecoder(req.Payload, req.Headers) is bodyParts:array<MultipartBodyType>)
+        {
+            MultipartBody body = new MultipartBody{MIMEBodies = bodyParts};
+            body.SourceData = req.Payload;
+            req.MimePayload = body;
+        }
+    }
+
+    observe server issues res:HttpContract.Response where res.Payload.Count > 0 && res.Headers.ContentTypeContains("multipart")
+    {
+        if (MimeBodyDecoder(res.Payload, res.Headers) is bodyParts:array<MultipartBodyType>)
+        {
+            MultipartBody body = new MultipartBody{ MIMEBodies = bodyParts};
+            body.SourceData = res.Payload;
+            res.MimePayload = body;
+        }
+    }
+}
+
+// Indentifies whether the payload of lower protocol contains MIME data by checking "MIME-Version"
+bool HasMimeVersion(array<binary> payloads)
+{
+    foreach (var payload in payloads)
+    {
+        if (HasMimeVersion(payload))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool HasMimeVersion(binary payload)
+{
+     return payload.IndexOf(MIMEVersionBin) > 0;
+}
+const binary MIMEVersionBin = $[4D494D452D56657273696F6E]; // binary value of "MIME-Version"
+
+//-------------------- Message and types -------------------
+message Mime
+{
+    optional HttpHeadersType Headers; // Header fields may be absent in if MIME is encapsulated in SMTP
+    optional (array<MultipartBodyType> | binary) Bodies;
+
+    override string ToString()
+    {
+        string display = "";
+        if (Headers == nothing)
+        {
+            return "MIME message";
+        }
+        HttpHeadersType headers = Headers as HttpHeadersType;
+        if (("MIME-Version" in headers) && (headers["MIME-Version"] is string))
+        {
+            display += ", MIME-Version: " + (headers["MIME-Version"] as string) + ", ";
+        }
+        if ("Subject" in headers && headers["Subject"] is HeaderFieldType)
+        {
+            display += ", Subject:" + (headers["Subject"] as HeaderFieldType).Value.ToString();
+        }
+        return display.Count > 2 ? display.Segment(2) : "";
+    }
+}
+
+type MultipartBodyType
+{
+    // The absence of a Content-Type header usually indicates that the corresponding body has a content-type of "text/plain; charset=US-ASCII".
+    // http://tools.ietf.org/html/rfc2046#section-5.1
+    optional HttpHeadersType Headers;
+    (Mime | MultipartBodyType | binary | string | any) Body;
+    
+    override string ToString()
+    {
+        if (Headers == nothing)
+        {
+            return "text/plain";
+        }
+        else
+        {
+            map<string, any> headers = Headers as map<string, any>;
+            if ((ContentTypeKey in headers) && (headers[ContentTypeKey] is HeaderFieldType))
+            {
+                return (headers[ContentTypeKey] as HeaderFieldType).Value;
+            }
+            else
+            {
+                return "text/plain";
+            }
+        } 
+    }
+}
+
+// Due to OPN language limitation, to update field value of HTTP message, a new stand-alone type must be defined.
+// This type is defined only for extending HTTP message.
+type MultipartBody : MIMEBodyType
+{
+    array<MultipartBodyType> MIMEBodies;
+
+    override string ToString()
+    {
+        return "MIME-Encoded body";
+    }
+}
+
+//-------------------- Functions and Syntax -------------------
+Mime MimeDecoder(binary sourceData)
+{
+    stream s = sourceData;
+    optional map<string, any> oheader  = HeaderSyntax(s);
+    if (oheader == nothing)
+    {
+        ThrowDecodingException("MIME", "HeaderSyntax");
+    }
+    map<string, any> header = ParseBodyHeaders(oheader as map<string, any>);
+    CRLF(s);
+
+    var mime = new Mime { Headers = header };
+    if (s.BytePosition < s.ByteLength)
+    {
+        binary remainData = sourceData.Segment(s.BytePosition);
+        if (MimeBodyDecoder(remainData, header) is body:array<MultipartBodyType>)
+        {
+            mime.Bodies = body;
+        }
+        else
+        {
+            mime.Bodies = remainData;
+        }
+    }
+    mime.SourceData = sourceData;
+    return mime;
+}
+
+// This method only decode Mime's body. In MIME over HTTP, MIME's frame only contains body.
+// For contents of simple type, currently parse them with binary.
+optional array<MultipartBodyType> MimeBodyDecoder(binary sourceData, map<string, any> headers)
+{
+    binary dashBoundaryBin = null;
+
+    // Get the boundary from header
+    if (ContentTypeKey in headers && headers[ContentTypeKey] is ct:HeaderFieldType
+            && ct.Parameters is paras:map<string, optional string> && "boundary" in paras.Keys && paras["boundary"] is dashBoundary:string)
+    {
+        // Get boundary string from 2 places: 1. HTTP header for the first one. 2. for recursive case, get from parent body part's header.
+        dashBoundaryBin = DoubleDashBin + (dashBoundary.ToBinary(TextEncoding.ASCII) as binary);
+        if (DecodeMimeBodyWithBoundary(dashBoundaryBin, sourceData) is decodeRet:array<MultipartBodyType>)
+        {
+            return decodeRet;
+        }
+        else
+        {
+            // In implementation of protocol [MS-WSMV] in windows, for encryption scenario(section 2.2.9.1 of [MS-WSMV]), there probably an extra space between dashes and boundary.
+            // Below if statement handle the special windows implementation.
+            if (ct.Value == EncryptedContentType && dashBoundary == EncryptedBoundary)
+            {
+                dashBoundaryBin = DoubleDashBin + $[20] + EncryptedBoundaryBin;
+                return DecodeMimeBodyWithBoundary(dashBoundaryBin, sourceData);
+            }
+            else
+            {
+                throw "MIME message is not decoded successfully, the possible reason should be data format is inconsistent with protocol specification or HTTP payload is truncated.";
+            }
+        }
+
+    }
+    // Update for MIME over SMTP: Guess the boundary if the header is removed
+    else if (headers == {})
+    {
+        var boundaryOffset = sourceData.IndexOf($[2D2D]);
+        if (boundaryOffset >= 0 && DashBoundary(sourceData.Segment(boundaryOffset)) is dashBoundary2:string)
+        {
+            dashBoundaryBin = dashBoundary2.ToBinary(TextEncoding.ASCII) as binary;
+            return DecodeMimeBodyWithBoundary(dashBoundaryBin, sourceData);
+        }
+    }
+    return nothing;
+
+}
+
+const binary DoubleDashBin = $[2D2D];
+const string ContentTypeKey = "Content-Type";
+const string EncryptedContentType = "multipart/encrypted";
+const string EncryptedBoundary = "Encrypted Boundary";
+const binary EncryptedBoundaryBin = $[456E6372797074656420426F756E64617279]; // binary of "Encrypted Boundary"
+
+optional array<MultipartBodyType> DecodeMimeBodyWithBoundary(binary dashBoundaryBin, binary sourceData)
+{
+    assert dashBoundaryBin != null;
+
+    array<MultipartBodyType> bodies = [];
+
+    // http://tools.ietf.org/html/rfc2046, page 43, delimiter := CRLF dash-boundary
+    // However some implementation doesn't have starting CRLF.
+    binary delimiterBin = dashBoundaryBin;
+    binary closeDelimiterBin = delimiterBin + DoubleDashBin;
+    int delimiterBinCount = delimiterBin.Count;
+    int closeDelimiterBinCount = delimiterBinCount + 2;
+        
+    if (sourceData.Count < closeDelimiterBinCount) 
+        return nothing;
+
+    if (sourceData.Segment(0, dashBoundaryBin.Count) != dashBoundaryBin) // data doesn't start with dash boundary, consume preamble
+    {
+        // Skip Preamble part
+        var preambleSize = sourceData.IndexOf(dashBoundaryBin);
+        if (preambleSize > 0)
+        {
+            sourceData = sourceData.Segment(preambleSize);
+        }
+    }
+
+    // Check if it has reached to the last boundary
+    while (sourceData.Count > closeDelimiterBinCount + 2) // CRLF at end
+    {
+        // get position of next boundary
+        int nextBoundaryPos = sourceData.IndexOf(delimiterBin, delimiterBinCount);
+        if (nextBoundaryPos < 0)
+        {
+            break;
+        }
+        // Peek binary of next body part.
+        stream s = sourceData.Segment(0, nextBoundaryPos);
+        // update curPos
+        sourceData = sourceData.Segment(nextBoundaryPos);
+        // Parse header(including open delimiter)
+        optional MultipartBodyType oheader = MultipartBodyHeader(s);
+        // If decode header failed, throw exception
+        if (oheader == nothing)
+        {
+            ThrowDecodingException("MIME", "MultipartBodyHeader");
+        }
+
+        // Otherwise, continue parsing header of body part.
+        MultipartBodyType body = oheader as MultipartBodyType;
+        if (body.Headers is h:map<string, any>)
+        {
+            body.Headers = ParseBodyHeaders(h);
+        }
+        // finish parsing if there's no data left for Body part
+        if (s.BytePosition == s.ByteLength)
+        {
+            bodies += [body];
+            continue;
+        }
+        // Get the binary data of the Content part
+        binary contentData = s.PeekBytes(s.BitPosition);
+
+        if (body.Headers == nothing)
+        {
+            body.Body = ASCIIText(contentData) as string;
+        }
+        else 
+        {
+            var headers2 = body.Headers as HttpHeadersType;
+            if (ContentTypeKey in headers2 && headers2[ContentTypeKey] is HeaderFieldType)
+            {
+                // Get Content-Type from header of body part.
+                string contentType = (headers2[ContentTypeKey] as HeaderFieldType).Value;
+                // Multipart body.
+                if (contentType.Contains("multipart"))
+                {
+                    if (MimeBodyDecoder(contentData, headers2) is multiBody:array<MultipartBodyType>)
+                    {
+                        body.Body = multiBody;
+                    }
+                    else
+                    {
+                        body.Body = contentData;
+                    }
+                }
+                // full Mime
+                else if (contentType.Contains("message"))
+                {
+                    body.Body = MimeDecoder(contentData);
+                }
+                // Simple type.
+                else if (contentType.Contains("text/plain"))
+                {
+                    body.Body = ASCIIText(contentData) as string;
+                }
+                else
+                {
+                    body.Body = contentData;
+                }
+            }
+            // Content-type does not exist, default type.
+            // The absence of a Content-Type header usually indicates that the corresponding body has a content-type of "text/plain; charset=US-ASCII".
+            else
+            {
+                body.Body = ASCIIText(contentData) as string;
+            }
+        }
+        bodies += [body];
+    }
+
+    if (bodies.Count == 0) // decode failed
+    {
+        return nothing;
+    }
+    else
+    {
+        if (sourceData.Count < closeDelimiterBinCount || sourceData.Segment(0, closeDelimiterBinCount) != closeDelimiterBin)
+        {
+            ValidationCheck(false, null, CoreNetworkingResources.MIME_CLOSE_DELIMITER_MISSING);
+        }
+        return bodies;
+    }
+}
+
+// Secondary parsing header of body part.(Copy from HTTP)
+map<string, any> ParseBodyHeaders(map<string, any> headers)
+{
+    set<string> keys = headers.Keys;
+    if (keys[ContentTypeKey])
+    {
+        ParseHeaderValue<HeaderFieldType>(MODULE_NAME, ContentTypeKey, ref headers, ContentType, null);
+    }
+    // Future Reference: Need to add types which may occur in body part's header.
+    // Currently known: "Content-Disposition", "Content-Type"
+    return headers;
+}
+
+syntax ContentType = s:MediaType => new HeaderFieldType
+                                       {
+                                           Value = s.Value,
+                                           Parameters = ((s.Parameters != nothing && s.Parameters as map<string, optional string> == {}) ? nothing : s.Parameters)
+                                       };
+
+syntax decoder = TextDecoder;
+
+syntax HeaderSyntax = kk:(ss:MsgHeader CRLF => ss)* => HTTP.MergeHeaders(kk);
+syntax MsgHeader      = k:regex{\\w[^:]*} ":" v:(FieldValues?) => new HTTP.KeyValuePair{Key = k, Value = (v.Count == 0 ? "" : v[0])};
+// Regex: Pass QE Check 8/5/2013
+// Change the FieldValues syntax from: ([^\r\n]*\r\n[\\t ]+)*[^\r\n]* to: ([^\r\n]*\r\n[\\t ])*[^\r\n]*
+syntax FieldValues = k:regex{([^\r\n]*\r\n[\\t ])*[^\r\n]*}=> k.Trim();
+
+// Add "HTab?" in MultipartBodyHeader. Root cause: rfc 2049, page 7, section 4.
+syntax MultipartBodyHeader = Delimiter TransportPadding CRLF HTab? header:HeaderSyntax? CRLF?
+        =>new MultipartBodyType
+                        {
+                            Headers = header.Count == 0 ? nothing : header[0]
+                        };
+
+//RFC 2822
+syntax Text            = s:regex{.} => s;
+syntax CR              = "\r";
+syntax LF              = "\n";
+syntax CRLF            = s1:CR s2:LF => (s1 + s2);
+syntax NoWSCTL         = regex {\x01-\x08} | regex {\x11-\x12} | regex {\x14-\x31} | regex {\x127};
+syntax WSP             = s:(Space | HTab) => s;
+syntax FWS             = (WSP* CRLF)? WSP+;
+syntax CFWS            = (FWS? Comment)* (FWS? Comment) | FWS;
+syntax CText           = NoWSCTL | regex {\x33-\x39} | regex {\x42-\x91} | regex {\x93-\x126};
+syntax CContent        = CText | QuotedPair ;//CText | QuotedPair| Comment;
+syntax Comment         = "(" (FWS? CText | QuotedPair)* FWS? ")";//"(" (FWS? CContent)* FWS? ")";
+//syntax QuotedPair      = ("\\" Text)?; // | ObsQp;
+syntax Message         = Fields (CRLF Body)?;  // | obs-fields
+syntax Fields          = (Trace (ResentDate | ResentFrom | ResentSender | ResentTo | ResentCc | ResentBcc | ResentMsgId)*)*
+                         (OrigDate | From | Sender | ReplyTo | To | Cc | Bcc | Messageid | InReplyTo | References | Subject | Comments | Keywords | OptionalField)*;
+syntax Body            = (Text* CRLF)* Text*;
+syntax Trace           = Return? Received*;
+syntax Return          = Path CRLF;
+syntax Path            = CFWS? "<" (CFWS? | AddrSpec) ">" CFWS?; //| obs-path
+syntax Received        = NamValList ";" Datetime CRLF;
+syntax NamValList      = CFWS? (NameValPair (CFWS NameValPair)*)?;
+syntax NameValPair     = ItemName CFWS ItemMIMEValue;
+syntax ItemName        = Alpha ("-"? (Alpha | Digit))*;
+syntax ItemMIMEValue   = AngleAddr* | AddrSpec | Atom | Domain | MsgId;
+syntax Subject         = Unstructured CRLF;
+syntax UText           = NoWSCTL | regex{\x33-\x126}; // | obs-utext
+syntax Unstructured    = (FWS? UText)* FWS?;
+syntax Comments        = Unstructured CRLF;
+syntax Keywords        = Phrase ("," Phrase)* CRLF;
+syntax OptionalField   = FieldName ":" Unstructured CRLF;
+syntax FieldName       = FText*;
+syntax FText           = regex{\x33-\x57} | regex{\x59-\x126};
+syntax OrigDate        = Datetime CRLF;
+syntax Datetime        = (DayOfWeek ",")? Date FWS Time (CFWS)?;
+syntax DayOfWeek       = FWS? DayName; // | obs-day-of-week
+syntax DayName        = "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun";
+syntax Date            = Day Month Year;
+syntax Year            = Digit*;// obs-year
+syntax Month           = FWS MonthName FWS; // obs-month
+syntax MonthName      = "Jan" | "Feb" | "Mar" | "Apr" | "May" | "Jun" | "Jul" | "Aug" | "Sep" | "Oct" | "Nov" | "Dec";
+syntax Day             = FWS? Digit*; // obs-day
+syntax Time            = TimeOfDay FWS Zone;
+syntax TimeOfDay       = Hour ":" Minute ( ":" Second )? ;
+syntax Hour            = Digit*; // obs-hour
+syntax Minute          = Digit*; // obs-minute
+syntax Second          = Digit*; // obs-second
+syntax Zone            = ( "+" | "-" ) Digit*;// | obs-zone
+syntax From            = MailboxList CRLF;
+syntax Sender          = Mailbox CRLF;
+syntax ReplyTo         = AddressList CRLF;
+syntax To              = AddressList CRLF;
+syntax Cc              = AddressList CRLF;
+syntax Bcc             = (AddressList | CFWS?)? CRLF;
+syntax Messageid       = MsgId CRLF;
+syntax InReplyTo       = MsgId* CRLF;
+syntax References      = MsgId* CRLF;
+syntax MsgId           = CFWS? "<" IdLeft "@" IdRight ">" CFWS?;
+syntax IdLeft          = DotAtomText | NoFoldQuote; //| obs-id-left
+syntax IdRight         = DotAtomText | NoFoldLiteral; //| obs-id-right
+syntax NoFoldQuote     = Dquote (QText | QuotedPair)* Dquote;
+syntax NoFoldLiteral   = "[" (DText | QuotedPair)* "]";
+syntax ResentDate      = Datetime CRLF;
+syntax ResentFrom      = MailboxList CRLF;
+syntax ResentSender    = Mailbox CRLF;
+syntax ResentTo        = AddressList CRLF;
+syntax ResentCc        = AddressList CRLF;
+syntax ResentBcc       = (AddressList | CFWS?) CRLF;
+syntax ResentMsgId     = MsgId CRLF;
+syntax MailboxList     = Mailbox ("," Mailbox)*; // obs-mbox-list
+syntax AddressList     = Address ("," Address)*; // obs-addr-list
+syntax Address         = Mailbox | Group;
+syntax Mailbox         = NameAddr | AddrSpec;
+syntax NameAddr        = DisplayName? AngleAddr;
+syntax AngleAddr       = CFWS? "<" AddrSpec ">" CFWS?  ;// obs-angle-addr
+syntax AddrSpec        = LocalPart "@" Domain ;
+syntax LocalPart       = DotAtom | QuotedString ;// obs-local-part
+syntax Domain          = DotAtom | DomainLiteral ;// obs-domain
+syntax DotAtom         = CFWS? DotAtomText CFWS?;
+syntax DotAtomText     = AText* ("." AText*)*;
+syntax DomainLiteral   = CFWS? "[" (FWS? DContent)* FWS? "]" CFWS?;
+syntax DContent        = DText | QuotedPair ;
+syntax DText           = NoWSCTL | regex{\x33-\x90} | regex{\x94-\x126};
+syntax Group           = DisplayName ":" (MailboxList | CFWS)? ";" CFWS? ;
+syntax DisplayName     = Phrase;
+syntax Phrase          = Word*; //| obs-phrase;
+syntax Word            = Atom | QuotedString;
+syntax Atom            = CFWS? AText* CFWS?;
+syntax AText           = regex{[A-Za-z0-9]} | "!" | "#" | "$" | "%" | "&" | "'" | "*" | "+" | "-" | "/" | "=" | "?" | "^" | "_" | "`" | "{" | "|" | "}" | "~";
+//syntax QuotedString    = CFWS? Dquote (FWS? QContent)* FWS? Dquote CFWS?;
+syntax Dquote          = "$0022";
+syntax QText           = NoWSCTL | regex{\x33} | regex {\x35-\x91} | regex {\x93-\x126};
+syntax QContent        = QText | QuotedPair ;
+
+//RFC 822
+syntax Digit          = regex{[0-9]};
+syntax Alpha          = regex{[A-Za-z]};
+syntax LWspChar       = Space | HTab ;
+syntax Space          = " ";
+syntax HTab           = "\t";
+syntax Tab            = HTab;
+
+//RFC 2045
+// MIME Header Fields
+syntax EntityHeaders        = (Content CRLF)? (encoding CRLF)? (Id CRLF)? (Description CRLF)? (MIMEExtensionField CRLF)*;
+syntax MIMEMessageHeaders   = EntityHeaders Fields Version CRLF;
+syntax MIMEPartHeaders      = EntityHeaders;// Future Reference:  Fields?;
+
+// Content-Type Header Field
+syntax Content         = "Content-Type" ":" Type "/" SubType (";" Parameter)*;
+//syntax Type            = DiscreteType | CompositeType;
+syntax DiscreteType    = "text" | "image" | "audio" | "video" | "application" | ExtensionToken;
+syntax CompositeType   = "message" | "multipart" | ExtensionToken;
+syntax ExtensionToken  = IetfToken | XToken;
+syntax IetfToken = Token;//<An extension token defined by a standards-track RFC and registered with IANA.>
+syntax XToken = Token;//<The two characters "X-" or "x-" followed, with no intervening white space, by any token>
+//syntax SubType = ExtensionToken | IanaToken;
+syntax IanaToken = Token; //<A publicly-defined extension token. Tokens of this form must be registered with IANA as specified in RFC 2048.>
+//syntax Parameter = Attribute "=" MIMEValue;
+//syntax Attribute = Token;
+syntax MIMEValue = Token | QuotedString;
+//syntax Token = regex{[^\x32[\x00-\x37]\x127 ]+};//1*<Any CHAR except SPACE, CTLs, and tspecials or especials>
+syntax TSpecials = regex{ \"(\" | \")\" | \"<\" | \">\" | \"@\" | \",\" | \";\" | \":\" | \"\\\\\\" | \"\"\" | \"/\" | \"[\" | \"]\" | \"?\" | \"=\" };
+
+// Content-Transfer-Encoding Syntax
+syntax encoding = "Content-Transfer-Encoding" ":" Mechanism;
+syntax Mechanism = "7bit" | "8bit" | "binary" | "quoted-printable" | "base64" | IetfToken | XToken;
+
+// Quoted-Printable Content-Transfer-Encoding
+syntax QuotedPrintable = QpLine (CRLF QpLine)*;
+syntax QpLine = (QpSegment TransportPadding CRLF)* QpPart TransportPadding;
+syntax QpPart = QpSection;  // Future Reference: Validation, Maximum length of 76 characters
+syntax QpSegment = QpSection *(Space | Tab) "=";    // Future Reference: Validation, Maximum length of 76 characters
+syntax QpSection = ((PText | Space | Tab)* PText)?;
+
+syntax PText = HexOctet | SafeChar;
+syntax SafeChar = regex{\x33-\x60} | regex{\x62-\x126};
+syntax HexOctet = "=" (Digit | "A" | "B" | "C" | "D" | "E" | "F")*;
+
+// Content-ID Header Field
+syntax Id = MsgId;
+syntax Description = t:(Text*) => t;
+syntax MIMEExtensionField = regex{^Content-};//<Any RFC 822 header field which begins with the string "Content-">
+syntax Version = "MIME-Version" ":" Digit* "." Digit*;
+
+//RFC 2046
+//syntax Boundary = s1:((s:BChars => s)*) s2:BCharsNoSpace => ConvertStringArrayToString(s1 + [s2]);
+
+syntax Boundary = ss: BChars* => ConvertStringArrayToString(ss);
+
+syntax BChars   = s:(BCharsNoSpace | " ") => s;
+
+//syntax BCharsNoSpace = s:(Digit | Alpha | regex{\"'\" | \"(\" | \")\" | \"+\" | \"_\" | \",\" | \"-\" | \".\" | \"/\" | \":\" | \"=\" | \"?\"}) => s;
+// Future Reference: not from rfc, should use above commented BCharsNoSpace
+syntax BCharsNoSpace = s:(Digit | Alpha | regex{[^\r\n]}) => s;
+
+syntax DashBoundary = s0:"--" s1:regex{[^\r\n]+} => (s0 + s1);
+
+// page 22
+//syntax MultipartBody = (Preamble CRLF)? s0:DashBoundary s1:TransportPadding CRLF s2:BodyPart Encapsulation* CloseDelimiter TransportPadding (CRLF Epilogue)?;
+
+// Bug: syntax is unable to match "empty".
+syntax TransportPadding = s:LWspChar* => ((s == null) ? "" : s);
+
+//syntax Encapsulation = Delimiter TransportPadding CRLF BodyPart;
+
+syntax Delimiter = CRLF? s:DashBoundary => s;
+
+//syntax Preamble = s:DiscardText =>s CRLF?;
+syntax Preamble = preamble:(p:(distext:DiscardText CRLF =>distext)? CRLF? => (p.Count == 0 ? "" : p[0]))
+                    =>preamble;
+
+//syntax DiscardText = (Text* CRLF)* Text*;  // t1:((ts:(t:Text => t)* => ts) CRLF)* t2:((t:Text => t)*) => (t1 + t2);
+syntax DiscardText    = s:regex{[^-{2}][^\r\n]*} => s;
+
+// Future Reference: Should implement and support RFC2046, page 23.
+//syntax BodyPart = MIME-part-headers [CRLF Octet*]
+
+syntax Octet = regex{\x00-\xFF};
+
+//RFC  2047
+//syntax EncodedWord = "=?" Charset "?" encoding "?" EncodedText "?=";
+
+//syntax Charset = Token;
+
+//syntax Especials = regex{\"(\" | \")\" | \"<\" | \">\" | \"@\" | \",\" | \";\" | \":\" | \"\"\" | \"/\" | \"[\" | \"]\" | \"?\" | \".\" | \"=\"};
+
+//syntax  EncodedText = regex{[^\?\x20]+};//1*<Any printable ASCII character other than "?"or SPACE>;
+
+//RFC 2387
+//syntax RelatedParam   = ( ";" "start" "=" Cid )? ( ";" "start-info"  "=" ( CidList | MIMEValue ) )?( ";" "type"  "=" Type "|" SubType )?;
+
+//syntax CidList        = Cid CidList;
+
+//syntax Cid            = MsgId;
+
+//RFC 2183  Content-Disposition in bodypart'header
+syntax Disposition = "Content-Disposition" DispositionType (";" DispositionParm)*;
+syntax DispositionType = "inline" | "attachment" | ExtensionToken;
+syntax DispositionParm = FilenameParm | CreationDateParm | ModificationDateParm | ReadDateParm | SizeParm | Parameter;
+syntax FilenameParm = "filename" "=" MIMEValue;
+syntax CreationDateParm = "creation-date" "=" QuotedDatetime;
+syntax ModificationDateParm = "modification-date" "=" QuotedDatetime;
+syntax ReadDateParm = "read-date" "=" QuotedDatetime;
+syntax SizeParm = "size" "=" Digit*;
+syntax QuotedDatetime = Datetime;
+syntax MediaType        = s1:Type s2:"/" s3:SubType s5:((LWspChar | CRLF)* ";" (LWspChar | CRLF)* s4:Parameter => s4)*
+                        => new HeaderFieldType
+                        {
+                         Value = (s1 + s2 + s3),
+                         Parameters = ConvertArrayToMap(s5)
+                        };
+syntax Type             = s:Token => s;
+syntax SubType          = s:Token => s;
+syntax Parameter        = s1:Attribute "=" s2:ParameterValue
+                        => {s1 -> s2};
+syntax Attribute        = s:Token => s;
+syntax ParameterValue   = s:(Token | QuotedString) => s;
+syntax Token            = s:regex{[0-9a-zA-Z!#$%&`*+._'|~\x5E\x2D]+} => s;
+syntax QuotedString     = Quote ss:(s:(QDText | QuotedPair) => s)* Quote => ConvertStringArrayToString(ss);
+syntax QDText           = s:regex{[!\x23-\x7E \r\n]} => s;
+syntax QuotedPair       = s1:"\\" s2:Char => (s1 + s2);
+syntax Char             = s:regex{[\x00-\x7F]} => s;
+pattern Quote           = regex{\x22};

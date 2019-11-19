@@ -1,0 +1,251 @@
+protocol DTLS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Datagram Transport Layer Security",
+    ShortName = "DTLS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 6347"},
+            new Reference{Name = "RFC 5246"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "365107", Date = "06/26/2014"}
+        ]
+};
+
+using Utility;
+using Standard;
+using TLS;
+using IANA;
+
+const set<byte> DTLSMinorVersions = {0xFF, 0xFD};
+
+endpoint Server accepts RecordLayers issues RecordLayers;
+    
+client endpoint Client connected to Server;
+
+optional RecordLayers DTLSDecoder(stream s, TLS.SessionContext context)
+{
+    array<RecordLayer> recordArray = [];
+    int prePos = s.BitPosition;
+    int startPos = prePos;
+    array<DataChunks> chunks = [];
+    while (s.RemainingByteLength >= 13 && GetTLSRecordLength(s.PeekBytes(s.BitPosition, 13)) <= s.RemainingByteLength)
+    {
+        var res = BinaryDecoder<RecordLayer[context.IsEncrypted(s.CurrentByte), context.GetMacLength()]>(s);
+        if (res == nothing)
+        {
+            break;
+        }
+        
+        RecordLayer msg = res as RecordLayer;
+        if (msg.$"type" is ContentType.handshake &&
+            msg.fragment is hsArray:array<Handshake>)
+        {
+            foreach (Handshake hs in hsArray)
+            {
+                if (hs.msg_type is HandshakeType.server_hello &&
+                    hs.body is sh:ServerHello)
+                {
+                    context.IsEncryptedCipher = !(sh.cipher_suite in UnencryptedCipher);
+                    context.mac_length = GetMACLength(sh.cipher_suite);
+                    context.HasChangeCipherSent = false;
+                    if (context.ContextChanged != null)
+                    {
+                        context.ContextChanged(context);
+                    }
+                }
+                else if(hs.msg_type is HandshakeType.client_hello)
+                {
+                    context.HasChangeCipherSent = false;
+                }
+            }
+        }
+        else if (msg.$"type" is ContentType.change_cipher_spec)
+        {
+            context.HasChangeCipherSent = true;
+        }
+        
+        recordArray += [msg];
+        chunks += [new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitPosition - prePos}]}];
+        prePos = s.BitPosition;
+    }
+    
+    if (recordArray.Count == 0)
+    {
+        return nothing;
+    }
+    
+    RecordLayers recordLayers = new RecordLayers{records = recordArray};
+    recordLayers.SourceData = s.PeekBytes(startPos, (s.BytePosition - startPos / 8) as int);
+    DataChunks payloadChunk = new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = startPos, BitLength = s.BitPosition - startPos}]};
+    recordLayers.AssociateArrayField("records", chunks);
+    recordLayers.AssociateField("records", payloadChunk);
+    
+    return recordLayers;
+}
+
+bool IsDtlsHeader(binary data)
+{
+    return data.Count >= 3 && data[1] == 0xFE && (data[2] in DTLSMinorVersions);
+}
+
+bool IsCompleteDtls(binary bin)
+{    
+    int curBytePos = 0;
+    int length = 0;
+    while (curBytePos < bin.Count - 13)
+    {
+        length = GetDTLSRecordLength(bin.Segment(curBytePos, 13));
+        curBytePos += length;
+    }
+        
+    return ((curBytePos == bin.Count - 13) && (length == 13) ) || curBytePos == bin.Count;
+}
+
+ushort GetDTLSRecordLength(binary bin)
+{
+    return bin.Count >= 13 ? ((MakeWord(bin[11], bin[12]) + 13) as ushort) : 0;
+}
+
+message RecordLayers
+{
+    array<RecordLayer> records;
+    
+    override string ToString()
+    {
+        string summary = "Records: [";
+        
+        string sep = "";
+        foreach (RecordLayer record in records)
+        {
+            summary += sep + record.ToString();
+            sep = ", ";
+        }
+        
+        summary += "]";
+        
+        return summary;
+    }
+}
+
+type ProtocolVersion
+{
+    byte major;
+    byte minor;
+    
+    override string ToString()
+    {
+        ushort version = ((major << 8) + minor) as ushort;
+        switch (version)
+        {
+            case 0xFEFF => return "DTLS 1.0";
+            case 0xFEFD => return "DTLS 1.2";
+            default => return base.ToString();
+        }
+    }
+}
+
+type RecordLayer[bool IsEncrypted, uint MACLength]
+{
+    TLS.ContentType $"type";
+    ProtocolVersion version;
+    ushort epoch;
+    ulong sequence_number with BinaryEncoding{Width = 48};
+    ushort length;
+    optional [|(IsEncrypted ? length : ((length as long) - MACLength)) > 0|] 
+        ([|$"type" is ContentType.change_cipher_spec|] TLS.ChangeCipherSpec
+        | [|!IsEncrypted && $"type" is ContentType.alert|] TLS.Alert
+        | [|!IsEncrypted && $"type" is ContentType.handshake|] array<Handshake[version]>
+        | binary) fragment with BinaryEncoding{WidthForComposedType = ((IsEncrypted ? length : (length - MACLength)) * 8) as int};
+    optional [|!IsEncrypted && MACLength > 0|] binary MAC with BinaryEncoding{Length = MACLength};
+    
+    bool GetIsEncrypted()
+    {
+        return IsEncrypted;
+    }
+    
+    override string ToString()
+    {
+        string summary = GetMessageNameFromContentType($"type");
+        if (IsEncrypted)
+        {
+            summary += "(Encryted)";
+        }
+        else if ($"type" is ContentType.handshake)
+        {
+            summary += ": " + GetAllHandshakeType();
+        }
+        return summary;
+    }
+    
+    string GetAllHandshakeType()
+    {
+        string str = "";
+        
+        if (fragment is hsArray:array<Handshake>)
+        {
+            string sep = "[";
+            foreach (Handshake hs in hsArray)
+            {
+                str += sep + GetHandshakeNameFromHandshakeType(hs.msg_type);
+                sep = ", ";
+            }
+            str += "]";
+        }
+        
+        return str;
+    }
+}
+
+type Handshake[ProtocolVersion version]
+{
+    TLS.HandshakeType msg_type;
+    uint length with BinaryEncoding{Width = 24};
+    ushort message_seq;
+    uint fragment_offset with BinaryEncoding{Width = 24};
+    uint fragment_length with BinaryEncoding{Width = 24};
+    optional [|length > 0|] 
+        ([|msg_type is HandshakeType.client_hello|] ClientHello[length]
+        | [|msg_type is HandshakeType.server_hello|] TLS.ServerHello[length]
+        | [|msg_type is HandshakeType.hello_verify_request|] HelloVerifyRequest
+        | [|msg_type is HandshakeType.session_ticket|] TLS.NewSessionTicket
+        | [|msg_type is HandshakeType.certificate|] TLS.Certificate
+        | [|msg_type is HandshakeType.certificate_request && version.major == 3 && version.minor < 3|] TLS.CertificateRequest
+        | [|msg_type is HandshakeType.certificate_request && version.major == 3 && version.minor >= 3|] TLS.CertificateRequestV12
+        | [|msg_type is HandshakeType.finished|] TLS.Finished
+        | [|msg_type is HandshakeType.certificate_url|] TLS.CertificateURL
+        | [|msg_type is HandshakeType.certificate_status|] TLS.CertificateStatus
+        | [|msg_type is HandshakeType.supplemental_data|] TLS.SupplementalData
+        | binary) body with BinaryEncoding{WidthForComposedType = (length * 8) as int};
+}
+
+type ClientHello[uint Length]
+{
+    ProtocolVersion client_version;
+    TLS.Random random;
+    TLS.SessionID session_id;
+    byte cookie_length_in_bytes;
+    binary cookie with BinaryEncoding{Length = cookie_length_in_bytes};
+    ushort cipher_suites_length_in_bytes;
+    array<CipherSuite> cipher_suites with BinaryEncoding{WidthForComposedType = (cipher_suites_length_in_bytes * 8) as int};
+    byte compression_methods_length_in_bytes;
+    array<TLS.CompressionMethod> compression_methods with BinaryEncoding{WidthForComposedType = (compression_methods_length_in_bytes * 8) as int};
+    optional [|Length - 38 - session_id.length_in_bytes - cipher_suites_length_in_bytes - compression_methods_length_in_bytes > 0|] ushort extensions_length_in_bytes;
+    optional [|extensions_length_in_bytes != nothing && extensions_length_in_bytes > 0|] 
+        array<TLS.Extension[false]> extensions with BinaryEncoding{WidthForComposedType = (extensions_length_in_bytes != nothing ? (extensions_length_in_bytes * 8) : 0) as int};
+}
+
+type HelloVerifyRequest
+{
+    ProtocolVersion server_version;
+    byte cookie_length_in_bytes;
+    binary cookie with BinaryEncoding{Length = cookie_length_in_bytes};
+}

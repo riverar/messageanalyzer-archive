@@ -1,0 +1,951 @@
+protocol SSH with 
+BinaryEncodingDefaults{Endian = Endian.Big}, 
+Documentation
+{
+    ProtocolName = "Secure Shell Protocol",
+    ShortName = "SSH",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 4251"},
+            new Reference{Name = "RFC 4252"},
+            new Reference{Name = "RFC 4253"},
+            new Reference{Name = "RFC 4254"},
+            new Reference{Name = "RFC 4419"},
+            new Reference{Name = "RFC 4432"},
+            new Reference{Name = "RFC 5656"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class=RevisionClass.Major, Version="380827", Date="09/22/2015"}
+        ]
+};
+
+using Utility;
+using IANA;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using Diagnostics;
+
+const string MODULE_NAME = "SSH";
+
+/*
+ * RFC 4251     The Secure Shell (SSH) Protocol Architecture
+ * RFC 4252     The Secure Shell (SSH) Authentication Protocol
+ * RFC 4253     The Secure Shell (SSH) Transport Layer Protocol
+ * RFC 4254     The Secure Shell (SSH) Connection Protocol
+ * RFC 4419     Diffie-Hellman Group Exchange for the Secure Shell (SSH) Transport Layer Protocol
+ * RFC 4432     RSA Key Exchange for the Secure Shell (SSH) Transport Layer Protocol
+ * RFC 5656     Elliptic Curve Algorithm Integration in the Secure Shell Transport Layer
+ */
+
+// Only implementing the SSH-TRANS protocol, for other SSH protocols are encrypted.
+
+endpoint Server 
+    over TCP.Server
+    accepts ProtocolVersionExchange issues ProtocolVersionExchange
+    issues BinaryPacket accepts BinaryPacket
+    accepts EncryptedBinaryPacket issues EncryptedBinaryPacket;
+
+autostart actor SSHOverTCP(TCP.Server host)
+{
+    TCPDecodingHelper helper = null;
+    SSHSessionContext Context= null;
+    AlgorithmsHelper Algshelper = null;
+    
+    process host accepts s:TCP.Segment where s.DestinationPort == Port.SSH
+    {
+        Initialize();
+        helper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process host issues s:TCP.Segment where s.SourcePort == Port.SSH
+    {
+        Initialize();
+        helper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    void Initialize()
+    {
+        if (helper == null)
+        {
+            helper = new TCPDecodingHelper();
+
+            Context = new SSHSessionContext();
+            Algshelper = new AlgorithmsHelper();
+            
+            SSH.Server ept = endpoint SSH.Server over host;
+            
+            var acceptsCache = new SSHDecodingCache();
+            acceptsCache.InitializeSSHDecodingCache(ept, MessageDirection.Accepts, Context, Algshelper);
+            
+            var issuesCache = new SSHDecodingCache();
+            issuesCache.InitializeSSHDecodingCache(ept, MessageDirection.Issues, Context, Algshelper);
+
+            helper.AcceptsCache = acceptsCache;
+            helper.IssuesCache = issuesCache;
+        }
+    }
+    
+    ~endpoint(TCP.Server host)
+    {
+        if (helper != null)
+        {
+            helper.ClearInDestructor();
+        }
+    }
+}
+
+client endpoint Client connected to Server;
+
+message ProtocolVersionExchange
+{
+    string messages with BinaryEncoding{TextEncoding = TextEncoding.ASCII, TextTerminator = "\x0d\x0a"};
+    
+    override string ToString()
+    {
+        return "ProtocolVersionExchange, " + messages;
+    }
+}
+
+message BinaryPacket[int MACLength, KexMethod KMethod]
+{
+    uint packet_length;
+    byte padding_length;
+    optional [|packet_length - padding_length - 1 > 0|]
+        ([|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_KEXINIT|] SSH_MSG_KEXINIT
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_NEWKEYS|] SSH_MSG_NEWKEYS
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REQUEST_OLD && KMethod == KexMethod.DH|] SSH_MSG_KEX_DH_GEX_REQUEST_OLD
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REQUEST && KMethod == KexMethod.DH|] SSH_MSG_KEX_DH_GEX_REQUEST
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_GROUP && KMethod == KexMethod.DH|] SSH_MSG_KEX_DH_GEX_GROUP
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_INIT && KMethod == KexMethod.DH|] SSH_MSG_KEX_DH_GEX_INIT
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REPLY && KMethod == KexMethod.DH|] SSH_MSG_KEX_DH_GEX_REPLY
+        | [|stream.CurrentByte == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_PUBKEY && KMethod == KexMethod.RSA|] SSH_MSG_KEXRSA_PUBKEY
+        | [|stream.CurrentByte == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_SECRET && KMethod == KexMethod.RSA|] SSH_MSG_KEXRSA_SECRET
+        | [|stream.CurrentByte == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_DONE && KMethod == KexMethod.RSA|] SSH_MSG_KEXRSA_DONE
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXECDH.SSH_MSG_KEX_ECDH_INIT && KMethod == KexMethod.ECDH|] SSH_MSG_KEX_ECDH_INIT
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXECDH.SSH_MSG_KEX_ECDH_REPLY && KMethod == KexMethod.ECDH|] SSH_MSG_KEX_ECDH_REPLY
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXECMQV.SSH_MSG_ECMQV_INIT && KMethod == KexMethod.ECMQV|] SSH_MSG_ECMQV_INIT
+        | [|stream.CurrentByte == SSG_MSG_TYPE_KEXECMQV.SSH_MSG_ECMQV_REPLY && KMethod == KexMethod.ECMQV|] SSH_MSG_ECMQV_REPLY
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_SERVICE_REQUEST|] SSH_MSG_SERVICE_REQUEST
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_SERVICE_ACCEPT|] SSH_MSG_SERVICE_ACCEPT
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_DISCONNECT|] SSH_MSG_DISCONNECT
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_IGNORE|] SSH_MSG_IGNORE
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_UNIMPLEMENTED|] SSH_MSG_UNIMPLEMENTED
+        | [|stream.CurrentByte == SSH_MSG_TYPE.SSH_MSG_DEBUG|] SSH_MSG_DEBUG
+        | binary) payload with BinaryEncoding{WidthForComposedType = (packet_length - padding_length - 1) * 8};
+    optional [|padding_length > 0|] binary randompadding with BinaryEncoding{Length = padding_length};
+    optional [|MACLength > 0|] binary mac with BinaryEncoding{Length = MACLength};
+
+    override string ToString()
+    {
+        return payload is binary ? "Binary Packet" : payload.ToString();
+    }
+}
+
+message EncryptedBinaryPacket
+{
+    binary EncryptedData;
+    
+    override string ToString()
+    {
+        return "Encrypted Binary Packet";
+    }
+}
+
+// Basic Types defined in RFC 4251
+type SSHstring[bool IsUTF8]
+{
+    uint length;
+    optional [|length > 0|] string content 
+        with BinaryEncoding{TextEncoding = IsUTF8 ? TextEncoding.UTF8 : TextEncoding.ASCII, Length = length},
+            Encoding{Decoder = BinaryDecoder<string>, SourcePattern = TypeOf<binary>()};
+    
+    override string ToString()
+    {
+        return content is str:string ? str : "";
+    }
+}
+
+type SSHmpint
+{
+    uint length;
+    optional [|length > 0|] binary content with BinaryEncoding{Length = length},DisplayInfo{ToText = ContentToText};
+    
+    override string ToString()
+    {
+        return ContentToText(content);
+    }
+    
+    string ContentToText(any input)
+    {
+        var val = input as (optional binary);
+        if (val is bin:binary)
+        {
+            return "0x" + BinaryToText(bin);
+        }
+        else
+        {
+            return "";
+        }
+    }
+}
+
+// Transform binary to hexadecimal as string to show hex in UI.
+// E.g., Input: $[0102030F], Output: "0102030F"
+string BinaryToText(binary bin)
+{
+    return (bin as array<byte>).Accumulate<byte, string>((byte val, string text) => text + Format("{0:X2}", val));
+}
+
+pattern SSHname_list = SSHstring[false];
+
+pattern SSH_MSG_TYPE = enum byte
+{
+    // RFC 4253
+    SSH_MSG_DISCONNECT      = 1,
+    SSH_MSG_IGNORE          = 2,
+    SSH_MSG_UNIMPLEMENTED   = 3,
+    SSH_MSG_DEBUG           = 4,
+    SSH_MSG_SERVICE_REQUEST = 5,
+    SSH_MSG_SERVICE_ACCEPT  = 6,
+    SSH_MSG_KEXINIT         = 20,
+    SSH_MSG_NEWKEYS         = 21,
+    ...
+};
+
+// RFC 4432
+pattern SSH_MSG_TYPE_KEXRSA = enum byte
+{
+    SSH_MSG_KEXRSA_PUBKEY = 30,
+    SSH_MSG_KEXRSA_SECRET = 31,
+    SSH_MSG_KEXRSA_DONE   = 32,
+    ...
+};
+
+// RFC 4419
+pattern SSG_MSG_TYPE_KEXDH = enum byte
+{
+    SSH_MSG_KEX_DH_GEX_REQUEST_OLD = 30,
+    SSH_MSG_KEX_DH_GEX_REQUEST     = 34,
+    SSH_MSG_KEX_DH_GEX_GROUP       = 31,
+    SSH_MSG_KEX_DH_GEX_INIT        = 32,
+    SSH_MSG_KEX_DH_GEX_REPLY       = 33,
+    ...
+};
+
+// RFC 5656
+pattern SSG_MSG_TYPE_KEXECDH = enum byte
+{
+    SSH_MSG_KEX_ECDH_INIT = 30,
+    SSH_MSG_KEX_ECDH_REPLY = 31,
+    ...
+};
+
+pattern SSG_MSG_TYPE_KEXECMQV = enum byte
+{
+    SSH_MSG_ECMQV_INIT = 30,
+    SSH_MSG_ECMQV_REPLY = 31,
+    ...
+};
+
+// Types defined in RFC 4253
+type SSH_MSG_KEXINIT
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_KEXINIT;
+    binary cookie with BinaryEncoding{Length = 16},DisplayInfo{ToText = (any input) => "0x" + BinaryToText(input as binary)};
+    SSHname_list kex_algorithms;
+    SSHname_list server_host_key_algorithms;
+    SSHname_list encryption_algorithms_client_to_server;
+    SSHname_list encryption_algorithms_server_to_client;
+    SSHname_list mac_algorithms_client_to_server;
+    SSHname_list mac_algorithms_server_to_client;
+    SSHname_list compression_algorithms_client_to_server;
+    SSHname_list compression_algorithms_server_to_client;
+    SSHname_list languages_client_to_server;
+    SSHname_list languages_server_to_client;
+    bool first_kex_packet_follows;
+    uint reserved where value == 0;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEXINIT, Preferred Kex Methods: " + (kex_algorithms.ToString().Split([',']))[0] + ", cookie: 0x" + BinaryToText(cookie);
+    }
+}
+
+type SSH_MSG_NEWKEYS
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_NEWKEYS;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_NEWKEYS";
+    }
+}
+
+type SSH_MSG_DISCONNECT
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_DISCONNECT;
+    reason_code reason_code;
+    SSHstring[true] description;
+    SSHstring[false] language_tag;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_DISCONNECT, reason_code: " + EnumToStringInSummary<reason_code>(reason_code);
+    }
+}
+
+pattern reason_code = enum uint
+{
+    SSH_DISCONNECT_HOST_NOT_ALLOWED_TO_CONNECT       = 1,
+    SSH_DISCONNECT_PROTOCOL_ERROR                    = 2,
+    SSH_DISCONNECT_KEY_EXCHANGE_FAILED               = 3,
+    SSH_DISCONNECT_RESERVED                          = 4,
+    SSH_DISCONNECT_MAC_ERROR                         = 5,
+    SSH_DISCONNECT_COMPRESSION_ERROR                 = 6,
+    SSH_DISCONNECT_SERVICE_NOT_AVAILABLE             = 7,
+    SSH_DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED    = 8,
+    SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE           = 9,
+    SSH_DISCONNECT_CONNECTION_LOST                   = 10,
+    SSH_DISCONNECT_BY_APPLICATION                    = 11,
+    SSH_DISCONNECT_TOO_MANY_CONNECTIONS              = 12,
+    SSH_DISCONNECT_AUTH_CANCELLED_BY_USER            = 13,
+    SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE    = 14,
+    SSH_DISCONNECT_ILLEGAL_USER_NAME                 = 15,
+    ...
+};
+
+type SSH_MSG_SERVICE_REQUEST
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_SERVICE_REQUEST;
+    SSHstring[false] service_name;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_SERVICE_REQUEST, service_name: " + service_name.ToString();
+    }
+}
+
+type SSH_MSG_SERVICE_ACCEPT
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_SERVICE_ACCEPT;
+    SSHstring[false] service_name;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_SERVICE_ACCEPT, service_name: " + service_name.ToString();
+    }
+}
+
+type SSH_MSG_IGNORE
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_IGNORE;
+    SSHstring[false] data;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_IGNORE, data: " + data.ToString();
+    }
+}
+
+type SSH_MSG_DEBUG
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_DEBUG;
+    bool always_display;
+    SSHstring[true] $"message";
+    SSHstring[false] language_tag;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_DEBUG, message: " + $"message".ToString() + ", language_tag: " + language_tag.ToString() + ", always_display: " + always_display.ToString();
+    }
+}
+
+type SSH_MSG_UNIMPLEMENTED
+{
+    SSH_MSG_TYPE msgType where value == SSH_MSG_TYPE.SSH_MSG_UNIMPLEMENTED;
+    uint packet_sequence_number_of_rejected_message;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_UNIMPLEMENTED, packet_sequence_number_of_rejected_message: " + packet_sequence_number_of_rejected_message.ToString();
+    }
+}
+
+type Key
+{
+    SSHstring[false] key_format_identifier;
+    ([|key_format_identifier.ToString() == "ssh-dss"|] ssh_dss_key_format
+    | [|key_format_identifier.ToString() == "ssh-rsa"|] ssh_rsa_key_format
+    | [|key_format_identifier.ToString().StartWith("ecdsa-sha2-")|] ecdsa_sha2_key_format
+    | binary) key_data;
+    
+    override string ToString()
+    {
+        return "key format identifier: " + key_format_identifier.ToString();
+    }
+}
+
+type ssh_dss_key_format
+{
+    SSHmpint p;
+    SSHmpint q;
+    SSHmpint g;
+    SSHmpint y;
+}
+
+type ssh_rsa_key_format
+{
+    SSHmpint e;
+    SSHmpint n;
+}
+
+type ecdsa_sha2_key_format
+{
+    SSHstring[false] identifier;
+    SSHmpint Q;
+}
+
+type Signature
+{
+    SSHstring[false] signature_format_identifier;
+    uint signature_blob_length;
+    ([|signature_format_identifier.ToString().StartWith("ecdsa-sha2-")|] ecdsa_signature_blob
+    | binary) signature_blob with BinaryEncoding{WidthForComposedType = signature_blob_length * 8};
+    
+    override string ToString()
+    {
+        return "signature format identifier: " + signature_format_identifier.ToString();
+    }
+}
+
+type ecdsa_signature_blob
+{
+    SSHmpint r;
+    SSHmpint s;
+}
+
+// RFC 4419
+type SSH_MSG_KEX_DH_GEX_REQUEST_OLD
+{
+    SSG_MSG_TYPE_KEXDH msgType where value == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REQUEST_OLD;
+    uint n;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_DH_GEX_REQUEST_OLD, n: " + n.ToString();
+    }
+}
+
+type SSH_MSG_KEX_DH_GEX_REQUEST
+{
+    SSG_MSG_TYPE_KEXDH msgType where value == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REQUEST;
+    uint min;
+    uint n;
+    uint max;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_DH_GEX_REQUEST, min: " + min.ToString() + ", n: " + n.ToString() + ", max: " + max.ToString();
+    }
+}
+
+type SSH_MSG_KEX_DH_GEX_GROUP
+{
+    SSG_MSG_TYPE_KEXDH msgType where value == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_GROUP;
+    SSHmpint p;
+    SSHmpint g;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_DH_GEX_GROUP";
+    }
+}
+
+type SSH_MSG_KEX_DH_GEX_INIT
+{
+    SSG_MSG_TYPE_KEXDH msgType where value == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_INIT;
+    SSHmpint e;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_DH_GEX_INIT";
+    }
+}
+
+type SSH_MSG_KEX_DH_GEX_REPLY
+{
+    SSG_MSG_TYPE_KEXDH msgType where value == SSG_MSG_TYPE_KEXDH.SSH_MSG_KEX_DH_GEX_REPLY;
+    uint K_S_length;
+    Key K_S;
+    SSHmpint f;
+    uint signature_of_H_length;
+    Signature signature_of_H;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_DH_GEX_REPLY";
+    }
+}
+
+// RFC 4432
+type SSH_MSG_KEXRSA_PUBKEY
+{
+    SSH_MSG_TYPE_KEXRSA msgType where value == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_PUBKEY;
+    uint K_S_length;
+    Key K_S with BinaryEncoding{WidthForComposedType = K_S_length * 8};
+    uint K_T_length;
+    Key K_T with BinaryEncoding{WidthForComposedType = K_T_length * 8};
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEXRSA_PUBKEY";
+    }
+}
+
+type SSH_MSG_KEXRSA_SECRET
+{
+    SSH_MSG_TYPE_KEXRSA msgType where value == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_SECRET;
+    SSHmpint RSAES_OAEP_ENCRYPT_K_T_K;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEXRSA_SECRET";
+    }
+}
+
+type SSH_MSG_KEXRSA_DONE
+{
+    SSH_MSG_TYPE_KEXRSA msgType where value == SSH_MSG_TYPE_KEXRSA.SSH_MSG_KEXRSA_DONE;
+    uint signature_of_H_with_host_key_length;
+    Signature signature_of_H_with_host_key with BinaryEncoding{WidthForComposedType = signature_of_H_with_host_key_length * 8};
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEXRSA_DONE";
+    }
+}
+
+// RFC 5656
+type SSH_MSG_KEX_ECDH_INIT
+{
+    SSG_MSG_TYPE_KEXECDH msgType where value == SSG_MSG_TYPE_KEXECDH.SSH_MSG_KEX_ECDH_INIT;
+    SSHmpint Q_C;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_ECDH_INIT";
+    }
+}
+
+type SSH_MSG_KEX_ECDH_REPLY
+{
+    SSG_MSG_TYPE_KEXECDH msgType where value == SSG_MSG_TYPE_KEXECDH.SSH_MSG_KEX_ECDH_REPLY;
+    uint K_S_length;
+    Key K_S with BinaryEncoding{WidthForComposedType = K_S_length * 8};
+    SSHmpint Q_S;
+    uint the_signature_on_the_exchange_hash_length;
+    Signature the_signature_on_the_exchange_hash with BinaryEncoding{WidthForComposedType = the_signature_on_the_exchange_hash_length * 8};
+    
+    override string ToString()
+    {
+        return "SSH_MSG_KEX_ECDH_REPLY";
+    }
+}
+
+type SSH_MSG_ECMQV_INIT
+{
+    SSG_MSG_TYPE_KEXECMQV msgType where value == SSG_MSG_TYPE_KEXECMQV.SSH_MSG_ECMQV_INIT;
+    SSHmpint Q_C;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_ECMQV_INIT";
+    }
+}
+
+type SSH_MSG_ECMQV_REPLY
+{
+    SSG_MSG_TYPE_KEXECMQV msgType where value == SSG_MSG_TYPE_KEXECMQV.SSH_MSG_ECMQV_REPLY;
+    uint K_S_length;
+    Key K_S with BinaryEncoding{WidthForComposedType = K_S_length * 8};
+    SSHmpint Q_S;
+    SSHstring HMAC;
+    
+    override string ToString()
+    {
+        return "SSH_MSG_ECMQV_REPLY";
+    }
+}
+
+// Key exchange algorithm (For decoding purpose)
+pattern KexMethod = enum byte
+{
+    DH   = 0,
+    RSA  = 1,
+    ECDH = 2,
+    ECMQV = 3,
+    ...
+};
+
+// Session Context
+type SSHSessionContext
+{
+    KexMethod kexMethod;
+    bool isEncryptMethodc2s;
+    bool isEncryptMethods2c;
+    int macLengthc2s;
+    int macLengths2c;
+    
+    bool isNewKeysSentFromClient;
+    bool isNewKeysSentFromServer;
+    
+    SSHSessionContext()
+    {
+        Reset();
+    }
+    
+    void Reset()
+    {
+        kexMethod = KexMethod.DH;
+        isEncryptMethodc2s = true;
+        isEncryptMethods2c = true;
+        macLengthc2s = 0;
+        macLengths2c = 0;
+        isNewKeysSentFromClient = false;
+        isNewKeysSentFromServer = false;
+    }
+    
+    bool IsEncrypted(bool isClient)
+    {
+        return isClient ? (isNewKeysSentFromClient && isEncryptMethodc2s) : (isNewKeysSentFromServer && isEncryptMethods2c);
+    }
+    
+    void SetToEncrypted(bool isClient)
+    {
+        if (isClient)
+        {
+            isNewKeysSentFromClient = true;
+            isEncryptMethodc2s = true;
+        }
+        else
+        {
+            isNewKeysSentFromServer = true;
+            isEncryptMethods2c = true;
+        }
+    }
+    
+    int GetMacLength(bool isClient)
+    {
+        return isClient ? (isNewKeysSentFromClient ? macLengthc2s : 0) : (isNewKeysSentFromServer ? macLengths2c : 0);
+    }
+}
+
+// Algorithms helper : help to determine which algorithm to use
+type AlgorithmsHelper
+{
+    internal string kex_algorithms;
+    internal string encryption_algorithms_client_to_server;
+    internal string encryption_algorithms_server_to_client;
+    internal string mac_algorithms_client_to_server;
+    internal string mac_algorithms_server_to_client;
+    
+    internal bool IsMethodsSet;
+    
+    AlgorithmsHelper()
+    {
+        ResetMethods();
+    }
+    
+    void SetMethods(string cur_kex_algorithms, 
+                    string cur_encryption_algorithms_client_to_server,
+                    string cur_encryption_algorithms_server_to_client,
+                    string cur_mac_algorithms_client_to_server,
+                    string cur_mac_algorithms_server_to_client)
+    {
+        kex_algorithms = cur_kex_algorithms;
+        encryption_algorithms_client_to_server = cur_encryption_algorithms_client_to_server;
+        encryption_algorithms_server_to_client = cur_encryption_algorithms_server_to_client;
+        mac_algorithms_client_to_server = cur_mac_algorithms_client_to_server;
+        mac_algorithms_server_to_client = cur_mac_algorithms_server_to_client;
+        
+        IsMethodsSet = true;
+    }
+    
+    void ResetMethods()
+    {
+        kex_algorithms = "";
+        encryption_algorithms_client_to_server = "";
+        encryption_algorithms_server_to_client = "";
+        mac_algorithms_client_to_server = "";
+        mac_algorithms_server_to_client = "";
+        
+        IsMethodsSet = false;
+    }
+    
+    bool GetIsMethodsSet()
+    {
+        return IsMethodsSet;
+    }
+    
+    void SelectMethods(bool   isClient,
+                       string pair_kex_algorithms, 
+                       string pair_encryption_algorithms_client_to_server,
+                       string pair_encryption_algorithms_server_to_client,
+                       string pair_mac_algorithms_client_to_server,
+                       string pair_mac_algorithms_server_to_client)
+    {
+        if (isClient)
+        {
+            kex_algorithms = GetSeletedMethods(pair_kex_algorithms, kex_algorithms);
+            encryption_algorithms_client_to_server = GetSeletedMethods(pair_encryption_algorithms_client_to_server, encryption_algorithms_client_to_server);
+            encryption_algorithms_server_to_client = GetSeletedMethods(pair_encryption_algorithms_server_to_client, encryption_algorithms_server_to_client);
+            mac_algorithms_client_to_server = GetSeletedMethods(pair_mac_algorithms_client_to_server, mac_algorithms_client_to_server);
+            mac_algorithms_server_to_client = GetSeletedMethods(pair_mac_algorithms_server_to_client, mac_algorithms_server_to_client);
+        }
+        else
+        {
+            kex_algorithms = GetSeletedMethods(kex_algorithms, pair_kex_algorithms);
+            encryption_algorithms_client_to_server = GetSeletedMethods(encryption_algorithms_client_to_server, pair_encryption_algorithms_client_to_server);
+            encryption_algorithms_server_to_client = GetSeletedMethods(encryption_algorithms_server_to_client, pair_encryption_algorithms_server_to_client);
+            mac_algorithms_client_to_server = GetSeletedMethods(mac_algorithms_client_to_server, pair_mac_algorithms_client_to_server);
+            mac_algorithms_server_to_client = GetSeletedMethods(mac_algorithms_server_to_client, pair_mac_algorithms_server_to_client);
+        }
+    }
+    
+    void SetSSHSessionContext(SSHSessionContext context)
+    {
+        context.kexMethod = GetKexMethod();
+        context.isEncryptMethodc2s = IsEncryptMethod(true);
+        context.isEncryptMethods2c = IsEncryptMethod(false);
+        context.macLengthc2s = GetMacLength(true);
+        context.macLengths2c = GetMacLength(false);
+    }
+    
+    // For private use only.
+    internal string GetSeletedMethods(string clientMethods, string serverMethods)
+    {
+        string method = "unknown";
+        
+        if (clientMethods == null || serverMethods == null)
+        {
+            return method;
+        }
+        
+        array<string> clientMethodsList = clientMethods.Split([',']);
+        array<string> serverMethodsList = serverMethods.Split([',']);
+        
+        if (clientMethodsList == null || serverMethodsList == null)
+        {
+            return method;
+        }
+        
+        foreach (string cm in clientMethodsList)
+        {
+            if (cm in serverMethodsList)
+            {
+                method = cm;
+                break;
+            }
+        }
+        
+        return method;
+    }
+    
+    internal KexMethod GetKexMethod()
+    {
+        if (kex_algorithms.StartWith("rsa"))
+        {
+            return KexMethod.RSA;
+        }
+        else if (kex_algorithms.StartWith("ecdh"))
+        {
+            return KexMethod.ECDH;
+        }
+        else if (kex_algorithms.StartWith("ecmqv"))
+        {
+            return KexMethod.ECMQV;
+        }
+        else
+        {
+            return KexMethod.DH;
+        }
+    }
+    
+    internal bool IsEncryptMethod(bool isClient)
+    {
+        return isClient ? !encryption_algorithms_client_to_server.StartWith("none") :
+            !encryption_algorithms_server_to_client.StartWith("none");
+    }
+    
+    internal int GetMacLength(bool isClient)
+    {
+        string macMethod = isClient ? mac_algorithms_client_to_server : mac_algorithms_server_to_client;
+        
+        if (macMethod.StartWith("hmac-sha1"))
+        {
+            return 20;
+        }
+        else if (macMethod.StartWith("hmac-md5"))
+        {
+            return 16;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+}
+
+// Decoding Cache
+type SSHDecodingCache : TCPDecodingCache
+{
+    internal SSHSessionContext Context = null;
+    internal AlgorithmsHelper Algshelper = null;
+    internal bool IsClient = false;
+    internal bool EnableReassembly = false;
+    
+    void InitializeSSHDecodingCache(any endpoint ept, MessageDirection direction, SSHSessionContext context, AlgorithmsHelper algshelper)
+    {
+        base.Initialize(MODULE_NAME, ept, direction,
+            (binary bin) => true,
+            IsCompleteSSH,
+            DecodeSSHMessage,
+            (binary bin) => nothing);
+        IsClient = direction == MessageDirection.Accepts;
+        Context = context;
+        Algshelper = algshelper;
+    }
+    
+    uint? IsCompleteSSH(binary bin)
+    {
+        if (!EnableReassembly ||
+            Context.IsEncrypted(IsClient) ||
+            IsProtocolVersionExchange(bin))
+        {
+            return 0;
+        }
+        
+        int packetLength = GetPacketLength(bin);
+        if (packetLength == 0)
+        {
+            return null;
+        }
+        else if (packetLength <= bin.Count)
+        {
+            return 0;
+        }
+        else
+        {
+            return packetLength as uint;
+        }
+    }
+    
+    int GetPacketLength(binary bin)
+    {
+        return bin.Count >= 5 ? ((bin[0] << 24) + (bin[1] << 16) + (bin[2] << 8) + bin[3] + Context.GetMacLength(IsClient)) : 0;
+    }
+    
+    optional any message DecodeSSHMessage(stream s)
+    {
+        optional any message msg = nothing;
+        if (Context.IsEncrypted(IsClient))
+        {
+            msg = BinaryDecoder<EncryptedBinaryPacket>(s);
+            EnableReassembly = false;
+        }
+        else if (IsProtocolVersionExchange(s.PeekBytes(s.BitPosition, 4))) // SSH-
+        {
+            msg = BinaryDecoder<ProtocolVersionExchange>(s);
+            Context.Reset();
+            EnableReassembly = true;
+        }
+        else
+        {
+            byte msgType = s.PeekByte(s.BitPosition + 40);
+            
+            // Set the Context when 1 of the MSG_KEXINIT is missing
+            if (Algshelper.GetIsMethodsSet() &&
+                msgType != SSH_MSG_TYPE.SSH_MSG_KEXINIT)
+            {
+                Algshelper.SetSSHSessionContext(Context);
+                Algshelper.ResetMethods();
+            }
+
+            int packetLength = GetPacketLength(s.PeekBytes(s.BitPosition, 5));
+            if (packetLength > 0 && packetLength <= s.RemainingByteLength &&
+                BinaryDecoder<BinaryPacket[Context.GetMacLength(IsClient), Context.kexMethod]>(s) is bp:BinaryPacket)
+            {
+                msg = bp;
+                switch (msgType)
+                {
+                    case SSH_MSG_TYPE.SSH_MSG_KEXINIT =>
+                        if (bp.payload is init:SSH_MSG_KEXINIT)
+                        {
+                            if (!Algshelper.GetIsMethodsSet())
+                            {
+                                Context.Reset();
+                                Algshelper.SetMethods(init.kex_algorithms.ToString(),
+                                                      init.encryption_algorithms_client_to_server.ToString(),
+                                                      init.encryption_algorithms_server_to_client.ToString(),
+                                                      init.mac_algorithms_client_to_server.ToString(),
+                                                      init.mac_algorithms_server_to_client.ToString());
+                            }
+                            else
+                            {
+                                Algshelper.SelectMethods(IsClient,
+                                    init.kex_algorithms.ToString(),
+                                    init.encryption_algorithms_client_to_server.ToString(),
+                                    init.encryption_algorithms_server_to_client.ToString(),
+                                    init.mac_algorithms_client_to_server.ToString(),
+                                    init.mac_algorithms_server_to_client.ToString());
+                                Algshelper.SetSSHSessionContext(Context);
+                                Algshelper.ResetMethods();
+                            }
+                        }
+                    case SSH_MSG_TYPE.SSH_MSG_NEWKEYS =>                        
+                        if (IsClient)
+                        {
+                            Context.isNewKeysSentFromClient = true;
+                        }
+                        else
+                        {
+                            Context.isNewKeysSentFromServer = true;
+                        }
+                    default =>;
+                }
+                EnableReassembly = true;
+            }
+            else
+            {
+                msg = BinaryDecoder<EncryptedBinaryPacket>(s);
+                Context.SetToEncrypted(IsClient);
+                EnableReassembly = false;
+            }
+        }
+        
+        return msg;
+    }
+    
+    internal bool IsProtocolVersionExchange(binary bin)
+    {
+        return bin.Count >= 4 && bin.Segment(0, 4) == $[5353482D];
+    }
+
+    override void ClearExceptionally()
+    {
+        base.ClearExceptionally();
+        EnableReassembly = false;
+    }
+}
+
+// Is x started with y
+bool StartWith(this string x, string y)
+{
+    return x.Count >= y.Count && x.Segment(0, y.Count) == y;
+}

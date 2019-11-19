@@ -1,0 +1,698 @@
+protocol IPv6 with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Internet Protocol version 6",
+    ShortName = "IPv6",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 2460"},
+            new Reference{Name = "RFC 2402"},
+            new Reference{Name = "RFC 2675"},
+            new Reference{Name = "RFC 3122"},
+            new Reference{Name = "RFC 3513"},
+            new Reference{Name = "RFC 2646"},
+            new Reference{Name = "RFC 2711"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382950", Date = "11/30/2015"}
+        ]
+};
+
+using Standard;
+using Diagnostics;
+using IANA;
+using Utility;
+using Ethernet;
+using SolarisIPNET;
+using IPv4;
+using CoreNetworkingResources;
+
+annotation bool IPv6.Datagram#IsFragment;
+annotation uint IPv6.Datagram#FragId;
+annotation ushort IPv6.Datagram#FragOffset;
+annotation bool IPv6.Datagram#IsLastFrag;
+annotation ProtocolType IPv6.Datagram#NextHeader;
+annotation binary IPv6.Datagram#PartialHeadersBinary;
+
+// Endpoints
+endpoint TunnelNode over IPv6.Node accepts IPv6.Datagram;
+
+endpoint Node over IPv6.ReassemblyNode accepts IPv6.Datagram;
+
+// This ReassemblyNode endpoint takes care of the reassembly logic for fragments.
+endpoint ReassemblyNode[binary LocalIPv6Address, binary RemoteIPv6Address]
+    accepts IPv6.Datagram
+{
+    // Dispatcher that accepts the messege
+    void AcceptDispatcher(IPv6.Datagram m)
+    {
+        dispatch (endpoint Node over this) accepts m;
+    }
+    
+    // Used by reassembly logic, to store the fragments
+    map<uint, array<IPv6.Datagram>> fragments = {};
+    
+    process this accepts m : IPv6.Datagram where m.Payload.Count > 0
+    {
+        ReassembleAndDispatchDatagram(ref fragments, m, AcceptDispatcher);
+    }
+    
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        foreach (var datagrams in reassemblyNode.fragments.Values)
+        {
+            foreach (IPv6.Datagram datagram in datagrams)
+            {
+                ReportInsufficientData(datagram, DiagnosisLevel.Error, "IPv6: Insufficient fragments for reassembly.");
+                DisplayTopLevelMessage(datagram);
+            }
+        }
+        reassemblyNode.fragments = {};
+    }
+}
+
+// Actors
+autostart actor IPv6OverEthernet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType == 34525
+    {
+        switch (f.MacClientData)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv6", "Datagram");
+        }
+    }
+}
+
+autostart actor IPv6OverIPv4(IPv4.Node node)
+{
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.IPv6
+    {
+        switch (d.Payload)
+        {
+            case f:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(f);
+            default =>
+                ThrowDecodingException("IPv6", "Datagram");
+        }
+    }
+}
+
+autostart actor IPv6OverIPv6(IPv6.Node node)
+{
+    process node accepts p:IPv6.Datagram where p.NextProtocol == ProtocolType.IPv6
+    {
+        switch (p.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                dispatch (endpoint TunnelNode over node) accepts d;
+            default =>
+                ThrowDecodingException("IPv6", "Datagram");
+        }
+    }
+}
+
+autostart actor IPv6OverIPNET(SolarisIPNET.Node node)
+{
+    process node accepts f:SolarisIPNET.Frame where f.Family == SolarisIPNET.AddressFamilyIPv6
+    {
+        switch (f.Payload)
+        {
+            case d:IPv6.Datagram from IPv6Decoder =>
+                DispatchIPv6DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv6", "Datagram");
+        }
+    }
+}
+
+void DispatchIPv6DatagramToReassemblyNode(Datagram d)
+{
+    DispatchIPv6DatagramToReassemblyNode(d, null);
+}
+
+void DispatchIPv6DatagramToReassemblyNode(Datagram d, any endpoint lowerEP)
+{
+    binary localIPv6Addr;
+    binary remoteIPv6Addr;
+    GetLocalAndRemoteAddress(d.DestinationAddress.FlatAddress, d.SourceAddress.FlatAddress, out localIPv6Addr, out remoteIPv6Addr);
+
+    if (lowerEP == null)
+    {
+        dispatch (endpoint ReassemblyNode[localIPv6Addr, remoteIPv6Addr]) accepts d;
+    }
+    else
+    {
+        dispatch (endpoint ReassemblyNode[localIPv6Addr, remoteIPv6Addr] over lowerEP) accepts d;
+    }
+}
+
+int get PayloadLength(this IPv6.Datagram d)
+{
+    return d.Payload.Count;
+}
+
+// Message
+// 3. IPv6 Header Format - rfc2460
+message Datagram
+{
+    // Header
+    byte Version where ValidationCheck(value == 6, this, DiagnosisLevel.Error, () => "IPv6: The Version in message Datagram must be set to 6, not " + (value as string) + ".") with BinaryEncoding {Width = 4};
+    byte TrafficClass with BinaryEncoding {Width = 8};
+    uint FlowLabel with BinaryEncoding {Width = 20};
+    ushort Length;
+    // Don't use this field to identify the upper-layer protocol and use the message property NextProtocol instead
+    ProtocolType NextHeader;
+    byte HopLimit;
+    IPv6Address SourceAddress  with Visualization {AliasName = "Address"};
+    IPv6Address DestinationAddress  with Visualization {AliasName = "Address"};
+    optional array<ExtensionHeader> ExtensionHeaders with Encoding{Decoder = ExtensionHeadersDecoder};
+    // Different from IPv4, value "Length" field specifies the byte count of Payload, not including header.
+    binary Payload with BinaryEncoding{MaxLength = Length > 0 ? Length : 65535};
+    
+    optional array<ExtensionHeader> ExtensionHeadersDecoder(stream payloadStream)
+    {
+        array<ExtensionHeader> extensionHeaders = [];
+        byte nextHeader = NextHeader;
+        byte currentHeader = 0xFF;
+        /* Continue to decode the extension header if the current header is not IPv6Frag and value of NextHeader field match these values:
+         * HOPOPT = 0, IPv6Route = 43, IPv6Frag = 44, AH = 51, IPv6Opts = 60
+         */
+        while (nextHeader in {0, 43, 44, 51, 60} && currentHeader != ProtocolType.IPv6Frag)
+        {
+            if (BinaryDecoder<ExtensionHeader[nextHeader]>(payloadStream) is extensionHeader:ExtensionHeader)
+            {
+                extensionHeaders += [extensionHeader];
+                currentHeader = nextHeader;
+                nextHeader = extensionHeader.GetNextHeader();
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        if (extensionHeaders.Count() > 0)
+        {
+            return extensionHeaders;
+        }
+        else
+        {
+            return nothing;
+        }
+    }
+
+    override string ToString()
+    {
+        string summary;
+        if (this#IsFragment as bool)
+        {
+            summary += "Fragment, Offset: " + ((this#FragOffset as ushort) * 8 as string) + ", ";
+        }
+        else if (this.Origins.Count > 1)
+        {
+            summary += "Reassembled, " + (this.Origins.Count as string) + " Fragments" + ", ";
+        }
+        summary += "Next Protocol: " + this.NextProtocol.Name + ", Payload Length: " + (Length as string);
+        return summary;
+    }
+}
+
+// Data types
+IPv6Address get Source(this IPv6.Datagram ipv6Datagram)
+{
+    return ipv6Datagram.SourceAddress;
+}
+
+IPv6Address get Destination(this IPv6.Datagram ipv6Datagram)
+{
+    return ipv6Datagram.DestinationAddress;
+}
+
+string get Network(this IPv6.Datagram d)
+{
+    string src = GetAlias("Utility.IPv6Address", d.SourceAddress, this) ?? d.SourceAddress.ToString();
+    string dst = GetAlias("Utility.IPv6Address", d.DestinationAddress, this) ?? d.DestinationAddress.ToString();
+    return (d.SourceAddress.Octets > d.DestinationAddress.Octets ? (dst + " - " + src) : (src + " - " + dst));
+}
+
+long get NetworkHashCode(this IPv6.Datagram d)
+{
+    int src = GetHashCodeFromBinary(d.SourceAddress.Octets);
+    int dst = GetHashCodeFromBinary(d.DestinationAddress.Octets);
+
+    return src > dst ? ((src as long) + ((dst as long)<<32)) : ((dst as long) + ((src as long)<<32));
+}
+
+// Implement the IPv6Address type in detail based on rfc 3513
+
+// Global unicast
+type GlobalUnicastAddress
+{
+    binary Octets with BinaryEncoding {Length = 16};
+}
+
+// Unspecified
+type UnspecifiedAddress
+{
+    (binary where value == $[00000000000000000000000000000000]) Octetsldflddlldfkld with BinaryEncoding {Length = 16};
+}
+
+// Loopback
+type LoopbackAddress
+{
+    (binary where value == $[00000000000000000000000000000001]) Octets with BinaryEncoding {Length = 16};
+}
+
+// IPv6 Addresses with Embedded IPv4 Addresses - IPv4-compatible IPv6 address
+type IPv4CompatibleIPv6Address
+{
+    (binary where value == $[00000000000000000000]) GlobalRoutingPrefix with BinaryEncoding {Length = 10};
+    binary SubnetID where value == $[0000] with BinaryEncoding {Length = 2};
+    IPv4Address IPv4Address;
+}
+
+// IPv6 Addresses with Embedded IPv4 Addresses - IPv4-mapped IPv6 address
+type IPv4MappedIPv6Address
+{
+    (binary where value == $[0000000000000000]) GlobalRoutingPrefix with BinaryEncoding {Length = 8};
+    binary SubnetID where value == $[FFFF] with BinaryEncoding {Length = 2};
+    IPv4Address IPv4Address;
+}
+
+// Local-Use IPv6 Unicast Addresses - Link-Local
+type LinkLocalUnicastAddress
+{
+    (ushort where value == 0xFE80) Prefix with BinaryEncoding {Width = 10};
+    (binary where value == $[00000000000000]) SubnetID with BinaryEncoding {Width = 54};
+    binary InterfaceID with BinaryEncoding {Length = 8};
+}
+
+// Local-Use IPv6 Unicast Addresses - ite-Local
+type SiteLocalUnicastAddress
+{
+    (ushort where value == 0xFEC0) Prefix with BinaryEncoding {Width = 10};
+    binary SubnetID with BinaryEncoding {Width = 54};
+    binary Octets with BinaryEncoding {Length = 8};
+}
+
+// Multicast Addresses
+type MulticastAddress
+{
+    (byte where value == 0xFF) Prefix;
+    byte Reserved where ValidationCheck(value == 0, null, DiagnosisLevel.Error, "IPv6: The Reserved in type MulticastAddress must be set to zero, not " + (value as string) + ".") with BinaryEncoding {Width = 3};
+    TFlag T with BinaryEncoding {Width = 1};
+    Scop Scop with BinaryEncoding {Width = 4};
+    binary Octets with BinaryEncoding {Length = 14};
+}
+
+// Add Flag surffix for this pattern's name as usually T is used as type parameter in generic type definition
+pattern TFlag = enum byte {WellKnown = 0, Transient = 1};
+
+pattern Scop = enum byte
+{
+    Reserved0            = 0,
+    InterfaceLocal       = 1,
+    LinkLocal            = 2,
+    Reserved1            = 3,
+    AdminLocal           = 4,
+    SiteLocal            = 5,
+    Unassigned1          = 6,
+    Unassigned2          = 7,
+    OrganizationLocal    = 8,
+    Unassigned3          = 9,
+    Unassigned4          = 10,
+    Unassigned5          = 11,
+    Unassigned6          = 12,
+    Unassigned7          = 13,
+    GlobalScope          = 14,
+    Reserved2            = 15
+};
+
+pattern RoutingType = enum byte
+{
+    Type0 = 0,
+    // Future Reference: need add other RoutingTypes and give further decoding for mobile extensions
+};
+
+// Future Reference: Add more options for mobile IPv6
+ pattern OptionChoice = [|RemainingBitLength(stream) >= 8|]
+     ([|CurrentByte(stream) == 0|] Pad1Option |
+     [|CurrentByte(stream) == 1|] PadNOption |
+     [|CurrentByte(stream) == 194|] JumboPayloadOption | // c2
+     [|CurrentByte(stream) == 5|] RouterAlertOption | Options);
+       
+// 4.2  Options - rfc2460
+// Generic format of TLV-encoded option type
+type Options
+{
+    OptionType OptionType;
+    byte OptDataLen;
+    binary OptionData with BinaryEncoding {Length = OptDataLen};
+}
+
+type OptionType
+{
+    byte Action with BinaryEncoding {Width = 2},
+        Documentation {Description = "Specify the action that must be taken if the processing IPv6 node does not recognize the Option Type"};
+    byte ChangeEnroute with BinaryEncoding {Width = 1},
+        Documentation {Description = "Specifies whether or not the Option Data of that option can change en-route to the packet's final destination"};
+    byte OptionType with BinaryEncoding {Width = 5},
+        Documentation {Description = "Specifies the type of option"};
+}
+
+// Pad1 option
+type Pad1Option
+{
+    OptionType OptionType; // value != null && value.Action == 0 && value.ChangeEnroute == 0 && value.OptionType == 0
+}
+
+// PadN option
+type PadNOption
+{
+    OptionType OptionType; // value != null && value.Action == 0 && value.ChangeEnroute == 0 && value.OptionType == 1
+    byte OptDataLen;
+    optional  [|OptDataLen > 0|] array<byte> OptionData with BinaryEncoding {Length = OptDataLen};
+}
+
+// 2. Format of the Jumbo Payload Option - rfc2675
+type JumboPayloadOption
+{
+    OptionType OptionType; // value != null && value.Action == 3 && value.ChangeEnroute == 0 && value.OptionType == 2
+    byte OptDataLen;
+    uint JumboPayloadLength where ValidationCheckGreaterThan(value > 65535, null, true, ReferenceType.Type, "IPv6", "JumboPayloadLength", "JumboPayloadOption", 65535, value);
+}
+
+// Router alert option - rfc 2711
+type RouterAlertOption
+{
+    OptionType OptionType; // value != null && value.Action == 0 && value.ChangeEnroute == 0 && value.OptionType == 5
+    byte OptDataLen where ValidationCheck(value == 2, null, DiagnosisLevel.Warning, "IPv6: The OptDataLen in type RouterAlertOption must be set to 2, not " + (value as string) + ".");
+    ushort Value;
+}
+
+type ExtensionHeader[byte NextHeader]
+{
+    ( [|NextHeader == ProtocolType.HOPOPT|] HopbyHopOptionsHeader
+    | [|NextHeader == ProtocolType.IPv6Route|] RoutingHeader
+    | [|NextHeader == ProtocolType.IPv6Frag|] FragmentHeader
+    | [|NextHeader == ProtocolType.AH|] AuthenticationHeader
+    | [|NextHeader == ProtocolType.IPv6Opts|] DestinationOptionsHeader ) Header;
+    
+    // Get the NextHeader field value that defined in types of extension header
+    byte GetNextHeader()
+    {
+        switch (Header)
+        {
+            case h:HopbyHopOptionsHeader =>
+                return h.NextHeader;
+            case h:RoutingHeader =>
+                return h.NextHeader;
+            case h:FragmentHeader =>
+                return h.NextHeader;
+            case h:AuthenticationHeader =>
+                return h.NextHeader;
+            case h:DestinationOptionsHeader =>
+                return h.NextHeader;
+            default =>
+                throw "IPv6: Unrecoverable decoding failure, ExtensionHeader type is unknown.";
+        }
+    }
+}
+
+// 4.3  Hop-by-Hop Options Header - rfc2460
+type HopbyHopOptionsHeader
+{
+    ProtocolType NextHeader;
+    byte HdrExtLen;
+    array<OptionChoice> Options with BinaryEncoding{WidthForComposedType = (HdrExtLen * 8 + 6) * 8 as int};
+}
+
+// 4.4  Routing Header - rfc2460
+type RoutingHeader
+{
+    ProtocolType NextHeader;
+    byte HdrExtLen;
+    byte RoutingType;
+    byte SegmentsLeft;
+    // Future Reference: add more types for this TypeSpecificData field
+    ([|RoutingType == 0|] Type0RoutingHeaderData[HdrExtLen] | Blob[HdrExtLen * 8 + 4 as uint]) TypeSpecificData; // with BinaryEncoding {Size = (HdrExtLen * 8 + 4)}
+}
+
+type Type0RoutingHeaderData[byte HdrExtLen]
+{
+    uint Reserved;
+    array<IPv6Address> Address with BinaryEncoding{Length = HdrExtLen / 2};
+}
+
+// 4.5  Fragment Header - rfc2460
+type FragmentHeader
+{
+    ProtocolType NextHeader;
+    byte Reserved;
+    ushort FragmentOffset with BinaryEncoding {Width = 13};
+    byte Res with BinaryEncoding {Width = 2};
+    bool MFlag with BinaryEncoding {Width = 1};
+    uint Identification;
+}
+
+// 4.6  Destination Options Header - rfc2460
+type DestinationOptionsHeader
+{
+    ProtocolType NextHeader;
+    byte HdrExtLen;
+    array<OptionChoice> Options with BinaryEncoding{WidthForComposedType = (HdrExtLen * 8 + 6) * 8 as int};
+}
+
+// 2. Authentication Header Format - rfc2402
+type AuthenticationHeader
+{
+    ProtocolType NextHeader;
+    // It specifies the length of AH in 32-bit words minus '2'and the AH header is a multiple of 64 bits for IPv6"
+    byte PayloadLen where ValidationCheckGreaterThan((value % 2 == 0) && (value > 1), null, true, ReferenceType.Type, "IPv6", "PayloadLen", "AuthenticationHeader", ("1" + Format(IPV6_STR_A_MULTIPLE_OF, "2")), value);
+    
+    ushort Reserved;
+    uint SecurityParametersIndex;
+    uint SequenceNumber;
+    optional [|(PayloadLen - 1) * 4 > 0|] AuthenticationData[PayloadLen] AuthenticationData; // with BinaryEncoding {Length = (PayloadLen - 1)*4, TrailPadding = (PayloadLen % 2 == 0) ? 32 : 0};
+    optional [|PayloadLen % 2 == 0|] array<byte> TrailPadding with BinaryEncoding{Length = 4};
+}
+
+type AuthenticationData[byte PayloadLen]
+{
+    array<uint> IntegrityCheckValue with BinaryEncoding{Length = (PayloadLen - 2)};
+}
+
+// IPv6Address MappingUnicast - rfc2464
+type AddressMappingUnicast
+{
+    (byte where value == 1) Type;
+    (byte where value == 1) Length;
+    MacAddress EthernetAddress;
+}
+
+//----------------------------------------------------
+// Function
+optional IPv6.Datagram IPv6Decoder(binary binaryValue)
+{
+    if (BinaryDecoder<IPv6.Datagram>(binaryValue) is m:IPv6.Datagram)
+    {
+        if (m#NextHeader is nothing)
+        {
+            m#IsFragment = false;
+            if (m.ExtensionHeaders is nothing)
+            {
+                m#NextHeader = m.NextHeader;
+            }
+            else
+            {
+                ValidateExtensionHeaderAndSetAnotations(ref m, m.ExtensionHeaders as array<ExtensionHeader>, binaryValue, 0);
+            }
+        }
+        return m;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+/* Traverses each header in ExtensionHeaders feild, doing the validation check and setting the annotaions if necessary.
+ * The binaryValue parameter is refer to the binary data of IPv6 datagram.
+ * The headerLength parameter is refer to the totoal length of previous extension header.
+ */
+void ValidateExtensionHeaderAndSetAnotations(ref IPv6.Datagram m, array<ExtensionHeader> extensionHeaders, binary binaryValue, int headerLength)
+{
+    foreach (var extensionHeader in extensionHeaders)
+    {
+        switch (extensionHeader.Header)
+        {
+            case h:HopbyHopOptionsHeader =>
+            {
+                headerLength = (h.HdrExtLen + 1) * 8;
+                ValidationCheck(m.NextHeader == ProtocolType.HOPOPT, m, DiagnosisLevel.Information, "IPv6: The Hop-by-Hop Options header, when present, must immediately follow the IPv6 header.");
+            }
+
+            case h:RoutingHeader =>
+            {
+                headerLength = (h.HdrExtLen + 1) * 8;
+                // process rule on Routing Type value
+                if (h.RoutingType is RoutingType.Type0)
+                {
+                    if (h.SegmentsLeft != 0)
+                    {
+                        if (h.HdrExtLen % 2 == 1)
+                        throw "IPv6: The HdrExtLen in type RoutingHeader should be an even value."; // send an ICMP Parameter Problem, Code 0, message to the Source
+                        else
+                        {
+                            var n = h.HdrExtLen / 2;
+                            if (h.SegmentsLeft > n)
+                            {
+                                throw "IPv6: Unrecoverable decoding failure, the SegmentsLeft in type RoutingHeader should be less than half of HdrExtLen."; // send an ICMP Parameter Problem
+                            }
+                        }
+                    }
+                }
+                else if (h.SegmentsLeft != 0)
+                {
+                    throw "IPv6: Unrecoverable decoding failure, RoutingType is unrecognized."; // send an ICMP Parameter Problem, Code 0, message
+                }
+            }
+
+            case h:FragmentHeader =>
+            {
+                if (h.FragmentOffset == 0)
+                {
+                    /* Store the binary data from the offset of protocol beginning to the start offset of the fragment header
+                     * and update the value referring to the last NextHeader field in this binary data.
+                     */
+                    var partialHeadersLength = 40 + m.Length - m.Payload.Count - 8;
+                    var nextHeaderOffset = headerLength == 0? 6: partialHeadersLength - headerLength;
+                    m#PartialHeadersBinary = binaryValue.Segment(0, nextHeaderOffset) + ([h.NextHeader] as binary) + binaryValue.Segment(nextHeaderOffset + 1, partialHeadersLength - nextHeaderOffset - 1);
+                }
+            
+                m#IsFragment = true;
+                m#FragId = h.Identification;
+                m#FragOffset = h.FragmentOffset;
+                m#IsLastFrag = !h.MFlag;
+            }
+        
+            case h:AuthenticationHeader =>
+            {
+                headerLength = (h.PayloadLen + 1) * 4;
+            }
+        
+            case h:DestinationOptionsHeader =>
+            {
+                headerLength = (h.HdrExtLen + 1) * 8;
+            }
+        }
+    }
+    if (extensionHeaders.Count() > 0)
+        m#NextHeader = extensionHeaders[extensionHeaders.Count() - 1].GetNextHeader();
+}
+
+// Reassemble the fragments and dispatch the complete message
+void ReassembleAndDispatchDatagram(ref map<uint, array<IPv6.Datagram>> fragments, IPv6.Datagram m, void(IPv6.Datagram) dispatcher)
+{
+    if (!(m#IsFragment as bool))
+    {
+        dispatcher(m);
+    }
+    else
+    {
+        var id = m#FragId as uint;
+
+        // Catch the fragment
+        if (!(id in fragments))
+        {
+            // This is the first arrived fragment
+            fragments[id] = [m];
+        }
+        else
+        {
+            // This is a follow up fragment
+            // Check if the fragment is dulipcated with the previously stored fragments
+            if (!IsDuplicatedFragment(fragments[id], m))
+            {
+                // The InsertSorted function deals with fragments out of order
+                fragments[id] = fragments[id].InsertSorted<IPv6.Datagram>((IPv6.Datagram f1, IPv6.Datagram f2) => (f1#FragOffset as ushort) - (f2#FragOffset as ushort), m);
+            }
+            else
+            {
+                ErrorCodeIf(true, m, DiagnosisLevel.Information, "IPv6: Duplicated IPv6 fragment");
+                DisplayTopLevelMessage(m);
+            }
+        }
+
+        array<IPv6.Datagram> datagramArray = fragments[id];
+        if (IsFragmentsSequentialCompleted<IPv6.Datagram>(
+            datagramArray,
+            (IPv6.Datagram f) => f#FragOffset == 0, // Function to identify the first fragment
+            (IPv6.Datagram f) => (f#IsLastFrag as bool),
+            (IPv6.Datagram f) => (f#FragOffset as ushort) * 8, // Function to get the sequence token of current fragment
+            (IPv6.Datagram f) => (f#FragOffset as ushort) * 8 + (f.Payload).Count())) // Function to get the expected next sequence token, and define a CurrentPayloadLength property as it failed to the length value by using f.Payload.Count();
+        {
+            // Reassemble
+            // Collect the binary data of reassembled message from each fragment
+            var ressambledData = datagramArray[0]#PartialHeadersBinary as binary;
+            datagramArray[0]#PartialHeadersBinary = nothing;
+            
+            foreach (var f in datagramArray)
+            {
+                ressambledData += (f as IPv6.Datagram).Payload;
+            }
+                
+            // Update the value referring to the PayloadLength field in the ressambledData
+            var payloadLength = (ressambledData.Count - 40) as ushort;
+            ressambledData = ressambledData.Segment(0, 4) + payloadLength.ToBinary() + ressambledData.Segment(6);
+
+            // Try to decode the reassembled binary data
+            optional IPv6.Datagram rmsg = IPv6Decoder(ressambledData);
+            if (rmsg != nothing)
+            {
+                IPv6.Datagram rm = rmsg as IPv6.Datagram;
+                
+                // Set the oringins of the reassembled message
+                foreach (var f in datagramArray)
+                {
+                    rm.Origins += [f];
+                }
+                // Clear buffered fragments
+                fragments[id] = [];
+                // Dispatch the reassembled message
+                dispatcher(rm);
+            }
+            else
+            {
+                ThrowDecodingException("IPv6", "Reassembled Datagram");
+            }
+        }
+    }
+}
+
+bool IsDuplicatedFragment(array<IPv6.Datagram> datagrams, IPv6.Datagram m)
+{
+    foreach (IPv6.Datagram f in datagrams)
+    {
+        if (m#FragOffset == f#FragOffset)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Use to identify upper-layer protocol
+ProtocolType get NextProtocol(this IPv6.Datagram d)
+{
+    return d#NextHeader is nothing? d.NextHeader: d#NextHeader as ProtocolType;
+}

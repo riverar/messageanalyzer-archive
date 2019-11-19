@@ -1,0 +1,206 @@
+protocol PPPoE 
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Point-to-Point Protocol over Ethernet",
+    ShortName = "PPPoE",
+    Description = "This parser was added to provide a way to parse user-injected test case messages in capture files. Microsoft protocol documentation test suites utilize it heavily to provide demarcation of captures generated. This assists in mapping test cases to capture fragments."
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2516"},
+            new Reference{Name = "RFC 3817"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "360482", Date = "03/21/2014"}
+        ]
+};
+
+using Standard;
+using Ethernet;
+using Utility;
+using PPP;
+
+annotation string PPPoE.Datagram#EthernetDestination;
+annotation string PPPoE.Datagram#EthernetSource;
+
+endpoint Node[ushort SessionID]
+    over Ethernet.Node
+    accepts Datagram
+{
+    process this accepts p:PPPoE.Datagram where p.Payload != nothing
+    {
+        binary payload = p.Payload as binary;
+        switch (payload)
+        {
+            case m:PPP.Frame from BinaryDecoder<PPP.Frame> =>
+                m#PPPDestinationAddress = p#EthernetDestination;
+                m#PPPSourceAddress = p#EthernetSource;
+                dispatch (endpoint PPP.Node over this) accepts m;
+            default =>
+                ThrowDecodingException("PPP");
+        }
+    }
+}
+
+autostart actor PPPoEOverEthernet(Ethernet.Node node)
+{
+    process node accepts p:Ethernet.Frame where p.LengthOrType == 34916 | p.LengthOrType == 34915
+    {
+        Datagram d = PPPoEDecoder(p.MacClientData as stream, p.LengthOrType) as Datagram;
+        if (d != nothing)
+        {
+            var n = endpoint PPPoE.Node[d.SessionID] over node;
+            d#EthernetDestination = p.DestinationAddress.ToString();
+            d#EthernetSource = p.SourceAddress.ToString();
+            dispatch n accepts d;
+        }
+        else
+        {
+            ThrowDecodingException("PPPoE");
+        }
+    }
+}
+
+optional Datagram PPPoEDecoder(stream streamValue, ushort LengthOrType)
+{
+    var d = BinaryDecoder<Datagram>(streamValue);
+    if (d == nothing)
+    {
+        return nothing;
+    }
+    var datagram = d as Datagram;
+    int offset = streamValue.BytePosition;
+    if (LengthOrType == 34915)
+    {
+        array<PPPoETag> tags = [];
+        while (streamValue.BytePosition - offset < datagram.Length)
+        {
+            var tag = BinaryDecoder<PPPoETag>(streamValue);
+            if (tag != nothing)
+            {
+                tags += [tag as PPPoETag];
+            }
+            else
+            {
+                break;
+            }
+        }
+        datagram.Tags = tags;
+        if (tags.Count == 0)
+        {
+            datagram.Tags = nothing;
+        }
+    }
+    datagram.Payload = streamValue.PeekBytes(streamValue.BitPosition, datagram.Length - (streamValue.BytePosition - offset));
+    if (datagram.Payload == $[])
+    {
+        datagram.Payload = nothing;
+    }
+    return datagram;
+}
+
+message Datagram
+{
+    byte Version where ValidationCheck(value == 1, this, "Version must be 1.") with BinaryEncoding{Width = 4};
+    byte Type where ValidationCheck(value == 1, this, "Type must be 1.") with BinaryEncoding{Width = 4};
+    byte Code;
+    ushort SessionID;
+    ushort Length;
+    optional array<PPPoETag> Tags with Encoding{Ignore = true};
+    optional binary Payload with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string display;
+        switch (Code)
+        {
+            case 0x00 => display = "Session Data";
+            case 0x07 => display = "Offer (PADO)";
+            case 0x09 => display = "Initiation (PADI)";
+            case 0x19 => display = "Request (PADR)";
+            case 0x65 => display = "Session-confirmation (PADS)";
+            case 0xa7 => display = "Terminate (PADT)";
+            default => display = "Unknown Packet Code(" + Utility.DecToHexFormat(Code) + ")";
+        }
+        return display;
+    }
+}
+
+type PPPoETag
+{
+    (EndOfList | ServiceName | ACName | HostUniq | ACCookie | VendorSpecific | RelaySessionId | ServiceNameError | ACSystemError | DefaultType) PPPoETag;
+}
+
+type DefaultType
+{
+    ushort Type;
+    ushort Length;
+    binary Data with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type EndOfList
+{
+    (ushort where value == 0x0000) Type;
+    (ushort where value == 0x0000) Length;
+}
+
+type ServiceName
+{
+    (ushort where value == 0x0101) Type;
+    ushort Length;
+    optional [|Length > 0|] string ServiceName with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type ACName
+{
+    (ushort where value == 0x0102) Type;
+    ushort Length;
+    optional [|Length > 0|] string ACName with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type HostUniq
+{
+    (ushort where value == 0x0103) Type;
+    ushort Length;
+    optional [|Length > 0|] binary HostID with BinaryEncoding{Length = Length};
+}
+
+type ACCookie
+{
+    (ushort where value == 0x0104) Type;
+    ushort Length;
+    optional [|Length > 0|] binary ACCookie with BinaryEncoding{Length = Length};
+}
+
+type VendorSpecific
+{
+    (ushort where value == 0x0105) Type;
+    ushort Length;
+    optional [|Length > 0|] binary VendorSpecific with BinaryEncoding{Length = Length};
+}
+
+type RelaySessionId
+{
+    (ushort where value == 0x0110) Type;
+    ushort Length;
+    optional [|Length > 0|] binary RelaySessionId with BinaryEncoding{Length = Length};
+}
+
+type ServiceNameError
+{
+    (ushort where value == 0x0201) Type;
+    ushort Length;
+    optional [|Length > 0|] string ServiceNameError with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type ACSystemError
+{
+    (ushort where value == 0x0202) Type;
+    ushort Length;
+    optional [|Length > 0|] string ACSystemError with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}

@@ -1,0 +1,164 @@
+protocol GPCAP with
+Documentation
+{
+    ProtocolName = "Group Policy: Central Access Policies Protocol Extension",
+    ShortName = "GPCAP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-GPCAP", Version = "3.0", Date = "05/15/2014", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "", Date = ""}
+        ]
+};
+
+using ABNF;
+using Utility;
+using FAS;
+
+endpoint Server
+    over FAS.Server
+    accepts CentralAccessPolicyFileMessage issues CentralAccessPolicyFileMessage;
+
+// -------------------------------- actor ---------------------------------------------
+autostart actor GPCAPOverFAS(FAS.Server server)
+{
+    FASReassemblyHelper reassemblyHelper = null;
+    process server issues m:(any message) where server.FileName is fileName:string && IsGPCAP(fileName)  // read response
+    {
+        if (reassemblyHelper == null)
+        {
+            reassemblyHelper = new FASReassemblyHelper().
+                Initialize(server.MessageOffsetGetter, server.MessageDataGetter);
+        }
+        reassemblyHelper.AddDataMessage(m, server);
+        server.ReadResponseOffset = null;
+    }
+    
+    process server accepts m:(any message) where server.FileName is fileName:string && IsGPCAP(fileName) && !server.HasCloseRequestAccepted // write request
+    {
+        if (reassemblyHelper == null)
+        {
+            reassemblyHelper = new FASReassemblyHelper().
+                Initialize(server.MessageOffsetGetter, server.MessageDataGetter);
+        }
+        reassemblyHelper.AddDataMessage(m, server);
+    }
+
+    // rule mapping to CloseRquest message of SMB/SMB2, it triggers reassembly but it can not be reassembled.
+    // if use process rule here, CloseRquest message has to be dispatched again using DisplayToTopLevel().
+    observe server accepts m:(any message) 
+            where server.FileName is fileName:string && IsGPCAP(fileName) && server.HasCloseRequestAccepted &&
+                reassemblyHelper != null && reassemblyHelper.FileBuffer.Count > 0
+    {
+        server.HasCloseRequestAccepted = false;
+        server.FileName = "";
+
+        DecodeAndDispatchMessage(reassemblyHelper.FileBuffer, reassemblyHelper.Origins);
+    }
+
+    void DecodeAndDispatchMessage(binary fileData, array<any message> origins)
+    {
+        if (GetStringFromBinary(fileData) is str:string &&
+            InfFile(str) is msg:CentralAccessPolicyFileMessage)
+        {
+            msg.Origins = origins;
+            dispatch (endpoint GPCAP.Server over server) issues msg;
+            if (reassemblyHelper != null)
+            {
+                reassemblyHelper.ResetAfterSucceed();
+            }
+        }
+        else
+        {
+            ThrowDecodingException("GPCAP", "CentralAccessPolicyFileMessage");
+        }
+    }
+    ~endpoint(FAS.Server server)
+    {
+        if (reassemblyHelper != null)
+        {
+            reassemblyHelper.ReleaseCache();
+        }
+    }
+}
+
+// -------------------------------- message & types ---------------------------------------------
+message CentralAccessPolicyFileMessage
+{
+    optional array<UnicodePreambleType> Unicode;
+    VersionPreambleType Version;
+    array<SectionType> Sections;
+    
+    override string ToString()
+    {
+        return "CentralAccessPolicyFileMessage, " + Version.ToString() + ", Sections: " + Sections.ToString();
+    }
+}
+
+type UnicodePreambleType
+{
+    string Unicode;
+    
+    override string ToString()
+    {
+        return "Unicode: " + Unicode;
+    }
+}
+
+type VersionPreambleType
+{
+    string Signature;
+    optional int Revision;
+    
+    override string ToString()
+    {
+        return "Signature: " + Signature + (Revision == nothing ? "" : ", Revision: " + (Revision as string));
+    }
+}
+
+type SectionType
+{
+    string Header;
+    array<string> Settings;
+    
+    override string ToString()
+    {
+        return "Header: " + Header;
+    }
+}
+
+// -------------------------------- syntax ---------------------------------------------
+syntax LWS = regex{(\r\n)?[\x20\t]+};
+syntax InfFile = CRLF* u:UnicodePreamble v:VersionPreamble s:Sections
+                 => new CentralAccessPolicyFileMessage
+                    {
+                        Unicode = u.Count > 0? u : nothing,
+                        Version = v,
+                        Sections = s
+                    };
+// UnicodePreamble = *("[Unicode]" LineBreak "Unicode=yes" LineBreak)
+syntax UnicodePreambleSingle = "[Unicode]" LineBreak "Unicode=yes" LineBreak => new UnicodePreambleType{Unicode = "yes"};
+syntax UnicodePreamble = s:(UnicodePreambleSingle)* => s;
+// TDI 72254, in TD, it is signature
+syntax VersionPreamble = "[Version]" LineBreak "Signature=" "\"" s:"$Windows NT$" "\"" LineBreak r:("Revision=" v:"1" LineBreak => v)?
+                         => new VersionPreambleType{Signature = s, Revision = r.Count == 0 ? nothing : 1};
+syntax Sections = (Section)+; // Section | Section Sections
+syntax Section = h:Header s:Settings => new SectionType{Header = h, Settings = s};
+syntax Header = "[" s:HeaderValue "]" LineBreak => s;
+syntax HeaderValue = StringWithSpaces;
+syntax Settings = s:(Setting)+; // Settings = Setting / Setting Settings
+syntax Setting = s:Value LineBreak => s; // TDI 72254: Setting = "Value" LineBreak
+syntax Value = QuotedString;
+syntax LineBreak = CRLF;
+syntax String = regex{[0-9A-Za-z\d47\d45\d58\d59]*}; // String = *(ALPHANUM / %d47 / %d45 / %d58 / %d59)
+syntax StringWithSpaces = String | (s1:String s2:Wsp s3:StringWithSpaces => (s1 + s2 + (s3 as string)));
+syntax QuotedString = "\"" s:regex{[\x20-\x21\x23-\x7E]*} "\"" => s; // QuotedString = DQUOTE *(%x20-21 / %x23-7E) DQUOTE
+syntax Wsp = s:WSP* => ConvertStringArrayToString(s);
+

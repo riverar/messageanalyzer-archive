@@ -1,0 +1,1501 @@
+protocol L2TP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Layer 2 Tunneling Protocol",
+    ShortName = "L2TP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1994"},
+            new Reference{Name = "RFC 2661"},
+            new Reference{Name = "RFC 3145"},
+            new Reference{Name = "RFC 3301"},
+            new Reference{Name = "RFC 3308"},
+            new Reference{Name = "RFC 3437"},
+            new Reference{Name = "RFC 3573"},
+            new Reference{Name = "RFC 3817"},
+            new Reference{Name = "RFC 3931"},
+            new Reference{Name = "RFC 4045"},
+            new Reference{Name = "RFC 4591"},
+            new Reference{Name = "RFC 4454"},
+            new Reference{Name = "RFC 4667"},
+            new Reference{Name = "RFC 4951"},
+            new Reference{Name = "MS-L2TPIE", Version = "6.0", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "365739", Date = "07/10/2014"}
+        ]
+};
+
+using Standard;
+using IANA;
+using Utility;
+using UDP;
+using IPv4;
+using IPv6;
+using PPP;
+using Diagnostics;
+
+annotation string ControlMessageOverIP#Summary;
+annotation string ControlMessageOverUDP#Summary;
+annotation string DataMessageOverIP#DestinationAddress;
+annotation string DataMessageOverIP#SourceAddress;
+annotation string DataMessageOverUDP#DestinationAddress;
+annotation string DataMessageOverUDP#SourceAddress;
+
+annotation string PacketOverUDPv2#DestinationAddress;
+annotation string PacketOverUDPv2#SourceAddress;
+
+endpoint Node over IPv4.Node | over IPv6.Node | over UDP.Host 
+    accepts ControlMessageOverIP
+    accepts DataMessageOverIP
+    accepts ControlMessageOverUDP
+    accepts DataMessageOverUDP
+    accepts PacketOverUDPv2;
+    
+autostart actor L2TPOverIPv4(IPv4.Node node)
+{
+    TunnelSetupContext context;
+    
+    process node accepts d:IPv4.Datagram where d.Protocol == ProtocolType.L2TP
+    {
+        TunnelSetupContext.Initialize(ref context);
+        L2TPv3MessageOverIPDecoder(d.Payload, context, endpoint Node over node, d.DestinationAddress.ToString(), d.SourceAddress.ToString());
+    }
+}
+
+autostart actor L2TPOverIPv6(IPv6.Node node)
+{
+    TunnelSetupContext context;
+
+    process node accepts d:IPv6.Datagram where d.NextProtocol == ProtocolType.L2TP
+    {
+        TunnelSetupContext.Initialize(ref context);
+        L2TPv3MessageOverIPDecoder(d.Payload, context, endpoint Node over node, d.DestinationAddress.ToString(), d.SourceAddress.ToString());
+    }
+} 
+
+autostart actor L2TPOverUDP(UDP.Host node)
+{
+    TunnelSetupContext context;
+
+    process node accepts d:UDP.Datagram where d.Payload.Count > 1 && (d.SourcePort is Port.L2TP || d.DestinationPort is Port.L2TP) && ((d.Payload[1] & 0x0F) == 2) // Version == 2
+    {
+        switch (d.Payload)
+        {
+            case msg:PacketOverUDPv2 from BinaryDecoder<PacketOverUDPv2> =>
+                msg#DestinationAddress = BinaryToIP(d#DestinationAddress as binary);
+                msg#SourceAddress = BinaryToIP(d#SourceAddress as binary);
+                dispatch (endpoint Node over node) accepts msg;
+            default =>
+                ThrowDecodingException("L2TP", "PacketOverUDPv2");
+        }
+    }
+
+    process node accepts d:UDP.Datagram where d.Payload.Count > 1 && (d.SourcePort is Port.L2TP || d.DestinationPort is Port.L2TP) && ((d.Payload[1] & 0x0F) == 3) // Version == 3
+    {
+        TunnelSetupContext.Initialize(ref context);
+        L2TPv3MessageOverUDPDecoder(d.Payload, context, endpoint Node over node, BinaryToIP(d#DestinationAddress as binary), BinaryToIP(d#SourceAddress as binary));
+    }
+}
+
+autostart actor PPPOverL2TP(L2TP.Node node)
+{
+    process node accepts p:PacketOverUDPv2 where !p.L2TPHeader.T && p.Payload != nothing
+    {
+        switch (p.Payload as binary)
+        {
+            case f:Frame from BinaryDecoder<Frame> =>
+                var n = endpoint PPP.Node;
+                f#PPPDestinationAddress = p#DestinationAddress;
+                f#PPPSourceAddress = p#SourceAddress;
+                dispatch n accepts f;
+            default =>
+                ThrowDecodingException("L2TP", "PPP.Frame");
+        }
+   }
+   
+   process node accepts p:DataMessageOverIP
+   {
+        switch (p.TunnelPayload)
+        {
+            case f:Frame from BinaryDecoder<Frame> =>
+                var n = endpoint PPP.Node;
+                f#PPPDestinationAddress = p#DestinationAddress;
+                f#PPPSourceAddress = p#SourceAddress;
+                dispatch n accepts f;
+            default =>
+                ThrowDecodingException("L2TP", "PPP.Frame");
+        }
+   }
+   
+   process node accepts p:DataMessageOverUDP
+   {
+        switch (p.TunnelPayload)
+        {
+            case f:Frame from BinaryDecoder<Frame> =>
+                var n = endpoint PPP.Node;
+                f#PPPDestinationAddress = p#DestinationAddress;
+                f#PPPSourceAddress = p#SourceAddress;
+                dispatch n accepts f;
+            default =>
+                ThrowDecodingException("L2TP", "PPP.Frame");
+        }
+   }
+}
+
+message ControlMessageOverIP
+{
+    L2TPv3ControlMessageHeaderOverIP Header;
+    optional [|(Header.Length - 12) > 0|] array<AvpFormat> Avps;
+    
+    override string ToString()
+    {
+        return this#Summary != nothing ? this#Summary as string : base.ToString();
+    }
+}
+
+// [RFC 3931    4.1.1.2 L2TP Control and Data Traffic over IP]
+type L2TPv3ControlMessageHeaderOverIP
+{
+    uint SessionID where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "L2TP", "SessionID", "L2TPv3ControlMessageHeaderOverIP", value);
+    bool T where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "T", "L2TPv3ControlMessageHeaderOverIP", "1", "0")
+        with BinaryEncoding{Width = 1};
+    bool L where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "L", "L2TPv3ControlMessageHeaderOverIP", "1", "0")
+        with BinaryEncoding{Width = 1};
+    byte Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved1", "L2TPv3ControlMessageHeaderOverIP", value)
+        with BinaryEncoding{Width = 2};
+    bool S where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "S", "L2TPv3ControlMessageHeaderOverIP", "1", "0")
+        with BinaryEncoding{Width = 1};
+    byte Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved2", "L2TPv3ControlMessageHeaderOverIP", value)
+        with BinaryEncoding{Width = 7};
+    byte Ver where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "L2TP", "Ver", "L2TPv3ControlMessageHeaderOverIP", "3", value)
+        with BinaryEncoding{Width = 4};
+    ushort Length;
+    uint ControlConnectionID;
+    ushort Ns;
+    ushort Nr;
+}
+
+message DataMessageOverIP[uint CookieLength, ushort SpecificSublayerType]
+{
+    L2TPv3SessionHeaderOverIP[CookieLength] L2TPSessionHeader;
+    optional [|SpecificSublayerType == 1|] DefaultL2SpecificSublayer L2SpecificSublayer;
+    binary TunnelPayload;
+    
+    override string ToString()
+    {
+        return "Data message, Session ID: " + L2TPSessionHeader.SessionID.ToString() + 
+            (L2TPSessionHeader.Cookie == nothing ? "" : (", Cookie: 0x" + BinaryToText(L2TPSessionHeader.Cookie as binary))) + 
+            (L2SpecificSublayer == nothing ? "" : ", Default L2-Specific Sublayer");
+    }
+}
+
+// [RFC 3931    4.1.1.1 L2TPv3 Session Header Over IP]
+type L2TPv3SessionHeaderOverIP[uint CookieLength]
+{
+    uint SessionID;
+    optional [|CookieLength > 0|] binary Cookie with BinaryEncoding{Length = CookieLength},DisplayInfo{ToText = CookieToText};
+}
+
+message ControlMessageOverUDP
+{
+    ControlMessageHeader Header;
+    optional [|(Header.Length - 12) > 0|] array<AvpFormat> Avps;
+    
+    override string ToString()
+    {
+        return this#Summary != nothing ? this#Summary as string : base.ToString();
+    }
+}
+
+// [RFC 3931] 3.2.1.  L2TP Control Message Header
+type ControlMessageHeader
+{
+    bool T where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "T", "ControlMessageHeader", "1", "0")
+        with BinaryEncoding{Width = 1};
+    bool L where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "L", "ControlMessageHeader", "1", "0")
+        with BinaryEncoding{Width = 1};
+    byte Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved1", "ControlMessageHeader", value)
+        with BinaryEncoding{Width = 2};
+    bool S where ValidationCheckValue(value, null, true, ReferenceType.Type, "L2TP", "S", "ControlMessageHeader", "1", "0")
+        with BinaryEncoding{Width = 1};
+    byte Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved2", "ControlMessageHeader", value)
+        with BinaryEncoding{Width = 7};
+    byte Ver where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "L2TP", "Ver", "ControlMessageHeader", "3", value)
+        with BinaryEncoding{Width = 4};
+    ushort Length;
+    uint ControlConnectionID;
+    ushort Ns;
+    ushort Nr;
+}
+
+// [RFC 3931    3.2.2 L2TP Data Message]
+message DataMessageOverUDP[uint CookieLength, ushort SpecificSublayerType]
+{
+    L2TPSessionHeaderOverUDP[CookieLength] L2TPSessionHeader;
+    optional [|SpecificSublayerType == 1|] DefaultL2SpecificSublayer L2SpecificSublayer;
+    binary TunnelPayload;
+    
+    override string ToString()
+    {
+        return "Data message, Session ID: " + L2TPSessionHeader.SessionID.ToString() + 
+            (L2TPSessionHeader.Cookie == nothing ? "" : (", Cookie: 0x" + BinaryToText(L2TPSessionHeader.Cookie as binary))) + 
+            (L2SpecificSublayer == nothing ? "" : ", Default L2-Specific Sublayer");
+    }
+}
+
+// [RFC 3931    4.1.2.1 L2TP Session Header Over UDP]
+type L2TPSessionHeaderOverUDP[uint CookieLength]
+{
+    bool T where ValidationCheckValue(!value, null, true, ReferenceType.Type, "L2TP", "T", "L2TPSessionHeaderOverUDP", "1", "0")
+        with BinaryEncoding{Width = 1};
+    ushort Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved1", "L2TPSessionHeaderOverUDP", value)
+        with BinaryEncoding{Width = 11};
+    byte Ver where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "L2TP", "Ver", "L2TPSessionHeaderOverUDP", "3", value)
+        with BinaryEncoding{Width = 4};
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "Reserved", "L2TPSessionHeaderOverUDP", value);
+    uint SessionID;
+    optional [|CookieLength > 0|] binary Cookie with BinaryEncoding{Length = CookieLength},DisplayInfo{ToText = CookieToText};
+}
+
+string CookieToText(any input)
+{
+    var val = input as (optional binary);
+    if (val is bin:binary)
+    {
+        return "0x" + BinaryToText(bin);
+    }
+    else
+    {
+        return "";
+    }
+}
+
+// [RFC 3931    4.6 Default L2-Specific Sublayer]
+type DefaultL2SpecificSublayer
+{
+    byte Reserved1 with BinaryEncoding{Width = 1};
+    bool S with BinaryEncoding{Width = 1};
+    byte Reserved2 with BinaryEncoding{Width = 6};
+    uint SequenceNumber with BinaryEncoding{Width = 24};
+}
+
+// [RFC 3931    5.1 AVP Format]
+type AvpFormat
+{
+    bool M with BinaryEncoding{Width = 1};
+    bool H with BinaryEncoding{Width = 1};
+    byte rsvd where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "L2TP", "rsvd", "AvpFormat", value)
+        with BinaryEncoding{Width = 4};
+    ushort Length with BinaryEncoding{Width = 10};
+    // Future Reference: Use lookahead for better perf
+    optional ExtendedVendorIDAvpFormat Extended;
+    ([|Extended == nothing|] ushort | uint) VendorID;
+    ushort AttributeType;
+    optional [|Length - (Extended == nothing ? 6 : 12) > 0|] ([|H|] HidingAttributeValues
+    | [|AttributeType == 0|] MessageType
+    | [|AttributeType == 1|] ResultCode
+    | [|AttributeType == 2|] ProtocolVersion
+    | [|AttributeType == 3|] FramingCapabilities
+    | [|AttributeType == 4|] BearerCapabilities
+    | [|AttributeType == 5|] TieBreak
+    | [|AttributeType == 6|] FirmwareRevision
+    | [|AttributeType == 7|] HostName
+    | [|AttributeType == 8|] VendorName
+    | [|AttributeType == 9|] AssignedTunnelID
+    | [|AttributeType == 10|] ReceiveWindowSize
+    | [|AttributeType == 11|] Challenge
+    | [|AttributeType == 12|] Q931CauseCode
+    | [|AttributeType == 13|] ChallengeResponse
+    | [|AttributeType == 14|] AssignedSessionID
+    | [|AttributeType == 15|] CallSerialNumber
+    | [|AttributeType == 16|] MinimumBPS
+    | [|AttributeType == 17|] MaximumBPS
+    | [|AttributeType == 18|] BearerType
+    | [|AttributeType == 19|] FramingType
+    | [|AttributeType == 21|] CalledNumber
+    | [|AttributeType == 22|] CallingNumber
+    | [|AttributeType == 23|] SubAddress
+    | [|AttributeType == 24|] TxConnectSpeedv2
+    | [|AttributeType == 38|] RxConnectSpeedv2
+    | [|AttributeType == 25|] PhysicalChannelID
+    | [|AttributeType == 37|] PrivateGroupID
+    | [|AttributeType == 26|] InitialReceivedLCPCONFREQ
+    | [|AttributeType == 27 || AttributeType == 51|] LastSentLCPCONFREQ
+    | [|AttributeType == 28 || AttributeType == 52|] LastReceivedLCPCONFREQ
+    | [|AttributeType == 29|] ProxyAuthenType
+    | [|AttributeType == 30|] ProxyAuthenName
+    | [|AttributeType == 31|] ProxyAuthenChallenge
+    | [|AttributeType == 32|] ProxyAuthenID
+    | [|AttributeType == 33|] ProxyAuthenResponse
+    | [|AttributeType == 34|] CallErrors
+    | [|AttributeType == 35|] ACCM
+    | [|AttributeType == 36|] RandomVector
+    | [|AttributeType == 40|] RxMinimumBPS
+    | [|AttributeType == 41|] RxMaximumBPS
+    | [|AttributeType == 42|] ServiceCategory
+    | [|AttributeType == 43|] ServiceName
+    | [|AttributeType == 44|] CallingSubAddress
+    | [|AttributeType == 45|] VpiVciidentifier
+    | [|AttributeType == 46|] DisconnectCause
+    | [|AttributeType == 47|] CCDS
+    | [|AttributeType == 48|] SDS
+    | [|AttributeType == 49|] LCPWantOptions
+    | [|AttributeType == 50|] LCPAllowOptions
+    | [|AttributeType == 54|] ModemOnHoldStatus
+    | [|AttributeType == 55|] PPPoERelay
+    | [|AttributeType == 59|] MessageDigest
+    | [|AttributeType == 60|] RouterID
+    | [|AttributeType == 61|] AssignedControlConnectionID
+    | [|AttributeType == 62|] PWCapabilitiesList
+    | [|AttributeType == 63|] LocalSessionID
+    | [|AttributeType == 64|] RemoteSessionID
+    | [|AttributeType == 65|] AssignedCookie
+    | [|AttributeType == 66|] RemoteEndID
+    | [|AttributeType == 68|] PWType
+    | [|AttributeType == 69|] L2SpecificSublayer
+    | [|AttributeType == 70|] DataSequencing
+    | [|AttributeType == 71|] CircuitStatus
+    | [|AttributeType == 72|] PreferredLanguage
+    | [|AttributeType == 73|] ControlMessageAuthenticationNonce
+    | [|AttributeType == 74|] TxConnectSpeed
+    | [|AttributeType == 75|] RxConnectSpeed
+    | [|AttributeType == 76|] FailoverCapability
+    | [|AttributeType == 77|] TunnelRecovery
+    | [|AttributeType == 78|] SuggestedControlSequence
+    | [|AttributeType == 79|] FailoverSessionState
+    | [|AttributeType == 81|] NewOutgoingSessions
+    | [|AttributeType == 82|] NewOutgoingSessionsAcknowledgement
+    | [|AttributeType == 83|] WithdrawOutgoingSessions
+    | [|AttributeType == 84|] MulticastPacketsPriority
+    | [|AttributeType == 85|] FrameRelayHeaderLength
+    | [|AttributeType == 86|] ATMMaximumConcatenatedCells
+    | [|AttributeType == 88|] ATMAlarmStatus
+    | [|AttributeType == 89|] GroupID
+    | [|AttributeType == 90|] LocalEndID
+    | [|AttributeType == 91|] InterfaceMaximumTransmissionUnit
+    | binary) AttributeValue with BinaryEncoding{WidthForComposedType = ((Length - (Extended == nothing ? 6 : 12)) * 8) as int};
+}
+
+// [RFC 3931    5.1 AVP Format]
+type ExtendedVendorIDAvpFormat
+{
+    ushort VendorID where value == 0;
+    ushort AttributeType where value == 58;
+}
+
+// [RFC 2661] 4.3 Hiding of AVP Attribute Values
+type HidingAttributeValues
+{
+    ushort LengthOfOriginalValue;
+    binary OriginalAttributeValue with BinaryEncoding{Length = LengthOfOriginalValue};
+    optional binary Padding;
+}
+
+// [RFC 2661] 4.4.1 AVPs Applicable To All Control Messages
+
+// 0
+type MessageType
+{
+    MessageType_MessageType MessageType;
+}
+
+pattern MessageType_MessageType = enum ushort
+{
+    RESERVED = 0,
+    SCCRQ = 1,
+    SCCRP = 2,
+    SCCCN = 3,
+    StopCCN = 4,
+    HELLO = 6,
+    OCRQ = 7,
+    OCRP = 8,
+    OCCN = 9,
+    ICRQ = 10,
+    ICRP = 11,
+    ICCN = 12,
+    CDN = 14,
+    WEN = 15,
+    SLI = 16,
+    MDMST = 17,
+    SRRQ = 18,
+    SRRP = 19,
+    ACK = 20,
+    FSQ = 21,
+    FSR = 22,
+    MSRQ = 23,
+    MSRP = 24,
+    MSE = 25,
+    MSI = 26,
+    MSEN = 27,
+    ...
+};
+
+// 36
+type RandomVector
+{
+    binary RandomOctetString;
+}
+
+// [RFC 2661] 4.4.2 Result and Error Codes
+
+// 1
+type ResultCode
+{
+    ushort ResultCode;
+    optional ushort ErrorCode;
+    // WORKAROUND: BUG23734: Binary Encoding does not support UTF8 as Text Encoding.
+    // optional string ErrorMessage with BinaryEncoding{TextEncoding = TextEncoding.UTF8, Length = (Length-4)};
+    optional binary ErrorMessage;
+}
+
+// [RFC 2661] 4.4.3 Control Connection Management AVPs
+
+// 2
+type ProtocolVersion
+{
+    byte Ver;
+    byte Rev;
+}
+
+// 3
+type FramingCapabilities
+{
+    uint Reservedforfutureframingtypedefinitions with BinaryEncoding{Width = 30};
+    bool A with BinaryEncoding{Width = 1};
+    bool S with BinaryEncoding{Width = 1};
+}
+
+// 4 (Changed in [RFC 3301])
+type BearerCapabilities
+{
+    uint Reservedforfuturebearertypedefinitions with BinaryEncoding{Width = 29};
+    bool B with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool D with BinaryEncoding{Width = 1};
+}
+
+// 5
+type TieBreak
+{
+    long TieBreakValue;
+}
+
+// 6
+type FirmwareRevision
+{
+    ushort FirmwareRevision;
+}
+
+// 7
+type HostName
+{
+    string HostName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 8
+type VendorName
+{
+    // WORKAROUND: BUG23734: Binary Encoding does not support UTF8 as Text Encoding.
+    // string VendorName with BinaryEncoding{TextEncoding = TextEncoding.UTF8, Length = Length};
+    binary VendorName;
+}
+
+// 9
+type AssignedTunnelID
+{
+    ushort AssignedTunnelID;
+}
+
+// 10
+type ReceiveWindowSize
+{
+    ushort WindowSize;
+}
+
+// 11
+type Challenge
+{
+    binary Challenge;
+}
+
+// 13
+type ChallengeResponse
+{
+    binary Response;
+}
+
+// [RFC 2661] 4.4.4 Call Management AVPs
+
+// 12
+type Q931CauseCode
+{
+    ushort CauseCode;
+    byte CauseMsg;
+    string AdvisoryMsg with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 14
+type AssignedSessionID
+{
+    ushort AssignedSessionID;
+}
+
+// 15
+type CallSerialNumber
+{
+    uint CallSerialNumber;
+}
+
+// 16
+type MinimumBPS
+{
+    uint MinimumBPS;
+}
+
+// 17
+type MaximumBPS
+{
+    uint MaximumBPS;
+}
+
+// 18 (Changed in [RFC 3301])
+type BearerType
+{
+    uint ReservedforfutureBearerTypes with BinaryEncoding{Width = 29};
+    bool B with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool D with BinaryEncoding{Width = 1};
+}
+
+// 19
+type FramingType
+{
+    uint ReservedforfutureFramingTypes with BinaryEncoding{Width = 30};
+    bool A with BinaryEncoding{Width = 1};
+    bool D with BinaryEncoding{Width = 1};
+}
+
+// 21 (Changed in [RFC 3301])
+type CalledNumber
+{
+    NSAPType NSAP;
+}
+
+// 22 (Changed in [RFC 3301])
+type CallingNumber
+{
+    NSAPType NSAP;
+}
+
+// 23
+type SubAddress
+{
+    string SubAddress with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 24
+type TxConnectSpeedv2
+{
+    uint BPS;
+}
+
+// 38
+type RxConnectSpeedv2
+{
+    uint BPS;
+}
+
+// 25
+type PhysicalChannelID
+{
+    uint PhysicalChannelID;
+}
+
+// 37
+type PrivateGroupID
+{
+    binary PrivateGroupID;
+}
+
+// [RFC 2661] 4.4.5 Proxy LCP and Authentication AVPs
+
+// 26
+type InitialReceivedLCPCONFREQ
+{
+    binary LCPCONFREQ;
+}
+
+// 27, 51
+type LastSentLCPCONFREQ
+{
+    binary LCPCONFREQ;
+}
+
+// 28, 52
+type LastReceivedLCPCONFREQ
+{
+    binary LCPCONFREQ;
+}
+
+// 29
+type ProxyAuthenType
+{
+    ushort AuthenType;
+}
+
+// 30
+type ProxyAuthenName
+{
+    binary ProxyAuthenName;
+}
+
+// 31
+type ProxyAuthenChallenge
+{
+    binary Challenge;
+}
+
+// 32
+type ProxyAuthenID
+{
+    byte Reserved;
+    byte ID;
+}
+
+// 33
+type ProxyAuthenResponse
+{
+    binary Response;
+}
+
+// [RFC 2661] 4.4.6 Call Status AVPs
+
+// 34
+type CallErrors
+{
+    ushort Reserved;
+    uint CRCErrors;
+    uint FramingErrors;
+    uint HardwareOverruns;
+    uint BufferOverruns;
+    uint TimeoutErrors;
+    uint AlignmentErrors;
+}
+
+// 35
+type ACCM
+{
+    ushort Reserved;
+    uint SendAccm;
+    uint ReceiveAccm;
+}
+
+// [RFC 3301] 5.2 New AVP definition
+
+// 40
+type RxMinimumBPS
+{
+    uint RxMinimumBPS;
+}
+
+// 41
+type RxMaximumBPS
+{
+    uint RxMaximumBPS;
+}
+
+// 42
+type ServiceCategory
+{
+    ushort ReservedforfutureQoSind with BinaryEncoding{Width = 15};
+    bool S with BinaryEncoding{Width = 1};
+}
+
+// 43
+type ServiceName
+{
+    // WORKAROUND: BUG23734: Binary Encoding does not support UTF8 as Text Encoding.
+    // string ServiceName with BinaryEncoding{TextEncoding = TextEncoding.UTF8, Length = Length};
+    binary ServiceName;
+}
+
+// 44
+type CallingSubAddress
+{
+    NSAPType NSAP;
+}
+
+type NSAPType
+{
+    byte Afi;
+    ([|Afi == 0x39 || Afi == 0xBD|] Dcc     |
+    [|Afi == 0x47 || Afi == 0xC5|] Icd      |
+    [|Afi == 0x45 || Afi == 0xC3|] E164     |
+    [|Afi == 0x49 || Afi == 0xC7|] LocalTdi |
+    UnKnown) Address;
+}
+
+type Dcc
+{
+    ushort Idi;
+    binary Hodsp with BinaryEncoding{Length = 10};
+    binary Esi with BinaryEncoding{Length = 6};
+    byte Sel;
+}
+
+type Icd
+{
+    ushort Idi;
+    binary Hodsp with BinaryEncoding{Length = 10};
+    binary Esi with BinaryEncoding{Length = 6};
+    byte Sel;
+}
+
+type E164
+{
+    binary E164 with BinaryEncoding{Length = 8};
+    binary Hodsp with BinaryEncoding{Length = 4};
+    binary Esi with BinaryEncoding{Length = 6};
+    byte Sel;
+}
+
+type LocalTdi
+{
+    binary Hodsp with BinaryEncoding{Length = 12};
+    binary Esi with BinaryEncoding{Length = 6};
+    byte Sel;
+}
+
+type UnKnown
+{
+    binary Data;
+}
+
+// 45
+type VpiVciidentifier
+{
+    ushort resvd with BinaryEncoding{Width = 4};
+    ushort VPI with BinaryEncoding{Width = 12};
+    ushort VCI;
+}
+
+// [RFC 3145] 2. PPP Disconnect Cause Code AVP
+
+// 46
+type DisconnectCause
+{
+    ushort DisconnectCode;
+    ushort ControlProtocolNumber;
+    byte Direction;
+    // WORKAROUND: BUG23734: Binary Encoding does not support UTF8 as Text Encoding.
+    // optional string Message with BinaryEncoding{TextEncoding = TextEncoding.UTF8, Length = Length};
+    optional binary Message;
+}
+
+// [RFC 3308] 4.1. Session DS AVP
+
+// 47
+type CCDS
+{
+    ushort PHBCode;
+}
+
+// [RFC 3308] 3.1. Control Connection DS AVP
+
+// 48
+type SDS
+{
+    ushort PHBCode;
+}
+
+// [RFC 3437] 2.1 LCP Want Options
+
+// 49
+type LCPWantOptions
+{
+    binary LCPConfigureReq;
+}
+
+// [RFC 3437] 2.2 LCP Allow Options
+
+// 50
+type LCPAllowOptions
+{
+    binary LCPConfigureAck;
+}
+
+// [RFC 3573] 4.2. Modem On-Hold Status AVP
+
+// 54
+type ModemOnHoldStatus
+{
+    bool H with BinaryEncoding{Width = 1};
+    ushort reserved with BinaryEncoding{Width = 11};
+    byte Timeout with BinaryEncoding{Width = 4};
+}
+
+// [RFC 3817] 4. PPPoE Relay AVP
+
+// 55
+type PPPoERelay
+{
+    binary PPPoEPADMessage;
+}
+
+// [RFC 3931] 5.4.1 General Control Message AVPs
+
+// 59
+type MessageDigest
+{
+    byte DigestType;
+    binary MessageDigest;
+}
+
+// 73
+type ControlMessageAuthenticationNonce
+{
+    binary Nonce;
+}
+
+// 60
+type RouterID
+{
+    uint RouterIdentifier;
+}
+
+// 61
+type AssignedControlConnectionID
+{
+    uint AssignedControlConnectionID;
+}
+
+// 62
+type PWCapabilitiesList
+{
+    array<PWType> PWTypes;
+}
+
+// 72
+type PreferredLanguage
+{
+    string PreferredLanguage with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+}
+
+// 63
+type LocalSessionID
+{
+    uint LocalSessionID;
+}
+
+// 64
+type RemoteSessionID
+{
+    uint RemoteSessionID;
+}
+
+// 65
+type AssignedCookie
+{
+    binary AssignedCookie;
+}
+
+// 66
+type RemoteEndID
+{
+    binary RemoteEndID;
+}
+
+// 68
+type PWType
+{
+    ushort PWType;
+}
+
+// 69
+type L2SpecificSublayer
+{
+    ushort L2SpecificSublayerType;
+}
+
+// 70
+type DataSequencing
+{
+    ushort DataSequencingLevel;
+}
+
+// 74
+type TxConnectSpeed
+{
+    ulong ConnectSpeedinbps;
+}
+
+// 75
+type RxConnectSpeed
+{
+    ulong ConnectSpeedinbps;
+}
+
+// 71
+type CircuitStatus
+{
+    ushort Reserved with BinaryEncoding{Width = 14};
+    bool N with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+}
+
+// [RFC 4951] 5.1. Failover Capability AVP
+
+// 76
+type FailoverCapability
+{
+    ushort Reserved with BinaryEncoding{Width = 14};
+    bool D with BinaryEncoding{Width = 1};
+    bool C with BinaryEncoding{Width = 1};
+    uint RecoveryTime;
+}
+
+// 77
+type TunnelRecoveryv2
+{
+    ushort Reserved1;
+    ushort Reserved2;
+    ushort RecoverTunnelId;
+    ushort Reserved3;
+    ushort RecoverRemoteTunnelId;
+}
+
+type TunnelRecovery
+{
+    ushort Reserved;
+    uint RecoverTunnelId;
+    uint RecoverRemoteTunnelId;
+}
+
+// [RFC 4951] 5.3 Suggested Control Sequence AVP
+// 78
+type SuggestedControlSequence
+{
+    ushort Reserved;
+    ushort SuggestedNs;
+    ushort SuggestedNr;
+}
+
+// [RFC 4951] 5.4 Failover Session State AVP
+// 79
+type FailoverSessionStatev2
+{
+    ushort Reserved1;
+    ushort Reserved2;
+    ushort SessionId;
+    ushort Reserved3;
+    ushort RemoteSessionId;
+}
+
+type FailoverSessionState
+{
+    ushort Reserved;
+    uint SessionId;
+    uint RemoteSessionId;
+}
+
+// [RFC 4045] 6.2.1. New Outgoing Sessions AVP (MSI)
+// 81
+type NewOutgoingSessions
+{
+    array<ushort> SessionID;
+}
+
+// [RFC 4045] 6.2.2. New Outgoing Sessions AVP (MSI)
+// 82
+type NewOutgoingSessionsAcknowledgement 
+{
+    array<ushort> SessionID;
+}
+
+// [RFC 4045] 6.2.3. Withdraw Outgoing Sessions AVP (MSI)
+// 83
+type WithdrawOutgoingSessions 
+{
+    array<ushort> SessionID;
+}
+
+// [RFC 4045] 6.3. Multicast Packets Priority AVP (MSI
+// 84
+type MulticastPacketsPriority
+{
+    ushort PriorityValue;
+}
+
+// [RFC 4591] 3.5 Frame Relay Header Length AVP
+// 85
+type FrameRelayHeaderLength
+{
+    ushort FrameRelayHeaderLength;
+}
+
+// [RFC 4454] 6. ATM Maximum Concatenated Cells AVP
+// 86
+type ATMMaximumConcatenatedCells
+{
+    ushort ATMMaximumConcatenatedCells;
+}
+
+// [RFC 4454] 8.1 ATM Alarm Status AVP
+// 88
+type ATMAlarmStatus
+{
+    ushort CircuitStatusReason;
+    ushort Alarm;
+}
+
+// [RFC 4667] 4.3. New AVPs for L2VPN
+// 89
+type GroupID
+{
+    binary AGI;
+}
+
+// 90
+type LocalEndID
+{
+    binary SAII;
+}
+
+// 91
+type InterfaceMaximumTransmissionUnit
+{
+    ushort InterfaceMtu;
+}
+
+// [MS-L2TPIE] 2.2.1.1 L2TP AV Pair: Microsoft Vendor-specific Correlation ID Type (0x01)
+type MicrosoftVendorspecificCorrelationIDType
+{
+    guid CorrelationID;
+}
+
+string GetMessageTypeString(ushort messageType)
+{
+    switch (messageType)
+    {
+        case  0 => return "reserved";
+        case  1 => return "(SCCRQ) Start-Control-Connection-Request";
+        case  2 => return "(SCCRP) Start-Control-Connection-Reply";
+        case  3 => return "(SCCCN) Start-Control-Connection-Connected";
+        case  4 => return "(StopCCN) Stop-Control-Connection-Notification";
+        case  5 => return "reserved";
+        case  6 => return "(HELLO) hello";
+        case  7 => return "(OCRQ) Outgoing-Call-Request";
+        case  8 => return "(OCRP) Outgoing-Call-Reply";
+        case  9 => return "(OCCN) Outgoing-Call-Connected";
+        case 10 => return "(ICRQ) Incoming-Call-Request";
+        case 11 => return "(ICRP) Incoming-Call-Reply";
+        case 12 => return "(ICCN) Incoming-Call-Connected";
+        case 13 => return "reserved";
+        case 14 => return "(CDN) Call-Disconnect-Notify";
+        case 15 => return "(WEN) WAN-Error-Notify";
+        case 16 => return "(SLI) Set-Link-Info";
+        case 17 => return "(MDMST) Modem Status";
+        case 18 => return "(SRRQ) Service Relay Request Message"; //[RFC3817]
+        case 19 => return "(SRRP) Service Relay Reply Message"; //[RFC3817]
+        case 20 => return "(ACK) Explicit Acknowledgement"; //[RFC3931]
+        case 21 => return "(FSQ) Failover Session Query Message"; //[draft-ietf-l2tpext-failover-04.txt]
+        case 22 => return "(FSR) Failover Session Response Message"; //[draft-ietf-l2tpext-failover-04.txt]
+        case 23 => return "(MSRQ) Multicast-Session-Request"; //[RFC4045]
+        case 24 => return "(MSRP) Multicast-Session-Response"; //[RFC4045]
+        case 25 => return "(MSE) Multicast-Session-Establishment"; //[RFC4045]
+        case 26 => return "(MSI) Multicast-Session-Information"; //[RFC4045]
+        case 27 => return "(MSEN) Multicast-Session-End-Notify"; //[RFC4045]
+        default => return "Unhandled L2TP Message Type";
+    }
+}
+
+string CollectInformationInControlMessage(uint curConnectionID, array<AvpFormat> avps, TunnelSetupContext context)
+{
+    MessageType_MessageType messageType;
+    uint assignConnectionID = 0;
+    uint lsid = 0;
+    uint rsid = 0;
+    binary cookie = $[];
+    ushort specificSublayer = 0;
+    
+    // String for summary
+    string assignedTunnelIDStr = "";
+    string cookieStr = "";
+    string specificSublayerStr = "";
+    string lsidStr = "";
+    string rsidStr = "";
+    
+    // Extract Information from AVPair
+    foreach (AvpFormat avp in avps)
+    {
+        if (avp.AttributeValue != nothing)
+        {
+            switch (avp.AttributeType)
+            {
+                case 0 =>
+                    messageType = (avp.AttributeValue as MessageType).MessageType;
+                case 61 =>
+                    assignConnectionID = (avp.AttributeValue as AssignedControlConnectionID).AssignedControlConnectionID;
+                    assignedTunnelIDStr = ", Assigned Control Connection ID: " + assignConnectionID.ToString();
+                case 63 =>
+                    lsid = (avp.AttributeValue as LocalSessionID).LocalSessionID;
+                    lsidStr = ", Local Session ID: " + lsid.ToString();
+                case 64 =>
+                    rsid = (avp.AttributeValue as RemoteSessionID).RemoteSessionID;
+                    rsidStr = ", Remote Session ID: " + rsid.ToString();
+                case 65 =>
+                    cookie = (avp.AttributeValue as AssignedCookie).AssignedCookie;
+                    cookieStr = cookie.Count == 0 ? "" : (", Assigned Cookie: 0x" + BinaryToText(cookie));
+                case 69 =>
+                    specificSublayer = (avp.AttributeValue as L2SpecificSublayer).L2SpecificSublayerType;
+                    specificSublayerStr = specificSublayer == 0 ? "" : ", Default L2-Specific Sublayer";
+                default =>
+                    ;
+            }
+        }
+    }
+    
+    // Maintain map
+    switch (messageType)
+    {
+        case MessageType_MessageType.SCCRP =>
+            context.TunnelIDPairMap[curConnectionID] = assignConnectionID;
+            context.TunnelIDPairMap[assignConnectionID] = curConnectionID;
+        case (MessageType_MessageType.ICRQ | MessageType_MessageType.OCRQ | MessageType_MessageType.ICRP | MessageType_MessageType.OCRP) =>
+            if (curConnectionID in context.SessionIDMap)
+            {
+                if (context.SessionIDMap[curConnectionID] == null)
+                    context.SessionIDMap[curConnectionID] = {};
+                context.SessionIDMap[curConnectionID][lsid] = true;
+            }
+            if (cookie.Count != 0)
+            {
+                context.CookieLengthMap[lsid] = cookie.Count as uint;
+            }
+            if (specificSublayer != 0)
+            {
+                context.SpecificSublayerSet[lsid] = true;
+            }
+        case MessageType_MessageType.CDN =>
+            if (curConnectionID in context.SessionIDMap && context.SessionIDMap[curConnectionID] != null)
+            {
+                context.SessionIDMap[curConnectionID][lsid] = false;
+            }
+            if (lsid in context.CookieLengthMap)
+            {
+                context.CookieLengthMap = context.CookieLengthMap.Remove(lsid);
+            }
+            if (lsid in context.SpecificSublayerSet)
+            {
+                context.SpecificSublayerSet[lsid] = false;
+            }
+            uint pairConnectionID = context.TunnelIDPairMap[curConnectionID];
+            if (pairConnectionID in context.SessionIDMap && context.SessionIDMap[pairConnectionID] != null)
+            {
+                context.SessionIDMap[pairConnectionID][rsid] = false;
+            }
+            if (rsid in context.CookieLengthMap)
+            {
+                context.CookieLengthMap = context.CookieLengthMap.Remove(rsid);
+            }
+            if (rsid in context.SpecificSublayerSet)
+            {
+                context.SpecificSublayerSet[rsid] = false;
+            }
+        case MessageType_MessageType.StopCCN =>
+            if (curConnectionID in context.SessionIDMap && context.SessionIDMap[curConnectionID] != null)
+            {
+                foreach (uint sid in context.SessionIDMap[curConnectionID])
+                {
+                    if (sid in context.CookieLengthMap)
+                    {
+                        context.CookieLengthMap = context.CookieLengthMap.Remove(sid);
+                    }
+                    if (sid in context.SpecificSublayerSet)
+                    {
+                        context.SpecificSublayerSet[sid] = false;
+                    }
+                }
+                context.SessionIDMap = context.SessionIDMap.Remove(curConnectionID);
+            }
+            if (curConnectionID in context.TunnelIDPairMap)
+            {
+                uint pairConnectionID = context.TunnelIDPairMap[curConnectionID];
+                if (pairConnectionID in context.SessionIDMap && context.SessionIDMap[pairConnectionID] != null)
+                {
+                    foreach (uint sid in context.SessionIDMap[pairConnectionID])
+                    {
+                        if (sid in context.CookieLengthMap)
+                        {
+                            context.CookieLengthMap = context.CookieLengthMap.Remove(sid);
+                        }
+                        if (sid in context.SpecificSublayerSet)
+                        {
+                            context.SpecificSublayerSet[sid] = false;
+                        }
+                    }
+                    context.SessionIDMap = context.SessionIDMap.Remove(pairConnectionID);
+                }
+                context.TunnelIDPairMap = context.TunnelIDPairMap.Remove(curConnectionID);
+                if (pairConnectionID in context.TunnelIDPairMap)
+                {
+                    context.TunnelIDPairMap = context.TunnelIDPairMap.Remove(pairConnectionID);
+                }
+            }
+        default =>
+            ;
+    }
+    
+    // Generate Summary
+    string summary = EnumToString(messageType, "L2TP.MessageType_MessageType") + ", Control Connection ID: " + curConnectionID.ToString();
+    return summary + assignedTunnelIDStr + lsidStr + rsidStr + cookieStr + specificSublayerStr;
+}
+
+void L2TPv3MessageOverIPDecoder(stream s, TunnelSetupContext context, Node node, string destinationAddress, string sourceAddress)
+{
+    if (s.PeekBytes(0, 4) == $[00000000]) //Decode as Control message
+    {
+        var p = BinaryDecoder<ControlMessageOverIP>(s);
+        if (p is msg:ControlMessageOverIP)
+        {
+            string summary = "Control message, ";
+            if (msg.Avps != nothing)
+            {
+                summary += CollectInformationInControlMessage(msg.Header.ControlConnectionID, msg.Avps as array<AvpFormat>, context);
+            }
+            else
+            {
+                summary += "ZLB ACK, Control Connection ID: " + msg.Header.ControlConnectionID.ToString();
+            }
+            msg#Summary = summary;
+            dispatch node accepts msg;
+        }
+        else
+        {
+            ThrowDecodingException("L2TP", "ControlMessageOverIP");
+        }
+    }
+    else //Decode as Data message
+    {
+        uint sid = (BinaryDecoder<UintInBigEndian>(s.PeekBytes(0, 4)) as UintInBigEndian).Value;
+        uint cookieLength = sid in context.CookieLengthMap ? context.CookieLengthMap[sid] : 0;
+        ushort specificSublayerType = context.SpecificSublayerSet[sid] ? 1 : 0;
+        var p = BinaryDecoder<DataMessageOverIP[cookieLength, specificSublayerType]>(s);
+        if (p is msg:DataMessageOverIP)
+        {
+            msg#DestinationAddress = destinationAddress;
+            msg#SourceAddress = sourceAddress;
+            dispatch node accepts msg;
+        }
+        else
+        {
+            ThrowDecodingException("L2TP", "DataMessageOverIP");
+        }
+    }
+}
+
+void L2TPv3MessageOverUDPDecoder(stream s, TunnelSetupContext context, Node node, string destinationAddress, string sourceAddress)
+{
+    if ((s.PeekByte(0) & 0x80) > 0) //Decode as Control message
+    {
+        var p = BinaryDecoder<ControlMessageOverUDP>(s);
+        if (p is msg:ControlMessageOverUDP)
+        {
+            string summary = "Control message, ";
+            if (msg.Avps != nothing)
+            {
+                summary += CollectInformationInControlMessage(msg.Header.ControlConnectionID, msg.Avps as array<AvpFormat>, context);
+            }
+            else
+            {
+                summary += "ZLB ACK, Control Connection ID: " + msg.Header.ControlConnectionID.ToString();
+            }
+            msg#Summary = summary;
+            dispatch node accepts msg;
+        }
+        else
+        {
+            ThrowDecodingException("L2TP", "ControlMessageOverIP");
+        }
+    }
+    else //Decode as Data message
+    {
+        uint sid = (BinaryDecoder<UintInBigEndian>(s.PeekBytes(0, 4)) as UintInBigEndian).Value;
+        uint cookieLength = sid in context.CookieLengthMap ? context.CookieLengthMap[sid] : 0;
+        ushort specificSublayerType = context.SpecificSublayerSet[sid] ? 1 : 0;
+        var p = BinaryDecoder<DataMessageOverUDP[cookieLength, specificSublayerType]>(s);
+        if (p is msg:DataMessageOverUDP)
+        {
+            msg#DestinationAddress = destinationAddress;
+            msg#SourceAddress = sourceAddress;
+            dispatch node accepts msg;
+        }
+        else
+        {
+            ThrowDecodingException("L2TP", "DataMessageOverIP");
+        }
+    }
+}
+
+// [RFC 2661] L2TP version 2
+message PacketOverUDPv2
+{
+    L2TPHeaderv2 L2TPHeader;
+    optional [|L2TPHeader.Length != nothing && ((L2TPHeader.Length as int) - 8 - (L2TPHeader.S ? 4 : 0) - (L2TPHeader.O ? (2 + (L2TPHeader.OffsetSize as int)) : 0)) > 0|] ([|L2TPHeader.T|] array<AvpFormatv2>
+    | binary) Payload;
+    
+    override string ToString()
+    {
+        string summary = "";
+        if (L2TPHeader.T)
+        {
+            summary = "Control message";
+            if (Payload == nothing)
+            {
+                summary += ", ZLB ACK";
+            }
+            else if (Payload is p:array<AvpFormatv2> && p[0].AttributeValue != nothing && p[0].AttributeValue is m:MessageType)
+            {
+                summary += ", " + GetMessageTypeString(m.MessageType);
+            }
+        }
+        else
+        {
+            summary = "Data message";
+        }
+        
+        return summary + ", TunnelID: " + L2TPHeader.TunnelID.ToString() + ", SessionID: " + L2TPHeader.SessionID.ToString();
+    }
+}
+
+// [RFC 2661] 3.1 L2TP Header Format
+type L2TPHeaderv2
+{
+    bool T with BinaryEncoding{Width = 1};
+    bool L with BinaryEncoding{Width = 1};
+    byte Reserved1 with BinaryEncoding{Width = 2};
+    bool S with BinaryEncoding{Width = 1};
+    byte Reserved2 with BinaryEncoding{Width = 1};
+    bool O with BinaryEncoding{Width = 1};
+    bool P with BinaryEncoding{Width = 1};
+    byte Reserved3 with BinaryEncoding{Width = 4};
+    byte Ver where ValidationCheckValue(value == 2, null, true, ReferenceType.Type, "L2TP", "Ver", "L2TPHeaderv2", "2", value)
+        with BinaryEncoding{Width = 4};
+    optional [|L|] ushort Length;
+    ushort TunnelID;
+    ushort SessionID;
+    optional [|S|] ushort Ns;
+    optional [|S|] ushort Nr;
+    optional [|O|] ushort OffsetSize;
+    optional [|O|] binary Offsetpad with BinaryEncoding{Length = OffsetSize as ushort};
+    
+    override string ToString()
+    {
+        return (T ? "Control message" : "Data message") + ", Tunnel ID: " + TunnelID.ToString() + ", Session ID: " + SessionID.ToString();
+    }
+}
+
+// [RFC 2661] 4.1 AVP Format
+type AvpFormatv2
+{
+    bool M with BinaryEncoding{Width = 1};
+    bool H with BinaryEncoding{Width = 1};
+    byte rsvd with BinaryEncoding{Width = 4};
+    ushort Length with BinaryEncoding{Width = 10};
+    ushort VendorID;
+    ushort AttributeType;
+    optional [|Length - 6 > 0|] ([|H|] HidingAttributeValues
+    | [|AttributeType == 0|] MessageType
+    | [|AttributeType == 36|] RandomVector
+    | [|AttributeType == 1 && VendorID == 0|] ResultCode
+    | [|AttributeType == 2|] ProtocolVersion
+    | [|AttributeType == 3|] FramingCapabilities
+    | [|AttributeType == 4|] BearerCapabilities
+    | [|AttributeType == 5|] TieBreak
+    | [|AttributeType == 6|] FirmwareRevision
+    | [|AttributeType == 7|] HostName
+    | [|AttributeType == 8|] VendorName
+    | [|AttributeType == 9|] AssignedTunnelID
+    | [|AttributeType == 10|] ReceiveWindowSize
+    | [|AttributeType == 11|] Challenge
+    | [|AttributeType == 13|] ChallengeResponse
+    | [|AttributeType == 12|] Q931CauseCode
+    | [|AttributeType == 14|] AssignedSessionID
+    | [|AttributeType == 15|] CallSerialNumber
+    | [|AttributeType == 16|] MinimumBPS
+    | [|AttributeType == 17|] MaximumBPS
+    | [|AttributeType == 18|] BearerType
+    | [|AttributeType == 19|] FramingType
+    | [|AttributeType == 21|] CalledNumber
+    | [|AttributeType == 22|] CallingNumber
+    | [|AttributeType == 23|] SubAddress
+    | [|AttributeType == 24|] TxConnectSpeedv2
+    | [|AttributeType == 38|] RxConnectSpeedv2
+    | [|AttributeType == 25|] PhysicalChannelID
+    | [|AttributeType == 37|] PrivateGroupID
+    | [|AttributeType == 26|] InitialReceivedLCPCONFREQ
+    | [|AttributeType == 27 || AttributeType == 51|] LastSentLCPCONFREQ
+    | [|AttributeType == 28 || AttributeType == 52|] LastReceivedLCPCONFREQ
+    | [|AttributeType == 29|] ProxyAuthenType
+    | [|AttributeType == 30|] ProxyAuthenName
+    | [|AttributeType == 31|] ProxyAuthenChallenge
+    | [|AttributeType == 32|] ProxyAuthenID
+    | [|AttributeType == 33|] ProxyAuthenResponse
+    | [|AttributeType == 34|] CallErrors
+    | [|AttributeType == 35|] ACCM
+    | [|AttributeType == 40|] RxMinimumBPS
+    | [|AttributeType == 41|] RxMaximumBPS
+    | [|AttributeType == 42|] ServiceCategory
+    | [|AttributeType == 43|] ServiceName
+    | [|AttributeType == 44|] CallingSubAddress
+    | [|AttributeType == 45|] VpiVciidentifier
+    | [|AttributeType == 46|] DisconnectCause
+    | [|AttributeType == 47|] CCDS
+    | [|AttributeType == 48|] SDS
+    | [|AttributeType == 49|] LCPWantOptions
+    | [|AttributeType == 50|] LCPAllowOptions
+    | [|AttributeType == 54|] ModemOnHoldStatus
+    | [|AttributeType == 55|] PPPoERelay
+    | [|AttributeType == 77|] TunnelRecoveryv2
+    | [|AttributeType == 79|] FailoverSessionStatev2
+    | [|VendorID == 0x0137 && AttributeType == 1|] MicrosoftVendorspecificCorrelationIDType
+    | binary) AttributeValue with BinaryEncoding{WidthForComposedType = ((Length - 6) * 8) as int};
+}
+
+// Save context when setup tunnel and session.
+type TunnelSetupContext
+{
+    map<uint, uint> CookieLengthMap; // Map of <SessionID, CookieLength> pair
+    set<uint> SpecificSublayerSet; // Set of <SessionID>. If set[SessionID] == true , the L2SpecificSublayer in DataMessage of this Session is DefaultL2SpecificSublayer
+    map<uint, uint> TunnelIDPairMap; // Map of <ControlConnectionID, ControlConnectionID> pair
+    map<uint, set<uint>> SessionIDMap; // Map of <ControlConnectionID, set<SessionID>> pair. Multiple session can be setuped in 1 tunnel.
+    
+    static void Initialize(ref TunnelSetupContext context)
+    {
+        if (context == null)
+        {
+            context = new TunnelSetupContext
+            {
+                CookieLengthMap = {},
+                SpecificSublayerSet = {},
+                TunnelIDPairMap = {},
+                SessionIDMap = {}
+            };
+        }
+    }
+}
+
+// Transform binary to hexadecimal as string to show hex in UI.
+// E.g., Input: $[0102030F], Output: "0102030F"
+string BinaryToText(binary bin)
+{
+    return (bin as array<byte>).Accumulate<byte, string>((byte val, string text) => text + Format("{0:X2}", val));
+}

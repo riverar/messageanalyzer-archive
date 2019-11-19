@@ -1,0 +1,243 @@
+// partial implemented
+module JWT with 
+JsonEncodingDefaults{},
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "JSON Web Token (JWT)",
+    ShortName = "JWT",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "JSON Web Token (JWT)", Link = "https://tools.ietf.org/html/rfc7519"},
+            new Reference{Name = "JSON Web Signature (JWS)", Link = "https://tools.ietf.org/html/rfc7515"},
+            new Reference{Name = "JSON Web Encryption (JWE)", Link = "https://tools.ietf.org/html/rfc7516"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="360841", Date="12/01/2016"}
+        ]
+};
+
+using X509;
+using CoreNetworkingResources;
+
+/* JSON Web Token (JWT): https://tools.ietf.org/html/rfc7519
+ JWTs are always represented using the JWS Compact Serialization or the JWE Compact Serialization. (RFC 7519,section 1.)
+ If the object is using the JWS Compact Serialization or the JWE Compact Serialization, 
+ the number of base64url-encoded segments separated by period ('.') characters differs for JWSs and JWEs:
+    JWSs have three segments separated by two period ('.') characters.
+    JWEs have five segments separated by four period ('.') characters. (RFC 7516, section 9)
+*/
+pattern JSONWebToken = JWS | JWE;
+
+optional (JSONWebToken | string) DecodeJWT<JWS_HEADERT, JWT_CLAIMST, JWE_HEADERT>(string s)
+{
+    array<string> parts = s.Split(['.']);
+    if (parts.Count == 3)
+    {
+        return DecodeJWSParts<JWS_HEADERT, JWT_CLAIMST>(parts);
+    }
+    else if (parts.Count == 5)
+    {
+        return DecodeJWEParts<JWE_HEADERT>(parts);
+    }
+    else
+    {
+        return s;
+    }
+}
+
+optional (JWS | string) DecodeJWS<JWS_HEADERT, JWT_CLAIMST>(string s)
+{
+    array<string> parts = s.Split(['.']);
+    if (parts.Count == 3)
+    {
+        return DecodeJWSParts<JWS_HEADERT, JWT_CLAIMST>(parts);
+    }
+    else
+    {
+        return s;
+    }
+}
+
+optional JWS DecodeJWSParts<JWS_HEADERT, JWT_CLAIMST>(array<string> threeParts)
+{
+    JWS jws = new JWS();
+    // decode JWS
+    if (URLBase64StringToBinary(threeParts[0]) is bin:binary && JsonDecoder<JWS_HEADERT>(bin) is header:JWS_HEADERT)
+        jws.Header = header;
+    else
+        jws.Header = threeParts[0];
+
+    if (URLBase64StringToBinary(threeParts[1]) is bin1:binary && JsonDecoder<JWT_CLAIMST>(bin1) is claims:JWT_CLAIMST)
+        jws.Payload = claims;
+    else
+        jws.Payload = threeParts[1];
+
+    jws.Signature = URLBase64StringToBinary(threeParts[2]) is bin2:binary ? bin2 : threeParts[2];
+    return jws;
+}
+
+optional (JWE | string) DecodeJWE<JWE_HEADERT>(string s)
+{
+    array<string> parts = s.Split(['.']);
+    if (parts.Count == 5)
+    {
+        return DecodeJWEParts<JWE_HEADERT>(parts);
+    }
+    else
+    {
+        return s;
+    }
+}
+
+JWE DecodeJWEParts<JWE_HEADERT>(array<string> fiveParts)
+{
+    // decode JWE
+    JWE jwe = new JWE();
+    if (URLBase64StringToBinary(fiveParts[0]) is bin3:binary && JsonDecoder<JWE_HEADERT>(bin3) is header:JWE_HEADERT)
+        jwe.Header = header;
+    else
+        jwe.Header = fiveParts[0];
+    jwe.EncryptionKey = URLBase64StringToBinary(fiveParts[1]) is bin4:binary ? bin4 : fiveParts[1];
+    jwe.InitilizationVector = URLBase64StringToBinary(fiveParts[2]) is bin5:binary ? bin5 : fiveParts[2];
+    jwe.Ciphertext = URLBase64StringToBinary(fiveParts[3]) is bin6:binary ? bin6 : fiveParts[3];
+    jwe.AuthenticationTag = URLBase64StringToBinary(fiveParts[4]) is bin7:binary ? bin7 : fiveParts[4];
+    return jwe;
+}
+
+// WORKAROUND for Base64URL, URL may have no padding for Base64 encoded string
+optional binary URLBase64StringToBinary(string str)
+{
+    if (str != null)
+    {
+        str = str.Replace("%2B", "+").Replace("%2F", "/").Replace("%2b", "+").Replace("%2f", "/").Replace("%3D", "=").Replace("%3d", "=");
+        int lastGroupLen = str.Count % 4;
+        if (lastGroupLen == 3)
+        {
+            str = str + "=";
+        }
+        else if (lastGroupLen == 2)
+        {
+            str = str + "==";
+        }
+    }
+    return Base64StringToBinary(str);
+}
+
+/*
+JSON Web Signature (JWS), RFC 7515
+represents content secured with digital signatures or Message Authentication Codes (MACs) using JSON-based data structures
+
+JWS Compact Serialization format:
+    BASE64URL(UTF8(JWS Protected Header)) || '.' ||
+    BASE64URL(JWS Payload) || '.' ||
+    BASE64URL(JWS Signature)
+*/
+type JWS
+{
+    (JWS_Header | string) Header;
+    (JWT_Claims | string) Payload;
+    (binary | string) Signature;
+}
+
+/*
+JSON Web Encryption (JWE), RFC 7516
+represents encrypted content using JSON-based data structures.
+*/
+type JWE
+{
+    (JWE_Header | string) Header;
+    (binary | string) EncryptionKey;
+    (binary | string) InitilizationVector;
+    (binary | string) Ciphertext;
+    (binary | string) AuthenticationTag;
+}
+
+// RFC 7515
+type JWS_Header
+{
+    string alg; // Algorithm
+    optional string jku; // JWK Set URL
+    optional string jwk; // JSON Web Key, the public key that corresponds to the key used to digitally sign the JWS, MUST be encoded as a JWK Set [JWK]
+    optional string kid; // Key ID
+    optional string x5u; // X.509 URL
+    // X.509 Certificate Chain
+    optional array<X509.Certificate> x5c with Encoding{Decoder = Certs_Decoder, SourcePattern = TypeOf<array<string>>()};
+    optional string x5t; // X.509 Certificate SHA-1 Thumbprint
+    optional string $"x5t#s256"; // X.509 Certificate SHA-256 Thumbprint
+    optional string typ; // Type, declare the media type of this complete JWS.
+    optional string cty; // Content Type, declare the media type of the secured content (the payload)
+    optional string crit; // Critical    
+    optional array<json> PublicOrPrivateHeaderParameters  with JsonEncoding{IsAny = true};
+
+    optional array<X509.Certificate> Certs_Decoder(array<string> strs)
+    {
+        array<X509.Certificate> certs = [];
+        foreach (string s in strs)
+        {
+            if (URLBase64StringToBinary(s) is bin:binary && Asn1BerDecoder<X509.Certificate>(bin) is cert:X509.Certificate)
+            {
+                certs += [cert];
+            }
+            else
+            {
+                ValidationCheck(false, null, OAuth2_CERT_DECODING_FAILURE);
+            }
+        }
+        return certs;
+    }
+}
+// RFC 7519
+type JWT_Claims
+{
+    optional string iss; // Issuer, identifies the principal that issued the JWT
+    optional string sub; // Subject, identifies the principal that is the subject of the JWT
+    optional string aud; // Audience, identifies the recipients that the JWT is intended for
+    optional string exp; // Expiration Time, identifies the expiration time on or after which the JWT MUST NOT be accepted for processing
+    optional string nbf; // Not Before, identifies the time before which the JWT MUST NOT be accepted for processing
+    optional string iat; // Issued At, identifies the time at which the JWT was issued
+    optional string jti; // JWT ID, provides a unique identifier for the JWT.
+    optional array<json> PublicOrPrivateClaims  with JsonEncoding{IsAny = true};
+}
+// RFC 7516
+type JWE_Header
+{
+    string alg; // Algorithm
+    optional string enc; // Encryption Algorithm
+    optional string zip; // Compression Algorithm
+    optional string jku; // JWK Set URL
+    optional string jwk; // JSON Web Key, the public key that corresponds to the key used to digitally sign the JWS, MUST be encoded as a JWK Set [JWK]
+    optional string kid; // Key ID
+    optional string x5u; // X.509 URL
+    // X.509 Certificate Chain
+    optional array<X509.Certificate> x5c with Encoding{Decoder = Certs_Decoder, SourcePattern = TypeOf<array<string>>()};
+    optional string x5t; // X.509 Certificate SHA-1 Thumbprint
+    optional string $"x5t#s256"; // X.509 Certificate SHA-256 Thumbprint
+    optional string typ; // Type, declare the media type of this complete JWS.
+    optional string cty; // Content Type, declare the media type of the secured content (the payload)
+    optional string crit; // Critical
+    optional array<json> PublicOrPrivateHeaderParameters with JsonEncoding{IsAny = true};
+
+    optional array<X509.Certificate> Certs_Decoder(array<string> strs)
+    {
+        array<X509.Certificate> certs = [];
+        foreach (string s in strs)
+        {
+            if (Base64StringToBinary(s) is bin:binary && Asn1BerDecoder<X509.Certificate>(bin) is cert:X509.Certificate)
+            {
+                certs += [cert];
+            }
+            else
+            {
+                ValidationCheck(false, null, OAuth2_CERT_DECODING_FAILURE);
+            }
+        }
+        return certs;
+    }
+}

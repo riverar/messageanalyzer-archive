@@ -1,0 +1,326 @@
+protocol NTP with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Network Time Protocol",
+    ShortName = "NTP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 1305"},
+            new Reference{Name = "RFC 2030"},
+            new Reference{Name = "RFC 5905"},
+            new Reference{Name = "RFC 5906"},
+            new Reference{Name = "MS-SNTP", Version = "24.0", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using UDP;
+using PublicResources;
+using Etw;
+
+endpoint Node 
+    over UDP.Host 
+    accepts Message;
+
+autostart actor NTPOverUDP(UDP.Host host)
+{
+    process host accepts p:UDP.Datagram where p.Payload.Count > 0 && p.DestinationPort == Port.NTP | p.SourcePort == Port.NTP
+    {
+        if (p.Payload.Count >= 48 && BinaryDecoder<Message[(p.Payload.Count - 48) as uint]>(p.Payload) is m:Message)
+        {
+            dispatch (endpoint NTP.Node over host) accepts m;
+        }
+        else
+        {
+            ThrowDecodingException("NTP");
+        }
+    }
+}
+
+message Message[uint ExtLen]
+{
+    Leap Leap    with BinaryEncoding {Width = 2}, DisplayInfo{ToText = GetLeap};
+    byte Version where ValidationCheck(value <= 4 && value > 0, this,"NTP: The Version in message Message should be less than or equal to 4.") with BinaryEncoding {Width = 3};
+    Mode Mode    where ValidationCheck(value < 7 && value > 0, this, "Zero and 7 are reserved for Mode.") with BinaryEncoding {Width = 3}, DisplayInfo{ToText = GetMode};
+    Stratum Stratum with DisplayInfo{ToText = GetStratum};
+    sbyte Poll;
+    sbyte Precision;
+    int RootDelay;
+    uint RootDispersion;
+    ([|Stratum == 0 || Stratum == 1|] ReferenceID | [|Stratum >= 2|] IPv4Address) ReferenceIdentifier;
+    ulong ReferenceTimestamp with DisplayInfo{ToText = NtpTimestampToString};
+    ulong OriginateTimestamp  with DisplayInfo{ToText = NtpTimestampToString};
+    ulong ReceiveTimestamp  with DisplayInfo{ToText = NtpTimestampToString};
+    ulong TransmitTimestamp  with DisplayInfo{ToText = NtpTimestampToString};
+    optional [|ExtLen > 0|] ([|ExtLen in {12, 20, 24}|] Authenticator[ExtLen] | [|ExtLen == 72 && Version == 3|] ExtendedAuthenticator | [|ExtLen > 26 && Version == 4|] Autokey | binary) ExtensionField
+        with BinaryEncoding{WidthForComposedType = (ExtLen) * 8 as int};
+    
+    override string ToString()
+    {
+        return "Leap: " + GetLeap(Leap) + ", Version: " + (Version as string) + ", Mode: " + GetMode(Mode) + ", Stratum: " + GetStratum(Stratum);
+    }
+    
+    // RFC 1305, page 9
+    // NTP timestamps are represented as a 64-bit unsigned fixed-point number, in seconds relative to 0h on 1 January 1900.
+    // The integer part is in the first 32 bits and the fraction part in the last 32 bits.
+    string NtpTimestampToString(any intervals)
+    {
+        ulong interv = (intervals as ulong);
+        double sec = ((interv & 0xFFFFFFFF00000000) >> 32) + ((interv & 0x00000000FFFFFFFF) as double) / 4294967296; // 4294967296 = power(2, 32)
+        return CreateDateTime(1900, 1, 1).AddSeconds(sec).ToLocalTime().ToString("MM/dd/yyyy HH:mm:ss.fffffff K");
+    }
+}
+
+// RFC 1305 (http://www.ietf.org/rfc/rfc1305.pdf), Appendix C. Authentication Issues, page 63. (MessageDigest.Length = 8)
+// RFC 2030, 4. NTP Message Format, page 8. (MessageDigest.Length = 12)
+// RFC 5906, page 25. (MessageDigest.Length = 16)
+type Authenticator[uint Length]
+{
+    uint KeyIdentifier;
+    binary MessageDigest with BinaryEncoding{Length = Length - 4};
+}
+
+// [MS-SNTP] 2.2.3 / 2.2.4
+type ExtendedAuthenticator
+{
+    KeyIdentifierFlags KeyIdentifier with BinaryEncoding{Endian = Endian.Little};
+    byte Reserved where ValidationCheck(0 == value, null, PublicResources.NTP_ExtendedAuthenticator_Reserved);
+    byte Flags;
+    byte ClientHashIDHints;
+    byte SignatureHashID;
+    Blob[64] CryptoChecksum;
+}
+
+// RFC 5906: In Autokey the 8-bit Field Type field is interpreted as the version
+// number, currently 2.  For future versions, values 1-7 have been
+// reserved for Autokey; other values may be assigned for other
+// applications. Page 25.
+type Autokey
+{
+    byte R    with BinaryEncoding{Width = 1};
+    byte E    with BinaryEncoding{Width = 1};
+    byte Code with BinaryEncoding{Width = 6};
+    byte FieldType where ValidationCheck(value == 2, null, "Field Type field should be 2.");
+    ushort Length;
+    int AssociationID;
+    int TimeStamp;
+    int FileStamp;
+    uint ValueLength;
+    binary Value with BinaryEncoding{Length = ValueLength};
+    uint SignatureLength;
+    binary Signature with BinaryEncoding{Length = SignatureLength};
+    binary Padding with BinaryEncoding{Length = 4 - ((Length - 24 - ValueLength - SignatureLength) % 4)};
+}
+
+// [MS-SNTP] 2.2.3 / 2.2.4
+type KeyIdentifierFlags
+{
+    int Rid  with BinaryEncoding {Width = 31};
+    int Sign with BinaryEncoding {Width = 1};
+}
+
+type ReferenceID
+{
+    string ReferenceIdentifier with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 4};
+    override string ToString()
+    {
+        switch (ReferenceIdentifier)
+        {
+            case "ACTS" =>
+                return "NIST telephone modem";
+            case "ATOM" =>
+                return "Atomic clock (calibrated)";
+            case "callsign" =>
+                return "Generic radio";
+            case "CHU" =>
+                return "HF Radio CHU Ottawa, Ontario";
+            case "DCF" =>
+                return "LF Radio DCF77 Mainflingen, DE 77.5 kHz";
+            case "DCN" =>
+                return "DCN routing protocol";
+            case "DTS" =>
+                return "Digital Time Service";
+            case "GAL" =>
+                return "Galileo Positioning System";
+            case "GOES" =>
+                return "GOES UHF environment satellite";
+            case "GPS" =>
+                return "GPS UHF satellite positioning";
+            case "HBG" =>
+                return "LF Radio HBG Prangins, HB 75 kHz";
+            case "IRIG" =>
+                return "Inter-Range Instrumentation Group";
+            case "JJY" =>
+                return "LF Radio JJY Fukushima, JP 40 kHz, Saga, JP 60 kHz";
+            case "LORC" =>
+                return "LORAN-C radionavigation";
+            case "LOCL" =>
+                return "Uncalibrated Local Clock";
+            case "MSF" =>
+                return "LF Radio MSF Anthorn, UK 60 kHz";
+            case "NIST" =>
+                return "NIST public modem";
+            case "PTB" =>
+                return "European telephone modem";
+            case "PPS" =>
+                return "Generic pulse-per-second";
+            case "TDF" =>
+                return "MF Radio Allouis, FR 162 kHz";
+            case "TSP" =>
+                return "TSP time protocol";
+            case "USNO" =>
+                return "USNO telephone modem";
+            case "VLF" =>
+                return "VLF radio";
+            case "VMTP" =>
+                return "The client is utilizing the virtualization host's hardware as a time source.";
+            case "WWV" =>
+                return "HF Radio WWV Ft. Collins, CO";
+            case "WWVB" =>
+                return "LF Radio WWVB Ft. Collins, CO 60 kHz";
+            // default value is "WWVH"
+            default =>
+                return "HF Radio WWVH Kauai, HI";
+        }
+    }
+}
+
+string GetStratum(any s)
+{
+    if (s is val:byte)
+    {
+        if (val <= 1)
+        {
+            return EnumToString(val, "NTP.Stratum");
+        }
+        else if (val <= 16)
+        {
+            return "secondary server(via NTP)";
+        }
+        else
+        {
+            return "reserved";
+        }
+    }
+    return "Unrecognized Stratum";
+}
+
+string GetLeap(any s)
+{
+    if (s is val:byte)
+    {
+        return (val <= 2) ? EnumToString(val, "NTP.Leap") : "alarm condition (clock not synchronized)";
+    }
+    return "Unrecognized Leap";
+}
+
+string GetMode(any s)
+{
+    if (s is val:byte)
+    {
+        return (val <= 6) ? EnumToString(val, "NTP.Mode") : "reserved for private use";
+    }
+    return "Unrecognized Mode";
+}
+
+pattern Leap = enum byte
+{
+    $"no warning"                   = 0,
+    $"last minute has 61 seconds"   = 1,
+    $"last minute has 59 seconds"   = 2,
+    ...
+};
+
+pattern Mode = enum byte
+{
+    $"symmetric active"     = 1,
+    $"symmetric passive"    = 2,
+    $"client"               = 3,
+    $"server"               = 4,
+    $"broadcast"            = 5,
+    $"NTP control messages" = 6,
+    ...
+};
+
+pattern Stratum = enum byte
+{
+    $"unspecified or invalid"     = 0,
+    $"primary reference"    = 1,
+    ...
+};
+
+
+// Properties to expose time offset and delta
+
+DateTime get T0(this Message m)
+{
+        ulong interv = (m.OriginateTimestamp as ulong);
+        double sec = ((interv & 0xFFFFFFFF00000000) >> 32) + ((interv & 0x00000000FFFFFFFF) as double) / 4294967296; // 4294967296 = power(2, 32)
+        DateTime ts = CreateDateTime(1900, 1, 1).AddSeconds(sec);
+
+	return ts;
+}
+
+DateTime get T1(this Message m)
+{
+        ulong interv = (m.ReceiveTimestamp as ulong);
+        double sec = ((interv & 0xFFFFFFFF00000000) >> 32) + ((interv & 0x00000000FFFFFFFF) as double) / 4294967296; // 4294967296 = power(2, 32)
+        DateTime ts = CreateDateTime(1900, 1, 1).AddSeconds(sec);
+
+	return ts;
+}
+
+DateTime get T2(this Message m)
+{
+        ulong interv = (m.TransmitTimestamp as ulong);
+        double sec = ((interv & 0xFFFFFFFF00000000) >> 32) + ((interv & 0x00000000FFFFFFFF) as double) / 4294967296; // 4294967296 = power(2, 32)
+        DateTime ts = CreateDateTime(1900, 1, 1).AddSeconds(sec);
+
+	return ts;
+}
+
+DateTime get T3(this Message m)
+{
+	any message am = m;
+	while(am.Origins.Count != 0)
+	{
+		am = am.Origins[0];
+		if(am is Etw.EtwProviderMsg)
+		{
+			break;
+		}
+	}
+
+	if(!(am is Etw.EtwProviderMsg))
+		return null;
+
+	var e = am as Etw.EtwProviderMsg;
+
+	return e.EventRecord.Header.TimeStamp ;
+}
+
+double get NTPRoundTripDelay(this Message m)
+{
+	TimeSpan ts = (this.T3 - this.T0) - (this.T2 - this.T1);
+	return ts.TotalSeconds();
+}
+
+double get UTCTimeOffset(this Message m)
+{	
+	TimeSpan numerator = (this.T1 - this.T0) + (this.T2 - this.T3);
+	double retraw = numerator.TotalSeconds()/2;
+
+	return retraw ;
+}

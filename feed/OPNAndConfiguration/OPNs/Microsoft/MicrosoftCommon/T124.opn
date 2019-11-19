@@ -1,0 +1,539 @@
+protocol T124 with
+Asn1EncodingDefaults{ EncodingRule = Asn1EncodingRule.CanonicalPER },
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "TERMINALS FOR TELEMATIC SERVICES: Generic Conference Control",
+    ShortName = "T124",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "T.124"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376455", Date = "04/03/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using Technologies.ASN1;
+using T125;
+
+annotation ushort ConnectGccPdu#T124SourcePort;
+annotation ushort ConnectGccPdu#T124DestinationPort;
+annotation ushort ConnectData#T124SourcePort;
+annotation ushort ConnectData#T124DestinationPort;
+annotation ushort ConnectDataResponse#T124SourcePort;
+annotation ushort ConnectDataResponse#T124DestinationPort;
+
+endpoint Node over 
+    T125.Node accepts ConnectGccPdu issues ConnectGccPdu accepts ConnectData issues ConnectDataResponse
+{
+    process this accepts req:ConnectData
+    {
+        switch (req.ConnectPDU as binary)
+        {
+            case pdu:ConnectGccPdu from Asn1PerDecoder<ConnectGccPdu> =>
+                pdu#T124DestinationPort = req#T124DestinationPort;
+                pdu#T124SourcePort = req#T124SourcePort;
+                dispatch (endpoint Node over this) accepts pdu;
+            default =>
+                ThrowDecodingException("T124", "ConnectGccPdu");
+        }
+    }
+    
+    process this issues rsp:ConnectDataResponse
+    {
+        switch (rsp.ConnectPDU as binary)
+        {
+            case pdu:ConnectGccPdu from Asn1PerDecoder<ConnectGccPdu> =>
+                pdu#T124DestinationPort = rsp#T124DestinationPort;
+                pdu#T124SourcePort = rsp#T124SourcePort;
+                dispatch (endpoint Node over this) issues pdu;
+            default =>
+                ThrowDecodingException("T124", "ConnectGccPdu");
+        }
+    }
+}
+
+autostart actor T124OverT125(T125.Node node)
+{
+    process node accepts req:ConnectInitial
+    {
+        switch (req.UserData as binary)
+        {
+            case data:ConnectData from Asn1PerDecoder<ConnectData> =>
+                data#T124DestinationPort = req#T125DestinationPort;
+                data#T124SourcePort = req#T125SourcePort;
+                dispatch (endpoint Node over node) accepts data;
+            default =>
+                ThrowDecodingException("T124", "ConnectData");
+        }
+    }
+    
+    process node issues rsp:ConnectResponse
+    {
+        stream s = rsp.UserData as binary;
+        switch (s)
+        {
+            case data:ConnectDataResponse from Asn1PerDecoder<ConnectDataResponse> =>
+                var prePosition = s.BitPosition;
+                data.Length = BinaryDecoder<AsnPerLengthDeterminant>(s);
+                data.AssignFieldEncodingInfo("Length", s.BitPosition, s.BitPosition - prePosition);
+                data.AssignFieldEncodingInfo("ConnectPDU", s.BitPosition, s.RemainingBitLength);
+                data.ConnectPDU = BinaryDecoder<binary>(s);
+                data#T124DestinationPort = rsp#T125DestinationPort;
+                data#T124SourcePort = rsp#T125SourcePort;
+                dispatch (endpoint Node over node) issues data;
+            default =>
+                ThrowDecodingException("T124", "ConnectDataResponse");
+        }
+    }
+}
+
+// Future Reference: Add other messages not used by RDP family
+message ConnectData
+{
+    Key T124Identifier;
+    OctetString ConnectPDU;
+    
+    override string ToString()
+    {
+        return "ConnectData, T124Identifier: " + (T124Identifier.ToString());
+    }
+}
+
+type AsnPerLengthDeterminant
+{
+    byte Length1;
+    optional [| (Length1 & 0xC0) != 0|] byte Length2;
+    optional [| (Length1 & 0xC0) == 0xC0|] byte Length3;
+    
+    override string ToString()
+    {
+        int Length = 0;
+        if((Length1 & 0xC0) == 0)
+        {
+            Length = Length1;
+        }
+        else if((Length1 & 0xC0) == 0x80)
+        {
+            Length = (Length1 & 0x3F);
+            Length = (Length << 8) + (Length2 as int);
+        }
+        else if((Length1 & 0xC0) == 0xC0)
+        {
+            int LengthHigh = ((Length1 as int) & 0x07);
+            int LengthLow = ((Length2 as int) & 0x3F);
+            LengthLow = (LengthLow << 8) + (Length3 as int); 
+            Length = (LengthHigh << 14) + LengthLow;
+        }
+        
+        return "AsnPerLength: " + Length.ToString();
+    }
+}
+message ConnectDataResponse
+{
+    Key T124Identifier;
+    optional AsnPerLengthDeterminant Length with Encoding{Ignore = true};
+    optional binary ConnectPDU with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        string str = "ConnectDataResponse, T124Identifier: " + (T124Identifier as string);
+        if (Length != nothing)
+        {
+            str += ", Length: " + Length.ToString();
+        }
+        return str;
+    }
+}
+
+// Future Reference: test with capture for other messages
+message ConnectGccPdu
+{
+    (ConferenceCreateRequestPattern | ConferenceCreateResponsePattern | ConferenceQueryRequestPattern | ConferenceQueryResponsePattern
+        | ConferenceJoinRequestPattern | ConferenceJoinResponsePattern | ConferenceInviteRequestPattern | ConferenceInviteResponsePattern) ConnectPdu;
+    
+    override string ToString()
+    {
+        string summary = "";
+        if (ConnectPdu is ConferenceCreateRequest)
+        {
+            summary += "ConferenceCreateRequest message";
+        }
+        else if (ConnectPdu is ConferenceCreateResponse)
+        {
+            summary += "ConferenceCreateResponse message";
+        }
+        else
+        {
+            summary += "Unkown message";
+        }
+        summary += " sent as MCS-Connect-Provider user data";
+        return summary;
+    }
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ChannelID = Integer with Asn1Encoding {LowerEndValue = 1, UpperEndValue = 65535};
+pattern StaticChannelID = Integer with Asn1Encoding {LowerEndValue = 1, UpperEndValue = 1000};
+pattern DynamicChannelID = Integer with Asn1Encoding {LowerEndValue = 1001, UpperEndValue = 65535};
+pattern UserID = DynamicChannelID;
+pattern TokenID = Integer with Asn1Encoding {LowerEndValue = 1, UpperEndValue = 65535};
+pattern StaticTokenID = Integer with Asn1Encoding {LowerEndValue = 1, UpperEndValue = 16383};
+pattern DynamicTokenID = Integer with Asn1Encoding {LowerEndValue = 16384, UpperEndValue = 65535};
+pattern Time = Integer with Asn1Encoding {LowerEndValue = -2147483648, UpperEndValue = 2147483647};
+pattern Handle = Integer with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 4294967295};
+pattern H221NonStandardIdentifier = OctetString with Asn1Encoding {MinSize = 4, MaxSize = 255};
+pattern Object = ObjectIdentifier with Asn1Encoding {TagNumber = 0};
+pattern H221NonStandard = H221NonStandardIdentifier with Asn1Encoding {TagNumber = 1};
+pattern Key = Object | H221NonStandard;
+
+type NonStandardParameter
+{
+    Key Key;
+    OctetString Data;
+}
+
+pattern TextString = BMPString with Asn1Encoding {MinSize = 0, MaxSize = 255};
+pattern SimpleTextString = BMPString with Asn1Encoding {MinSize = 0, MaxSize = 255};
+pattern SimpleNumericString = NumericString with Asn1Encoding {LowerAlphabet = '0', UpperAlphabet = '9', MinSize = 1, MaxSize = 255};
+pattern DiallingString = NumericString with Asn1Encoding {LowerAlphabet = '0', UpperAlphabet = '9', MinSize = 1, MaxSize = 16};
+pattern SubAddressString = NumericString with Asn1Encoding {LowerAlphabet = '0', UpperAlphabet = '9', MinSize = 1, MaxSize = 40};
+pattern ExtraDiallingString = NumericString with Asn1Encoding {MinSize = 1, MaxSize = 255};
+
+pattern UserData = set<UserDataType>;
+type UserDataType
+{
+    Key Key;
+    optional OctetString Value;
+}
+
+type Password
+{
+    SimpleNumericString Numeric;
+    optional SimpleTextString Text with Asn1Encoding {TagNumber = 0};
+    optional TextString UnicodeText with Asn1Encoding {TagNumber = 1, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern Numeric = SimpleNumericString with Asn1Encoding {TagNumber = 0};
+pattern Text = SimpleTextString with Asn1Encoding {TagNumber = 1};
+pattern UnicodeText = TextString with Asn1Encoding {TagNumber = 2, Flags = Asn1EncodingFlags.Extended};
+pattern PasswordSelector = Numeric | Text | UnicodeText;
+
+pattern PasswordString = PasswordSelector with Asn1Encoding {TagNumber = 0, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+pattern ResponseData = UserData with Asn1Encoding {TagNumber = 1};
+pattern ChallengeResponseItem = PasswordString | ResponseData;
+
+pattern PasswordInTheClear = Null with Asn1Encoding {TagNumber = 0};
+pattern NonStandardAlgorithm = NonStandardParameter with Asn1Encoding {TagNumber = 1};
+pattern ChallengeResponseAlgorithm = PasswordInTheClear | NonStandardAlgorithm;
+
+type ChallengeItem
+{
+    ChallengeResponseAlgorithm ResponseAlgorithm with Asn1Encoding {IsExtensible = true};
+    UserData ChallengeData;
+} with Asn1Encoding {IsExtensible = true};
+
+type ChallengeRequest
+{
+    Integer ChallengeTag;
+    set<ChallengeItem> ChallengeSet;
+} with Asn1Encoding {IsExtensible = true};
+
+type ChallengeResponse
+{
+    Integer ChallengeTag;
+    ChallengeResponseAlgorithm ResponseAlgorithm with Asn1Encoding {IsExtensible = true};
+    ChallengeResponseItem ResponseItem with Asn1Encoding {IsExtensible = true};
+} with Asn1Encoding {IsExtensible = true};
+
+type ChallengeResponseInChoice
+{
+    optional ChallengeRequest ChallengeRequest with Asn1Encoding {TagNumber = 0};
+    optional ChallengeResponse ChallengeResponse with Asn1Encoding {TagNumber = 1};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern PasswordInTheClearChallenge = PasswordSelector with Asn1Encoding {TagNumber = 0, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+pattern ChallengeResponseInChoicePattern = ChallengeResponseInChoice with Asn1Encoding {TagNumber = 1};
+pattern PasswordChallengeRequestResponse = PasswordInTheClearChallenge | ChallengeResponseInChoicePattern;
+
+type ConferenceName
+{
+    SimpleNumericString Numeric;
+    optional SimpleTextString Text with Asn1Encoding {TagNumber = 0};
+    optional TextString UnicodeText with Asn1Encoding {TagNumber = 1, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceNameSelector = Numeric | Text | UnicodeText;
+
+pattern ConferenceNameModifier = SimpleNumericString;
+
+pattern Privilege = enum
+{
+    Terminate = 0,
+    EjectUser = 1,
+    Add = 2,
+    LockUnlock = 3,
+    Transfer = 4,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 4, IsExtensible = true};
+
+pattern TerminationMethod = enum
+{
+    Automatic = 0,
+    manual = 1,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 1, IsExtensible = true};
+
+pattern NonStandardScheme = NonStandardParameter with Asn1Encoding {TagNumber = 0};
+pattern ConferencePriorityScheme = NonStandardScheme;
+
+type ConferencePriority
+{
+    Integer Priority with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 65535};
+    ConferencePriorityScheme Scheme with Asn1Encoding{IsExtensible = true};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern Conventional = Null with Asn1Encoding {TagNumber = 0};
+pattern Counted = Null with Asn1Encoding {TagNumber = 1};
+pattern Anonymous = Null with Asn1Encoding {TagNumber = 2};
+pattern NonStandardCategory = NonStandardParameter with Asn1Encoding {TagNumber = 3};
+pattern NodeCategory = Conventional | Counted | Anonymous | NonStandardCategory;
+
+pattern ConventionalOnly = Null with Asn1Encoding {TagNumber = 0};
+pattern CountedOnly = Null with Asn1Encoding {TagNumber = 1};
+pattern AnonymousOnly = Null with Asn1Encoding {TagNumber = 2};
+pattern ConventionalControl = Null with Asn1Encoding {TagNumber = 3};
+pattern UnrestrictedMode = Null with Asn1Encoding {TagNumber = 4};
+pattern NonStandardMode = NonStandardParameter with Asn1Encoding {TagNumber = 5};
+pattern ConferenceMode = ConventionalOnly | CountedOnly | AnonymousOnly | ConventionalControl | UnrestrictedMode | NonStandardMode;
+
+type TransferModes
+{
+    Boolean Speech;
+    Boolean VoiceBand;
+    Boolean Digital56k;
+    Boolean Digital64k;
+    Boolean Digital128k;
+    Boolean Digital192k;
+    Boolean Digital256k;
+    Boolean Digital320k;
+    Boolean Digital384k;
+    Boolean Digital512k;
+    Boolean Digital768k;
+    Boolean Digital1152k;
+    Boolean Digital1472k;
+    Boolean Digital1536k;
+    Boolean Digital1920k;
+    Boolean PacketMode;
+    Boolean FrameMode;
+    Boolean Atm;
+} with Asn1Encoding {IsExtensible = true};
+
+type HighLayerCompatibility
+{
+    Boolean Telephony3kHz;
+    Boolean Telephony7kHz;
+    Boolean Videotelephony;
+    Boolean Videoconference;
+    Boolean Audiographic;
+    Boolean Audiovisual;
+    Boolean Multimedia;
+
+} with Asn1Encoding {IsExtensible = true};
+
+type AggregatedChannel
+{
+    TransferModes TransferModes;
+    DiallingString InternationalNumber;
+    optional SubAddressString SubAddress with Asn1Encoding {TagNumber = 0};
+    optional ExtraDiallingString ExtraDialling with Asn1Encoding {TagNumber = 1};
+    optional HighLayerCompatibility HighLayerCompatibility with Asn1Encoding {TagNumber = 2};
+} with Asn1Encoding {IsExtensible = true};
+
+type TransportConnection
+{
+    OctetString NsapAddress with Asn1Encoding {MinSize = 1, MaxSize = 20};
+    OctetString TransportSelector with Asn1Encoding {TagNumber = 0};
+}
+
+pattern AggregatedChannelPattern = AggregatedChannel with Asn1Encoding {TagNumber = 0};
+pattern TransportConnectionPattern = TransportConnection with Asn1Encoding {TagNumber = 1};
+pattern NonStandard = NonStandardParameter with Asn1Encoding {TagNumber = 3};
+pattern NetworkAddressChoice with Asn1Encoding {IsExtensible = true} = AggregatedChannelPattern | TransportConnectionPattern | NonStandard;
+pattern NetworkAddress = array<NetworkAddressChoice>;
+
+pattern NodeType = enum
+{
+    Terminal = 0,
+    MultiportTerminal = 1,
+    Mcu = 2,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 2, IsExtensible = true};
+
+pattern CallingNode = Null with Asn1Encoding {TagNumber = 0};
+pattern CalledNode = Null with Asn1Encoding {TagNumber = 1};
+pattern Unknown = Integer with Asn1Encoding {TagNumber = 2, LowerEndValue = 0, UpperEndValue = 4294967295};
+pattern AsymmetryIndicator = CallingNode | CalledNode | Unknown;
+
+type ConferenceDescriptor
+{
+    ConferenceName ConferenceName;
+    optional ConferenceNameModifier ConferenceNameModifier with Asn1Encoding {TagNumber = 0};
+    optional TextString ConferenceDescription with Asn1Encoding {TagNumber = 1};
+    Boolean LockedConference;
+    Boolean PasswordInTheClearRequired;
+    optional NetworkAddress NetworkAddress with Asn1Encoding {TagNumber = 2};
+    optional Boolean defaultConferenceFlag with Asn1Encoding{Flags = Asn1EncodingFlags.Extended};
+    optional ConferenceMode ConferenceMode with Asn1Encoding{IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceCreateRequestPattern = ConferenceCreateRequest with Asn1Encoding {TagNumber = 0};
+type ConferenceCreateRequest
+{
+    ConferenceName ConferenceName;
+    optional Password ConvenerPassword with Asn1Encoding {TagNumber = 0};
+    optional Password Password with Asn1Encoding {TagNumber = 1};
+    Boolean LockedConference;
+    Boolean ListedConference;
+    Boolean ConductibleConference;
+    TerminationMethod TerminationMethod;
+    optional set<Privilege> ConductorPrivileges with Asn1Encoding {TagNumber = 2};
+    optional set<Privilege> ConductedPrivileges with Asn1Encoding {TagNumber = 3};
+    optional set<Privilege> NonConductedPrivileges with Asn1Encoding {TagNumber = 4};
+    optional TextString ConferenceDescription with Asn1Encoding {TagNumber = 5};
+    optional TextString CallerIdentifier with Asn1Encoding {TagNumber = 6};
+    optional UserData UserData with Asn1Encoding {TagNumber = 7};
+    optional ConferencePriority ConferencePriority with Asn1Encoding{Flags = Asn1EncodingFlags.Extended};
+    optional ConferenceMode ConferenceMode with Asn1Encoding{Tagging = Asn1Tagging.Explicit, IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceCreateResponseResult = enum
+{
+    Success = 0,
+    UserRejected = 1,
+    ResourcesNotAvailable = 2,
+    RejectedForSymmetryBreaking = 3,
+    LockedConferenceNotSupported = 4,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 4, IsExtensible = true};
+
+pattern ConferenceCreateResponsePattern = ConferenceCreateResponse with Asn1Encoding {TagNumber = 1};
+type ConferenceCreateResponse
+{
+    UserID NodeID;
+    Integer Tag;
+    ConferenceCreateResponseResult Result;
+    optional UserData UserData with Asn1Encoding {TagNumber = 0};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceQueryRequestPattern = ConferenceQueryRequest with Asn1Encoding {TagNumber = 2};
+type ConferenceQueryRequest
+{
+    NodeType NodeType;
+    optional AsymmetryIndicator AsymmetryIndicator with Asn1Encoding {TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    optional UserData UserData with Asn1Encoding {TagNumber = 1};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceQueryResponseResult = enum
+{
+    Success = 0,
+    UserRejected = 1,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 1, IsExtensible = true};
+
+pattern ConferenceQueryResponsePattern = ConferenceQueryResponse with Asn1Encoding {TagNumber = 3};
+type ConferenceQueryResponse
+{
+    NodeType NodeType;
+    optional AsymmetryIndicator AsymmetryIndicator with Asn1Encoding {TagNumber = 0, Tagging = Asn1Tagging.Explicit};
+    set<ConferenceDescriptor> ConferenceList;
+    ConferenceQueryResponseResult Result;
+    optional UserData UserData with Asn1Encoding {TagNumber = 0};
+    optional Boolean WaitForInvitationFlag with Asn1Encoding{TagNumber = 1, Flags = Asn1EncodingFlags.Extended};
+    optional Boolean NoUnlistedConferenceFlag with Asn1Encoding{TagNumber = 2, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceJoinRequestPattern = ConferenceJoinRequest with Asn1Encoding {TagNumber = 4};
+type ConferenceJoinRequest
+{
+    optional ConferenceNameSelector ConferenceName with Asn1Encoding {TagNumber = 0, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+    optional ConferenceNameModifier ConferenceNameModifier with Asn1Encoding {TagNumber = 1};
+    optional Integer Tag with Asn1Encoding {TagNumber = 2};
+    optional PasswordChallengeRequestResponse Password with Asn1Encoding {TagNumber = 3, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+    optional PasswordSelector ConvenerPassword with Asn1Encoding {TagNumber = 4, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+    optional TextString CallerIdentifier with Asn1Encoding {TagNumber = 5};
+    optional UserData UserData with Asn1Encoding {TagNumber = 6};
+    optional NodeCategory NodeCategory with Asn1Encoding {TagNumber = 7, Tagging = Asn1Tagging.Explicit, IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceJoinResponseResult = enum
+{
+    Success = 0,
+    UserRejected = 1,
+    InvalidConference = 2,
+    InvalidPassword = 3,
+    InvalidConvenerPassword = 4,
+    ChallengeResponseRequired = 5,
+    InvalidChallengeResponse = 6,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 6, IsExtensible = true};
+
+pattern ConferenceJoinResponsePattern = ConferenceJoinResponse with Asn1Encoding {TagNumber = 5};
+type ConferenceJoinResponse
+{
+    optional UserID NodeID with Asn1Encoding {TagNumber = 0};
+    UserID TopNodeID;
+    Integer Tag;
+    optional ConferenceNameSelector ConferenceNameAlias with Asn1Encoding {TagNumber = 1, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+    Boolean PasswordInTheClearRequired;
+    Boolean LockedConference;
+    Boolean ListedConference;
+    Boolean ConductibleConference;
+    TerminationMethod TerminationMethod;
+    optional set<Privilege> ConductorPrivileges with Asn1Encoding {TagNumber = 2};
+    optional set<Privilege> ConductedPrivileges with Asn1Encoding {TagNumber = 3};
+    optional set<Privilege> NonConductedPrivileges with Asn1Encoding {TagNumber = 4};
+    optional TextString ConferenceDescription with Asn1Encoding {TagNumber = 5};
+    optional PasswordChallengeRequestResponse Password with Asn1Encoding {TagNumber = 6, Tagging = Asn1Tagging.Explicit, IsExtensible = true};
+    ConferenceJoinResponseResult Result;
+    optional UserData UserData with Asn1Encoding {TagNumber = 7};
+    optional NodeCategory NodeCategory with Asn1Encoding{TagNumber = 8, Tagging = Asn1Tagging.Explicit, IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+    optional ConferenceMode ConferenceMode with Asn1Encoding{TagNumber = 9, Tagging = Asn1Tagging.Explicit, IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceInviteRequestPattern = ConferenceInviteRequest with Asn1Encoding {TagNumber = 6};
+type ConferenceInviteRequest
+{
+    ConferenceName ConferenceName;
+    UserID NodeID;
+    UserID TopNodeID;
+    Integer Tag;
+    Boolean PasswordInTheClearRequired;
+    Boolean LockedConference;
+    Boolean ListedConference;
+    Boolean ConductibleConference;
+    TerminationMethod TerminationMethod;
+    optional set<Privilege> ConductorPrivileges with Asn1Encoding {TagNumber = 0};
+    optional set<Privilege> ConductedPrivileges with Asn1Encoding {TagNumber = 1};
+    optional set<Privilege> NonConductedPrivileges with Asn1Encoding {TagNumber = 2};
+    optional TextString ConferenceDescription with Asn1Encoding {TagNumber = 3};
+    optional TextString CallerIdentifier with Asn1Encoding {TagNumber = 4};
+    optional UserData UserData with Asn1Encoding {TagNumber = 5};
+    optional ConferencePriority ConferencePriority with Asn1Encoding{TagNumber = 6, Flags = Asn1EncodingFlags.Extended};
+    optional ConferenceMode ConferenceMode with Asn1Encoding{TagNumber = 7, Tagging = Asn1Tagging.Explicit, IsExtensible = true, Flags = Asn1EncodingFlags.Extended};
+} with Asn1Encoding {IsExtensible = true};
+
+pattern ConferenceInviteResponseResult = enum
+{
+    Success = 0,
+    UserRejected = 1,
+} with Asn1Encoding {LowerEndValue = 0, UpperEndValue = 1, IsExtensible = true};
+
+pattern ConferenceInviteResponsePattern = ConferenceInviteResponse with Asn1Encoding {TagNumber = 7};
+type ConferenceInviteResponse
+{
+    ConferenceInviteResponseResult Result;
+    optional UserData UserData with Asn1Encoding {TagNumber = 0};
+} with Asn1Encoding {IsExtensible = true};

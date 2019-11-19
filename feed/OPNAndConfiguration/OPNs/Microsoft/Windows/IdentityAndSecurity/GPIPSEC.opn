@@ -1,0 +1,1511 @@
+protocol GPIPSEC with 
+Documentation
+{
+    ProtocolName = "Group Policy: IP Security (IPsec) Protocol Extension",
+    ShortName = "GPIPSEC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-GPIPSEC", Version = "21.0", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "", Date = "11/06/2014"}
+        ]
+};
+
+using Standard;
+using Technologies.ASN1;
+using LDAP;
+using Utility;
+using Diagnostics;
+using InfrastructureResources;
+
+endpoint Server 
+    over LDAP.Server
+    provides Contract;
+
+// To mark if it's a Creation request or a Modification request.
+// true: it's a Creation request;
+// false: it's a Modification request.
+annotation bool Contract.CreationOrModificationRequest#IsCreation;
+// To mark the target object type of this request.
+annotation ObjectType Contract.CreationOrModificationRequest#ObjType;
+
+annotation bool Contract.CreationOrModificationResponse#IsCreation;
+annotation ObjectType Contract.CreationOrModificationResponse#ObjType;
+
+// To mark the object type of this operation
+annotation ObjectType Contract.PolicyRetrievalRequest#ObjType;
+annotation ObjectType Contract.PolicyRetrievalResponse#ObjType;
+
+const map<string, ObjectType> ObjectNameMapToType =
+{
+    "ipsecPolicy" -> ObjectType.IPsecPolicy,
+    "ipsecISAKMPPolicy" -> ObjectType.IPsecISAKMPPolicy,
+    "ipsecNFA" -> ObjectType.IPsecNFA,
+    "ipsecNegotiationPolicy" -> ObjectType.IPsecNegotiationPolicy,
+    "ipsecFilter" ->  ObjectType.IPsecFilter,
+    // repeat for lowercase
+    "ipsecpolicy" -> ObjectType.IPsecPolicy,
+    "ipsecisakmppolicy" -> ObjectType.IPsecISAKMPPolicy,
+    "ipsecnfa" -> ObjectType.IPsecNFA,
+    "ipsecnegotiationpolicy" -> ObjectType.IPsecNegotiationPolicy,
+    "ipsecfilter" ->  ObjectType.IPsecFilter
+};
+
+const map<ObjectType, string> ObjectTypeMapToName =
+{
+     ObjectType.IPsecPolicy -> "ipsecPolicy",
+     ObjectType.IPsecISAKMPPolicy -> "ipsecISAKMPPolicy",
+     ObjectType.IPsecNFA -> "ipsecNFA",
+     ObjectType.IPsecNegotiationPolicy -> "ipsecNegotiationPolicy",
+     ObjectType.IPsecFilter -> "ipsecFilter"
+};
+
+const string ObjectClassString = "objectclass";
+const string IPsecPolicyObjectPathStartString = "cn=ipsec";
+const string PolicyDataRetrievalStartString = "cn=ip security,cn=system";
+const string GpoLocationStartString = "cn=ipsec,cn=windows,cn=microsoft,cn=machine,cn=";
+
+autostart actor GPIPSECOverLDAP(LDAP.Server server)
+{ 
+    RequestCacheEntry cache;
+    process server accepts req:LDAP.LdapMessage where IsIPsecCreateOrModifyRequest(req, out cache)
+    {
+        assert cache != null;
+        LDAP.AttributeList attrList = [];
+        if (cache.OpType == OperationType.Create) // It's a LDAP Add Operation
+        {
+            attrList = cache.AddRequest.Attributes;
+        }
+        else if (cache.OpType == OperationType.Modify)
+        {
+            foreach (var item in cache.ModifyRequest.Modifications)
+            {
+                attrList += [item.Modification];
+            }
+        }
+        Contract.CreationOrModificationRequest ipsecReq = new Contract.CreationOrModificationRequest
+        {
+            Entry = cache.OpType == OperationType.Create ? cache.AddRequest.Entry : cache.ModifyRequest.Object
+        };
+        switch (cache.ObjType)
+        {
+            case ObjectType.IPsecPolicy => 
+                if (DecodeIPsecPolicyObject(attrList) is obj:IPsecPolicyObject)
+                {
+                    ipsecReq.Object = obj;
+                }
+                else
+                {
+                    ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest", UTILITY_PARSE_ERROR, ["IPsecPolicyObject"]);
+                }
+            case ObjectType.IPsecISAKMPPolicy =>
+                if (DecodeIPsecISAKMPPolicyObject(attrList) is obj:IPsecISAKMPPolicyObject)
+                {
+                    ipsecReq.Object = obj;
+                }
+                else
+                {
+                    ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest", UTILITY_PARSE_ERROR, ["IPsecISAKMPPolicyObject"]);
+                }
+            case ObjectType.IPsecNFA =>
+                if (DecodeIPsecNFAObject(attrList) is obj:IPsecNFAObject)
+                {
+                    ipsecReq.Object = obj;
+                }
+                else
+                {
+                    ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest", UTILITY_PARSE_ERROR, ["IPsecNFAObject"]);
+                }
+            case ObjectType.IPsecNegotiationPolicy =>
+                if (DecodeIPsecNegotiationPolicyObject(attrList) is obj:IPsecNegotiationPolicyObject)
+                {
+                    ipsecReq.Object = obj;
+                }
+                else
+                {
+                    ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest", UTILITY_PARSE_ERROR, ["IPsecNegotiationPolicyObject"]);
+                }
+            case ObjectType.IPsecFilter =>
+                if (DecodeIPsecFilterObject(attrList) is obj:IPsecFilterObject)
+                {
+                    ipsecReq.Object = obj;
+                }
+                else
+                {
+                    ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest", UTILITY_PARSE_ERROR, ["IPsecFilterObject"]);
+                }
+            default =>
+                ThrowDecodingException("GPIPSEC", "CreationOrModificationRequest");
+        }
+        ipsecReq#IsCreation = cache.AddRequest != null;
+        ipsecReq#ObjType = cache.ObjType;
+        cache.ClearRequest();
+        dispatch (endpoint Server over server) accepts ipsecReq;
+    }
+    
+    // Create or Modify Response
+    process server issues res:LDAP.LdapMessage where cache != null && res.MessageID == cache.MsgId 
+            && (cache.OpType == OperationType.Create || cache.OpType == OperationType.Modify)
+    {
+       Contract.CreationOrModificationResponse cmResponse = new Contract.CreationOrModificationResponse
+       {
+           // If server return other response here, it may be successfully parsed as LDAP.AddResponse or LDAP.ModifyResponse here. Because pef can not
+           // tell the difference of 2 extended class object which have the same base class. 
+            ResultCode = cache.OpType == OperationType.Create ? (res.ProtocolOp as LDAP.AddResponse).ResultCode : (res.ProtocolOp as LDAP.ModifyResponse).ResultCode
+       };
+       cmResponse#IsCreation = (cache.OpType == OperationType.Create);
+       cmResponse#ObjType = cache.ObjType;
+       dispatch (endpoint Server over server) issues cmResponse; 
+    }
+
+    // Assignment Request
+    process server accepts req:LDAP.LdapMessage where IsPolicyAssignmentRequest(req, out cache)
+    {
+        assert cache != null;
+        LDAP.AttributeList attrList = [];
+        if (cache.OpType == OperationType.AssignCreate)
+        {
+            attrList = cache.AddRequest.Attributes;
+        }
+        else if (cache.OpType == OperationType.AssignModify) 
+        {
+            foreach (var item in cache.ModifyRequest.Modifications)
+            {
+                attrList += [item.Modification];
+            }
+        }
+        
+        Contract.AssignmentRequest assignmentReq = new Contract.AssignmentRequest
+        {
+            Entry = cache.OpType == OperationType.AssignCreate ? cache.AddRequest.Entry : cache.ModifyRequest.Object,
+            Object = DecodeIPsecObject(attrList)
+        };
+
+        cache.ClearRequest();
+        dispatch (endpoint Server over server) accepts assignmentReq;
+    }
+    
+    // Assignment Response
+    process server issues res:LDAP.LdapMessage where cache != null && res.MessageID == cache.MsgId 
+            && (cache.OpType == OperationType.AssignCreate || cache.OpType == OperationType.AssignModify)
+    {
+       Contract.AssignmentResponse amResponse = new Contract.AssignmentResponse
+       {
+            ResultCode = cache.OpType == OperationType.AssignCreate ? (res.ProtocolOp as LDAP.AddResponse).ResultCode : (res.ProtocolOp as LDAP.ModifyResponse).ResultCode
+       };
+       dispatch (endpoint Server over server) issues amResponse; 
+    }
+    
+    // Retrieve Request
+    process server accepts req:LDAP.LdapMessage where IsPolicyRetrievalRequest(req, out cache)
+    {
+        assert cache != null;
+        Contract.PolicyRetrievalRequest retrievalReq = new Contract.PolicyRetrievalRequest
+        {
+            baseObject = cache.SearchRequest.BaseObject,
+            Scope = cache.SearchRequest.Scope,
+            derefAliases =cache.SearchRequest.DerefAliases,
+            sizeLimit = cache.SearchRequest.SizeLimit,
+            timeLimit = cache.SearchRequest.TimeLimit,
+            typesOnly = cache.SearchRequest.TypesOnly,
+            Filter = cache.SearchRequest.Filter,
+            Attributes = cache.SearchRequest.Attributes
+        };
+        retrievalReq#ObjType = cache.ObjType;
+        cache.ClearRequest();
+        retrievalReq.ValidationCheckForPolicyRetrievalRequest();
+        dispatch (endpoint Server over server) accepts retrievalReq;
+    }
+    
+    // Retrieve Response
+    process server issues res:LDAP.LdapMessage where cache != null && res.ProtocolOp is LDAP.SearchResultEntry && res.MessageID == cache.MsgId
+    {
+       LDAP.SearchResultEntry result = res.ProtocolOp as LDAP.SearchResultEntry;
+       Contract.PolicyRetrievalResponse retResponse = new Contract.PolicyRetrievalResponse
+       {
+            Entry = result.ObjectName
+       };
+       retResponse#ObjType = cache.ObjType;
+       switch (cache.ObjType)
+       {
+           case ObjectType.IPsecPolicy => 
+               if (DecodeIPsecPolicyObject(result.Attributes) is obj:IPsecPolicyObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecPolicyObject"]);
+               }
+           case ObjectType.IPsecISAKMPPolicy =>
+               if (DecodeIPsecISAKMPPolicyObject(result.Attributes) is obj:IPsecISAKMPPolicyObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecISAKMPPolicyObject"]);
+               }
+           case ObjectType.IPsecNFA =>
+               if (DecodeIPsecNFAObject(result.Attributes) is obj:IPsecNFAObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecNFAObject"]);
+               }
+           case ObjectType.IPsecNegotiationPolicy =>
+               if (DecodeIPsecNegotiationPolicyObject(result.Attributes) is obj:IPsecNegotiationPolicyObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecNegotiationPolicyObject"]);
+               }
+           case ObjectType.IPsecFilter =>
+               if (DecodeIPsecFilterObject(result.Attributes) is obj:IPsecFilterObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecFilterObject"]);
+               }
+           case ObjectType.All =>
+               if (DecodeIPsecObject(result.Attributes) is obj:IPsecObject)
+               {
+                   retResponse.Object = obj;
+               }
+               else
+               {
+                   ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse", UTILITY_PARSE_ERROR, ["IPsecObject"]);
+               }
+           default =>
+            ThrowDecodingException("GPIPSEC", "PolicyRetrievalResponse");
+       }
+        
+       dispatch (endpoint Server over server) issues retResponse; 
+    }
+}
+
+bool IsIPsecCreateOrModifyRequest(LDAP.LdapMessage req, out RequestCacheEntry cacheEntry)
+{
+    cacheEntry = null;
+    if (req.ProtocolOp is addReq:LDAP.AddRequest)
+    {
+        if (addReq.Entry is obj:string)
+        {
+            if (IPsecPolicyObjectPath(obj) is objectClass:string && objectClass.ToLower() is oc:string)
+            {
+                if (oc in ObjectNameMapToType)
+                {
+                    cacheEntry = new RequestCacheEntry{};
+                    cacheEntry.ObjType = ObjectNameMapToType[oc];
+                    cacheEntry.MsgId = req.MessageID;
+                    cacheEntry.AddRequest = addReq;
+                    cacheEntry.OpType = OperationType.Create;
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else if (req.ProtocolOp is LDAP.ModifyRequest)
+    {
+        var modReq = req.ProtocolOp as LDAP.ModifyRequest;
+        if (IPsecPolicyObjectPath(modReq.Object as string) is objectClass:string && objectClass.ToLower() is oc:string)
+        {
+            if (oc in ObjectNameMapToType)
+            {
+                cacheEntry = new RequestCacheEntry{};
+                cacheEntry.ObjType = ObjectNameMapToType[oc];
+                cacheEntry.MsgId = req.MessageID;
+                cacheEntry.ModifyRequest = modReq;
+                cacheEntry.OpType = OperationType.Modify;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+syntax IPsecPolicyObjectPathSyntax = regex{(?i)cn=} s1:AllObjectName regex{(?i)(\{[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}\},cn=ip\ssecurity,cn=system)[\x00-\xFF]*$} => s1;
+syntax AllObjectName = regex{(?i)ipsec(policy|isakmppolicy|nfa|negotiationpolicy|filter)};
+syntax IPsecSearchFilter = regex{(?i)\(objectclass\s==\s} s:AllObjectName regex{(?i)(\)\s&&\s\(cn\s==\s)} AllObjectName regex{(?i)(\{[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}\})[\x00-\xFF]*$} => s;
+
+optional string IPsecPolicyObjectPath(string s)
+{
+    if (s.Count < 8 || s.Segment(0, 8).ToLower() != IPsecPolicyObjectPathStartString) // pre-check s is starting with "cn=ipsec"
+    {
+        return nothing;
+    }
+    var ret = IPsecPolicyObjectPathSyntax(s);
+    return ret;
+}
+
+ObjectType GetRetrieveObjectType(LDAP.SearchRequest req)
+{
+   string filter = req.Filter.Content.ToString();
+   if (filter.Count == 11 && filter.ToLower() == "objectclass")
+   {
+       return ObjectType.All;
+   }
+   else
+   {
+        if (IPsecSearchFilter(filter) is obj:string && obj.ToLower() is objLower:string && objLower in ObjectNameMapToType)
+        {
+            return ObjectNameMapToType[objLower];
+        }
+   }
+   return ObjectType.Invalid;
+}
+
+syntax PolicyDataRetrievalSyntax = s:regex{(?i)(cn=ip\ssecurity,cn=system)[\x00-\xFF]*$} => s;
+syntax GpoLocationSyntax = s:regex{(?i)(cn=ipsec,cn=windows,cn=microsoft,cn=machine,cn=\{[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}\},cn=policies,cn=system)[\x00-\xFF]*$} => s;
+
+optional string PolicyDataRetrieval(string s)
+{
+    if (s.Count < 24 || s.Segment(0, 24).ToLower() != PolicyDataRetrievalStartString) // pre-check s is starting with "cn=ip security,cn=system"
+    {
+        return nothing;
+    }
+    var ret = PolicyDataRetrievalSyntax(s);
+    return ret;
+}
+
+optional string GpoLocation(string s)
+{
+    if (s.Count < 47 || s.Segment(0, 47).ToLower() != GpoLocationStartString) // pre-check s is starting with "cn=ipsec,cn=windows,cn=microsoft,cn=machine,cn="
+    {
+        return nothing;
+    }
+    var ret = GpoLocationSyntax(s);
+    return ret;
+}
+
+bool IsPolicyRetrievalRequest(LDAP.LdapMessage req, out RequestCacheEntry cacheEntry)
+{
+    cacheEntry = null;
+    if (req.ProtocolOp is serRequest:LDAP.SearchRequest)
+    {
+        if (serRequest.BaseObject is baseObject:string)
+        {
+            if((PolicyDataRetrieval(baseObject) != nothing || GpoLocation(baseObject) != nothing))
+            {
+                cacheEntry = new RequestCacheEntry{};
+                if (GetRetrieveObjectType(serRequest) is objType:ObjectType && objType != ObjectType.Invalid)
+                {
+                    cacheEntry.MsgId = req.MessageID;
+                    cacheEntry.SearchRequest = serRequest;
+                    cacheEntry.ObjType = objType;
+                    cacheEntry.OpType = cacheEntry.ObjType == ObjectType.All ? OperationType.RetrieveLocationNameDescription : OperationType.RetrieveData;
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            return false;
+        }
+        
+    }
+    return false;
+}
+
+bool IsPolicyAssignmentRequest(LDAP.LdapMessage req, out RequestCacheEntry cacheEntry)
+{
+    cacheEntry = null;
+    if (req.ProtocolOp is addRequest:LDAP.AddRequest)
+    {
+        if (addRequest.Entry is baseObject:string)
+        {
+            baseObject = addRequest.Entry as string;
+            if (GpoLocation(baseObject) != nothing)
+            {
+                cacheEntry = new RequestCacheEntry{};
+                cacheEntry.MsgId = req.MessageID;
+                cacheEntry.AddRequest = addRequest;
+                cacheEntry.ObjType = ObjectType.Invalid;
+                cacheEntry.OpType = OperationType.AssignCreate;
+                return true;
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else if (req.ProtocolOp is modRequest:LDAP.ModifyRequest)
+    {
+        if (modRequest.Object is baseObject:string)
+        {
+            baseObject = modRequest.Object as string;
+            if (GpoLocation(baseObject) != nothing)
+            {
+                cacheEntry = new RequestCacheEntry{};
+                cacheEntry.MsgId = req.MessageID;
+                cacheEntry.ModifyRequest = modRequest;
+                cacheEntry.ObjType = ObjectType.Invalid;
+                cacheEntry.OpType = OperationType.AssignModify;
+                return true;
+            }
+        }
+        else
+        {
+            return false;
+        }
+    }
+    return false;
+}
+
+optional IPsecPolicyObject DecodeIPsecPolicyObject(LDAP.AttributeList attributes)
+{
+    IPsecPolicyObject obj = new IPsecPolicyObject{};
+    string objType;
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0)
+        {
+            return null;
+        }
+        objType = (attr.Type as string).ToLower();
+        string temp;
+        if (objType != "ipsecnfareference" && objType != "ipsecdata")
+        {
+            temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        }
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "description" => 
+                obj.description = temp;
+            case "whenchanged" => 
+                obj.whenChanged = temp;
+            case "ipsecid" => 
+                obj.ipsecID = temp;
+            case "distinguishedname" => 
+                obj.distinguishedName = temp;
+            case "ipsecisakmpreference" => 
+                obj.ipsecISAKMPReference = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "ipsecnfareference" =>
+                if (DecodeUTF8StringArray(attr.Vals[0]) is r:array<UTF8String>)
+                {
+                    obj.ipsecNFAReference = r;
+                }
+                else
+                {
+                    return nothing;
+                }
+            case "ipsecdatatype" => 
+                obj.ipsecDataType = temp;
+            case "ipsecdata" =>
+                if (BinaryDecoder<ipsecPolicy_ipsecData>(attr.Vals[0] as binary) is data:ipsecPolicy_ipsecData)
+                {
+                    obj.ipsecData = data;
+                }
+                else
+                {
+                    return nothing;
+                }
+            default =>
+                ;
+        }
+    }
+    return obj;
+}
+
+optional IPsecISAKMPPolicyObject DecodeIPsecISAKMPPolicyObject(LDAP.AttributeList attributes)
+{
+    IPsecISAKMPPolicyObject obj = new IPsecISAKMPPolicyObject{};
+    string objType;
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0)
+        {
+            return null;
+        }
+        objType = (attr.Type as string).ToLower();
+        string temp;
+        if (objType != "ipsecdata")
+        {
+            temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        }
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "whenchanged" => 
+                obj.whenChanged = temp;
+            case "ipsecid" => 
+                obj.ipsecID = temp;
+            case "distinguishedname" => 
+                obj.distinguishedName = temp;
+            case "ipsecownersreference" => 
+                obj.ipsecOwnersReference = temp;
+            case "ipsecdatatype" => 
+                obj.ipsecDataType = temp;
+            case "ipsecdata" =>
+                if (BinaryDecoder<ipsecISAKMPPolicy_ipsecData>(attr.Vals[0] as binary) is data:ipsecISAKMPPolicy_ipsecData)
+                {
+                    obj.ipsecData = data as ipsecISAKMPPolicy_ipsecData;
+                }   
+                else
+                {
+                    return nothing;
+                }
+            default =>
+                ;
+        }
+    }
+    return obj;
+}
+
+optional IPsecNFAObject DecodeIPsecNFAObject(LDAP.AttributeList attributes)
+{
+    IPsecNFAObject obj = new IPsecNFAObject{};
+    string objType;
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0)
+        {
+            return null;
+        }
+        objType = (attr.Type as string).ToLower();
+        string temp;
+        if (objType != "ipsecdata")
+        {
+            temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        }
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "description" => 
+                obj.description = temp;
+            case "whenchanged" => 
+                obj.whenChanged = temp;
+            case "ipsecid" => 
+                obj.ipsecID = temp;
+            case "distinguishedname" => 
+                obj.distinguishedName = temp;
+            case "ipsecfilterreference" => 
+                obj.ipsecFilterReference = temp;
+            case "ipsecnegotiationpolicyreference" => 
+                obj.ipsecNegotiationPolicyReference = temp;
+            case "ipsecownersreference" => 
+                obj.ipsecOwnersReference = temp;
+            case "ipsecdatatype" => 
+                obj.ipsecDataType = temp;
+            case "ipsecdata" =>
+                if (BinaryDecoder<ipsecNFA_ipsecData>(attr.Vals[0] as binary) is data:ipsecNFA_ipsecData)
+                {
+                    obj.ipsecData = data;
+                }
+                else
+                {
+                    return nothing;
+                }
+            default =>
+                ;
+        }
+    }
+    return obj;
+}
+
+optional IPsecNegotiationPolicyObject DecodeIPsecNegotiationPolicyObject(LDAP.AttributeList attributes)
+{
+    IPsecNegotiationPolicyObject obj = new IPsecNegotiationPolicyObject{};
+    string objType;
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0)
+        {
+            return null;
+        }
+        objType = (attr.Type as string).ToLower();
+        string temp;
+        if (objType != "ipsecownersreference" && objType != "ipsecdata")
+        {
+            temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        }
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "description" => 
+                obj.Description = temp;
+            case "whenchanged" => 
+                obj.whenChanged = temp;
+            case "ipsecid" => 
+                obj.ipsecID = temp;
+            case "distinguishedname" => 
+                obj.distinguishedName = temp;
+            case "ipsecnegotiationpolicyaction" => 
+                obj.ipsecNegotiationPolicyAction = temp;
+            case "ipsecnegotiationpolicytype" => 
+                obj.ipsecNegotiationPolicyType = temp;
+            case "ipsecownersreference" =>
+                if (DecodeUTF8StringArray(attr.Vals[0]) is r:array<UTF8String>)
+                {
+                    obj.ipsecOwnersReference = r;
+                }
+                else
+                {
+                    return nothing;
+                }
+            case "ipsecdatatype" => 
+                obj.ipsecDataType = temp;
+            case "ipsecdata" =>
+                if (BinaryDecoder<ipsecNegotiationPolicy_ipsecData>(attr.Vals[0] as binary) is data:ipsecNegotiationPolicy_ipsecData)
+                {
+                    obj.ipsecData = data;
+                }
+                else
+                {
+                    return nothing;
+                }
+           default =>
+                ;
+        }
+    }
+    return obj;
+}
+
+type UTF8StringArray
+{
+    array<UTF8String> items;
+}
+
+optional array<UTF8String> DecodeUTF8StringArray(LDAP.AttributeValue attribute)
+{
+    if (BinaryDecoder<UTF8StringArray>(attribute as binary) is s:UTF8StringArray)
+    {
+        return s.items;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+optional IPsecFilterObject DecodeIPsecFilterObject(LDAP.AttributeList attributes)
+{
+    IPsecFilterObject obj = new IPsecFilterObject{};
+    string objType;
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0)
+        {
+            return null;
+        }
+        objType = (attr.Type as string).ToLower();
+        string temp;
+        if (objType != "ipsecownersreference" && objType != "ipsecdata")
+        {
+            temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        }
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "description" => 
+                obj.description = temp;
+            case "whenchanged" => 
+                obj.whenChanged = temp;
+            case "ipsecid" => 
+                obj.ipsecID = temp;
+            case "distinguishedname" => 
+                obj.distinguishedName = temp;
+            case "ipsecownersreference" => 
+                if (DecodeUTF8StringArray(attr.Vals[0]) is r:array<UTF8String>)
+                {
+                    obj.ipsecOwnersReference = r;
+                }
+                else
+                {
+                    return nothing;
+                }
+            case "ipsecdatatype" => 
+                obj.ipsecDataType = temp;
+            case "ipsecdata" => 
+                var data = BinaryDecoder<ipsecFilter_ipsecData>(attr.Vals[0] as binary);
+                if (data != nothing)
+                {
+                    obj.ipsecData = data as ipsecFilter_ipsecData;
+                }
+                else
+                {
+                    return nothing;
+                }
+            default =>
+                ;
+        }
+    }
+    return obj;
+}
+
+IPsecObject DecodeIPsecObject(LDAP.AttributeList attributes)
+{
+    IPsecObject obj = new IPsecObject{};
+    foreach(var attr in attributes)
+    {
+        if (attr.Vals.Count == 0) continue;
+        var objType = (attr.Type as string).ToLower();
+        string temp = LDAP.DecodeOctetStringAsUTF8(attr.Vals[0]) as string;
+        switch (objType)
+        {
+            case "objectclass" => 
+                obj.objectClass = temp;
+            case "ipsecname" => 
+                obj.ipsecName = temp;
+            case "description" => 
+                obj.description = temp;
+            case "ipsecownersreference" =>
+                obj.ipsecOwnersReference = temp;
+            default =>
+            ;
+        }
+    }
+    return obj;
+}
+
+contract Contract
+{
+    // 2.2.1
+    accepts message CreationOrModificationRequest
+    {
+        LDAP.LdapDN Entry;
+        IPsecObjectPattern Object;
+        
+        override string ToString()
+        {
+            if (this#IsCreation as bool)
+            {
+                 return ObjectTypeMapToName[this#ObjType as ObjectType] + " Creation Request, " + "create object: " + Entry.ToString();
+            }
+            else
+            {
+                return ObjectTypeMapToName[this#ObjType as ObjectType] + " Modification Request, " + "modify object: " + Entry.ToString();
+            }            
+        }
+    }
+    
+    issues message CreationOrModificationResponse
+    {
+        LDAP.ResultCode ResultCode;
+    
+        override string ToString()
+        {
+            if (this#IsCreation as bool)
+            {
+                return ObjectTypeMapToName[this#ObjType as ObjectType] + " Creation Response, ResultCode: " + EnumToString(ResultCode, "LDAP.ResultCode");
+            }
+            else
+            {
+                return ObjectTypeMapToName[this#ObjType as ObjectType] + " Modification Response, ResultCode: " + EnumToString(ResultCode, "LDAP.ResultCode");
+            }
+        }
+    }
+    
+    // 2.2.2
+    accepts message AssignmentRequest
+    {
+        LDAP.LdapDN Entry;
+        IPsecObject Object;
+        
+        override string ToString()
+        {
+            return "IPsec Policy Assignment Request, " + "Entry: " + Entry.ToString();
+        }
+    }
+    
+    issues message AssignmentResponse
+    {
+        LDAP.ResultCode ResultCode;
+    
+        override string ToString()
+        {
+            return "IPsec Policy Assignment Response, ResultCode: " + EnumToString(ResultCode, "LDAP.ResultCode");
+        }
+    }
+    
+    // 2.2.3
+    accepts message PolicyRetrievalRequest
+    {
+        LDAP.LdapDN baseObject;
+        LDAP.Scope Scope;
+        LDAP.DerefAliases derefAliases;
+        Integer sizeLimit;
+        Integer timeLimit;
+        Boolean typesOnly;
+        LDAP.Filter Filter;
+        LDAP.AttributeSelection Attributes;
+        override string ToString()
+        {
+            if (this#ObjType ==  ObjectType.All)
+            {
+                return "Policy Location Name And Description Retrieval Request";
+            }
+            else 
+            {
+                return "Policy Data Retrieval Request, retrieve " + ObjectTypeMapToName[this#ObjType as ObjectType] + " object: " + baseObject.ToString(); 
+            }
+        }
+        
+        void ValidationCheckForPolicyRetrievalRequest()
+        {
+            ValidationCheckValue(Scope == 0, this, true, ReferenceType.Message, "GPIPSEC", "Scope", "PolicyRetrievalRequest", "0", Scope);
+            ValidationCheckValue(derefAliases == 0, this, true, ReferenceType.Message, "GPIPSEC", "derefAliases", "PolicyRetrievalRequest", "0", derefAliases);
+            ValidationCheckValue(sizeLimit == 0, this, true, ReferenceType.Message, "GPIPSEC", "sizeLimit", "PolicyRetrievalRequest", "0", sizeLimit);
+            ValidationCheckValue(timeLimit == 0, this, true, ReferenceType.Message, "GPIPSEC", "timeLimit", "PolicyRetrievalRequest", "0", timeLimit);
+            ValidationCheckValue(typesOnly == false, this, true, ReferenceType.Message, "GPIPSEC", "typesOnly", "PolicyRetrievalRequest", "false", typesOnly);
+        }
+    }
+     
+    issues message PolicyRetrievalResponse
+    {
+        LDAP.LdapDN Entry;
+        IPsecObjectPattern Object;
+        
+        override string ToString()
+        {   
+            if (this#ObjType ==  ObjectType.All)
+            {
+                return "Policy Location Name And Description Retrieval Response, return object: " + Entry.ToString(); 
+            }
+            else
+            {
+                return "Policy Data Retrieval Response, return " + ObjectTypeMapToName[this#ObjType as ObjectType] +" object: " + Entry.ToString();
+            }
+        }
+    }
+}
+
+pattern IPsecObjectPattern = IPsecPolicyObject | IPsecISAKMPPolicyObject | IPsecNFAObject | IPsecNegotiationPolicyObject | IPsecFilterObject | IPsecObject;
+
+// 2.2.1.1.1
+type IPsecPolicyObject
+{
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString description;
+    optional LDAP.LdapString whenChanged;
+    optional LDAP.LdapString ipsecID;
+    optional LDAP.LdapDN distinguishedName;
+    optional LDAP.LdapDN ipsecISAKMPReference;
+    optional array<UTF8String> ipsecNFAReference;
+    optional LDAP.LdapString ipsecDataType;
+    optional ipsecPolicy_ipsecData ipsecData;
+}
+    
+// 2.2.1.2.1
+type IPsecISAKMPPolicyObject
+{
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString whenChanged;
+    optional LDAP.LdapString ipsecID;
+    optional LDAP.LdapDN distinguishedName;
+    optional LDAP.LdapDN ipsecOwnersReference;
+    optional LDAP.LdapString ipsecDataType;
+    optional ipsecISAKMPPolicy_ipsecData ipsecData;
+}
+    
+// 2.2.1.3.1
+type IPsecNFAObject
+{
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString description;
+    optional LDAP.LdapString whenChanged;
+    optional LDAP.LdapString ipsecID;
+    optional LDAP.LdapDN distinguishedName;
+    optional LDAP.LdapDN ipsecFilterReference;
+    optional LDAP.LdapDN ipsecNegotiationPolicyReference;
+    optional LDAP.LdapDN ipsecOwnersReference;
+    optional LDAP.LdapString ipsecDataType;
+    optional ipsecNFA_ipsecData ipsecData;
+}
+    
+// 2.2.1.4.1
+type IPsecNegotiationPolicyObject
+{
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString Description;
+    optional LDAP.LdapString whenChanged;
+    optional LDAP.LdapString ipsecID;
+    optional LDAP.LdapDN distinguishedName;
+    optional LDAP.LdapDN ipsecNegotiationPolicyAction; 
+    optional LDAP.LdapDN ipsecNegotiationPolicyType; 
+    optional array<UTF8String> ipsecOwnersReference;
+    optional LDAP.LdapString ipsecDataType;
+    optional ipsecNegotiationPolicy_ipsecData ipsecData;
+}
+
+// 2.2.1.5.1
+type IPsecFilterObject
+{
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString description;
+    optional LDAP.LdapString whenChanged;
+    optional LDAP.LdapString ipsecID;
+    optional LDAP.LdapDN distinguishedName;
+    optional array<UTF8String> ipsecOwnersReference;
+    optional LDAP.LdapString ipsecDataType;
+    optional ipsecFilter_ipsecData ipsecData;
+}
+
+// 2.2.2
+type IPsecObject
+{
+    LDAP.LdapDN ipsecOwnersReference;
+    optional LDAP.LdapString objectClass;
+    optional LDAP.LdapString ipsecName;
+    optional LDAP.LdapString description;
+}
+
+// 2.2.1.1.1
+type ipsecPolicy_ipsecData
+{
+    (guid where value == {22202163-4f4c-11d1-863b-00a0248d3021}) IPsec_Policy_ID;
+    uint DataLength where ValidationCheckValue(value == 0x00000004, null, true, ReferenceType.Type, "GPIPSEC", "DataLength", "ipsecPolicy_ipsecData", "0x00000004", value);
+    uint PollingInterval;
+    byte Unused where ValidationCheckValue(value == 0x00, null, true, ReferenceType.Type, "GPIPSEC", "Unused", "ipsecPolicy_ipsecData", "0x00", value);
+}
+
+// 2.2.1.2.1
+type ipsecISAKMPPolicy_ipsecData
+{
+    (guid where value == {80DC20B8-2EC8-11D1-A89E-00A0248D3021}) ISAKMPPolicyTypeID;
+    uint DataLength;
+    guid ISAKMPPolicyInstance;
+    uint Zero1 where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero1", "ipsecISAKMPPolicy_ipsecData", "0x00000000", value);
+    MasterPFSRequired MasterPFSRequired where ValidationCheckEnumValue(InRange<MasterPFSRequired>(value), null, true, ReferenceType.Type, "GPIPSEC", "MasterPFSRequired", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00000000, 0x00000001", value);
+    ISAKMPOptions ISAKMPOptions where ValidationCheckEnumValue(InRange<MasterPFSRequired>(value), null, true, ReferenceType.Type, "GPIPSEC", "ISAKMPOptions", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00000000, 0x00000001, 0x00000002, 0x00000003", value);
+    NewDH NewDH1 where ValidationCheckEnumValue(InRange<NewDH>(value), null, false, ReferenceType.Type, "GPIPSEC", "NewDH1", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00, 0x01, 0x02, 0x03", value);
+    NewDH NewDH2 where ValidationCheckEnumValue(InRange<NewDH>(value), null, false, ReferenceType.Type, "GPIPSEC", "NewDH2", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00, 0x01, 0x02, 0x03", value);
+    NewDH NewDH3 where ValidationCheckEnumValue(InRange<NewDH>(value), null, false, ReferenceType.Type, "GPIPSEC", "NewDH3", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00, 0x01, 0x02, 0x03", value);
+    NewDH NewDH4 where ValidationCheckEnumValue(InRange<NewDH>(value), null, false, ReferenceType.Type, "GPIPSEC", "NewDH4", 
+            "ipsecISAKMPPolicy_ipsecData", "0x00, 0x01, 0x02, 0x03", value);
+    uint QMLimit;
+    uint MMLifetime;
+    binary Zero2 with BinaryEncoding{Length = 20};
+    uint SecurityMethodCount;
+    array<SecurityMethod> SecurityMethods with BinaryEncoding{Length = SecurityMethodCount};
+}
+
+pattern MasterPFSRequired = enum uint
+{
+    NotRequired = 0x00000000,
+    Required = 0x00000001,
+    ...
+};
+
+pattern ISAKMPOptions = enum uint
+{
+    NoPolicyModifier = 0x00000000,
+    PerformX509CertificateMapping  = 0x00000001,
+    DoNotSendPeeCRP = 0x00000002,
+    PerformX509CertificateMappingAndDoNotSendPeeCRP = 0x00000003,
+    ...
+};
+
+pattern NewDH = enum byte
+{
+    NotUsed = 0x00,
+    DES_MD5_DH2048 = 0x01,
+    DES_SHA1_DH2048 = 0x02,
+    DES3_MD5_DH2048 = 0x03,
+    DES3_SHA1_DH2048 = 0x04,
+    ...
+};
+
+type SecurityMethod
+{
+    byte MajorVersion where ValidationCheckValue(value == 0x00, null, true, ReferenceType.Type, "GPIPSEC", "MajorVersion", "SecurityMethod", "0x00", value);
+    byte MinorVersion where ValidationCheckValue(value == 0x00, null, true, ReferenceType.Type, "GPIPSEC", "MinorVersion", "SecurityMethod", "0x00", value);
+    ushort Zero3  where ValidationCheckValue(value == 0x0000, null, true, ReferenceType.Type, "GPIPSEC", "Zero3 ", "SecurityMethod", "0x0000", value);
+    EncryptionAlgorithmID EncryptionAlgorithmID where ValidationCheckEnumValue(InRange<EncryptionAlgorithmID>(value), null, true, ReferenceType.Type, 
+            "GPIPSEC", "EncryptionAlgorithmID", "SecurityMethod", "0x0000000000000000, 0x0000000000000001, 0x0000000000000002, 0x0000000000000003", value);
+    uint Zero4 where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero4 ", "SecurityMethod", "0x00000000", value);
+    HashAlgorithmID HashAlgorithmID where ValidationCheckEnumValue(InRange<HashAlgorithmID>(value), null, true, ReferenceType.Type, 
+            "GPIPSEC", "HashAlgorithmID", "SecurityMethod", "0x0000000000000000, 0x0000000000000001, 0x0000000000000002", value);
+    uint Zero5 where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero5 ", "SecurityMethod", "0x00000000", value);
+    ulong Zero6 where ValidationCheckValue(value == 0x0000000000000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero6 ", "SecurityMethod", "0x0000000000000000", value);
+    RandomFunction RandomFunction where ValidationCheckEnumValue(InRange<RandomFunction>(value), null, true, ReferenceType.Type, "GPIPSEC", "RandomFunction", 
+            "SecurityMethod", "0x01, 0x02, 0x03, 0x04", value);
+    binary Zero7 where ValidationCheckValue(value == $[00000000000000], null, true, ReferenceType.Type, "GPIPSEC", "Zero7 ", "SecurityMethod", "$[00000000000000]", value)
+            with BinaryEncoding{Length = 7};
+    OakleyGroup OakleyGroup where ValidationCheckEnumValue(InRange<OakleyGroup>(value), null, true, ReferenceType.Type, "GPIPSEC", "OakleyGroup", 
+            "SecurityMethod", "0x00000000, 0x00000001, 0x00000002, 0x10000001", value);    
+    uint QMLimit;
+    uint OakleyLifetimeKB;
+    uint OakleyLifetimeSecs;
+    PFSIdentityRequired PFSIdentityRequired where ValidationCheckEnumValue(InRange<PFSIdentityRequired>(value), null, true, ReferenceType.Type, "GPIPSEC", "PFSIdentityRequired", 
+            "SecurityMethod", "0x00000000, 0x00000001", value);
+}
+
+pattern EncryptionAlgorithmID = enum ulong
+{
+    None = 0x0000000000000000,
+    DES_CBC = 0x0000000000000001,
+    DES3_CBC = 0x0000000000000002, 
+    DES3_CBC_3 = 0x0000000000000003,
+    ...
+};
+
+pattern HashAlgorithmID = enum ulong
+{
+    None = 0x0000000000000000,
+    MD5 = 0x0000000000000001,
+    SHA1 = 0x0000000000000002
+    ...
+};
+
+pattern RandomFunction = enum byte
+{
+    DES_MD5_Group14 = 0x01,
+    DES_SHA_Group14 = 0x02,
+    DES3_MD5_Group14 = 0x03,
+    DES3_SHA_Group14 = 0x04,
+    ...
+};
+
+pattern OakleyGroup = enum uint
+{
+    NotUsed = 0x00000000,
+    Group1 = 0x00000001,
+    Group2 = 0x00000002,
+    Group14 = 0x10000001,
+    ...
+};
+
+pattern PFSIdentityRequired = enum uint
+{
+    NotRequired = 0x00000000,
+    Required = 0x00000001,
+    ...
+};
+
+// 2.2.1.3.1
+type ipsecNFA_ipsecData
+{
+    (guid where value == {11BBAC00-498D-11D1-8639-00A0248D3021}) NFAPolicyID;
+    uint DataLength;
+    uint AuthMethodCount;
+    array<AuthMethod> AuthMethods with BinaryEncoding{Length = AuthMethodCount};
+    InterfaceType InterfaceType where ValidationCheckEnumValue(InRange<InterfaceType>(value), null, true, ReferenceType.Type, "GPIPSEC", "InterfaceType", 
+            "ipsecNFA_ipsecData", "0xFFFFFFFF, 0xFFFFFFFE, 0xFFFFFFFD", value);
+    uint InterfaceNameLength;
+    string InterfaceName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = InterfaceNameLength / 2};
+    IPv4Address TunnelAddress;
+    IsTunnelSpecifier IsTunnelSpecifier where ValidationCheckEnumValue(InRange<IsTunnelSpecifier>(value), null, true, ReferenceType.Type, "GPIPSEC", "IsTunnelSpecifier", 
+            "ipsecNFA_ipsecData", "0x00000000, 0x00000001", value);
+    IsActiveSpecifier IsActiveSpecifier where ValidationCheckEnumValue(InRange<IsActiveSpecifier>(value), null, true, ReferenceType.Type, "GPIPSEC", "IsActiveSpecifier", 
+            "ipsecNFA_ipsecData", "0x00000000, 0x00000001", value);
+    uint TunnelEndPointNameLength;
+    string TunnelEndPointName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = TunnelEndPointNameLength / 2};
+    optional (guid  where value == {01010101-0101-0101-0101-010101010101}) AltAuthMethodId1;
+    optional [|AltAuthMethodId1 != nothing|] uint AltAuthNumMethodsCount;
+    optional [|AltAuthMethodId1 != nothing|] array<AltAuthMethodData> AltAuthMethodData with BinaryEncoding{Length = AltAuthNumMethodsCount as uint};
+    optional (guid  where value == {01010101-0101-0101-0101-010101010102}) AltAuthMethodId2; 
+    uint Zero1  where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero1 ", "ipsecNFA_ipsecData", "0x00000000", value);
+    optional [|AltAuthMethodId2 != nothing|] array<AltAuthMethodFlag> AltAuthMethodFlags with BinaryEncoding{Length = AltAuthNumMethodsCount as uint};
+    optional (guid  where value == {01010101-0101-0101-0101-010101010103}) IPv6TunnelModeID; 
+    IPv6Address IPv6TunnelModeAddress;
+}
+
+type AuthMethod
+{
+    AuthType AuthType where ValidationCheckEnumValue(InRange<AuthType>(value), null, true, ReferenceType.Type, "GPIPSEC", "AuthType", 
+            "AuthMethod", "0x00000001, 0x00000003, 0x00000005", value);
+    uint AuthLength;
+    ([|AuthType == 0x00000001 || AuthType == 0x00000003|] string | [|AuthType == 0x00000005|] ushort | binary) AuthMethodData 
+        with BinaryEncoding{WidthForComposedType = (AuthLength as int) * 8, TextEncoding = TextEncoding.Unicode};
+}
+
+pattern AuthType = enum uint
+{
+    PSK = 0x00000001,
+    X509 = 0x00000003,
+    Kerberos = 0x00000005,
+    ...
+};
+
+pattern InterfaceType = enum uint
+{
+    DialupOnly = 0xFFFFFFFF,
+    LANOnly = 0xFFFFFFFE,
+    All = 0xFFFFFFFD,
+    ...
+};
+
+pattern IsTunnelSpecifier = enum uint
+{
+    NotTunnel = 0x00000000,
+    Tunnel = 0x00000001,
+    ...
+};
+
+pattern IsActiveSpecifier = enum int
+{
+    NotActive = 0x00000000,
+    Active = 0x00000001,
+    ...
+};
+
+type AltAuthMethodData
+{
+    AuthType AltAuthType where ValidationCheckEnumValue(InRange<AuthType>(value), null, true, ReferenceType.Type, "GPIPSEC", "AltAuthType", 
+            "AuthMethod", "0x00000001, 0x00000003, 0x00000005", value);
+    uint AltAuthMethodLength;
+    ([|AltAuthType == 0x00000001 || AltAuthType == 0x00000003|] string | [|AltAuthType == 0x00000005|] byte | binary) AltAuthMethodValue 
+            with BinaryEncoding{WidthForComposedType = (AltAuthMethodLength as int) * 8, TextEncoding = TextEncoding.Unicode};
+}
+
+pattern AltAuthMethodFlag = enum uint
+{
+    NotCertificate = 0x00000000,
+    EnableAccountMapping = 0x00000001,
+    ExcludeCA = 0x00000002,
+    ...
+};
+
+// 2.2.1.4
+type ipsecNegotiationPolicy_ipsecData
+{
+    (guid where value == {80DC20B9-2EC8-11D1-A89E-00A0248D3021}) NegotiationPolicyID;
+    uint DataLength;
+    uint SecurityOfferCount;
+    array<SecurityOfferData> SecurityOfferData with BinaryEncoding{Length = SecurityOfferCount};
+}
+
+type SecurityOfferData
+{
+    uint LifetimeSeconds;
+    uint LifetimeKBytes;
+    uint NegotiationOptions where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "GPIPSEC", "NegotiationOptions ", "SecurityOfferData", "0x00000000", value);
+    PFSQMRequired PFSQMRequired where ValidationCheckEnumValue(InRange<PFSQMRequired>(value), null, true, ReferenceType.Type, "GPIPSEC", "PFSQMRequired", 
+            "SecurityOfferData", "0x00000000, 0x00000001", value);
+    uint AlgorithmOfferCount where ValidationCheckLessThanOrEqualTo(value <= 3, null, true, ReferenceType.Type, "GPIPSEC", "AlgorithmOfferCount", "SecurityOfferData", "3", value);
+    array<AlgorithmOfferData> AlgorithmOfferData with BinaryEncoding{Length = AlgorithmOfferCount}; 
+}
+
+pattern PFSQMRequired = enum uint
+{
+    UseQMPFS = 0x00000000,
+    NotUseQMPFS = 0x00000001,
+    ...
+};
+
+type AlgorithmOfferData
+{
+    ([|OfferType ==0x00000001|] AlgorithmIdentifierAH | [|OfferType ==0x00000002|] AlgorithmIdentifierESP | uint) AlgorithmIdentifier with DisplayInfo{ToText = AlgorithmIdentifierToText};
+    ESPIntegrityIdentifier ESPIntegrityIdentifier where ValidationCheckEnumValue(InRange<ESPIntegrityIdentifier>(value), null, true, ReferenceType.Type, "GPIPSEC", "ESPIntegrityIdentifier", 
+            "SecurityOfferData", "0x00000000, 0x00000001, 0x00000002", value);
+    OfferType OfferType where ValidationCheckEnumValue(InRange<OfferType>(value), null, true, ReferenceType.Type, "GPIPSEC", "OfferType", 
+            "SecurityOfferData", "0x00000001, 0x00000002", value);
+    ulong Zero1 where ValidationCheckValue(value == 0x0000000000000000, null, true, ReferenceType.Type, "GPIPSEC", "Zero1 ", "AlgorithmOfferData", "0x0000000000000000", value);
+    
+    string AlgorithmIdentifierToText(any id)
+    {
+        if (OfferType == 0x00000001)
+        {
+            return EnumToString(id, "GPIPSEC.AlgorithmIdentifierAH");
+        }
+        else if (OfferType == 0x00000002)
+        {
+            return EnumToString(id, "GPIPSEC.AlgorithmIdentifierESP");
+        }
+        else
+        {
+            return DecToHexFormat(id);
+        }
+    }
+}
+
+pattern AlgorithmIdentifierAH = enum uint
+{
+    AH_MD5 = 0x00000001,
+    AH_SHA1 = 0x00000002,
+    ...
+};
+
+pattern AlgorithmIdentifierESP = enum uint
+{
+    ESP_NULL = 0x00000001,
+    ESP_DES = 0x00000002,
+    ESP_3DES = 0x00000003,
+    ...
+};
+
+pattern ESPIntegrityIdentifier = enum uint
+{
+    None = 0x00000000,
+    ESPWithMD5 = 0x00000001,
+    ESPWithSHA1 = 0x00000002,
+    ...
+};
+
+pattern OfferType = enum uint
+{
+    AH = 0x00000001,
+    ESP = 0x00000002,
+    ...
+};
+
+// 2.2.1.5.1
+type ipsecFilter_ipsecData
+{
+     guid FilterPolicyID1 where ValidationCheckValue(value == {80DC20B5-2EC8-11D1-A89E-00A0248D3021}, null, false, ReferenceType.Type, 
+            "GPIPSEC", "FilterPolicyID1 ", "ipsecFilter_ipsecData", "{80DC20B5-2EC8-11D1-A89E-00A0248D3021}", value);
+    uint DataLength1;
+    uint NumberOfFilters1;
+    //bug# 67611: GPIPSEC:  the length of  field FilterSpec is not consistent with TD
+    //array<FilterSpec1> FilterSpec1 with BinaryEncoding{WidthForComposedType = (DataLength1 * 8) as int};
+    array<FilterSpec1> FilterSpec1 with BinaryEncoding{Length = NumberOfFilters1};
+    guid FilterPolicyID2 where ValidationCheckValue(value == {35FECD3D-AE29-4373-8A6A-C5D8FAB2FB08}, null, false, 
+        ReferenceType.Type, "GPIPSEC", "FilterPolicyID2 ", "ipsecFilter_ipsecData", "{35FECD3D-AE29-4373-8A6A-C5D8FAB2FB08}", value);
+    uint DataLength2;
+    // Number-Of-Filters11 (4 bytes):  Optional. This field is present when Filter-Policy-ID2 is specified. The number of Filter-Spec1 (legacy filters) that are present. 
+    // If this value is nonzero, it overrides the value present in Number-Of-Filters1.
+    uint NumberOfFilters11;
+    uint NumberOfFilters2;
+    array<FilterSpec2> FilterSpec2 with BinaryEncoding{Length = NumberOfFilters2};
+}
+
+type FilterSpec1
+{
+    uint SourceLengthOfDNSName1;
+    string SourceDNSName1 with BinaryEncoding{Length = SourceLengthOfDNSName1, TextEncoding = TextEncoding.ASCII}; // FQDN
+    uint DestinationLengthOfDNSName1;
+    string DestinationDNSName1  with BinaryEncoding{Length = DestinationLengthOfDNSName1, TextEncoding = TextEncoding.ASCII}; // FQDN
+    uint FilterDescriptionLength1;
+    string FilterDescription1 with BinaryEncoding{Length = FilterDescriptionLength1 / 2 , TextEncoding = TextEncoding.Unicode};
+    guid FilterSpecificationID1;
+    LegacyMirrorOptions LegacyMirrorOptions where ValidationCheckEnumValue(InRange<LegacyMirrorOptions>(value), null, true, ReferenceType.Type, "GPIPSEC", "LegacyMirrorOptions", 
+            "FilterSpec1", "0x00000000, 0x00000001", value); 
+    IPv4Address LegacySourceAddress;
+    IPv4Address LegacySourceMask;
+    IPv4Address LegacyDestinationAddress;
+    IPv4Address LegacyDestinationMask;
+    IPv4Address LegacyTunnelAddress;
+    uint LegacyProtocol;
+    ushort LegacySourcePort;
+    ushort LegacyDestinationPort;
+    LegacyIsTunnel LegacyIsTunnel where ValidationCheckEnumValue(InRange<LegacyIsTunnel>(value), null, true, ReferenceType.Type, "GPIPSEC", "LegacyIsTunnel", 
+            "FilterSpec1", "0x00, 0x01", value); 
+    LegacySpecialFilter LegacySpecialFilter where ValidationCheckEnumValue(InRange<LegacyIsTunnel>(value), null, false, ReferenceType.Type, "GPIPSEC", "LegacySpecialFilter", 
+            "FilterSpec1", "0x00, 0x01, 0x02, 0x03, 0x04, 0x81, 0x82, 0x83, 0x84", value);
+    ushort LegacyFilterOptions where ValidationCheckValue(value == 0x00, null, true, ReferenceType.Type, "GPIPSEC", "LegacyFilterOptions ", "FilterSpec1", "0x0000", value);
+}
+
+pattern LegacyMirrorOptions = enum int
+{
+    NotMirrored = 0x00000000,
+    Mirrored = 0x00000001,
+    ...
+};
+
+pattern LegacyIsTunnel = enum byte
+{
+    NotTunnelFilter = 0x00,
+    TunnelFilter = 0x01,
+    ...
+};
+
+pattern LegacySpecialFilter = enum byte
+{
+    NotSpecialFilter = 0x00,
+    UseDNSasSrc = 0x01,
+    UseWINDSasSrc = 0x02,
+    UseDHCPasSrc = 0x03,
+    UseDefaultGatewayAsSrc = 0x04,
+    UseDNSasDest = 0x81,
+    UseWINSasDest = 0x82,
+    UseDHCPasDest = 0x83,
+    UseDefaultGatewayAsDest = 0x84,
+    ...
+};
+
+type FilterSpec2
+{
+    uint SourceLengthOfDNSName2;
+    string SourceDNSName2 with BinaryEncoding{Length = SourceLengthOfDNSName2, TextEncoding = TextEncoding.ASCII}; // FQDN
+    uint DestinationLengthOfDNSName2;
+    string DestinationDNSName2  with BinaryEncoding{Length = DestinationLengthOfDNSName2, TextEncoding = TextEncoding.ASCII}; // FQDN
+    uint FilterDescriptionLength2;
+    string FilterDescription2 with BinaryEncoding{Length = FilterDescriptionLength2 / 2, TextEncoding = TextEncoding.Unicode};
+    guid FilterSpecificationID2;
+    MirrorFlags MirrorFlags where ValidationCheckEnumValue(InRange<MirrorFlags>(value), null, false, ReferenceType.Type, "GPIPSEC", "MirrorFlags", 
+            "FilterSpec2", "0x00000000, 0x00000001", value);
+    AddressData SourceAddressData;
+    AddressData DestinationAddressData;
+    IPsecPortData SourcePortData;
+    IPsecPortData DestinationPortData;
+    uint FilterProtocol;
+    FilterFlags FilterFlags where ValidationCheckEnumValue(InRange<FilterFlags>(value), null, false, ReferenceType.Type, "GPIPSEC", "FilterFlags", 
+            "FilterSpec2", "0x00000000, 0x00000008", value);
+}
+
+pattern MirrorFlags = enum uint
+{
+    NotMirrored = 0x00000000,
+    Mirrored = 0x00000001,
+    ...
+};
+
+type AddressData
+{
+    IPsecAddressType IPsecAddressType where ValidationCheckEnumValueTooManyItems(InRange<IPsecAddressType>(value), null, true, 
+            ReferenceType.Type, "GPIPSEC", "IPsecAddressType", "AddressData", "AddressData","MS-GPIPSEC");
+    IPsecAddressVersion IPsecAddressVersion where ValidationCheckEnumValue(InRange<IPsecAddressVersion>(value), null, true, 
+            ReferenceType.Type, "GPIPSEC", "IPsecAddressVersion", "AddressData", "0x00000001, 0x00000002, 0x00000003", value);
+    (IPAddressDataFormat[IPsecAddressVersion] | binary) IPAddressDataFormat with BinaryEncoding{WidthForComposedType = 32 * 8};
+}
+
+pattern IPsecAddressType = enum uint
+{
+    AllTraffic = 0x00000000,
+    SingleIPAddress = 0x00000001,
+    RangeOfIPAddress = 0x00000002,
+    IPSubnet = 0x00000004,
+    LocalIPAddress = 0x00000008,
+    LocalDNSIPAddress = 0x00000010,
+    LocalWINSIPAddress = 0x00000020,
+    LocalDHCPIPAddress = 0x00000040,
+    LocalDefaultGatewayIPAddress = 0x00000080,
+    ...
+};
+
+pattern IPsecAddressVersion = enum int
+{
+    IPv4 = 0x00000001,
+    IPv6 = 0x00000002,
+    Both = 0x00000003,
+    ...
+};
+
+type IPAddressDataFormat[IPsecAddressVersion Version]
+{
+    IPAddress[Version] IPAddress;
+    IPAddress[Version] IPAddressSecondary;  
+}
+
+type IPAddress[IPsecAddressVersion Version]
+{
+    ([|Version == IPsecAddressVersion.IPv4|] IPv4Address | [|Version == IPsecAddressVersion.IPv6|] IPv6Address ) Address;
+    optional ([|Version == IPsecAddressVersion.IPv4|] binary) Padding with BinaryEncoding{Length = 12}; 
+}
+
+type IPsecPortData
+{
+    IPsecPortType IPsecPortType where ValidationCheckEnumValue(InRange<IPsecPortType>(value), null, true, ReferenceType.Type, "GPIPSEC", "IPsecPortType", 
+            "SourceData", "0x00000000, 0x00000001, 0x00000002", value);
+    ushort IPsecPort;
+    ushort IPsecPortRangeEnd;
+}
+
+pattern IPsecPortType = enum uint
+{
+    Any = 0x00000000,
+    Single = 0x00000001,
+    Range = 0x00000002,
+    ...
+};
+
+pattern FilterFlags = enum uint
+{
+    None = 0x00000000,
+    V2 = 0x00000008,
+    ...
+};
+
+pattern OperationType = enum byte
+{
+    Invalid,
+    Create,
+    Modify,
+    AssignCreate,
+    AssignModify,
+    RetrieveLocationNameDescription,
+    RetrieveData
+};
+
+pattern RetrieveType = enum byte
+{
+    RetrieveLocationNameDescription,
+    RetrieveData  
+};
+
+pattern ObjectType = enum byte
+{
+    Invalid,
+    IPsecPolicy,
+    IPsecISAKMPPolicy,
+    IPsecNFA,
+    IPsecNegotiationPolicy,
+    IPsecFilter,
+    All
+};
+
+pattern UTF8String = string with BinaryEncoding{TextEncoding = TextEncoding.UTF8};
+
+type RequestCacheEntry
+{
+    MessageID MsgId;
+    OperationType OpType;
+    ObjectType ObjType;
+    LDAP.AddRequest AddRequest; // If bug #65203 resolved, should remove this field from cache. 
+    LDAP.ModifyRequest ModifyRequest;
+    LDAP.SearchRequest SearchRequest;
+    
+    void Reset()
+    {
+        MsgId = 0;
+        OpType = OperationType.Invalid;
+        ObjType = ObjectType.Invalid;
+        AddRequest = null;
+        ModifyRequest = null;
+        SearchRequest = null;
+    }
+    
+    void ClearRequest()
+    {
+        AddRequest = null;
+        ModifyRequest = null;
+        SearchRequest = null;
+    }
+}

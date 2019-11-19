@@ -1,0 +1,882 @@
+protocol RTCP with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "RTP A Transport Protocol for Real-Time Applications",
+    ShortName = "RTCP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3550"},
+            new Reference{Name = "RFC 3611"},
+            new Reference{Name = "RFC 6051"},
+            new Reference{Name = "RFC 4585"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "363238", Date = "04/28/2014"},
+        ]
+};
+
+using IANA;
+using Standard;
+using Utility;
+using RTP;
+using UDP;
+
+/* Record the port which is negotiated by RTP.
+ * And binded with the source & destination address as a conversation key.
+ */
+map<ushort, set<binary>> RtcpPorts = {};
+
+endpoint Node over UDP.Host accepts IPacket;
+
+/* Ref: RFC 3550 11. RTP over Network and Transport Protocols
+ * RTCP stream SHOULD use the next higher (odd) destination port number.
+ * For applications that take a single port number as a parameter and
+ * derive the RTP and RTCP port pair from that number, if an odd number
+ * is supplied then the application SHOULD replace that number with the
+ * next lower (even) number to use as the base of the port pair.
+ */
+autostart actor RTPObserver(RTP.Node node)
+{
+    observe node accepts d:RTP.Datagram
+    {
+        // Save both source & destination port into set
+        ushort destinationPort = ((d#DestinationPort as ushort) + 1) as ushort;
+        ushort sourcePort = ((d#SourcePort as ushort) + 1) as ushort;
+        AddToRtcpPorts(d#SourceAddress as binary, d#DestinationAddress as binary, sourcePort, destinationPort);
+    }
+    
+    void AddToRtcpPorts(binary sourceAddress, binary destinationAddress, ushort sourcePort, ushort destinationPort)
+    {
+        var addressPair = sourceAddress + destinationAddress;
+        set<binary> addressPairs = null;
+        if (!(sourcePort in RtcpPorts))
+            addressPairs = {};
+        else
+            addressPairs = RtcpPorts[sourcePort];
+        
+        addressPairs[addressPair] = true;
+        RtcpPorts[sourcePort] = addressPairs;
+        
+        addressPairs = null;
+        if (!(destinationPort in RtcpPorts))
+            addressPairs = {};
+        else
+            addressPairs = RtcpPorts[destinationPort];
+
+        addressPairs[addressPair] = true;
+        RtcpPorts[destinationPort] = addressPairs;
+    }
+}
+
+autostart actor RTCPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram 
+        where !IsRTP(d) && (IsValidPortNumber(d#SourceAddress as binary, d#DestinationAddress as binary, d.SourcePort, d.DestinationPort) ||
+                            IsValidRTCPPacket(d))
+
+    {
+        DecodeAndDispatchPacket(d.Payload);
+    }
+    
+    bool IsValidPortNumber(binary sourceAddress, binary destinationAddress, ushort sourcePort, ushort destinationPort)
+    {
+        var addressPair = sourceAddress + destinationAddress;
+        if (sourcePort in RtcpPorts && addressPair in RtcpPorts[sourcePort])
+            return true;
+        else if (destinationPort in RtcpPorts && addressPair in RtcpPorts[destinationPort])
+            return true;
+        else
+            return false;
+    }
+
+    bool IsValidRTCPPacket(UDP.Datagram d)
+    {
+        // Padding assures the total message Length must be a mutiple of 4 bytes
+        if (d.Payload.Count < 4 || (d.Payload.Count % 4) != 0)
+        {
+            return false;
+        }
+
+        if (InRange<IANA.Port>(d.DestinationPort) || d.DestinationPort == 2302 || 
+            InRange<IANA.Port>(d.SourcePort) || d.SourcePort == 2302)
+        {
+            return false;
+        }
+
+        // port number must be odd and larger than 1024
+        if ((d.SourcePort >= 1024 && (d.SourcePort % 2 == 0)) || 
+            (d.DestinationPort >= 1024 && (d.DestinationPort % 2 == 0)))
+        {
+            return false;
+        }
+
+         // Version (first 2 bits) must be 2
+        if (((d.Payload[0] as byte) & 0xC0) != 0x80)
+        {
+            return false;
+        }
+
+        // First packet within compound should be a sender or receiver report.
+        // - allow BYE because it happens anyway
+        // - allow APP because it's not compound (without requiring packet type value registration)
+        var packetType = d.Payload[1] as byte;
+        if (!(packetType == RTCPControlPacketTypes.SR || packetType == RTCPControlPacketTypes.RR ||
+            packetType == RTCPControlPacketTypes.BYE || packetType == RTCPControlPacketTypes.APP))
+        {
+            return false;
+        }
+        return true;
+    }
+}
+
+void DecodeAndDispatchPacket(stream s)
+{
+    while (s.BytePosition < s.ByteLength)
+    {
+        int startIndex = s.BytePosition;
+        // The byte of packet type
+        switch (s.PeekByte(s.BitPosition + 8))
+        {
+            case RTCPControlPacketTypes.SR =>
+                switch (s)
+                {
+                    case sender:SenderReportPacket from BinaryDecoder<SenderReportPacket> =>
+                        int length = sender.Length * 4 + 4;
+                        ValidationCheck((startIndex + length <= s.ByteLength), sender, 
+                            () => "Incomplete SR (Sender Report RTCP Packet):package length(" + Utility.DecToHexFormat(length) + ") > binary length(" + Utility.DecToHexFormat(s.ByteLength - startIndex) + ")");
+                        ValidationCheck((length >= (28 + 24 * sender.ReportCount)), sender, 
+                            () => "Incomplete SR (Sender Report RTCP Packet):package length(" + Utility.DecToHexFormat(length) + ") < header length(" + Utility.DecToHexFormat(28 + 24 * sender.ReportCount) + ")");
+                        if ((startIndex + length <= s.ByteLength) && (length > (28 + 24 * sender.ReportCount)))
+                        {
+                            // The last octet of the padding is a count of how many padding octets should be ignored, including itself 
+                            byte padLength = sender.P ? s.PeekByte(8 * (startIndex + length - 1)) : 0;
+                            ushort extensionLength = (length - (28 + 24 * sender.ReportCount) - padLength) as ushort;
+                            sender.ProfileSpecificExtensions = (extensionLength > 0) ? BinaryDecoder<ProfileSpecificExtensions[extensionLength]>(s) : nothing;
+                            sender.PaddingForP = Padding(sender.P, s, padLength);
+                            sender.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        }
+                        dispatch endpoint Node accepts sender;
+                    default =>
+                        // rfc 3550 9.1 Confidentiality. For encrypted portion
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.RR =>
+                switch (s)
+                {
+                    case receiver:ReceiverReportPacket from BinaryDecoder<ReceiverReportPacket> =>
+                        int length = receiver.Length * 4 + 4;
+                        ValidationCheck((startIndex + length <= s.ByteLength), receiver, 
+                            () => "Incomplete RR (Receiver Report RTCP Packet):package length(" + Utility.DecToHexFormat(length) + ") > binary length(" + Utility.DecToHexFormat(s.ByteLength - startIndex) + ")");
+                        ValidationCheck((length >= (8 + 24 * receiver.ReportCount)), receiver, 
+                            () => "Incomplete RR (Receiver Report RTCP Packet):package length(" + Utility.DecToHexFormat(length) + ") < header length(" + Utility.DecToHexFormat(8 + 24 * receiver.ReportCount) + ")");
+                        if ((startIndex + length <= s.ByteLength) && (length > (8 + 24 * receiver.ReportCount)))
+                        {
+                            byte padLength = receiver.P ? s.PeekByte(8 * (startIndex + length - 1)) : 0;
+                            ushort extensionLength = (length - (8 + 24 * receiver.ReportCount) - padLength) as ushort;
+                            receiver.ProfileSpecificExtensions = (extensionLength > 0) ? BinaryDecoder<ProfileSpecificExtensions[extensionLength]>(s) : nothing;
+                            receiver.PaddingForP = Padding(receiver.P, s, padLength);
+                            receiver.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        }
+                        dispatch endpoint Node accepts receiver;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.SDES =>
+                switch (s)
+                {
+                    case sdes:SourceDescriptionPacket from BinaryDecoder<SourceDescriptionPacket> =>
+                        int length = sdes.Length * 4 + 4;
+                        sdes.PaddingForP = Padding(sdes.P, s);
+                        sdes.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        dispatch endpoint Node accepts sdes;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.BYE =>
+                switch (s)
+                {
+                    case bye:GoodbyeRTCPPacket from BinaryDecoder<GoodbyeRTCPPacket> =>
+                        int length = bye.Length * 4 + 4;
+                        bye.PaddingForP = Padding(bye.P, s);
+                        bye.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        dispatch endpoint Node accepts bye;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.APP =>
+                switch (s)
+                {
+                    case app:ApplicationDefinedRTCPPacket from BinaryDecoder<ApplicationDefinedRTCPPacket> =>
+                        int length = app.Length * 4 + 4;
+                        if ((startIndex + length <= s.ByteLength) && (length > 12))
+                        {
+                            byte padLength = app.P ? s.PeekByte(8 * (startIndex + length - 1)) : 0;
+                            // ApplicationDependentData
+                            uint appDataLength = (length - 12 - padLength) as uint;
+                            if (BinaryDecoder<Blob[appDataLength]>(s) is appData:Blob)
+                                app.ApplicationDependentData = appData.Data as array<byte>;
+                            app.PaddingForP = Padding(app.P, s);
+                            app.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        }
+                        dispatch endpoint Node accepts app;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.RTPFB =>
+                switch (s)
+                {
+                    case rtpfb: TransportLayerFeedbackMessage from BinaryDecoder<TransportLayerFeedbackMessage> =>
+                        int length = rtpfb.Length * 4 + 4;
+                        rtpfb.PaddingForP = Padding(rtpfb.P, s);
+                        rtpfb.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        dispatch endpoint Node accepts rtpfb;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.PSFB =>
+                switch (s)
+                {
+                    case psfb: PayloadSpecificFeedbackMessage from BinaryDecoder<PayloadSpecificFeedbackMessage> =>
+                        int length = psfb.Length * 4 + 4;
+                        psfb.PaddingForP = Padding(psfb.P, s);
+                        psfb.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        dispatch endpoint Node accepts psfb;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            case RTCPControlPacketTypes.XR =>
+                switch (s)
+                {
+                    case xr:ExtendedReportPacket from BinaryDecoder<ExtendedReportPacket> =>
+                        int length = xr.Length * 4 + 4;
+                        ValidationCheck((startIndex + length <= s.ByteLength), xr, 
+                        () => "Incomplete XR (RTP Control Protocol Extended Reports):package length(" + Utility.DecToHexFormat(length) + ") > binary length(" + Utility.DecToHexFormat(s.ByteLength - startIndex) + ")");
+                        ValidationCheck((length >= 8), xr, 
+                        () => "Incomplete XR (RTP Control Protocol Extended Reports):package length(" + Utility.DecToHexFormat(length) + ") < header length(8)");
+                        if ((startIndex + length <= s.ByteLength) && (length > 8))
+                        {
+                            // The last octet of the padding is a count of how many padding octets should be ignored, including itself
+                            byte padLength = xr.P ? s.PeekByte(8 * (startIndex + length - 1)) : 0;
+                            // The total length of blocks
+                            uint blockLength = (length - 8 - padLength) as uint;
+                                
+                            if (BinaryDecoder<Blob[blockLength]>(s) is blocks:Blob)
+                            {
+                                xr.ReportBlocks = BinaryDecoder<array<XRReportBlocks>>(blocks.Data) as array<XRReportBlocks>;
+                            }
+                            xr.PaddingForP = Padding(xr.P, s, padLength);
+                            xr.Padding = Padding(s, length - (s.BytePosition - startIndex));
+                        }
+                        dispatch endpoint Node accepts xr;
+                    default =>
+                        DecodeAndDispatchEncryptedPortion(s);
+                }
+            default =>
+                DecodeAndDispatchEncryptedPortion(s);
+        }
+    }
+}
+
+void DecodeAndDispatchEncryptedPortion(stream s)
+{
+    switch (s)
+    {
+        case ep:EncryptedPacket from BinaryDecoder<EncryptedPacket> =>
+            dispatch endpoint Node accepts ep;
+        default =>
+            ThrowDecodingException("RTCP");
+    }
+}
+
+/* P - Need padding if it's set
+ * PadLength - The length of padding data
+ */
+optional array<byte> Padding(bool P, stream s, byte padLength)
+{
+    if (P)
+    {
+        return Padding(s, padLength);
+    }
+    return nothing;
+}
+
+optional array<byte> Padding(stream s, int padLength)
+{
+    if (padLength > 0)
+    {
+        var pad = BinaryDecoder<Blob[padLength as uint]>(s);
+        if (pad == nothing)
+        {
+            return nothing;
+        }
+        return (pad as Blob).Data as array<byte>;
+    }
+    return nothing;
+}
+
+// Padding to 32-bit boundry
+optional array<byte> Padding(bool P, stream s)
+{
+    if (P)
+    {
+        byte padLength = (4 - s.BytePosition % 4) as byte;
+        return Padding(s, padLength);
+    }
+    return nothing;
+}
+
+// In order to pass message as parameter in dispatcher
+message IPacket
+{
+}
+
+// rfc 3550 6.4.1 SR: Sender Report RTCP Packet
+message SenderReportPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte ReportCount with BinaryEncoding{Width = 5};
+    
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.SR) PacketType;
+    // The length of the RTCP packet in 32-bit words minus one
+    ushort Length;
+    uint SSRCOfSender;
+    // DateTime has 8 byte and can't be used for NTPTimeStamp or RTPTimeStamp
+    uint NTPTimeStampMostSignificantWord;
+    uint NTPTimeStampLeastSignificantWord;
+    uint RTPTimeStamp;
+    uint SenderPacketCount;
+    uint SenderOctetCount;
+    
+    array<ReportBlock> ReportBlock with BinaryEncoding{Length = ReportCount};
+    
+    optional any ProfileSpecificExtensions with Encoding{Ignore = true};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+        
+    override string ToString()
+    {
+        return "SR: Sender Report RTCP Packet, Length: " + (Length.ToString());
+    }
+}
+
+type ReportBlock
+{
+    uint SSRCIdentifier;
+    byte FractionLost;
+    uint CumulativeNumberOfPacketsLost with BinaryEncoding{Width = 24};
+    uint ExtendedHigthestSequenceNumberReceived;
+    uint InterarrivalJitter;
+    uint LastSR;
+    uint DelaySinceLastSR;
+}
+
+// rfc 3550 6.4.2 RR: Receiver Report RTCP Packet
+message ReceiverReportPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte ReportCount with BinaryEncoding{Width = 5};
+    
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.RR) PacketType;
+    ushort Length;
+    uint SSRCOfPacketSender;
+    array<ReportBlock> ReportBlock with BinaryEncoding{Length = ReportCount};
+    
+    optional any ProfileSpecificExtensions with Encoding{Ignore = true};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+        
+    override string ToString()
+    {
+        return "RR: Receiver Report RTCP Packet, Length: " + (Length.ToString());
+    }
+}
+
+// rfc 3550 6.5 SDES: Source Description RTCP Packet
+message SourceDescriptionPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte SourceCount with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.SDES) PacketType;
+    ushort Length;
+    array<SourceDescriptionChunk[Length]> Chunk with BinaryEncoding{Length = SourceCount};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return "SDES: Source Description RTCP Packet, Length: " + (Length.ToString());
+    }
+}
+
+type SourceDescriptionChunk[ushort Length]
+{
+    uint SSRCOrCSRCIdentifier;
+    array<SDESItem> SDESItems;
+    /* The list of items in each chunk MUST be terminated by one or more null octets, the first of which is
+     * interpreted as an item type of zero to denote the end of the list.
+     */
+    SEDSType End where value == SEDSType.End;
+    // Each chunk starts on a 32-bit boundary
+    optional [|(GetSDESItemsLength() + 1) % 4 != 0|] array<byte> Padding with BinaryEncoding{Length = (4 - (GetSDESItemsLength() + 1) % 4)};
+
+    uint GetSDESItemsLength()
+    {
+        uint length = 0;
+        foreach (SDESItem item in SDESItems)
+            length += item.ItemLength();
+        return length;
+    }
+}
+
+type SDESItem
+{
+    (CanonicalEndPointEdentifier |
+    UserName                     |
+    ElectronicMailAddress        |
+    PhoneNumber                  |
+    GeographicUserLocation       |
+    ApplicationOrToolName        |
+    NoticeStatus                 |
+    RprivateExtensions) Item;
+    
+    uint ItemLength()
+    {
+        switch (Item)
+        {
+            case item: SDESItemBase => return (item.Length + 2) as uint;
+            default => throw "error";
+        }
+    }
+}
+
+type SDESItemBase
+{
+    SEDSType Type;
+    byte Length;
+}
+
+// rfc 3550 6.5.1 CNAME: Canonical End-Point Identifier SDES Item
+type CanonicalEndPointEdentifier: SDESItemBase
+{
+    invariant Type == SEDSType.CName;
+    // Future Reference: Use UTF-8 when it's supported
+    string UserAndDomainName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.2 NAME: User Name SDES Item
+type UserName: SDESItemBase
+{
+    invariant Type == SEDSType.Name;
+    // Future Reference: Use UTF-8 when it's supported
+    string CommonNameOfSource with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.3 EMAIL: Electronic Mail Address SDES Item
+type ElectronicMailAddress: SDESItemBase
+{
+    invariant Type == SEDSType.Email;
+    // Future Reference: Use UTF-8 when it's supported
+    string EmailAddressOfSource with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.4 PHONE: Phone Number SDES Item
+type PhoneNumber: SDESItemBase
+{
+    invariant Type == SEDSType.Phone;
+    // Future Reference: Use UTF-8 when it's supported
+    string PhoneNumberOfSource with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.5 LOC: Geographic User Location SDES Item
+type GeographicUserLocation: SDESItemBase
+{
+    invariant Type == SEDSType.Loc;
+    // Future Reference: Use UTF-8 when it's supported
+    string GeographicLocationOfSite with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.6 TOOL: Application or Tool Name SDES Item
+type ApplicationOrToolName: SDESItemBase
+{
+    invariant Type == SEDSType.Tool;
+    // Future Reference: Use UTF-8 when it's supported
+    string NameOrVersionOfSourceApplication with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.7 NOTE: Notice/Status SDES Item
+type NoticeStatus: SDESItemBase
+{
+    invariant Type == SEDSType.Note;
+    // Future Reference: Use UTF-8 when it's supported
+    string NoteAboutTheSource with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.5.8 PRIV: Private Extensions SDES Item
+type RprivateExtensions: SDESItemBase
+{
+    invariant Type == SEDSType.Priv;
+    byte PrefixLength;
+    // Future Reference: Use UTF-8 when it's supported
+    string PrefixString with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = PrefixLength};
+    string ValueString with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+// rfc 3550 6.6 BYE: Goodbye RTCP Packet
+message GoodbyeRTCPPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte SourceCount with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.BYE) PacketType;
+    ushort Length;
+    
+    array<uint> SSRCOrCSRC with BinaryEncoding{Length = SourceCount};
+    optional byte LeavingReasonLength;
+    optional [|!(LeavingReasonLength is nothing)|] string ReasonForLeaving with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = LeavingReasonLength as byte};
+    optional [|!(LeavingReasonLength is nothing) && ((LeavingReasonLength as byte) + 1) % 4 != 0|] array<byte> PadTo32bitBoundary with BinaryEncoding{Length = (4 - ((LeavingReasonLength as byte) + 1) % 4)};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+        
+    override string ToString()
+    {
+        return "BYE: Goodbye RTCP Packet" + ", Length: " + (Length.ToString());
+    }
+}
+
+// rfc 3550 6.7 APP: Application-Defined RTCP Packet
+message ApplicationDefinedRTCPPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte SubType with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.APP) PacketType;
+    ushort Length;
+    
+    uint SSRCOrCSRC;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 4};
+    optional array<byte> ApplicationDependentData with Encoding{Ignore = true};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return "APP: Application-Defined RTCP Packet" + ", Length: " + (Length.ToString());
+    }
+}
+
+// rfc 3611 2.  XR Packet Format
+message ExtendedReportPacket:IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.XR) PacketType;
+    ushort Length;
+    
+    uint SSRC;
+    // Decodes manully in decoder
+    array<XRReportBlocks> ReportBlocks with Encoding{Ignore = true};
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return "XR Packet Format" + ", Length: " + (Length.ToString());
+    }
+}
+
+type XRReportBlocks
+{
+    (LossRLEReportBlock | 
+     DuplicateRLEReportBlock | 
+     PacketReceiptTimesReportBlock | 
+     ReceiverReferenceTimeReportBlock | 
+     DLRRReportBlock | 
+     StatisticsSummaryReportBlock | 
+     VoIPMetricsReportBlock) ReportBlocks;
+}
+
+// rfc 3611 4.1.  Loss RLE Report Block
+type LossRLEReportBlock
+{
+    (BlockType where value == BlockType.LossRLE) Type;
+    byte Reserved with BinaryEncoding{Width = 4};
+    byte Thinning with BinaryEncoding{Width = 4};
+    ushort BlockLength;
+    
+    uint SSRCOfSource;
+    ushort BeginSequence;
+    ushort EndSequence;
+    array<RLEReportBlockChunk> Chunks;
+    ushort TerminatingNull where ValidationCheck(value == 0, null, "RTCP: LossRLEReportBlock.TerminatingNull must be zero.");
+}
+
+type RLEReportBlockChunk
+{
+    (RunLengthChunk | BitVector) Chunk;
+}
+
+type RunLengthChunk
+{
+    (bool where !value) ChunkType with BinaryEncoding{Width = 1};
+    bool RunType with BinaryEncoding{Width = 1};
+    ushort RunLength where ValidationCheck(value != 0, null, "RTCP: RunLengthChunk.RunLength must be zero.");
+}
+
+type BitVector
+{
+    (bool where value) ChunkType with BinaryEncoding{Width = 1};
+    ushort BitVector with BinaryEncoding{Width = 15};
+}
+
+// rfc 3611 4.2.  Duplicate RLE Report Block
+type DuplicateRLEReportBlock
+{
+    (BlockType where value == BlockType.DuplicateRLE) Type;
+    byte Reserved with BinaryEncoding{Width = 4};
+    byte Thinning with BinaryEncoding{Width = 4};
+    ushort BlockLength;
+    
+    uint SSRCOfSource;
+    ushort BeginSequence;
+    ushort EndSequence;
+    array<RLEReportBlockChunk> Chunks;
+    ushort TerminatingNull where ValidationCheck(value == 0, null, "RTCP: DuplicateRLEReportBlock.TerminatingNull must be zero.");
+}
+
+// rfc 3611 4.3.  Packet Receipt Times Report Block
+type PacketReceiptTimesReportBlock
+{
+    (BlockType where value == BlockType.PacketReceiptTimes) Type;
+    byte Reserved with BinaryEncoding{Width = 4};
+    byte Thinning with BinaryEncoding{Width = 4};
+    ushort BlockLength;
+    
+    uint SSRCOfSource;
+    ushort BeginSequence;
+    ushort EndSequence;
+    array<uint> ReceiptTimes with BinaryEncoding{Length = (BlockLength * 4 + 4 - 12) / 4};
+}
+
+// rfc 3611 4.4.  Receiver Reference Time Report Block
+type ReceiverReferenceTimeReportBlock
+{
+    (BlockType where value == BlockType.ReceiverReferenceTime) Type;
+    byte Reserved where ValidationCheck(value == 0, null, "RTCP: ReceiverReferenceTimeReportBlock.Reserved must be zero.");
+    ushort BlockLength where ValidationCheck(value == 2, null, "RTCP: ReceiverReferenceTimeReportBlock.BlockLength must be 2.");
+    // WORKAROUND: Bug #31163 - DateTime not works, unhandled exception: inconsistent metadata: inconsistent signature for field System.DateTime datetime
+    long NTPTimestamp;
+}
+
+// rfc 3611 4.5.  DLRR Report Block
+type DLRRReportBlock
+{
+    (BlockType where value == BlockType.DLRR) Type;
+    byte Reserved where ValidationCheck(value == 0, null, "RTCP: DLRRReportBlock.Reserved must be zero.");
+    ushort BlockLength;
+    
+    // The length of the RTCP packet in 32-bit words minus one
+    array<DLRRSubBlock> Blocks with BinaryEncoding{Length = (BlockLength * 4) / 12};
+}
+
+type DLRRSubBlock
+{
+    uint SSRC;
+    uint LastRR;
+    uint DelaySinceLastRR;
+}
+
+// rfc 3611 4.6.  Statistics Summary Report Block
+type StatisticsSummaryReportBlock
+{
+    (BlockType where value == BlockType.StatisticsSummary) Type;
+    bool LossReport with BinaryEncoding{Width = 1};
+    bool DuplicateReport with BinaryEncoding{Width = 1};
+    bool Jitter with BinaryEncoding{Width = 1};
+    byte TTLOrHopLimit with BinaryEncoding{Width = 2};
+    byte Reserved with BinaryEncoding{Width = 3};
+    ushort BlockLength where ValidationCheck(value == 9, null, "RTCP: StatisticsSummaryReportBlock.BlockLength must be 9.");
+    
+    ushort SSRCOfSource;
+    ushort BeginSequence;
+    ushort EndSequence;
+    uint LostPackets;
+    uint DuplicatePlackets;
+    uint MinJitter;
+    uint MaxJitter;
+    uint MeanJitter;
+    uint DevJitter;
+    byte MinTTLOrHL;
+    byte MaxTTLOrHL;
+    byte MeanTTLOrHL;
+    byte DevTTLOrHL;
+}
+
+// rfc 3611 4.7.  VoIP Metrics Report Block
+type VoIPMetricsReportBlock
+{
+    (BlockType where value == BlockType.VoIPMetrics) Type;
+    byte Reserved where ValidationCheck(value == 0, null, "RTCP: VoIPMetricsReportBlock.Reserved must be zero.");
+    ushort BlockLength where ValidationCheck(value == 8, null, "RTCP: VoIPMetricsReportBlock.BlockLength must be 8.");
+    
+    uint SSRCOfSource;
+    byte LossRate;
+    byte DiscardRate;
+    byte BurstDesity;
+    byte GapDensity;
+    ushort BurstDuration;
+    ushort GapDuration;
+    ushort RoundTripDelay;
+    ushort EndSystemDelay;
+    byte SignalLevel;
+    byte NoiseLevel;
+    byte RERL;
+    byte Gmin;
+    byte RFactor;
+    byte ExtRFactor;
+    byte MOSLQ;
+    byte MOSCQ;
+    byte RXConfig;
+    byte Reserved1 where ValidationCheck(value == 0, null, "RTCP: VoIPMetricsReportBlock.Reserved1 must be zero.");
+    ushort JBNominal;
+    ushort JBMaximum;
+    ushort JBAbsMax;
+}
+
+// rfc 4585 6.2.   Transport Layer Feedback Messages
+message TransportLayerFeedbackMessage: IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte FeedbackMessageType with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.RTPFB) PacketType;
+    ushort Length;
+    uint SSRCOfPacketSender;
+    uint SSRCOfMediaSource;
+    
+    ([|FeedbackMessageType == 1|] GenericNACK | Blob[(Length * 4 + 4 - 12) as uint]) FeedbackControlInformation;
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        return "RTPFB: Transport Layer Feedback Messages" + ", Length: " + (Length.ToString());
+    }
+}
+
+type GenericNACK
+{
+    ushort PacketID;
+    ushort BitmaskOfLostPackets;
+}
+
+// rfc 4585 6.3.  Payload-Specific Feedback Messages
+message PayloadSpecificFeedbackMessage: IPacket
+{
+    byte Version where ValidationCheck(value == 2, this, "Version must be 2.") with BinaryEncoding{Width = 2};
+    bool P with BinaryEncoding{Width = 1};
+    byte FeedbackMessageType with BinaryEncoding{Width = 5};
+    (RTCPControlPacketTypes where value == RTCPControlPacketTypes.PSFB) PacketType;
+    ushort Length;
+    uint SSRCOfPacketSender;
+    uint SSRCOfMediaSource;
+    // There MUST NOT be any Feedback Control Information
+    ([|FeedbackMessageType == 1|] Blob[0] |
+     [|FeedbackMessageType == 2|] SliceLossIndication |
+     [|FeedbackMessageType == 3|] ReferencePictureSelectionIndication[(Length * 4 + 4 - 12) as ushort] |
+     // For unassigned FeedbackMessageType and Application layer FB (AFB) message type(15) 
+     Blob[(Length * 4 + 4 - 12) as uint]) FeedbackControlInformation;
+    // The padding for P bit
+    optional array<byte> PaddingForP with Encoding{Ignore = true};
+    // The padding to meet Length
+    optional array<byte> Padding with Encoding{Ignore = true};
+    
+    override string ToString()
+    {
+        return "PSFB: Payload-Specific Feedback Messages" + ", Length: " + (Length.ToString());
+    }
+}
+
+// rfc 3550 9.1 Confidentiality
+message EncryptedPacket: IPacket
+{
+    uint RandomNumberRedrawn;
+    binary EncryptedPacket;
+    
+    override string ToString()
+    {
+        return "Encrypted Message";
+    }
+}
+
+type SliceLossIndication
+{
+    ushort First with BinaryEncoding{Width = 13};
+    ushort Number with BinaryEncoding{Width = 13};
+    ushort PictureID with BinaryEncoding{Width = 6};
+}
+
+type ReferencePictureSelectionIndication[ushort Length]
+{
+    byte PB;
+    byte Resolved where ValidationCheck(value == 0, null, "RTCP: ReferencePictureSelectionIndication.Resolved must be zero.") with BinaryEncoding{Width = 1};
+    byte PayloadType with BinaryEncoding{Width = 7};
+    uint NativeRPSIBitString with BinaryEncoding{Width = (32 - PB)};
+    uint Padding with BinaryEncoding{Width = PB};
+}
+
+pattern BlockType = enum byte
+{
+    LossRLE                             = 1,
+    DuplicateRLE                        = 2,
+    PacketReceiptTimes                  = 3,
+    ReceiverReferenceTime               = 4,
+    DLRR                                = 5,
+    StatisticsSummary                   = 6,
+    VoIPMetrics                         = 7,
+};
+
+/* Future Reference: Add MS part for profile-specific extenstions.
+ * Ref: http://msdn.microsoft.com/en-us/library/dd920967(v=office.12).aspx
+ */
+type ProfileSpecificExtensions[ushort Length]
+{
+    binary ExtensionInfo with BinaryEncoding{Length = Length};
+}
+
+// Joins the source/destination address and port values as one binary value
+binary MakeBinary(binary sourceAddress, binary destinationAddress, ushort port)
+{
+    if (sourceAddress <= destinationAddress)
+    {
+        return sourceAddress + destinationAddress + port.ToBinary();
+    }
+    else
+    {
+        return destinationAddress + sourceAddress + port.ToBinary();
+    }
+}

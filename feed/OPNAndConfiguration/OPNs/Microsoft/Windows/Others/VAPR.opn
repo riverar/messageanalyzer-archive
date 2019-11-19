@@ -1,0 +1,332 @@
+protocol VAPR with
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII},
+XmlEncodingDefaults{Namespace = ""},
+Documentation
+{
+    ProtocolName = "Virtual Application Publishing and Reporting (App-V) Protocol",
+    ShortName = "VARP",
+    DocumentName = "MS-VAPR",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-VAPR", Version = "2.0", Date = "06/01/2017", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+        new Revision {Class = RevisionClass.Major, Version = "", Date = ""}
+    ]
+};
+
+using HTTP;
+using Utility;
+using Configurations;
+
+endpoint Server over HTTP.Server
+    accepts GetPackageRequest issues GetPackageResponse
+    accepts SetReportRequest;
+
+autostart actor VAPRServerOverHTTP(HTTP.Server server)
+{
+    bool isVAPRGetPackageRequestReceived = false;
+    ClientVersion clientVersion;
+    ClientOS clientOS;
+    VAPRConfiguration config = GetConfigurableValue<VAPRConfiguration>();
+
+    process server accepts httpRequest:HttpContract.Request where IsVAPRGetPackageRequest(httpRequest, out clientVersion, out clientOS)
+    {
+        isVAPRGetPackageRequestReceived = true;
+        
+        var msg = new GetPackageRequest
+        {
+            ClientVersion = clientVersion,
+            ClientOS = clientOS,
+        };
+        clientVersion = null;
+        clientOS = null;
+
+        dispatch (endpoint VAPR.Server over server) accepts msg;
+    }
+
+    // This solution of GetPackage response identification is based on the assumption that
+    // HTTP response follows HTTP request and there is no other HTTP messages between the
+    // HTTP request and response on the same HTTP server endpoint.
+    // The solution does not work in the HTTP pipeline scenario.
+    process server issues httpResponse:HttpContract.Response where isVAPRGetPackageRequestReceived
+    {
+        isVAPRGetPackageRequestReceived = false;
+
+        switch (httpResponse.Payload)
+        {
+            case getPackageResponse:GetPackageResponse from XmlDecoder<GetPackageResponse> =>
+                dispatch (endpoint VAPR.Server over server) issues getPackageResponse;
+            default =>
+                ThrowDecodingException("VAPR", "GetPackageResponse");
+        }
+    }
+
+    // SetReport request is in HTTP Payload and there is not identity in HTTP URI path or HTTP header. 
+    // Also SetReport request is XML encoded but with empty namespace.
+    // So it is hard to identify SetReport request from HTTP request efficiently. And it is not good performance
+    // to try decode SetReport from each HTTP request payload.
+    // 
+    // Parsing Configuration solution has the better performance to identify SetReport request.
+    process server accepts httpRequest:HttpContract.Request
+        where httpRequest.Method == "POST" && httpRequest.Payload.Count > 0 &&
+            ContainsReportingUri(ref config.ReportingUris, httpRequest.Uri.ToString())
+    {
+        if (BinaryStringDecoder(httpRequest.Payload, TextEncoding.UTF16) is str:string)
+        {
+            switch (str)
+            {
+                case setReportRequest:SetReportRequest from XmlDecoder<SetReportRequest> =>
+                    dispatch (endpoint VAPR.Server over server) accepts setReportRequest;
+                default =>
+                    ThrowDecodingException("VAPR", "SetReportRequest");
+            }
+        }
+        else
+        {
+            ThrowDecodingException("VAPR", "SetReportRequest");
+        }
+    }
+
+    bool IsVAPRGetPackageRequest(HttpContract.Request request, out ClientVersion clientVersion, out ClientOS clientOS)
+    {
+        clientVersion = null;
+        clientOS = null;
+        if (request.Method == "GET" && request.Uri.Query is parameters:map<string, string> &&
+            parameters.Keys["ClientVersion"] && parameters.Keys["ClientOS"])
+        {
+            if (ClientVersionSyntax(parameters["ClientVersion"]) is clientVersionTmp:ClientVersion)
+            {
+                clientVersion = clientVersionTmp;
+            }
+            if (ClientOSSyntax(parameters["ClientOS"]) is clientOSTmp:ClientOS)
+            {
+                clientOS = clientOSTmp;
+            }
+
+            isVAPRGetPackageRequestReceived = clientVersion != null && clientOS != null;
+            return clientVersion != null && clientOS != null;
+        }
+        else
+        {
+            return false;
+        }
+    }
+}
+
+// ------------------------------------- Syntax ---------------------------------------------//
+syntax ClientVersionSyntax = v1:regex{[0-9]{1,5}} "." v2:regex{[0-9]{1,5}} "." v3:regex{[0-9]{1,5}} "." v4:regex{[0-9]{1,5}}
+    => new ClientVersion
+        {
+            VersionValue1 = v1,
+            VersionValue2 = v2,
+            VersionValue3 = v3,
+            VersionValue4 = v4,
+        };
+
+syntax ClientOSSyntax = cs:("WindowsClient" | "WindowsServer") "_" osv:OSVersionSyntax "_" ob:("x86" | "x64")
+    => new ClientOS
+        {
+            ClientServer = cs,
+            OSVersion = osv,
+            OSBitness = ob,
+        };
+    
+syntax OSVersionSyntax = major:regex{[0-9]{1,10}} "." minor:regex{[0-9]{1,10}}
+    => new OSVersion
+        {
+            OSVersionValueMajor = major,
+            OSVersionValueMinor = minor
+        };
+
+// ------------------------------------- Messages & Types ---------------------------------------------//
+message GetPackageRequest
+{
+    ClientVersion ClientVersion;
+    ClientOS ClientOS;
+
+    override string ToString()
+    {
+        return "GetPackageRequest, ClientVersion: " + ClientVersion.ToString() +
+            ", ClientOS: " + ClientOS.ToString();
+    }
+}
+
+message GetPackageResponse
+{
+    optional Packages Packages;
+    optional Group Group;
+    decimal Protocol 
+        where ValidationCheckValue(value == (2.0 as decimal), this, true, ReferenceType.Message,
+            "VAPR", "Protocol", "GetPackageResponse", "2.0", value)
+        with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "GetPackageResponse, Protocol: " + Protocol.ToString();
+    }
+}
+
+message SetReportRequest
+{
+    PKG_LIST PKG_LIST;
+    APP_RECORDS APP_RECORDS;
+    string Host with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Ver with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string ProcessorArch with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string OSVer with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    byte OSServicePack with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string OSType with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+
+    override string ToString()
+    {
+        return "SetReportRequest, Host: " + Host +
+            ", Ver: " + Ver + ", ProcessorArch: " + ProcessorArch +
+            ", OSVer: " + OSVer + ", OSServicePack: " + OSServicePack.ToString() +
+            ", OSType: " + OSType;
+    }
+}
+
+type ClientVersion
+{
+    string VersionValue1;
+    string VersionValue2;
+    string VersionValue3;
+    string VersionValue4;
+
+    override string ToString()
+    {
+        return VersionValue1 + "." + VersionValue2 + "." + VersionValue3 + "." + VersionValue4;
+    }
+}
+
+type ClientOS
+{
+    string ClientServer;
+    OSVersion OSVersion;
+    string OSBitness;
+
+    override string ToString()
+    {
+        return ClientServer + "_" + OSVersion.ToString() + "_" + OSBitness;
+    }
+}
+
+type OSVersion
+{
+    string OSVersionValueMajor;
+    string OSVersionValueMinor;
+
+    override string ToString()
+    {
+        return OSVersionValueMajor + "." + OSVersionValueMinor;
+    }
+}
+
+type Packages
+{
+    // WORKAOURND: OPN XML codec does not accept an empty array. 
+    // Add optional keyword so that decoding will not fail if zero elements.
+    optional array<PublishingPackage> Package;
+}
+
+type PublishingPackage
+{
+    optional DeploymentConfiguration DeploymentConfiguration;
+    optional UserConfiguration UserConfiguration;
+    string PackageUrl with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string VersionId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string PackageId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type DeploymentConfiguration
+{
+    DateTime Timestamp with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Path with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    ushort ConfigurationId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type UserConfiguration
+{
+    bool Conflict with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    DateTime Timestamp with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Path with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    ushort ConfigurationId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type Group
+{
+    // WORKAOURND: OPN XML codec does not accept an empty array. 
+    // Add optional keyword so that decoding will not fail if zero elements.
+    optional array<GroupPackage> Package;
+    string VersionID with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Name with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    byte Priority with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string GroupId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type GroupPackage
+{
+    string VersionId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string PackageId with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    bool VersionOptional with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    bool PackageOptional with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type PKG_LIST
+{
+    // WORKAOURND: OPN XML codec does not accept an empty array. 
+    // Add optional keyword so that decoding will not fail if zero elements.
+    optional array<PKG_DATA> PKG_DATA;
+}
+
+type PKG_DATA
+{
+    string Guid with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string VerGuid with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Name with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Ver with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string Source with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional byte PctCached with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+type APP_RECORDS
+{
+    // WORKAOURND: OPN XML codec does not accept an empty array. 
+    // Add optional keyword so that decoding will not fail if zero elements.
+    optional array<APP_RECORD> APP_RECORD;
+}
+
+type APP_RECORD
+{
+    string Name with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Ver with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string Server with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string User with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string PackageVersion with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional string ConnectionGroupVersion with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    DateTime Launched with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    string LaunchStatus with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+    optional DateTime Shutdown with XmlEncoding{Kind = XmlKind.Attribute, Namespace = ""};
+}
+
+// ------------------------------------- Utilities ---------------------------------------------//
+bool ContainsReportingUri(ref set<string> reportingUris, string reportingUri)
+{
+    reportingUri = reportingUri.ToLower();
+    foreach (var uri in reportingUris)
+    {
+        if (uri.ToLower() == reportingUri)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}

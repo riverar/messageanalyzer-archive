@@ -1,0 +1,211 @@
+protocol OAPX with
+JsonEncodingDefaults{},
+Documentation
+{
+    ProtocolName = "OAuth 2.0 Protocol Extensions",
+    ShortName = "OAPX",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference{Name = "MS-OAPX", Version = "8.0", Date = "09/15/2017", ProgramName = ProgramName.WSPP},
+    ],
+    RevisionSummary =
+    [
+        new Revision{Class = RevisionClass.Major, Version = "381536", Date = "09/29/2015"},
+    ]
+};
+
+using HTTP;
+using OAuth2;
+using Standard;
+using OIDCE;
+using JWT;
+
+autostart actor OAPXExtendingOAuth2(OAuth2.AuthorizationServer server)
+{
+    observe server accepts authReq:OAuth2.AuthorizationRequest
+    {
+        if (DecodeOAPXAuthorizationRequestParameters(ref authReq) is oapxParams:OAPXAuthorizationRequestParameters)
+        {
+            array<ParameterExtension> extensions = (authReq.parameterExtensions == nothing) ? [] : authReq.parameterExtensions as array<ParameterExtension>;
+            extensions += [oapxParams];
+            authReq.parameterExtensions = extensions;
+        }
+    }
+
+    observe server accepts tokenReq:OAuth2.AccessTokenRequest
+    {
+        if (DecodeOAPXAccessTokenRequestParameters(ref tokenReq) is tokenParams:OAPXAccessTokenRequestParameters)
+        {
+            if (tokenParams.requested_token_use != nothing || tokenParams.resource != nothing || tokenParams.use_windows_client_authentication != nothing ||
+                tokenParams.csr != nothing || tokenParams.csr_type != nothing || tokenParams.x5c != nothing)
+            {
+                array<ParameterExtension> extensions = (tokenReq.parameterExtensions == nothing) ? [] : tokenReq.parameterExtensions as array<ParameterExtension>;
+                extensions += [tokenParams];
+                tokenReq.parameterExtensions = extensions;
+            }
+        }
+    }
+
+    observe server issues tokenRes:OAuth2.AccessTokenResponse
+    {
+        if (((tokenRes.Origins)[0] is httpRes:HttpContract.Response) && JsonDecoder<OAPXAccessTokenResponseParameters>(httpRes.Payload) is tokenParams:OAPXAccessTokenResponseParameters)
+        {
+            if (tokenParams.resource != nothing || tokenParams.x5c != nothing)
+            {
+                array<ParameterExtension> extensions = (tokenRes.parameterExtensions == nothing) ? [] : tokenRes.parameterExtensions as array<ParameterExtension>;
+                extensions += [tokenParams];
+                tokenRes.parameterExtensions = extensions;
+            }
+        }
+    }
+}
+
+// this message contains extension fields of OAPX
+type OAPXAuthorizationRequestParameters:ParameterExtension
+{
+    /*in HTTP Uri query*/
+    // 2.2.2.1, OPTIONAL
+    optional string resource;
+    // 2.2.2.2, OPTIONAL, base64 URL encoded JSON-formatted string
+    optional (resource_params | string) resource_params;
+    // 2.2.2.3, OPTIONAL, 
+    optional string ClientRequestId;
+    // 2.2.2.4, OPTIONAL
+    optional string login_hint;
+    optional string username;
+    // 2.2.2.5, OPTIONAL
+    optional string domain_hint;
+    // 2.2.2.6, OPTIONAL
+    optional string nonce;
+    // 2.2.2.7, OPTIONAL
+    optional PromptType prompt;
+    // 2.2.2.8, OPTIONAL
+    optional string max_age;
+    // 2.2.2.9, OPTIONAL
+    optional (JSONWebToken | string) id_token_hint;
+    // 2.2.2.10, OPTIONAL
+    optional string amr_values;
+    // 2.2.2.11, OPTIONAL
+    optional string mfa_max_age;
+    /* in HTTP header field */
+    optional string $"client-request-id";
+    
+    override string ToString()
+    {
+        return "OAPXAuthorizationRequestParameters, resource: " + (resource as string) + 
+            (login_hint != nothing ? (", login_hint: " + login_hint.ToString()) : "") +
+            (username != nothing ? (", username: " + username.ToString()) : "");
+    }
+}
+
+pattern PromptType = enum string
+{
+    None        = "none",
+    Login       = "login",
+    ...
+};
+
+type resource_params
+{
+    array<KeyValuePair> Properties;
+}
+
+type KeyValuePair
+{
+    string Key;
+    string Value;
+}
+
+const set<string> OXPXDefinedErrorCode = {"invalid_resource", "server_error"};
+
+optional OAPXAuthorizationRequestParameters DecodeOAPXAuthorizationRequestParameters(ref OAuth2.AuthorizationRequest authReq)
+{
+    if ((authReq.otherParameters is paras:map<string, string>) && paras.Count > 0 && paras.Keys["resource"])
+    {
+        OAPXAuthorizationRequestParameters oapx = new OAPXAuthorizationRequestParameters{};
+        // required field
+        oapx.resource = AssignFieldOrReportError(ref paras, "resource", "OAPXAuthorizationRequestParameters");
+        // optional field
+        var resourceParams = AssignField(ref paras, "resource_params");
+        if (resourceParams is resourceParamsStr:string)
+        {
+            if (Base64StringToBinary(resourceParamsStr as string) is bin:binary && JsonDecoder<resource_params>(bin) is v:resource_params)
+            {
+                oapx.resource_params = v;
+            }
+            else
+            {
+                oapx.resource_params = resourceParamsStr;
+            }
+        }
+
+        oapx.ClientRequestId = AssignField(ref paras, "ClientRequestId");
+        oapx.login_hint = AssignField(ref paras, "login_hint");
+        oapx.username = AssignField(ref paras, "username");
+        oapx.domain_hint = AssignField(ref paras, "domain_hint");
+        oapx.nonce = AssignField(ref paras, "nonce");
+        oapx.prompt = AssignField(ref paras, "prompt");
+        oapx.max_age = AssignField(ref paras, "max_age");
+        oapx.amr_values = AssignField(ref paras, "amr_values");
+        oapx.mfa_max_age = AssignField(ref paras, "mfa_max_age");
+        var idTokenHint = AssignField(ref paras, "id_token_hint");
+        oapx.id_token_hint = idTokenHint != nothing ? DecodeJWT<JWS_Header, OIDCE_IDToken_JWT_Claims, JWE_Header>(idTokenHint as string) : nothing;
+        authReq.otherParameters = (paras.Count() == 0) ? nothing : paras;
+        return oapx;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+type OAPXAccessTokenRequestParameters:ParameterExtension
+{
+    optional string requested_token_use;
+    optional string resource;
+    optional string use_windows_client_authentication;
+    optional string csr;
+    optional CsrType csr_type;
+    optional string x5c;
+    optional string tbidv2;
+}
+
+// section 2.2.3
+pattern CsrType = enum string
+{
+    CsrValue    = "http://schemas.microsoft.com/windows/pki/2009/01/enrollment#PKCS10",
+    ...
+};
+
+type OAPXAccessTokenResponseParameters:ParameterExtension
+{
+    optional string resource;
+    optional string x5c;
+}
+
+optional OAPXAccessTokenRequestParameters DecodeOAPXAccessTokenRequestParameters(ref OAuth2.AccessTokenRequest tokenReq)
+{
+    if (tokenReq.otherParameters is paras:map<string, string>)
+    {
+        var tokenParams = new OAPXAccessTokenRequestParameters{};
+        // Finally decode [MS-OAPX] extension fields.
+        tokenParams.requested_token_use = AssignField(ref paras, "requested_token_use");
+        tokenParams.resource = AssignField(ref paras, "resource");
+        tokenParams.use_windows_client_authentication = AssignField(ref paras, "use_windows_client_authentication");
+        tokenParams.csr = AssignField(ref paras, "csr");
+        tokenParams.csr_type = AssignField(ref paras, "csr_type");
+        tokenParams.x5c = AssignField(ref paras, "x5c");
+        tokenParams.tbidv2 = AssignField(ref paras, "tbidv2");
+        tokenReq.otherParameters = paras;
+        return tokenParams;
+    }
+    else 
+    {
+        return nothing;
+    }
+}

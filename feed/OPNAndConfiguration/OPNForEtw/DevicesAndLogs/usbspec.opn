@@ -1,0 +1,2056 @@
+protocol UsbSpec;
+using Etw;
+using EtwEvent;
+using Standard;
+using Utility;
+using Diagnostics;
+
+using NtStatusModule;
+using UsbMessageProt;
+
+//string Format(string format, any a, any b, any c, any d, any e, any f, any g, any h, any i, any j) { return ""; } // up to {9}
+//string Format(string format, array<any> a) { return ""; } // up to {9}
+//string Format(string format, any a, any b, any c) { return ""; }
+//string Format(string format, any a, any b) { return ""; }
+//string Format(string format, any a) { return ""; }
+
+string Format(string format) { return format; } // makes it easier to add/remove parameters
+
+string OptionalByteToHex(any optionalByte)
+{
+    optional byte temp = optionalByte as optional byte;
+    if (temp == nothing)
+    {
+                return "";
+     }
+     else
+     {
+                return DecToHexFormat(temp as byte);
+     }
+}
+string ByteToHex(any Byte)
+{
+    return DecToHexFormat(Byte as byte);
+}
+ulong UlongFromEtwPointer(EtwPointer pointer)
+{
+    if (pointer.pointerValue is uint) {
+        // Must unbox pointerValue as its original type before casting to ulong
+        return (pointer.pointerValue as uint) as ulong;
+    } else {
+        return pointer.pointerValue as ulong;
+    }
+}
+
+// TODO: #q: How will the user discover all devices in the trace? Pivoting on port path or device description gives an incomplete view. I want to know in 1 place, ideally for all devices at once:
+// - Description
+// - Port path
+// - Speed
+// - Driver name
+// Need views for this?
+
+// OPN features not implemented yet:
+// Collection patterns [Type1+]
+// Specify byte length of an array with unknown element length (supposed to be possible with BinaryEncoding{Width}
+
+//
+// --- USB-defined data types ---
+//
+
+pattern UsbRequestTypeRecipient = enum
+{
+    Device = 0,
+    Interface = 1,
+    Endpoint = 2,
+    Other = 3
+};
+
+pattern UsbRequestTypeType = enum
+{
+    Standard = 0,
+    Class = 1,
+    Vendor = 2
+};
+
+pattern UsbRequestTypeDirection = enum
+{
+    HostToDevice = 0,
+    DeviceToHost = 1
+};
+
+pattern UsbStandardSetupRequest = enum byte
+{
+    GET_STATUS        = 0,
+    CLEAR_FEATURE     = 1,
+    SET_FEATURE       = 3,
+    SET_ADDRESS       = 5,
+    GET_DESCRIPTOR    = 6,
+    SET_DESCRIPTOR    = 7,
+    GET_CONFIGURATION = 8,
+    SET_CONFIGURATION = 9,
+    GET_INTERFACE     = 10,
+    SET_INTERFACE     = 11,
+    SYNCH_FRAME       = 12,
+    SET_SEL           = 48,
+    SET_ISOCH_DELAY   = 49
+};
+
+pattern UsbHubSetupRequest = enum
+{
+    CLEAR_TT_BUFFER   = 8,
+    RESET_TT          = 9,
+    GET_TT_STATE      = 10,
+    STOP_TT           = 11,
+    SET_HUB_DEPTH     = 12,
+    GET_PORT_ERR_COUNT= 13,
+};
+
+pattern UsbDescriptorType = enum byte
+{
+    DEVICE                            = 1,
+    CONFIGURATION                     = 2,
+    STRING                            = 3,
+    INTERFACE                         = 4,
+    ENDPOINT                          = 5,
+    DEVICE_QUALIFIER                  = 6,
+    OTHER_SPEED_CONFIGURATION         = 7,
+    INTERFACE_POWER                   = 8, // may be defunct?
+    OTG                               = 9,
+    DEBUG                             = 10,
+    INTERFACE_ASSOCIATION             = 11,
+    BOS                               = 15,
+    DEVICE_CAPABILITY                 = 16,
+    SUPERSPEED_USB_ENDPOINT_COMPANION = 48,
+    //
+    // Explicitly allow other values for this type (will be displayed as a number)
+    //
+    ...
+};
+
+pattern UsbHubDescriptorType = enum byte
+{
+    HUB                               = 0x29,
+    SUPERSPEED_HUB                    = 0x2A,
+};
+
+pattern UsbDeviceFeature = enum ushort
+{
+    // Non-SS only:
+    DEVICE_REMOTE_WAKEUP = 1,
+    TEST_MODE            = 2,
+    // SS only:
+    U1_ENABLE            = 48,
+    U2_ENABLE            = 49,
+    LTM_ENABLE           = 50
+};
+
+pattern UsbInterfaceFeature = enum ushort
+{
+    // SS only:
+    FUNCTION_SUSPEND = 0
+};
+
+pattern UsbEndpointFeature = enum ushort
+{
+    ENDPOINT_HALT = 0
+};
+
+pattern UsbHubFeature = enum
+{
+    C_HUB_LOCAL_POWER = 0,
+    C_HUB_OVER_CURRENT = 1,
+};
+
+pattern UsbHubPortFeature = enum
+{
+    PORT_CONNECTION = 0,
+    PORT_ENABLE = 1, // 2.0 only
+    PORT_SUSPEND = 2, // 2.0 only
+    PORT_OVER_CURRENT = 3,
+    PORT_RESET = 4,
+    PORT_LINK_STATE = 5, // 3.0 only
+    PORT_POWER = 8,
+    PORT_LOW_SPEED = 9, // 2.0 only
+    C_PORT_CONNECTION = 16,
+    C_PORT_ENABLE = 17, // 2.0 only
+    C_PORT_SUSPEND = 18, // 2.0 only
+    C_PORT_OVER_CURRENT = 19,
+    C_PORT_RESET = 20,
+    PORT_TEST = 21, // 2.0 only
+    PORT_INDICATOR = 22, // 2.0 only
+    PORT_U1_TIMEOUT = 23, // 3.0 only
+    PORT_U2_TIMEOUT = 24, // 3.0 only
+    C_PORT_LINK_STATE = 25, // 3.0 only
+    C_PORT_CONFIG_ERROR = 26, // 3.0 only
+    PORT_REMOTE_WAKE_MASK = 27, // 3.0 only
+    BH_PORT_RESET = 28, // 3.0 only
+    C_BH_PORT_RESET = 29, // 3.0 only
+    FORCE_LINKPM_ACCEPT = 30, // 3.0 only
+};
+
+pattern UsbSpeed = enum
+{
+    LowSpeed = 0,
+    FullSpeed = 1,
+    HighSpeed = 2,
+    SuperSpeed = 3,
+};
+
+pattern UsbDeviceCapabilityType = enum byte
+{
+    Wireless_USB = 1,
+    USB_20_EXTENSION = 2,
+    SUPERSPEED_USB = 3,
+    CONTAINER_ID = 4,
+};
+
+pattern UsbLanguageId = enum ushort
+{
+    Afrikaans                  = 0x0436,
+    Albanian                   = 0x041c,
+    Arabic_Saudi_Arabia        = 0x0401,
+    Arabic_Iraq                = 0x0801,
+    Arabic_Egypt               = 0x0c01,
+    Arabic_Libya               = 0x1001,
+    Arabic_Algeria             = 0x1401,
+    Arabic_Morocco             = 0x1801,
+    Arabic_Tunisia             = 0x1c01,
+    Arabic_Oman                = 0x2001,
+    Arabic_Yemen               = 0x2401,
+    Arabic_Syria               = 0x2801,
+    Arabic_Jordan              = 0x2c01,
+    Arabic_Lebanon             = 0x3001,
+    Arabic_Kuwait              = 0x3401,
+    Arabic_UAE                 = 0x3801,
+    Arabic_Bahrain             = 0x3c01,
+    Arabic_Qatar               = 0x4001,
+    Armenian                   = 0x042b,
+    Assamese                   = 0x044d,
+    Azeri_Latin                = 0x042c,
+    Azeri_Cyrillic             = 0x082c,
+    $"Basque (Basque)"         = 0x042d,
+    Belarussian                = 0x0423,
+    Bangla                     = 0x0445,
+    Bulgarian                  = 0x0402,
+    Burmese                    = 0x0455,
+    Catalan                    = 0x0403,
+    Chinese_Taiwan             = 0x0404,
+    Chinese_PRC                = 0x0804,
+    Chinese_Hong_Kong_SAR_PRC  = 0x0c04,
+    Chinese_Singapore          = 0x1004,
+    Chinese_Macau_SAR          = 0x1404,
+    Croatian                   = 0x041a,
+    Czech                      = 0x0405,
+    Danish                     = 0x0406,
+    Dutch_Netherlands          = 0x0413,
+    Dutch_Belgium              = 0x0813,
+    English_United_States      = 0x0409,
+    English_United_Kingdom     = 0x0809,
+    English_Australian         = 0x0c09,
+    English_Canadian           = 0x1009,
+    English_New_Zealand        = 0x1409,
+    English_Ireland            = 0x1809,
+    English_South_Africa       = 0x1c09,
+    English_Jamaica            = 0x2009,
+    English_Caribbean          = 0x2409,
+    English_Belize             = 0x2809,
+    English_Trinidad           = 0x2c09,
+    English_Zimbabwe           = 0x3009,
+    English_Philippines        = 0x3409,
+    Estonian                   = 0x0425,
+    Faeroese                   = 0x0438,
+    Persian                    = 0x0429,
+    Finnish                    = 0x040b,
+    French_Standard            = 0x040c,
+    French_Belgian             = 0x080c,
+    French_Canadian            = 0x0c0c,
+    French_Switzerland         = 0x100c,
+    French_Luxembourg          = 0x140c,
+    French_Monaco              = 0x180c,
+    Georgian                   = 0x0437,
+    German_Standard            = 0x0407,
+    German_Switzerland         = 0x0807,
+    German_Austria             = 0x0c07,
+    German_Luxembourg          = 0x1007,
+    German_Liechtenstein       = 0x1407,
+    Greek                      = 0x0408,
+    Gujarati                   = 0x0447,
+    Hebrew                     = 0x040d,
+    Hindi                      = 0x0439,
+    Hungarian                  = 0x040e,
+    Icelandic                  = 0x040f,
+    Indonesian                 = 0x0421,
+    Italian_Standard           = 0x0410,
+    Italian_Switzerland        = 0x0810,
+    Japanese                   = 0x0411,
+    Kannada                    = 0x044b,
+    Kashmiri_India             = 0x0860,
+    Kazakh                     = 0x043f,
+    Konkani                    = 0x0457,
+    Korean                     = 0x0412,
+    Korean_Johab               = 0x0812,
+    Latvian                    = 0x0426,
+    Lithuanian                 = 0x0427,
+    Lithuanian_Classic         = 0x0827,
+    Macedonian                 = 0x042f,
+    Malay_Malaysian            = 0x043e,
+    Malay_Brunei_Darussalam    = 0x083e,
+    Malayalam                  = 0x044c,
+    Manipuri                   = 0x0458,
+    Marathi                    = 0x044e,
+    Nepali_India               = 0x0861,
+    Norwegian_Bokmal           = 0x0414,
+    Norwegian_Nynorsk          = 0x0814,
+    Odia                       = 0x0448,
+    Polish                     = 0x0415,
+    Portuguese_Brazil          = 0x0416,
+    Portuguese_Standard        = 0x0816,
+    Punjabi                    = 0x0446,
+    Romanian                   = 0x0418,
+    Russian                    = 0x0419,
+    Sanskrit                   = 0x044f,
+    Serbian_Cyrillic           = 0x0c1a,
+    Serbian_Latin              = 0x081a,
+    Sindhi                     = 0x0459,
+    Slovak                     = 0x041b,
+    Slovenian                  = 0x0424,
+    Spanish_Traditional_Sort   = 0x040a,
+    Spanish_Mexican            = 0x080a,
+    Spanish_Modern_Sort        = 0x0c0a,
+    Spanish_Guatemala          = 0x100a,
+    Spanish_Costa_Rica         = 0x140a,
+    Spanish_Panama             = 0x180a,
+    Spanish_Dominican_Republic = 0x1c0a,
+    Spanish_Venezuela          = 0x200a,
+    Spanish_Colombia           = 0x240a,
+    Spanish_Peru               = 0x280a,
+    Spanish_Argentina          = 0x2c0a,
+    Spanish_Ecuador            = 0x300a,
+    Spanish_Chile              = 0x340a,
+    Spanish_Uruguay            = 0x380a,
+    Spanish_Paraguay           = 0x3c0a,
+    Spanish_Bolivia            = 0x400a,
+    Spanish_El_Salvador        = 0x440a,
+    Spanish_Honduras           = 0x480a,
+    Spanish_Nicaragua          = 0x4c0a,
+    Spanish_Puerto_Rico        = 0x500a,
+    Sutu                       = 0x0430,
+    Swahili_Kenya              = 0x0441,
+    Swedish                    = 0x041d,
+    Swedish_Finland            = 0x081d,
+    Tamil                      = 0x0449,
+    Tatar_Tatarstan            = 0x0444,
+    Telugu                     = 0x044a,
+    Thai                       = 0x041e,
+    Turkish                    = 0x041f,
+    Ukrainian                  = 0x0422,
+    Urdu_Pakistan              = 0x0420,
+    Urdu_India                 = 0x0820,
+    Uzbek_Latin                = 0x0443,
+    Uzbek_Cyrillic             = 0x0843,
+    Vietnamese                 = 0x042a,
+    HID_Usage_Data_Descriptor  = 0x04ff,
+    HID_Vendor_Defined_1       = 0xf0ff,
+    HID_Vendor_Defined_2       = 0xf4ff,
+    HID_Vendor_Defined_3       = 0xf8ff,
+    HID_Vendor_Defined_4       = 0xfcff,
+    //
+    // Explicitly allow other values for this type (will be displayed as a number)
+    //
+    ...
+};
+
+pattern UsbLinkState = enum
+{
+    U0                    = 0,
+    U1                    = 1,
+    U2                    = 2,
+    U3                    = 3,
+    SS_Disabled           = 4,
+    Rx_Detect             = 5,
+    SS_Inactive           = 6,
+    Polling               = 7,
+    Recovery              = 8,
+    Hot_Reset             = 9,
+    Compliance_Mode       = 10,
+    Loopback              = 11,
+    Reserved12            = 12,
+    Reserved13            = 13,
+    Reserved14            = 14,
+    Resume                = 15 // xHCI PORTSC only, won't see this for hubs
+};
+
+pattern UsbXhciTrbType = enum
+{
+    TRB_TYPE_RESERVED                            = 0,
+    TRB_TYPE_NORMAL                              = 1,
+    TRB_TYPE_SETUP_STAGE                         = 2,
+    TRB_TYPE_DATA_STAGE                          = 3,
+    TRB_TYPE_STATUS_STAGE                        = 4,
+    TRB_TYPE_ISOCH                               = 5,
+    TRB_TYPE_LINK                                = 6,
+    TRB_TYPE_EVENT_DATA                          = 7,
+    TRB_TYPE_ENABLE_SLOT_COMMAND                 = 9,
+    TRB_TYPE_DISABLE_SLOT_COMMAND                = 10,
+    TRB_TYPE_ADDRESS_DEVICE_COMMAND              = 11,
+    TRB_TYPE_CONFIGURE_ENDPOINT_COMMAND          = 12,
+    TRB_TYPE_EVALUATE_CONTEXT_COMMAND            = 13,
+    TRB_TYPE_RESET_ENDPOINT_COMMAND              = 14,
+    TRB_TYPE_STOP_ENDPOINT_COMMAND               = 15,
+    TRB_TYPE_SET_DEQUEUE_POINTER_COMMAND         = 16,
+    TRB_TYPE_RESET_DEVICE_COMMAND                = 17,
+    TRB_TYPE_FORCE_EVENT_COMMAND                 = 18,
+    TRB_TYPE_NEGOTIATE_BANDWIDTH_COMMAND         = 19,
+    TRB_TYPE_SET_LATENCY_TOLERANCE_VALUE_COMMAND = 20,
+    TRB_TYPE_GET_PORT_BANDWIDTH_COMMAND          = 21,
+    TRB_TYPE_FORCE_HEADER_COMMAND                = 22,
+    TRB_TYPE_NO_OP_COMMAND                       = 23,
+    TRB_TYPE_TRANSFER_EVENT                      = 32,
+    TRB_TYPE_COMMAND_COMPLETION_EVENT            = 33,
+    TRB_TYPE_PORT_STATUS_CHANGE_EVENT            = 34,
+    TRB_TYPE_BANDWIDTH_REQUEST_EVENT             = 35,
+    TRB_TYPE_DOORBELL_EVENT                      = 36,
+    TRB_TYPE_HOST_CONTROLLER_EVENT               = 37,
+    TRB_TYPE_DEVICE_NOTIFICATION_EVENT           = 38,
+    TRB_TYPE_MFINDEX_WRAP_EVENT                  = 39
+};
+
+//
+// --- USB-defined data structures ---
+//
+
+type USB_SETUP_PACKET
+{
+    byte bmRequestType;
+    byte bRequest;
+    ushort wValue;
+    ushort wIndex;
+    ushort wLength;
+}
+
+type USB_COMMON_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional [|bLength > 2|] array<byte> Unparsed with BinaryEncoding { Length = bLength - 2 as uint };
+}
+
+type USB_DEVICE_DESCRIPTOR
+{
+    //
+    // All fields are optional because any length device descriptor can be requested. In other words
+    // it is valid for the device to respond with 0 bytes if 0 bytes were requested in wLength, and
+    // partial descriptor responses are valid.
+    //
+    // This is also true for most or all standard requests.
+    //
+    optional byte bLength; // TODO: must be 18. adding this check for all descirptors will cover short descriptor errors
+    optional UsbDescriptorType bDescriptorType;
+    optional ushort bcdUSB; // TODO: rules (where ValidationCheck)
+    optional byte bDeviceClass;
+    optional byte bDeviceSubClass;
+    optional byte bDeviceProtocol;
+    optional byte bMaxPacketSize0; // TODO: rules
+    optional ushort idVendor;
+    optional ushort idProduct;
+    optional ushort bcdDevice; // TODO: rules
+    optional byte iManufacturer;
+    optional byte iProduct;
+    optional byte iSerialNumber;
+    optional byte bNumConfigurations;
+}
+
+type USB_DEVICE_QUALIFIER_DESCRIPTOR
+{
+    optional byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional ushort bcdUSB; // TODO: rules
+    optional byte bDeviceClass;
+    optional byte bDeviceSubClass;
+    optional byte bDeviceProtocol;
+    optional byte bMaxPacketSize0;
+    optional byte bNumConfigurations;
+    // TODO: #FeatureRequest: Can we hide "reserved" fields (unused bits)? (lower pri: show them if they are not 0)
+    optional byte bReserved; // TODO: must be zero
+}
+
+type USB_ENDPOINT_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional byte bEndpointAddress with DisplayInfo{ToText=OptionalByteToHex};
+    optional byte bmAttributes;
+    optional ushort wMaxPacketSize;
+    //
+    // bInterval is normally 1 byte, but 2 for USB_ENDPOINT_DESCRIPTOR2 (which is only detectable
+    // via bLength). And for USB_ENDPOINT_DESCRIPTOR2, there is a second extra byte: bSyncAddress.
+    //
+    optional ushort bInterval with BinaryEncoding{Width = (bLength == 9 ? 16 : 8)};
+    optional [|bLength == 9|] byte bSyncAddress;
+}
+
+type USB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional byte bMaxBurst;
+    invariant (bMaxBurst == nothing || (bMaxBurst as byte) < 16);
+    optional byte bmAttributes; // TODO: interpretation depends on the preceding endpoint descriptor, need a parameter and actor
+    optional ushort wBytesPerInterval;
+}
+
+// TODO
+type USB_INTERFACE_DESCRIPTOR2
+{
+}
+
+type USB_INTERFACE_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional byte bInterfaceNumber;
+    optional byte bAlternateSetting;
+    optional byte bNumEndpoints;
+    optional byte bInterfaceClass;
+    optional byte bInterfaceSubClass;
+    optional byte bInterfaceProtocol;
+    optional byte iInterface;
+}
+
+type USB_CONFIGURATION_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional ushort wTotalLength;
+    optional byte bNumInterfaces;
+    optional byte bConfigurationValue;
+    optional byte iConfiguration;
+    optional byte bmAttributes;
+    optional byte bMaxPower;
+}
+
+type USB_STRING_DESCRIPTOR_LANGIDS
+{
+    byte bLength;
+    UsbDescriptorType DescriptorType;
+    //array<UsbLanguageId> wLANGID with BinaryEncoding { Length = (bLength-2)/2 as uint };
+    array<UsbLanguageId> wLANGID;
+}
+
+type USB_STRING_DESCRIPTOR
+{
+    byte bLength;
+    UsbDescriptorType DescriptorType;
+    //string bString with BinaryEncoding { Length = (bLength-2)/2 as uint, TextEncoding = TextEncoding.BigEndianUnicode }; // I think this was removed because it doesn't work when we query a partial descriptor
+    string bString with BinaryEncoding { TextEncoding = TextEncoding.UTF16 }; // TODO: I don't think it's UTF-16, it's just "Unicode" (fixed width)
+}
+
+type USB_INTERFACE_ASSOCIATION_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional byte bFirstInterface;
+    optional byte bInterfaceCount;
+    optional byte bFunctionClass;
+    optional byte bFunctionSubClass;
+    optional byte bFunctionProtocol;
+    optional byte iFunction;
+}
+
+type USB_BOS_DESCRIPTOR
+{
+    byte bLength;
+    optional UsbDescriptorType bDescriptorType;
+    optional ushort wTotalLength; // TODO: rules
+    optional byte bNumDeviceCaps;
+}
+
+type USB_DEVICE_CAPABILITY_DESCRIPTOR
+{
+    byte bLength; // TODO: rules
+    UsbDescriptorType bDescriptorType;
+    UsbDeviceCapabilityType bDevCapabilityType;
+    optional [|bLength > 3|] array<byte> Unparsed with BinaryEncoding { Length = bLength - 3 as uint };
+}
+
+type USB_20_EXTENSION_DESCRIPTOR
+{
+    byte bLength;
+    UsbDescriptorType bDescriptorType;
+    UsbDeviceCapabilityType bDevCapabilityType;
+    // bmAttributes
+    uint Reserved2 with BinaryEncoding { Width = 30 };
+    uint LpmSupported with BinaryEncoding { Width = 1 };
+    uint Reserved1 with BinaryEncoding { Width = 1 };
+}
+
+type USB_SUPERSPEED_DEVICE_CAPABILITY_DESCRIPTOR
+{
+    byte bLength;
+    UsbDescriptorType bDescriptorType;
+    UsbDeviceCapabilityType bDevCapabilityType;
+    // bmAttributes
+    // TODO: validate that bits go in the right places in parsing (or do we need to break out each bitfield as a separate types?)
+    byte Reserved2 with BinaryEncoding { Width = 6 };
+    byte LtmCapable with BinaryEncoding { Width = 1 };
+    byte Reserved1 with BinaryEncoding { Width = 1 };
+    // wSpeedsSupported
+    ushort Reserved3 with BinaryEncoding { Width = 12 };
+    ushort UsbSuperSpeedSupported with BinaryEncoding { Width = 1 };
+    ushort UsbHighSpeedSupported with BinaryEncoding { Width = 1 };
+    ushort UsbFullSpeedSupported with BinaryEncoding { Width = 1 };
+    ushort UsbLowSpeedSupported with BinaryEncoding { Width = 1 };
+    // bFunctionalitySupport
+    UsbSpeed LowestSupportedSpeed with BinaryEncoding { Width = 16 };
+    byte bU1DevExitLatUsec;
+    ushort wU2DevExitLatUsec;
+}
+
+type USB_CONTAINER_ID_DESCRIPTOR
+{
+    byte bLength;
+    UsbDescriptorType bDescriptorType;
+    UsbDeviceCapabilityType bDevCapabilityType;
+    byte bReserved;
+    guid ContainerID;
+}
+
+type UsbMultipleDescriptors
+{
+    array<
+        // Expected in Configuration descriptor:
+        [| value != null && value.bDescriptorType == UsbDescriptorType.CONFIGURATION         |] USB_CONFIGURATION_DESCRIPTOR |
+        [| value != null && value.bDescriptorType == UsbDescriptorType.INTERFACE             |] USB_INTERFACE_DESCRIPTOR |
+        [| value != null && value.bDescriptorType == UsbDescriptorType.ENDPOINT              |] USB_ENDPOINT_DESCRIPTOR |
+        [| value != null && value.bDescriptorType == UsbDescriptorType.SUPERSPEED_USB_ENDPOINT_COMPANION |] USB_SUPERSPEED_ENDPOINT_COMPANION_DESCRIPTOR |
+        [| value != null && value.bDescriptorType == UsbDescriptorType.INTERFACE_ASSOCIATION |] USB_INTERFACE_ASSOCIATION_DESCRIPTOR |
+        // Expected in BOS descriptor (device capability descriptors):
+        [| value != null && value.bDescriptorType == UsbDescriptorType.BOS                       |] USB_BOS_DESCRIPTOR |
+        [| value != null && value.bDescriptorType    == UsbDescriptorType.DEVICE_CAPABILITY &&
+           value.bDevCapabilityType == UsbDeviceCapabilityType.USB_20_EXTENSION |] USB_20_EXTENSION_DESCRIPTOR |
+        [| value != null && value.bDescriptorType    == UsbDescriptorType.DEVICE_CAPABILITY &&
+           value.bDevCapabilityType == UsbDeviceCapabilityType.SUPERSPEED_USB   |] USB_SUPERSPEED_DEVICE_CAPABILITY_DESCRIPTOR |
+        [| value != null && value.bDescriptorType    == UsbDescriptorType.DEVICE_CAPABILITY &&
+           value.bDevCapabilityType == UsbDeviceCapabilityType.CONTAINER_ID     |] USB_CONTAINER_ID_DESCRIPTOR |
+        // catch-all for device capability. should not see this
+        [| value != null && value.bDescriptorType == UsbDescriptorType.DEVICE_CAPABILITY &&
+           value.bDevCapabilityType != UsbDeviceCapabilityType.USB_20_EXTENSION &&
+           value.bDevCapabilityType != UsbDeviceCapabilityType.SUPERSPEED_USB &&
+           value.bDevCapabilityType != UsbDeviceCapabilityType.CONTAINER_ID     |] USB_DEVICE_CAPABILITY_DESCRIPTOR |
+        // catch-all for other descriptor types. conjunct the negation of all previous conditions for deterministic (non-order-dependent) behavior
+        [| value != null && value.bDescriptorType != UsbDescriptorType.CONFIGURATION         &&
+           value.bDescriptorType != UsbDescriptorType.INTERFACE             &&
+           value.bDescriptorType != UsbDescriptorType.ENDPOINT              &&
+           value.bDescriptorType != UsbDescriptorType.SUPERSPEED_USB_ENDPOINT_COMPANION &&
+           value.bDescriptorType != UsbDescriptorType.INTERFACE_ASSOCIATION &&
+           value.bDescriptorType != UsbDescriptorType.BOS                   &&
+           value.bDescriptorType != UsbDescriptorType.DEVICE_CAPABILITY     &&
+           true                                                                |] USB_COMMON_DESCRIPTOR 
+    > Descriptors;
+}
+
+pattern UsbTtThinkTime = enum ushort // actaully only 2 bits, but inside a 16-bit field
+{
+    AtMost8FSBitTimes = 0,
+    AtMost16FSBitTimes = 1,
+    AtMost24FSBitTimes = 2,
+    AtMost32FSBitTimes = 3,
+};
+
+pattern UsbOvercurrentProtectionMode = enum ushort
+{
+    Global = 0,
+    IndividualPort = 1,
+    NoOvercurrentProtection = 2,
+    NoOvercurrentProtection1 = 3,
+};
+
+pattern UsbLogicalPowerSwitchingMode = enum ushort
+{
+    Ganged = 0, // all ports power switched at once
+    IndividualPort = 1,
+    ReservedNoPowerSwitching = 2, // USB 1.0 only
+    ReservedNoPowerSwitching1 = 3,
+};
+
+type USB_HUB_30_PORT_REMOTE_WAKE_MASK
+{
+    optional byte Reserved with BinaryEncoding { Width = 5 };
+    optional byte Overcurrent_RemoteWakeEnabled with BinaryEncoding { Width = 1};
+    optional byte Disconnect_RemoteWakeEnabled with BinaryEncoding { Width = 1 };
+    optional byte Connect_RemoetWakeEnabled with BinaryEncoding { Width = 1 };
+}
+
+type USB_HUB_DESCRIPTOR
+{
+    optional byte bLength;
+    optional UsbHubDescriptorType bDescriptorType;
+    optional byte bNumberOfPorts; // named bNbrPorts in spec
+    optional ushort Reserved with BinaryEncoding { Width = 8 };
+    optional ushort PortIndicatorsSupported with BinaryEncoding { Width = 1 };
+    optional UsbTtThinkTime TtThinkTime with BinaryEncoding { Width = 2 };
+    optional UsbOvercurrentProtectionMode OvercurrentProtectionMode with BinaryEncoding { Width = 2 };
+    optional ushort IsCompoundDevice with BinaryEncoding { Width = 1 };
+    optional UsbLogicalPowerSwitchingMode LogicalPowerSwitchingMode with BinaryEncoding { Width = 2 };
+    optional byte bPowerOn2PowerGood_2ms; // reported in 2 ms intervals. named bPwrOn2Pwrgood in spec
+    optional byte bHubControllerCurrent_Ma; // named bHubContrCurrent in spec
+    // TODO: #q: Can we have an array of bits?
+    optional [|bNumberOfPorts != nothing|] array<byte> DeviceRemovable
+        with BinaryEncoding { Length = (((bNumberOfPorts as byte) - 1) / 8) + 1 as uint}; // one bit for each port
+    optional [|bNumberOfPorts != nothing|] array<byte> PortPwrCtrlMask
+        with BinaryEncoding { Length = (((bNumberOfPorts as byte) - 1) / 8) + 1 as uint}; // one bit for each port (USB 1.0 only, else Reserved set to f's)
+}
+
+type USB_SUPERSPEED_HUB_DESCRIPTOR
+{
+    optional byte bLength;
+    optional UsbHubDescriptorType bDescriptorType;
+    optional byte bNumberOfPorts; // named bNbrPorts in spec
+    optional ushort Reserved with BinaryEncoding { Width = 11 };
+    optional UsbOvercurrentProtectionMode OvercurrentProtectionMode with BinaryEncoding { Width = 2 };
+    optional ushort IsCompoundDevice with BinaryEncoding { Width = 1 };
+    optional UsbLogicalPowerSwitchingMode LogicalPowerSwitchingMode with BinaryEncoding { Width = 2 };
+    optional byte bPowerOn2PowerGood_2ms; // reported in 2 ms intervals. named bPwrOn2Pwrgood in spec
+    optional byte bHubControllerCurrent_4Ma; // reported in aCurrentUnit = 4mA (USB3 only). named bHubContrCurrent in spec
+    optional byte bHubPacketHeaderDecodeLatency_100ns; // named bHubHdrDecLat in spec
+    optional ushort wHubDelay_Ns;
+    optional ushort DeviceRemovable;
+}
+
+type USB_HUB_STATUS
+{
+    optional uint Reserved2 with BinaryEncoding { Width = 14 };
+    optional uint C_HUB_OVER_CURRENT with BinaryEncoding { Width = 1 };
+    optional uint C_HUB_LOCAL_POWER with BinaryEncoding { Width = 1 };
+    optional uint Reserved1 with BinaryEncoding { Width = 14 };
+    optional uint Overcurrent with BinaryEncoding { Width = 1 };
+    optional uint LocalPowerInactive with BinaryEncoding { Width = 1 }; // 0 = Local(aka self aka not bus) power supply good
+}
+
+//
+// Note: Bitfields are most significant bit first in OPN
+//
+type Usb2PortStatus
+{
+    ushort Reserved3 with BinaryEncoding { Width = 11 };
+    ushort C_PORT_RESET with BinaryEncoding { Width = 1 };
+    ushort C_PORT_OVER_CURRENT with BinaryEncoding { Width = 1 };
+    ushort C_PORT_SUSPEND with BinaryEncoding { Width = 1 };
+    ushort C_PORT_ENABLE with BinaryEncoding { Width = 1 };
+    ushort C_PORT_CONNECTION with BinaryEncoding { Width = 1 };
+    ushort Reserved2 with BinaryEncoding { Width = 3 };
+    ushort PORT_INDICATOR with BinaryEncoding { Width = 1 };
+    ushort PORT_TEST with BinaryEncoding { Width = 1 };
+    ushort PORT_HIGH_SPEED with BinaryEncoding { Width = 1 };
+    ushort PORT_LOW_SPEED with BinaryEncoding { Width = 1 };
+    ushort PORT_POWER with BinaryEncoding { Width = 1 };
+    ushort Reserved1 with BinaryEncoding { Width = 3 };
+    ushort PORT_RESET with BinaryEncoding { Width = 1 };
+    ushort PORT_OVER_CURRENT with BinaryEncoding { Width = 1 };
+    ushort PORT_SUSPEND with BinaryEncoding { Width = 1 };
+    ushort PORT_ENABLE with BinaryEncoding { Width = 1 };
+    ushort PORT_CONNECTION with BinaryEncoding { Width = 1 };
+}
+
+type Usb3PortStatus
+{
+    ushort Reserved4 with BinaryEncoding { Width = 8 };
+    ushort C_PORT_CONFIG_ERROR with BinaryEncoding { Width = 1 };
+    ushort C_PORT_LINK_STATE with BinaryEncoding { Width = 1 };
+    ushort C_BH_PORT_RESET with BinaryEncoding { Width = 1 };
+    ushort C_PORT_RESET with BinaryEncoding { Width = 1 };
+    ushort C_PORT_OVER_CURRENT with BinaryEncoding { Width = 1 };
+    ushort Reserved3 with BinaryEncoding { Width = 2 };
+    ushort C_PORT_CONNECTION with BinaryEncoding { Width = 1 };
+    ushort Reserved2 with BinaryEncoding { Width = 3 };
+    ushort PORT_SPEED with BinaryEncoding { Width = 3 }; // for USB3, always 0 -> 5Gbps
+    ushort PORT_POWER with BinaryEncoding { Width = 1 };
+    UsbLinkState PORT_LINK_STATE with BinaryEncoding { Width = 4 };
+    ushort PORT_RESET with BinaryEncoding { Width = 1 };
+    ushort PORT_OVER_CURRENT with BinaryEncoding { Width = 1 };
+    ushort Reserved1 with BinaryEncoding { Width = 1 };
+    ushort PORT_ENABLE with BinaryEncoding { Width = 1 };
+    ushort PORT_CONNECTION with BinaryEncoding { Width = 1 };
+}
+
+string StatusBitsForUsb2PortStatus(Usb2PortStatus Status)
+{
+    return Format("{0}{1}{2}{3}{4}{5}{6}{7}{8}{9}", [
+        Status.PORT_CONNECTION   == 1 ? "c" : "",
+        Status.PORT_ENABLE       == 1 ? "e" : "",
+        Status.PORT_SUSPEND      == 1 ? "s" : "",
+        Status.PORT_OVER_CURRENT == 1 ? "o" : "",
+        Status.PORT_RESET        == 1 ? "r" : "",
+        Status.PORT_POWER        == 1 ? "p" : "",
+        Status.PORT_LOW_SPEED    == 1 ? "l" : "",
+        Status.PORT_HIGH_SPEED   == 1 ? "h" : "",
+        Status.PORT_TEST         == 1 ? "t" : "",
+        Status.PORT_INDICATOR    == 1 ? "i" : ""]);
+}
+
+string ChangeBitDescriptionForUsb2PortStatus(Usb2PortStatus Status)
+{
+    string description = "";
+
+    if (Status.C_PORT_RESET == 1) {
+        if (description == "") {
+            description = Format("PORT_RESET changed to {0}", Status.PORT_RESET);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_OVER_CURRENT == 1) {
+        if (description == "") {
+            description = Format("PORT_OVER_CURRENT changed to {0}", Status.PORT_OVER_CURRENT);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_SUSPEND == 1) {
+        if (description == "") {
+            description = Format("PORT_SUSPEND changed to {0}", Status.PORT_SUSPEND);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_ENABLE == 1) {
+        if (description == "") {
+            description = Format("PORT_ENABLE changed to {0}", Status.PORT_ENABLE);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_CONNECTION == 1) {
+        if (description == "") {
+            description = Format("PORT_CONNECTION changed to {0}", Status.PORT_CONNECTION);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+
+    return description;
+}
+
+string ChangeBitDescriptionForUsb3PortStatus(Usb3PortStatus Status)
+{
+    string description = "";
+
+    if (Status.C_PORT_LINK_STATE == 1) {
+        if (description == "") {
+            description = Format("PORT_LINK_STATE changed to {0}",
+                                 EnumToString(Status.PORT_LINK_STATE, "UsbSpec.UsbLinkState"));
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_CONFIG_ERROR == 1) {
+        if (description == "") {
+            description = Format("Port link partner configure failure (C_PORT_CONFIG_ERROR)");
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_BH_PORT_RESET == 1) {
+        if (description == "") {
+            description = Format("BH_PORT_RESET (warm reset) complete");
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_RESET == 1 && Status.C_BH_PORT_RESET != 1) {
+        if (description == "") {
+            description = Format("PORT_RESET (hot reset) complete");
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_OVER_CURRENT == 1) {
+        if (description == "") {
+            description = Format("PORT_OVER_CURRENT changed to {0}", Status.PORT_OVER_CURRENT);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+    if (Status.C_PORT_CONNECTION == 1) {
+        if (description == "") {
+            description = Format("PORT_CONNECTION changed to {0}", Status.PORT_CONNECTION);
+        } else {
+            description = "Multiple changes";
+        }
+    }
+
+    return description;
+}
+
+// TODO: combine usb2 and usb3 port status, making some fields optional
+type UsbPortStatus
+{
+    Usb3PortStatus PortStatus;
+}
+
+type GetConfigurationDataPacket
+{
+    optional byte ConfigurationValue;
+}
+
+type GetInterfaceDataPacket
+{
+    optional byte AlternateInterfaceSetting;
+}
+
+//type UsbDeviceStatus[bool IsUsb3]
+type UsbDeviceStatus
+{
+    ushort  Reserved2 with BinaryEncoding { Width = 11 };
+    ushort  LtmEnable with BinaryEncoding { Width = 1 };
+    ushort  U2Enable with BinaryEncoding { Width = 1 };
+    ushort  U1Enable with BinaryEncoding { Width = 1 };
+    ushort  RemoteWakeup with BinaryEncoding { Width = 1 };
+    ushort  SelfPowered with BinaryEncoding { Width = 1 };
+    //optional[|!IsUsb3|] ushort Reserved1 with BinaryEncoding { Width = 3 };
+    //optional[|IsUsb3|] ushort  LtmEnable with BinaryEncoding { Width = 1 };
+    //optional[|IsUsb3|] ushort  U2Enable with BinaryEncoding { Width = 1 };
+    //optional[|IsUsb3|] ushort  U1Enable with BinaryEncoding { Width = 1 };
+}
+
+//type UsbInterfaceStatus[bool IsUsb3]
+type UsbInterfaceStatus
+{
+    ushort Reserved2 with BinaryEncoding { Width = 14 };
+    ushort FunctionRemoteWakeup with BinaryEncoding { Width = 1 };
+    ushort FunctionRemoteWakeCapable with BinaryEncoding { Width = 1 };
+
+    //optional[|IsUsb3|] ushort Reserved2 with BinaryEncoding { Width = 14 };
+    //optional[|IsUsb3|] ushort FunctionRemoteWakeup with BinaryEncoding { Width = 1 };
+    //optional[|IsUsb3|] ushort FunctionRemoteWakeCapable with BinaryEncoding { Width = 1 };
+    //optional[|!IsUsb3|] ushort Reserved1 with BinaryEncoding { Width = 16 };
+}
+
+type UsbEndpointStatus
+{
+    ushort Reserved with BinaryEncoding { Width = 15 };
+    ushort Halt with BinaryEncoding { Width = 1 };
+}
+
+type UsbFunctionSuspendOptions
+{
+    byte Reserved with BinaryEncoding { Width = 6 };
+    byte FunctionRemoteWakeEnabled with BinaryEncoding { Width = 1 };
+    byte FunctionSuspend with BinaryEncoding { Width = 1 };
+}
+
+type SetSelDataPacket
+{
+    optional byte U1SystemExitLatencyUsec;
+    optional byte U1DeviceToHostExitLatencyUsec;
+    // TODO: #q: instead of appending "Usec" (meaning microseconds) to the name, can these be formally defined as TimeSpans? same goes for Usec properties elsewhere in this file.
+    optional ushort U2SystemExitLatencyUsec;
+    optional ushort U2DeviceToHostExitLatencyUsec;
+}
+
+type SynchFrameDataPacket
+{
+    optional ushort SynchronizationFrameNumber;
+}
+
+type UsbXhciTrb
+{
+    ulong TypeDependentQword;
+    uint  TypeDependentDword;
+    // MSB first. TODO: validate ordering
+    uint  TypeDependent3 with BinaryEncoding { Width = 8 };
+    uint  TypeDependent2 with BinaryEncoding { Width = 8 };
+    UsbXhciTrbType TrbType with BinaryEncoding { Width = 6 };
+    uint  TypeDependent1 with BinaryEncoding { Width = 9 };
+    uint  CycleBit with BinaryEncoding { Width = 1 };
+}
+
+//
+// --- Software defined types ---
+//
+
+pattern UsbdStatus = enum uint
+{
+    USBD_STATUS_SUCCESS                          = 0x00000000,
+    USBD_STATUS_PENDING                          = 0x40000000,
+    USBD_STATUS_CRC                              = 0xC0000001,
+    USBD_STATUS_BTSTUFF                          = 0xC0000002,
+    USBD_STATUS_DATA_TOGGLE_MISMATCH             = 0xC0000003,
+    USBD_STATUS_STALL_PID                        = 0xC0000004,
+    USBD_STATUS_DEV_NOT_RESPONDING               = 0xC0000005,
+    USBD_STATUS_PID_CHECK_FAILURE                = 0xC0000006,
+    USBD_STATUS_UNEXPECTED_PID                   = 0xC0000007,
+    USBD_STATUS_DATA_OVERRUN                     = 0xC0000008,
+    USBD_STATUS_DATA_UNDERRUN                    = 0xC0000009,
+    USBD_STATUS_RESERVED1                        = 0xC000000A,
+    USBD_STATUS_RESERVED2                        = 0xC000000B,
+    USBD_STATUS_BUFFER_OVERRUN                   = 0xC000000C,
+    USBD_STATUS_BUFFER_UNDERRUN                  = 0xC000000D,
+    USBD_STATUS_NOT_ACCESSED                     = 0xC000000F,
+    USBD_STATUS_FIFO                             = 0xC0000010,
+    USBD_STATUS_XACT_ERROR                       = 0xC0000011,
+    USBD_STATUS_BABBLE_DETECTED                  = 0xC0000012,
+    USBD_STATUS_DATA_BUFFER_ERROR                = 0xC0000013,
+    USBD_STATUS_NO_PING_RESPONSE                 = 0xC0000014,
+    USBD_STATUS_INVALID_STREAM_TYPE              = 0xC0000015,
+    USBD_STATUS_INVALID_STREAM_ID                = 0xC0000016,
+    USBD_STATUS_ENDPOINT_HALTED                  = 0xC0000030,
+    USBD_STATUS_INVALID_URB_FUNCTION             = 0x80000200,
+    USBD_STATUS_INVALID_PARAMETER                = 0x80000300,
+    USBD_STATUS_ERROR_BUSY                       = 0x80000400,
+    USBD_STATUS_INVALID_PIPE_HANDLE              = 0x80000600,
+    USBD_STATUS_NO_BANDWIDTH                     = 0x80000700,
+    USBD_STATUS_INTERNAL_HC_ERROR                = 0x80000800,
+    USBD_STATUS_ERROR_SHORT_TRANSFER             = 0x80000900,
+    USBD_STATUS_BAD_START_FRAME                  = 0xC0000A00,
+    USBD_STATUS_ISOCH_REQUEST_FAILED             = 0xC0000B00,
+    USBD_STATUS_FRAME_CONTROL_OWNED              = 0xC0000C00,
+    USBD_STATUS_FRAME_CONTROL_NOT_OWNED          = 0xC0000D00,
+    USBD_STATUS_NOT_SUPPORTED                    = 0xC0000E00,
+    USBD_STATUS_INAVLID_CONFIGURATION_DESCRIPTOR = 0xC0000F00,
+    USBD_STATUS_INVALID_CONFIGURATION_DESCRIPTOR = 0xC0000F00,
+    USBD_STATUS_INSUFFICIENT_RESOURCES           = 0xC0001000,
+    USBD_STATUS_SET_CONFIG_FAILED                = 0xC0002000,
+    USBD_STATUS_BUFFER_TOO_SMALL                 = 0xC0003000,
+    USBD_STATUS_INTERFACE_NOT_FOUND              = 0xC0004000,
+    USBD_STATUS_INAVLID_PIPE_FLAGS               = 0xC0005000,
+    USBD_STATUS_TIMEOUT                          = 0xC0006000,
+    USBD_STATUS_DEVICE_GONE                      = 0xC0007000,
+    USBD_STATUS_STATUS_NOT_MAPPED                = 0xC0008000,
+    USBD_STATUS_HUB_INTERNAL_ERROR               = 0xC0009000,
+    USBD_STATUS_CANCELED                         = 0xC0010000,
+    USBD_STATUS_ISO_NOT_ACCESSED_BY_HW           = 0xC0020000,
+    USBD_STATUS_ISO_TD_ERROR                     = 0xC0030000,
+    USBD_STATUS_ISO_NA_LATE_USBPORT              = 0xC0040000,
+    USBD_STATUS_ISO_NOT_ACCESSED_LATE            = 0xC0050000,
+    USBD_STATUS_BAD_DESCRIPTOR                   = 0xC0100000,
+    USBD_STATUS_BAD_DESCRIPTOR_BLEN              = 0xC0100001,
+    USBD_STATUS_BAD_DESCRIPTOR_TYPE              = 0xC0100002,
+    USBD_STATUS_BAD_INTERFACE_DESCRIPTOR         = 0xC0100003,
+    USBD_STATUS_BAD_ENDPOINT_DESCRIPTOR          = 0xC0100004,
+    USBD_STATUS_BAD_INTERFACE_ASSOC_DESCRIPTOR   = 0xC0100005,
+    USBD_STATUS_BAD_CONFIG_DESC_LENGTH           = 0xC0100006,
+    USBD_STATUS_BAD_NUMBER_OF_INTERFACES         = 0xC0100007,
+    USBD_STATUS_BAD_NUMBER_OF_ENDPOINTS          = 0xC0100008,
+    USBD_STATUS_BAD_ENDPOINT_ADDRESS             = 0xC0100009,
+};
+
+bool USBD_ERROR(UsbdStatus usbdStatus) {
+    if ((usbdStatus & 0x80000000) != 0) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+//
+// User-mode USB IOCTLs (can be used in kernel mode)
+//
+pattern UsbIoctlCode = enum uint
+{
+    IOCTL_USB_HCD_GET_STATS_1                       = 0x2203fc,
+    IOCTL_USB_DIAGNOSTIC_MODE_ON                    = 0x220400,
+    IOCTL_USB_DIAGNOSTIC_MODE_OFF                   = 0x220404,
+    IOCTL_USB_GET_NODE_INFORMATION                  = 0x220408, // NOTE: Same value has different meaning to hub driver vs. controller driver (controller: IOCTL_USB_GET_ROOT_HUB_NAME)
+    IOCTL_USB_GET_NODE_CONNECTION_INFORMATION       = 0x22040c,
+    IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION   = 0x220410,
+    IOCTL_USB_GET_NODE_CONNECTION_NAME              = 0x220414,
+    IOCTL_USB_DIAG_IGNORE_HUBS_ON                   = 0x220418,
+    IOCTL_USB_DIAG_IGNORE_HUBS_OFF                  = 0x22041c,
+    IOCTL_USB_GET_NODE_CONNECTION_DRIVERKEY_NAME    = 0x220420,
+    IOCTL_GET_HCD_DRIVERKEY_NAME                    = 0x220424,
+    IOCTL_USB_HCD_GET_STATS_2                       = 0x220428,
+    IOCTL_USB_HCD_DISABLE_PORT                      = 0x220430,
+    IOCTL_USB_HCD_ENABLE_PORT                       = 0x220434,
+    IOCTL_USB_USER_REQUEST                          = 0x220438,
+    IOCTL_USB_GET_HUB_CAPABILITIES                  = 0x22043c,
+    IOCTL_USB_GET_NODE_CONNECTION_ATTRIBUTES        = 0x220440,
+    IOCTL_USB_HUB_CYCLE_PORT                        = 0x220444,
+    IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX    = 0x220448,
+    IOCTL_USB_RESET_HUB                             = 0x22044c,
+    IOCTL_USB_GET_HUB_CAPABILITIES_EX               = 0x220450,
+    IOCTL_USB_GET_HUB_INFORMATION_EX                = 0x220454,
+    IOCTL_USB_GET_PORT_CONNECTOR_PROPERTIES         = 0x220458,
+    IOCTL_USB_GET_NODE_CONNECTION_INFORMATION_EX_V2 = 0x22045c,
+};
+
+//
+// Kernel-mode only USB IOCTLs ("private" ones are internal to the USB core driver stack; by
+// contrast the word INTERNAL indicates kernel-mode only)
+//
+pattern UsbInternalIoctlCode = enum uint
+{
+    IOCTL_INTERNAL_USB_SUBMIT_URB                       = 0x220003,
+    IOCTL_INTERNAL_USB_RESET_PORT                       = 0x220007,
+    IOCTL_INTERNAL_USB_GET_ROOTHUB_PDO                  = 0x22000f,
+    IOCTL_INTERNAL_USB_GET_PORT_STATUS                  = 0x220013,
+    IOCTL_INTERNAL_USB_ENABLE_PORT                      = 0x220017,
+    IOCTL_INTERNAL_USB_GET_HUB_COUNT                    = 0x22001b,
+    IOCTL_INTERNAL_USB_CYCLE_PORT                       = 0x22001f,
+    IOCTL_INTERNAL_USB_GET_HUB_NAME                     = 0x220020,
+    IOCTL_INTERNAL_USB_SUBMIT_IDLE_NOTIFICATION         = 0x220027,
+    IOCTL_INTERNAL_USB_RECORD_FAILURE                   = 0x22002b,
+    IOCTL_INTERNAL_USB_GET_BUS_INFO                     = 0x220420,
+    IOCTL_INTERNAL_USB_GET_CONTROLLER_NAME              = 0x220424,
+    IOCTL_INTERNAL_USB_GET_BUSGUID_INFO                 = 0x220428,
+    IOCTL_INTERNAL_USB_GET_PARENT_HUB_INFO              = 0x22042c,
+    IOCTL_INTERNAL_USB_GET_DEVICE_HANDLE                = 0x220433,
+    IOCTL_INTERNAL_USB_GET_DEVICE_HANDLE_EX             = 0x220437,
+    IOCTL_INTERNAL_USB_GET_TT_DEVICE_HANDLE             = 0x22043b,
+    IOCTL_INTERNAL_USB_GET_TOPOLOGY_ADDRESS             = 0x22043f,
+    IOCTL_INTERNAL_USB_NOTIFY_IDLE_READY                = 0x220443,
+    IOCTL_INTERNAL_USB_REQ_GLOBAL_SUSPEND               = 0x220447,
+    IOCTL_INTERNAL_USB_REQ_GLOBAL_RESUME                = 0x22044b,
+    IOCTL_INTERNAL_USB_GET_DEVICE_CONFIG_INFO           = 0x22044f,
+    IOCTL_INTERNAL_USB_REGISTER_COMPOSITE_DEVICE        = 0x490003,
+    IOCTL_INTERNAL_USB_UNREGISTER_COMPOSITE_DEVICE      = 0x490007,
+    IOCTL_INTERNAL_USB_REQUEST_REMOTE_WAKE_NOTIFICATION = 0x49000b,
+    // private below here
+    IOCTL_INTERNAL_USB_QUERY_USB_CAPABILITY             = 0x49104b,
+    IOCTL_INTERNAL_USB_ENDPOINT_RESET                   = 0x49103f,
+    IOCTL_INTERNAL_USB_ROOTHUB_GET_INFO                 = 0x49100b,
+    IOCTL_INTERNAL_USB_ROOTHUB_GET_20PORT_INFO          = 0x49100f,
+    IOCTL_INTERNAL_USB_ROOTHUB_GET_30PORT_INFO          = 0x491013,
+    IOCTL_INTERNAL_USB_ADDRESS0_OWNERSHIP_ACQUIRE       = 0x491007,
+    IOCTL_INTERNAL_USB_USBDEVICE_ENABLE                 = 0x491017,
+    IOCTL_INTERNAL_USB_USBDEVICE_RESET                  = 0x49101b,
+    IOCTL_INTERNAL_USB_USBDEVICE_ADDRESS                = 0x49101f,
+    IOCTL_INTERNAL_USB_USBDEVICE_UPDATE                 = 0x491023,
+    IOCTL_INTERNAL_USB_USBDEVICE_HUB_INFO               = 0x491027,
+    IOCTL_INTERNAL_USB_USBDEVICE_DISABLE                = 0x49102b,
+    IOCTL_INTERNAL_USB_USBDEVICE_PURGEIO                = 0x49102f,
+    IOCTL_INTERNAL_USB_USBDEVICE_STARTIO                = 0x491033,
+    IOCTL_INTERNAL_USB_ENDPOINTS_CONFIGURE              = 0x491037,
+    IOCTL_INTERNAL_USB_DEFAULT_ENDPOINT_UPDATE          = 0x49103b,
+    IOCTL_INTERNAL_USB_GET_HUB_INFO                     = 0x491043,
+    IOCTL_INTERNAL_USB_USBDEVICE_TREE_PURGEIO           = 0x491053,
+    IOCTL_INTERNAL_USB_GET_DUMP_DATA                    = 0x491404,
+    IOCTL_INTERNAL_USB_FREE_DUMP_DATA                   = 0x491408,
+    IOCTL_INTERNAL_USB_NOTIFY_FORWARD_PROGRESS          = 0x49140f,
+    IOCTL_INTERNAL_USB_PROPAGATE_RESUME                 = 0x220fa3,
+    IOCTL_INTERNAL_USB_NOTIFY_HUB_PWR_LOSS              = 0x220fa7,
+    IOCTL_INTERNAL_USB_RESET_PORT_ASYNC                 = 0x220fb3,
+    IOCTL_INTERNAL_USB_RESET_NOTIFICATION_REQUEST       = 0x220fab,
+    IOCTL_INTERNAL_USB_SET_FUNCTION_HANDLE_DATA         = 0x49104f,
+    IOCTL_USB_GET_PORT_STATUS                           = 0x220010,
+};
+
+pattern UsbUrbFunction = enum ushort
+{
+    URB_FUNCTION_SELECT_CONFIGURATION                         = 0x0000,
+    URB_FUNCTION_SELECT_INTERFACE                             = 0x0001,
+    URB_FUNCTION_ABORT_PIPE                                   = 0x0002,
+    URB_FUNCTION_TAKE_FRAME_LENGTH_CONTROL                    = 0x0003,
+    URB_FUNCTION_RELEASE_FRAME_LENGTH_CONTROL                 = 0x0004,
+    URB_FUNCTION_GET_FRAME_LENGTH                             = 0x0005,
+    URB_FUNCTION_SET_FRAME_LENGTH                             = 0x0006,
+    URB_FUNCTION_GET_CURRENT_FRAME_NUMBER                     = 0x0007,
+    URB_FUNCTION_CONTROL_TRANSFER                             = 0x0008,
+    URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER                   = 0x0009,
+    URB_FUNCTION_ISOCH_TRANSFER                               = 0x000A,
+    URB_FUNCTION_GET_DESCRIPTOR_FROM_DEVICE                   = 0x000B,
+    URB_FUNCTION_SET_DESCRIPTOR_TO_DEVICE                     = 0x000C,
+    URB_FUNCTION_SET_FEATURE_TO_DEVICE                        = 0x000D,
+    URB_FUNCTION_SET_FEATURE_TO_INTERFACE                     = 0x000E,
+    URB_FUNCTION_SET_FEATURE_TO_ENDPOINT                      = 0x000F,
+    URB_FUNCTION_CLEAR_FEATURE_TO_DEVICE                      = 0x0010,
+    URB_FUNCTION_CLEAR_FEATURE_TO_INTERFACE                   = 0x0011,
+    URB_FUNCTION_CLEAR_FEATURE_TO_ENDPOINT                    = 0x0012,
+    URB_FUNCTION_GET_STATUS_FROM_DEVICE                       = 0x0013,
+    URB_FUNCTION_GET_STATUS_FROM_INTERFACE                    = 0x0014,
+    URB_FUNCTION_GET_STATUS_FROM_ENDPOINT                     = 0x0015,
+    URB_FUNCTION_RESERVED_0X0016                              = 0x0016,
+    URB_FUNCTION_VENDOR_DEVICE                                = 0x0017,
+    URB_FUNCTION_VENDOR_INTERFACE                             = 0x0018,
+    URB_FUNCTION_VENDOR_ENDPOINT                              = 0x0019,
+    URB_FUNCTION_CLASS_DEVICE                                 = 0x001A,
+    URB_FUNCTION_CLASS_INTERFACE                              = 0x001B,
+    URB_FUNCTION_CLASS_ENDPOINT                               = 0x001C,
+    URB_FUNCTION_RESERVE_0X001D                               = 0x001D,
+    URB_FUNCTION_SYNC_RESET_PIPE_AND_CLEAR_STALL              = 0x001E,
+    URB_FUNCTION_CLASS_OTHER                                  = 0x001F,
+    URB_FUNCTION_VENDOR_OTHER                                 = 0x0020,
+    URB_FUNCTION_GET_STATUS_FROM_OTHER                        = 0x0021,
+    URB_FUNCTION_CLEAR_FEATURE_TO_OTHER                       = 0x0022,
+    URB_FUNCTION_SET_FEATURE_TO_OTHER                         = 0x0023,
+    URB_FUNCTION_GET_DESCRIPTOR_FROM_ENDPOINT                 = 0x0024,
+    URB_FUNCTION_SET_DESCRIPTOR_TO_ENDPOINT                   = 0x0025,
+    URB_FUNCTION_GET_CONFIGURATION                            = 0x0026,
+    URB_FUNCTION_GET_INTERFACE                                = 0x0027,
+    URB_FUNCTION_GET_DESCRIPTOR_FROM_INTERFACE                = 0x0028,
+    URB_FUNCTION_SET_DESCRIPTOR_TO_INTERFACE                  = 0x0029,
+    URB_FUNCTION_GET_MS_FEATURE_DESCRIPTOR                    = 0x002A,
+    URB_FUNCTION_SYNC_RESET_PIPE                              = 0x0030,
+    URB_FUNCTION_SYNC_CLEAR_STALL                             = 0x0031,
+    URB_FUNCTION_CONTROL_TRANSFER_EX                          = 0x0032,
+    URB_FUNCTION_OPEN_STATIC_STREAMS                          = 0x0035,
+    URB_FUNCTION_CLOSE_STATIC_STREAMS                         = 0x0036,
+    URB_FUNCTION_BULK_OR_INTERRUPT_TRANSFER_USING_CHAINED_MDL = 0x0037,
+    URB_FUNCTION_ISOCH_TRANSFER_USING_CHAINED_MDL             = 0x0038,
+};
+
+//
+// --- Software-defined data structures ---
+//
+
+type URB
+{
+    ushort         Length;
+    UsbUrbFunction Function;
+    UsbdStatus     Status;
+    EtwPointer     UsbdDeviceHandle;
+    EtwPointer     UsbdFlags;
+}
+
+//
+// --- OPN types ---
+//
+
+pattern UsbStringDescriptorName = enum
+{
+    iManufacturer,
+    iProduct,
+    iSerialNumber,
+    iConfiguration,
+    iFunction,
+    iInterface,
+    MsOs,
+    Other
+};
+
+pattern UsbDirection = enum
+{
+    Out = 0b0, // Host-to-device
+    In  = 0b1  // Device-to-host
+};
+
+pattern UsbTransferType = enum
+{
+    Control     = 0b00,
+    Isochronous = 0b01,
+    Bulk        = 0b10,
+    Interrupt   = 0b11
+};
+
+UsbTransferType
+UsbEndpointTypeFromBmAttributes(byte bmAttributes)
+{
+    return (bmAttributes & 0x03) as UsbTransferType;
+}
+
+//
+// --- OPN contracts ---
+//
+
+string get UsbLength(this UsbStandardRequest.GenericTransfer m) // column/property
+{
+    return Format("{0} of {1}", m.LengthCompleted, m.LengthRequested);
+}
+
+void CopyGenericTransfer(UsbStandardRequest.GenericTransfer destination, UsbStandardRequest.GenericTransfer origin)
+{
+    destination.Status          = origin.Status;
+    destination.NtStatus        = origin.NtStatus;
+    destination.LengthRequested = origin.LengthRequested;
+    destination.LengthCompleted = origin.LengthCompleted;
+    destination.Direction       = origin.Direction;
+    destination.Type            = origin.Type;
+    destination.EndpointAddress = origin.EndpointAddress;
+    destination.DeviceInstance  = origin.DeviceInstance;
+    destination.UrbPtr          = origin.UrbPtr;
+}
+
+contract UsbStandardRequest
+{
+    //
+    // Allow all types of transfers to be searched for status
+    // Inherits UsbMessage to show USB properties on these upper level messages
+    //
+    issues message GenericTransfer : UsbMessage
+    {
+        UsbdStatus            Status;
+        NTSTATUS              NtStatus; // TODO: #q: How to make it not display if we don't have one? optional caused an exception.
+        uint                  LengthRequested;
+        uint                  LengthCompleted;
+        UsbDirection          Direction;
+        UsbTransferType       Type;
+        byte                  EndpointAddress with DisplayInfo{ToText=ByteToHex};
+        int                   DeviceInstance;
+        ulong                 UrbPtr; // TODO: #q: Can we just hide this field?
+        // TODO: Would data rate (UsbSpeed) be appropriate to add? Or would too many other device properties have similar relevance?
+        override string ToString()
+        {
+            string append;
+            // Append "Canceled" and other status codes
+            if (Status == UsbdStatus.USBD_STATUS_SUCCESS) {
+                append = "";
+            } else if (Status == UsbdStatus.USBD_STATUS_CANCELED) {
+                append = " - Canceled";
+            } else {
+                append = Format(" - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            }
+            return Format("{0} {1} Transfer{2}",
+                          EnumToString(Type, "UsbSpec.UsbTransferType"),
+                          EnumToString(Direction, "UsbSpec.UsbDirection"),
+                          append);
+        }
+        bool TransferFailed()
+        {
+            return USBD_ERROR(Status);
+        }
+    }
+
+    issues message GetDeviceDescriptor : GenericTransfer
+    {
+        USB_DEVICE_DESCRIPTOR DeviceDescriptor;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                // TODO: mark event as an error in the case of STATUS_CANCELED (for all standard control transfers, or all control transfers)
+                return Format("Get Device Descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            //else if (Length == sizeof(USB_DEVICE_DESCRIPTOR)) {} // TODO: #q: how to do this?
+            } else if (LengthRequested >= 18) {
+                return Format("Get Full Device Descriptor");
+            } else {
+                return Format("Get Partial Device Descriptor");
+            }
+        }
+    }
+
+    issues message GetConfigDescriptor : GenericTransfer
+    {
+        UsbMultipleDescriptors DescriptorSet;
+        byte                   ConfigurationIndex;
+
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Configuration Descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (DescriptorSet != null &&
+                       DescriptorSet.Descriptors.Count != 0 &&
+                       DescriptorSet.Descriptors[0] is USB_CONFIGURATION_DESCRIPTOR &&
+                       LengthCompleted == (DescriptorSet.Descriptors[0] as USB_CONFIGURATION_DESCRIPTOR).wTotalLength as ushort) {
+
+                return Format("Get Full Configuration Descriptor Set");
+
+            } else {
+
+                return Format("Get Partial Configuration Descriptor");
+            }
+        }
+    }
+
+    issues message GetLanguages : GenericTransfer
+    {
+        optional USB_STRING_DESCRIPTOR_LANGIDS StringDescriptor where ValidationCheck(value != nothing, null, "Not enough data in the underlying message to construct a string descriptor");
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Languages - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (LengthRequested == 2 && LengthCompleted == 2) { // 2 == sizeof(USB_COMMON_DESCRIPTOR)
+                return Format("Get Languages (String Descriptor 0) length");
+            } else {
+                return Format("Get Languages (String Descriptor 0)");
+            }
+        }
+    }
+
+    issues message GetStringDescriptor : GenericTransfer
+    {
+        USB_STRING_DESCRIPTOR             StringDescriptor;
+
+        // The language should be a valid USB language ID, or 0 (known cases of 0: MS OS descriptor query)
+        (UsbLanguageId | ushort)          Language where ValidationCheck(value is UsbLanguageId || value == 0, null, "Language field has value " + (Language as string) + " which is outside the allowed cases defined in UsbLanguageId enum."); // TODO: #q: Does not display the name of the language, it's just shown as a ushort
+
+        byte                              Index;
+        UsbStringDescriptorName           StringName;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get String Descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (LengthRequested == 2 && LengthCompleted == 2) { // 2 == sizeof(USB_COMMON_DESCRIPTOR)
+                return Format("Get String Descriptor {0} length",
+                              EnumToString(StringName, "UsbSpec.UsbStringDescriptorName"));
+            } else if (LengthCompleted < 4) {
+                return Format("Get String Descriptor {0} (incomplete)",
+                              EnumToString(StringName, "UsbSpec.UsbStringDescriptorName"));
+            } else if (StringDescriptor != null) {
+                return Format("Get String Descriptor {0} - \"{1}\"",
+                              EnumToString(StringName, "UsbSpec.UsbStringDescriptorName"),
+                              StringDescriptor.bString);
+            } else {
+                return Format("Get String Descriptor - {0}",
+                              EnumToString(StringName, "UsbSpec.UsbStringDescriptorName"));
+            }
+        }
+    }
+
+    issues message GetBosDescriptor : GenericTransfer
+    {
+        UsbMultipleDescriptors BosDescriptorSet;
+
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get BOS Descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (BosDescriptorSet != null &&
+                       BosDescriptorSet.Descriptors.Count != 0 &&
+                       BosDescriptorSet.Descriptors[0] is USB_BOS_DESCRIPTOR &&
+                       LengthCompleted == (BosDescriptorSet.Descriptors[0] as USB_BOS_DESCRIPTOR).wTotalLength as ushort) {
+
+                return Format("Get Full BOS Descriptor Set");
+
+            } else {
+
+                return Format("Get Partial BOS Descriptor");
+            }
+        }
+    }
+
+    issues message SetDescriptor : GenericTransfer
+    {
+        UsbDescriptorType DescriptorType;
+        byte              DescriptorIndex;
+        binary            Descriptor;
+    }
+
+    issues message SetAddress : GenericTransfer
+    {
+        byte              DeviceAddress;
+
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set Address - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set Address {0}", DeviceAddress);
+            }
+        }
+    }
+
+    issues message GetConfiguration : GenericTransfer
+    {
+        GetConfigurationDataPacket ConfigurationValuePacket;
+
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Configuration Value - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Configuration Value");
+            }
+        }
+    }
+
+    issues message SetConfiguration : GenericTransfer
+    {
+        byte                   ConfigurationValue;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set Configuration - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set Configuration {0}", ConfigurationValue);
+            }
+        }
+    }
+
+    issues message GetInterface : GenericTransfer
+    {
+        byte                   InterfaceNumber;
+        GetInterfaceDataPacket AlternateInterfaceSettingPacket;
+
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Interface Setting - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Interface Setting");
+            }
+        }
+    }
+
+    issues message SetInterface : GenericTransfer
+    {
+        byte                   InterfaceNumber;
+        byte                   AlternateInterfaceSetting;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set Interface - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set Interface {0} Setting {1}",
+                              InterfaceNumber, AlternateInterfaceSetting);
+            }
+        }
+    }
+
+    issues message GetDeviceStatus : GenericTransfer
+    {
+        //UsbDeviceStatus[true]  DeviceStatus;// TODO: detect usb3
+        UsbDeviceStatus DeviceStatus;// TODO: detect usb3
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Device Status - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Device Status");
+            }
+        }
+    }
+
+    issues message GetInterfaceStatus : GenericTransfer
+    {
+        //UsbInterfaceStatus[true] InterfaceStatus;// TODO: detect usb3
+        optional UsbInterfaceStatus InterfaceStatus where ValidationCheck(InterfaceStatus != nothing, null, "Not enough data in the underlying message for generating the interface status");// TODO: detect usb3
+        byte                     InterfaceIndex;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Interface Status - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Interface Status");
+            }
+        }
+    }
+
+    issues message GetEndpointStatus : GenericTransfer
+    {
+        byte                     RequestedEndpointAddress with DisplayInfo{ToText=ByteToHex};
+        UsbEndpointStatus        EndpointStatus;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Endpoint Status - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (EndpointStatus.Halt != 0) {
+                return Format("Get Endpoint Status - Halted");
+            } else {
+                return Format("Get Endpoint Status - Not Halted");
+            }
+        }
+    }
+
+    issues message SetIsochDelay : GenericTransfer
+    {
+        ushort HostToDeviceDelayNsec;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set Isoch Delay - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set Isoch Delay to {0} ns", HostToDeviceDelayNsec);
+            }
+        }
+    }
+
+    issues message SetSel : GenericTransfer
+    {
+        SetSelDataPacket LatencyValues;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set SEL Latency - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set SEL Latency");
+            }
+        }
+    }
+
+    issues message SynchFrame : GenericTransfer
+    {
+        byte                 EndpointAddressToSynch with DisplayInfo{ToText=ByteToHex};
+        SynchFrameDataPacket SynchronizationFrameNumberPacket;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get SYNCH_FRAME - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Endpoint Synchronization Frame Number (SYNCH_FRAME)");
+            }
+        }
+    }
+
+    issues message SetOrClearFeature : GenericTransfer
+    {
+        UsbStandardSetupRequest Request;
+        UsbRequestTypeRecipient Recipient;
+        optional [| Recipient == UsbRequestTypeRecipient.Interface |] byte RecipientInterfaceNumber;
+        optional [| Recipient == UsbRequestTypeRecipient.Endpoint |] byte RecipientEndpointAddress with DisplayInfo{ToText=ByteToHex};
+        ([| Recipient == UsbRequestTypeRecipient.Device    |] UsbDeviceFeature    |
+         [| Recipient == UsbRequestTypeRecipient.Interface |] UsbInterfaceFeature |
+         [| Recipient == UsbRequestTypeRecipient.Endpoint  |] UsbEndpointFeature  |
+         [| Recipient != UsbRequestTypeRecipient.Device    &&
+            Recipient != UsbRequestTypeRecipient.Interface &&
+            Recipient != UsbRequestTypeRecipient.Endpoint  |] ushort
+           ) Feature with DisplayInfo{ ToText = FeatureToText(Recipient) };
+        optional [| Recipient == UsbRequestTypeRecipient.Interface &&
+                    Feature as UsbInterfaceFeature == UsbInterfaceFeature.FUNCTION_SUSPEND |] UsbFunctionSuspendOptions SuspendOptions;
+
+        string(any) FeatureToText(UsbRequestTypeRecipient Recipient)
+        {
+            switch(Recipient)
+            {
+                case UsbRequestTypeRecipient.Device => return (any input) => EnumToString(input, "UsbSpec.UsbDeviceFeature");
+                case UsbRequestTypeRecipient.Interface => return (any input) => EnumToString(input, "UsbSpec.UsbInterfaceFeature");
+                case UsbRequestTypeRecipient.Endpoint => return (any input) => EnumToString(input, "UsbSpec.UsbEndpointFeature");
+                default => return (any input) => input.ToString();
+            }
+        }
+
+        override string ToString()
+        {
+            string setOrClear;
+            string description;
+            string append;
+            if (Request == UsbStandardSetupRequest.SET_FEATURE) {
+                setOrClear = "Set";
+            } else {
+                setOrClear = "Clear";
+            }
+            if (Recipient == UsbRequestTypeRecipient.Device) {
+                //
+                // Note that we don't cast Feature, it should already be stored as the correct type
+                //
+                description = Format("{0} Device Feature {1}",
+                                     setOrClear,
+                                     EnumToString(Feature, "UsbSpec.UsbDeviceFeature"));
+            } else if (Recipient == UsbRequestTypeRecipient.Interface) {
+
+                description = Format("{0} Interface {1} Feature {2}",
+                                     setOrClear,
+                                     RecipientInterfaceNumber as byte,
+                                     EnumToString(Feature, "UsbSpec.UsbInterfaceFeature"));
+
+                if (Feature as UsbInterfaceFeature == UsbInterfaceFeature.FUNCTION_SUSPEND) {
+                    description = Format("{0} - Suspend = {1}, Remote Wake = {2}", description,
+                                         (SuspendOptions as UsbFunctionSuspendOptions).FunctionSuspend,
+                                         (SuspendOptions as UsbFunctionSuspendOptions).FunctionRemoteWakeEnabled);
+                }
+
+            } else if (Recipient == UsbRequestTypeRecipient.Endpoint) {
+                description = Format("{0} Endpoint {1} Feature {2}",
+                                     setOrClear,
+                                     ByteToHex(RecipientEndpointAddress as byte),
+                                     EnumToString(Feature, "UsbSpec.UsbEndpointFeature"));
+            } else {
+                description = Format("{0} Feature {1}", setOrClear, Feature as string); // not expected
+            }
+            if (TransferFailed()) {
+                append = Format(" - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                append = "";
+            }
+            return Format("{0}{1}", description, append);
+        }
+    }
+
+    issues message ControlTransfer : GenericTransfer
+    {
+        USB_SETUP_PACKET SetupPacket;
+        binary           TransferData;
+    }
+
+    issues message BulkOrInterruptTransfer : GenericTransfer
+    {
+        binary           TransferData;
+    }
+
+    issues message IsochTransfer : GenericTransfer
+    {
+        // TODO: packets
+        uint StartFrame;
+        uint NumberOfPackets;
+        uint ErrorCount;
+    }
+}
+
+contract UsbHubRequest
+{
+    // TODO: is it really necessary for everything to inherit from GenericTransfer instead of a blank UsbMessage? we really only gain a couple of LengthCompleted checks, which could be done some other way, and take on a bunch of UI clutter. -- maybe 2 simple templates, Instance and Instance+Port
+    issues message GetPortStatus : UsbStandardRequest.GenericTransfer
+    {
+        uint           Port;
+        UsbPortStatus  PortStatus;
+    }
+    // TODO: resolve 2.0 vs 3.0 port status into 1 message, 1 type, etc.
+    issues message Get20PortStatus : UsbStandardRequest.GenericTransfer
+    {
+        uint           Port;
+        Usb2PortStatus PortStatus;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get20PortStatus - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get20PortStatus({0}): {1} {2}", Port,
+                              StatusBitsForUsb2PortStatus(PortStatus),
+                              ChangeBitDescriptionForUsb2PortStatus(PortStatus));
+            }
+        }
+    }
+    issues message Get30PortStatus : UsbStandardRequest.GenericTransfer
+    {
+        uint           Port;
+        Usb3PortStatus PortStatus;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get30PortStatus - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get30PortStatus({0}): {1} {2}", Port,
+                              EnumToString(PortStatus.PORT_LINK_STATE, "UsbSpec.UsbLinkState"),
+                              ChangeBitDescriptionForUsb3PortStatus(PortStatus));
+            }
+        }
+    }
+    issues message SuspendPort : UsbStandardRequest.GenericTransfer
+    {
+        uint Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("SuspendPort - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("SuspendPort({0})", Port);
+            }
+        }
+    }
+    issues message SoftwareResumePort : UsbStandardRequest.GenericTransfer
+    {
+        uint Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("ResumePort initiated by software - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("ResumePort({0}) initiated by software", Port);
+            }
+        }
+    }
+    issues message GetHubDescriptor : UsbStandardRequest.GenericTransfer
+    {
+        USB_HUB_DESCRIPTOR HubDescriptor;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get USB 2.0 Hub descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get USB 2.0 Hub Descriptor");
+            }
+        }
+    }
+    issues message GetSuperSpeedHubDescriptor : UsbStandardRequest.GenericTransfer
+    {
+        USB_SUPERSPEED_HUB_DESCRIPTOR HubDescriptor;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get SuperSpeed Hub Descriptor - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get SuperSpeed Hub Descriptor");
+            }
+        }
+    }
+    issues message GetHubStatus : UsbStandardRequest.GenericTransfer
+    {
+        USB_HUB_STATUS HubStatus;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get Hub Status - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get Hub Status");
+            }
+        }
+    }
+    issues message ClearHubChange : UsbStandardRequest.GenericTransfer
+    {
+        UsbHubFeature HubFeature;
+        UsbStandardSetupRequest SetOrClear;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Clear or set hub change bit - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (SetOrClear == UsbStandardSetupRequest.CLEAR_FEATURE) {
+                return Format("Clear hub change bit {0}",
+                              EnumToString(HubFeature, "UsbSpec.UsbHubFeature"));
+            } else {
+                return Format("! Set hub change bit {0}", // not expected
+                              EnumToString(HubFeature, "UsbSpec.UsbHubFeature"));
+            }
+        }
+    }
+    issues message ClearPortChange : UsbStandardRequest.GenericTransfer
+    {
+        UsbHubPortFeature PortFeature;
+        UsbStandardSetupRequest SetOrClear;
+        byte Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Clear or set port change bit - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (SetOrClear == UsbStandardSetupRequest.CLEAR_FEATURE) {
+                return Format("Clear port change bit {0}, port {1}",
+                              EnumToString(PortFeature, "UsbSpec.UsbHubPortFeature"),
+                              Port as string);
+            } else {
+                return Format("! Set port change bit {0}, port {1}", // not expected
+                              EnumToString(PortFeature, "UsbSpec.UsbHubPortFeature"),
+                              Port as string);
+            }
+        }
+    }
+    issues message ResetPort : UsbStandardRequest.GenericTransfer
+    {
+        byte Port;
+        bool WarmReset; // aka BH_PORT_RESET (USB3 only)
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Reset port - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (WarmReset) {
+                return Format("Warm Reset port {0}", Port as string);
+            } else {
+                return Format("Reset port {0}", Port as string);
+            }
+        }
+    }
+    issues message SetOrClearPortPower : UsbStandardRequest.GenericTransfer
+    {
+        byte Port;
+        UsbStandardSetupRequest SetOrClear;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set port power - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (SetOrClear == UsbStandardSetupRequest.CLEAR_FEATURE) {
+                return Format("Power-down hub port {0}", Port as string);
+            } else {
+                return Format("Power-up hub port {0}", Port as string);
+            }
+        }
+    }
+    issues message EnableOrDisablePort : UsbStandardRequest.GenericTransfer // USB2 only
+    {
+        byte Port;
+        UsbStandardSetupRequest SetOrClearPortEnable;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set or clear PORT_ENABLE - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (SetOrClearPortEnable == UsbStandardSetupRequest.CLEAR_FEATURE) {
+                return Format("Disable hub port {0}", Port as string);
+            } else {
+                return Format("Enable hub port {0}", Port as string);
+            }
+        }
+    }
+    issues message SetPortRemoteWakeMask : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        byte Port;
+        USB_HUB_30_PORT_REMOTE_WAKE_MASK WakeConditions;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set port wake conditions - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set port {0} wake conditions", Port as string);
+            }
+        }
+    }
+    issues message SetPortU1Timeout : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        byte Port;
+        byte U1Timeout_Us;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set port U1 timeout - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (U1Timeout_Us == 0) {
+                return Format("Disable U1 on port {0}", Port as string);
+            } else if (U1Timeout_Us == 0xff) {
+                return Format("Enable U1 on port {0} but do not initiate", Port as string);
+            } else {
+                return Format("Enable U1 on port {0} with timer", Port as string);
+            }
+        }
+    }
+    issues message SetPortU2Timeout : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        byte Port;
+        byte U2Timeout_256Us;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set port U2 timeout - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (U2Timeout_256Us == 0) {
+                return Format("Disable U2 on port {0}", Port as string);
+            } else if (U2Timeout_256Us == 0xff) {
+                return Format("Enable U2 on port {0} but do not initiate", Port as string);
+            } else {
+                return Format("Enable U2 on port {0} with timer", Port as string);
+            }
+        }
+    }
+    issues message SetPortLinkState : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        byte Port;
+        UsbLinkState TargetState;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set port link state - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set link state of port {0} to {1}",
+                              Port as string,
+                              EnumToString(TargetState, "UsbSpec.UsbLinkState"));
+            }
+        }
+    }
+    issues message SetOrClearPortFeature : UsbStandardRequest.GenericTransfer // catch-all
+    {
+        byte Port;
+        UsbStandardSetupRequest SetOrClear;
+        UsbHubPortFeature PortFeature;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set or clear port feature - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else if (SetOrClear == UsbStandardSetupRequest.CLEAR_FEATURE) {
+                return Format("Clear port {0} feature {1}",
+                              Port as string,
+                              EnumToString(PortFeature, "UsbSpec.UsbHubPortFeature"));
+            } else {
+                return Format("Set port {0} feature {1}",
+                              Port as string,
+                              EnumToString(PortFeature, "UsbSpec.UsbHubPortFeature"));
+            }
+        }
+    }
+    issues message SetHubDepth : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        ushort Depth;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Set hub depth - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Set hub depth to {1}", Depth as string);
+            }
+        }
+    }
+    issues message GetPortErrorCount : UsbStandardRequest.GenericTransfer // USB3 only
+    {
+        byte Port;
+        ushort NumberOfLinkErrors;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Get port error count - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Get port {0} error count", Port as string);
+            }
+        }
+    }
+    issues message ClearTtBuffer : UsbStandardRequest.GenericTransfer
+    {
+        byte DeviceAddress;
+        byte EndpointAddressToClear;
+        UsbTransferType EndpointType;
+        byte Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Clear TT Buffer - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Clear TT Buffer for port {0} EP {1}", Port as string, ToHex(EndpointAddress));
+            }
+        }
+    }
+    issues message ResetTt : UsbStandardRequest.GenericTransfer
+    {
+        byte Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Reset TT - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Reset TT for port {0}", Port as string);
+            }
+        }
+    }
+    issues message StopTt : UsbStandardRequest.GenericTransfer
+    {
+        byte Port;
+        override string ToString()
+        {
+            if (TransferFailed()) {
+                return Format("Stop TT - {0}", EnumToString(Status, "UsbSpec.UsbdStatus"));
+            } else {
+                return Format("Stop TT for port {0}", Port as string);
+            }
+        }
+    }
+    issues message InterruptTransfer : UsbStandardRequest.GenericTransfer
+    {
+        binary HubAndPortStatusChangeBitmap;
+        byte Port; // if only 1
+        uint BitmapAsUint() {
+            uint bitmapAsUint;
+            if (HubAndPortStatusChangeBitmap.Count == 0) {
+                bitmapAsUint = 0; // should not see this
+            } else if (HubAndPortStatusChangeBitmap.Count == 1) {
+                bitmapAsUint = HubAndPortStatusChangeBitmap[0] as uint;
+            } else if (HubAndPortStatusChangeBitmap.Count == 2) {
+                bitmapAsUint = BinaryDecoder<ushort>(HubAndPortStatusChangeBitmap) as uint;
+            } else if (HubAndPortStatusChangeBitmap.Count == 3) {
+                binary padded = [HubAndPortStatusChangeBitmap[0], HubAndPortStatusChangeBitmap[1], HubAndPortStatusChangeBitmap[2], 0] as binary;
+                bitmapAsUint = BinaryDecoder<uint>(padded) as uint;
+            } else {
+                // More than 4 bytes should be extremely rare
+                binary firstFourBytes = [HubAndPortStatusChangeBitmap[0], HubAndPortStatusChangeBitmap[1], HubAndPortStatusChangeBitmap[2], HubAndPortStatusChangeBitmap[3]] as binary;
+                bitmapAsUint = BinaryDecoder<uint>(firstFourBytes) as uint;
+            }
+            return bitmapAsUint;
+        }
+        byte PortFromBitmap() { // returns 0 for multichange or hub status change
+            uint bitmapAsUint = BitmapAsUint();
+            if (bitmapAsUint == 0) {
+                return 0;
+            }
+            if ((bitmapAsUint & (bitmapAsUint - 1)) != 0) { // multiple changes
+                return 0;
+            }
+            // Normal case - 1 bit changed
+            byte changedBit = 0;
+            while (bitmapAsUint != 1) {
+                bitmapAsUint = bitmapAsUint >> 1;
+                changedBit++;
+            }
+            return changedBit;
+        }
+        override string ToString()
+        {
+            if (Status == UsbdStatus.USBD_STATUS_CANCELED) {
+                return "Software cancelled hub status change interrupt transfer notification";
+            } else if (LengthCompleted == 0) {
+                return "!Length 0 Hub status change interrupt transfer notification"; // should not see this
+            } else {
+                // Normal/interesting case - Got bits back
+                uint bitmapAsUint = BitmapAsUint();
+
+                if (bitmapAsUint == 0 && HubAndPortStatusChangeBitmap.Count > 4) {
+                    return "Change in port status for a port number greater than 31";
+                } else if (bitmapAsUint == 0) {
+                    return "!No change Hub status change interrupt transfer notification"; // should not see this, but we do
+                } else if ((bitmapAsUint & (bitmapAsUint - 1)) != 0) {
+                    return "Multiple changes in hub status";
+                } else if (bitmapAsUint == 1) {
+                    return "Hub status change";
+                } else {
+                    return Format("Port {0} status change", Port as string);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,416 @@
+protocol RDPELE with
+Visualization{AliasName = "RDP"},
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: Licensing Extension",
+    DocumentName = "MS-RDPELE",
+    ShortName = "RDPELE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-RDPELE", Version = "11.2", Date = "08/08/2013", ProgramName = ProgramName.MCPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "379257", Date = "08/05/2015"}
+        ]
+};
+
+using RDPBCGR;
+using T125;
+using Utility;
+using Diagnostics;
+using InfrastructureResources;
+
+endpoint Server over T125.Node
+    issues SERVER_LICENSE_REQUEST
+    accepts CLIENT_NEW_LICENSE_REQUEST
+    accepts CLIENT_LICENSE_INFO
+    issues SERVER_PLATFORM_CHALLENGE
+    accepts CLIENT_PLATFORM_CHALLENGE_RESPONSE
+    issues SERVER_UPGRADE_LICENSE
+    issues SERVER_NEW_LICENSE
+    accepts LICENSE_ERROR_MESSAGE issues LICENSE_ERROR_MESSAGE;
+
+client endpoint Client connected to Server;
+
+autostart actor RDPELEOverT125(T125.Node node) follows RDPBCGROverT125
+{
+    // 2.2.2 The flags field of the security header MUST contain the SEC_LICENSE_PKT (0x0080) flag (see [MS-RDPBCGR] section 2.2.8.1.1.2.1) for all the licensing messages.
+    process node accepts domainMCSPDU:T125.DomainMCSPDU where (domainMCSPDU.DomainMCSPDU is T125.SendDataRequestPattern) && ((((domainMCSPDU.DomainMCSPDU as T125.SendDataRequestPattern).UserData as binary)[0] & 0x80) == 0x80)
+    {
+        ushort indexPort = (domainMCSPDU#T125SourcePort is port:ushort) ? port : 0;
+        bool serverMCSConnectResponsePDUReceived = (indexPort in ServerMCSConnectResponsePDUReceivedFlags) ? ServerMCSConnectResponsePDUReceivedFlags[indexPort] : false;
+        if (!serverMCSConnectResponsePDUReceived)
+        {
+            reject;
+            return;
+        }
+
+        binary payload = (domainMCSPDU.DomainMCSPDU as T125.SendDataRequestPattern).UserData as binary;
+        // Accroding to section 2.2.2, securityHeader depends on encryptionLevel, encryptionMethod, clientToServer and SEC_ENCRYPT flag.
+        uint encryptionLevel = (indexPort in encryptionLevels) ? encryptionLevels[indexPort] : 0;
+        uint encryptionMethod = (indexPort in encryptionMethods) ? encryptionMethods[indexPort] : 0;
+        bool clientToServer = true;
+        bool isSecEncrypt = ((payload[0] & 0x08) == 0x08);
+        // Accroding to section 2.2.2, licensing message depends on the value of the bMsgType field in the preamble structure. 
+        int bMsgType = GetbMsgType(payload, encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt);
+
+        // 2.2.2.3   Client License Information (CLIENT_LICENSE_INFO)
+        if (bMsgType == 0x12)
+        {
+            var m = BinaryDecoder<CLIENT_LICENSE_INFO[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as CLIENT_LICENSE_INFO;
+                dispatch endpoint Server over node accepts msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "CLIENT_LICENSE_INFO");
+            }
+        }
+        // 2.2.2.2   Client New License Request (CLIENT_NEW_LICENSE_REQUEST)
+        else if (bMsgType == 0x13)
+        {
+            var m = BinaryDecoder<CLIENT_NEW_LICENSE_REQUEST[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as CLIENT_NEW_LICENSE_REQUEST;
+                dispatch endpoint Server over node accepts msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "CLIENT_NEW_LICENSE_REQUEST");
+            }
+        }
+        
+        // 2.2.2.5   Client Platform Challenge Response (CLIENT_PLATFORM_CHALLENGE_RESPONSE)
+        else if (bMsgType == 0x15)
+        {
+            var m = BinaryDecoder<CLIENT_PLATFORM_CHALLENGE_RESPONSE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as CLIENT_PLATFORM_CHALLENGE_RESPONSE;
+                dispatch endpoint Server over node accepts msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "CLIENT_PLATFORM_CHALLENGE_RESPONSE");
+            }
+        }
+        // 2.2.2.7.1   License Error Message (LICENSE_ERROR_MESSAGE)
+        else if (bMsgType == 0xFF)
+        {
+            var m = BinaryDecoder<LICENSE_ERROR_MESSAGE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as LICENSE_ERROR_MESSAGE;
+                dispatch endpoint Server over node accepts msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "LICENSE_ERROR_MESSAGE");
+            }
+        }
+        else 
+        {
+            reject;
+        }
+    }
+
+    // 2.2.2 The flags field of the security header MUST contain the SEC_LICENSE_PKT (0x0080) flag (see [MS-RDPBCGR] section 2.2.8.1.1.2.1) for all the licensing messages.
+    process node issues domainMCSPDU:T125.DomainMCSPDU where (domainMCSPDU.DomainMCSPDU is T125.SendDataIndicationPattern) && ((((domainMCSPDU.DomainMCSPDU as T125.SendDataIndicationPattern).UserData as binary)[0] & 0x80) == 0x80)
+    {
+        ushort indexPort = (domainMCSPDU#T125DestinationPort is port:ushort) ? port : 0;
+        bool serverMCSConnectResponsePDUReceived = (indexPort in ServerMCSConnectResponsePDUReceivedFlags) ? ServerMCSConnectResponsePDUReceivedFlags[indexPort] : false;
+        if (!serverMCSConnectResponsePDUReceived)
+        {
+            reject;
+            return;
+        }
+
+        binary payload = (domainMCSPDU.DomainMCSPDU as T125.SendDataIndicationPattern).UserData as binary;
+        // Accroding to section 2.2.2, securityHeader depends on encryptionLevel, encryptionMethod, clientToServer and SEC_ENCRYPT flag.
+        uint encryptionLevel = (indexPort in encryptionLevels) ? encryptionLevels[indexPort] : 0;
+        uint encryptionMethod = (indexPort in encryptionMethods) ? encryptionMethods[indexPort] : 0;
+        bool clientToServer = false;
+        bool isSecEncrypt = ((payload[0] & 0x08) == 0x08);
+        // Accroding to section 2.2.2, licensing message depends on the value of the bMsgType field in the preamble structure.
+        int bMsgType = GetbMsgType(payload, encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt);
+
+        // 2.2.2.1   Server License Request (SERVER_LICENSE_REQUEST)
+        if (bMsgType == 0x01)
+        {
+            var m = BinaryDecoder<SERVER_LICENSE_REQUEST[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as SERVER_LICENSE_REQUEST;
+                dispatch endpoint Server over node issues msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "SERVER_LICENSE_REQUEST");
+            }
+        }
+        // 2.2.2.4   Server Platform Challenge (SERVER_PLATFORM_CHALLENGE)
+        else if (bMsgType == 0x02)
+        {
+            var m = BinaryDecoder<SERVER_PLATFORM_CHALLENGE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as SERVER_PLATFORM_CHALLENGE;
+                dispatch endpoint Server over node issues msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "SERVER_PLATFORM_CHALLENGE");
+            }
+        }
+        // 2.2.2.7   Server New License (SERVER_NEW_LICENSE)
+        else if (bMsgType == 0x03)
+        {
+            var m = BinaryDecoder<SERVER_NEW_LICENSE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as SERVER_NEW_LICENSE;
+                dispatch endpoint Server over node issues msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "SERVER_NEW_LICENSE");
+            }
+        }
+        // 2.2.2.6   Server Upgrade License (SERVER_UPGRADE_LICENSE)
+        else if (bMsgType == 0x04)
+        {
+            var m = BinaryDecoder<SERVER_UPGRADE_LICENSE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as SERVER_UPGRADE_LICENSE;
+                dispatch endpoint Server over node issues msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "SERVER_UPGRADE_LICENSE");
+            }
+        }
+        // 2.2.2.7.1   License Error Message (LICENSE_ERROR_MESSAGE)
+        else if (bMsgType == 0xFF)
+        {
+            var m = BinaryDecoder<LICENSE_ERROR_MESSAGE[encryptionLevel, encryptionMethod, clientToServer, isSecEncrypt]>(payload);
+            if (m != nothing)
+            {
+                var msg = m as LICENSE_ERROR_MESSAGE;
+                dispatch endpoint Server over node issues msg;
+            }
+            else
+            {
+                ThrowDecodingException("RDPELE", "LICENSE_ERROR_MESSAGE");
+            }
+        }
+        else 
+        {
+            reject;
+        }
+    }
+}
+
+// 2.2.2   Licensing PDU (TS_LICENSING_PDU)
+message TS_LICENSING_PDU[TSUDSCSec1EncryptionLevel EncryptionLevel, TSUDSCSec1EncryptionMethod EncryptionMethod, bool ClientToServer, bool IsSecEncrypt]
+{
+    (
+        ([|ClientToServer && (!IsSecEncrypt || (EncryptionLevel == TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_NONE))|] TS_SECURITY_HEADER) |
+        ([|ClientToServer && IsSecEncrypt && (EncryptionLevel in {TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_LOW,
+                                                                 TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_CLIENT_COMPATIBLE,
+                                                                 TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_HIGH})|] TS_SECURITY_HEADER1) |
+        ([|!ClientToServer && (!IsSecEncrypt || EncryptionLevel in {TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_NONE,
+                                                                    TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_LOW})|] TS_SECURITY_HEADER) |
+        ([|!ClientToServer && IsSecEncrypt && (EncryptionLevel in {TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_CLIENT_COMPATIBLE,
+                                                                  TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_HIGH})|] TS_SECURITY_HEADER1) |
+        ([|!ClientToServer && IsSecEncrypt && (EncryptionLevel == TSUDSCSec1EncryptionLevel.ENCRYPTION_LEVEL_FIPS)|] TS_SECURITY_HEADER2)
+    ) securityHeader;
+
+    LICENSE_PREAMBLE preamble;
+
+    override string ToString()
+    {
+        return "Licensing PDU";
+    }
+};
+
+// -----------------------------------------------------------------
+// 2.2.2.1   Server License Request (SERVER_LICENSE_REQUEST)
+message SERVER_LICENSE_REQUEST : TS_LICENSING_PDU
+{
+    binary ServerRandom with BinaryEncoding{Length = 32};
+    PRODUCT_INFO ProductInfo;
+    LICENSE_BINARY_BLOB KeyExchangeList; // WBlobType == LicenseBinaryBlobWBlobType.BBKeyExchgAlgBlob
+    LICENSE_BINARY_BLOB ServerCertificate; // WBlobType == LicenseBinaryBlobWBlobType.BBCertificateBlob
+    SCOPE_LIST ScopeList;
+
+    override string ToString()
+    {
+        return "Server License Request"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType")
+            + ", pbCompanyName: " + ProductInfo.pbCompanyName
+            + ", pbProductId: " + ProductInfo.pbProductId;
+    }
+}
+
+// 2.2.2.1.1   Product Information (PRODUCT_INFO)
+type PRODUCT_INFO
+{
+    uint dwVersion;
+    uint cbCompanyName;
+    string pbCompanyName with BinaryEncoding{TextEncoding = TextEncoding.UTF16, Length = cbCompanyName / 2};
+    uint cbProductId;
+    string pbProductId with BinaryEncoding{TextEncoding = TextEncoding.UTF16, Length = cbProductId / 2};
+};
+
+// 2.2.2.1.2   Scope List (SCOPE_LIST)
+type SCOPE_LIST
+{
+    uint ScopeCount;
+    array<SCOPE> ScopeArray with BinaryEncoding{Length = ScopeCount};
+};
+
+// 2.2.2.1.2.1   Scope (SCOPE)
+type SCOPE
+{
+    LICENSE_BINARY_BLOB Scope; // WBlobType == LicenseBinaryBlobWBlobType.BBScopeBlob
+
+    override string ToString()
+    {
+        return "SCOPE, Scope: " + Scope.ToString();
+    }
+};
+
+// -----------------------------------------------------------------
+// 2.2.2.2   Client New License Request (CLIENT_NEW_LICENSE_REQUEST)
+message CLIENT_NEW_LICENSE_REQUEST : TS_LICENSING_PDU
+{
+    uint PreferredKeyExchangeAlg where ValidationCheck(InRange<KeyExchangeAlg>(value), this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPELE", "PreferredKeyExchangeAlg", INFRASTRUCTURE_STR_MESSAGE, "CLIENT_NEW_LICENSE_REQUEST", INFRASTRUCTURE_STR_MUST, "KEY_EXCHANGE_ALG_RSA(0x00000001)", DecToHexFormat(value)]));
+    uint PlatformId;
+    binary ClientRandom with BinaryEncoding{Length = 32};
+    LICENSE_BINARY_BLOB EncryptedPreMasterSecret; // WBlobType == LicenseBinaryBlobWBlobType.BBRandomBlob
+    LICENSE_BINARY_BLOB ClientUserName; // WBlobType == LicenseBinaryBlobWBlobType.BBClientUserNameBlob
+    LICENSE_BINARY_BLOB ClientMachineName; // WBlobType == LicenseBinaryBlobWBlobType.BBClientMachineNameBlob
+
+    override string ToString()
+    {
+        string summary = "Client New License Request"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType")
+            + ", PreferredKeyExchangeAlg: " + DecToHexFormat(PreferredKeyExchangeAlg)
+            + ", PlatformId: " + DecToHexFormat(PlatformId);
+        if (ClientUserName.blobData is userName:string)
+        {
+            summary += ", ClientUserName: " + userName;
+        }
+        if (ClientMachineName.blobData is machineName:string)
+        {
+            summary += ", ClientMachineName: " + machineName;
+        }      
+        return summary;
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.3   Client License Information (CLIENT_LICENSE_INFO)
+message CLIENT_LICENSE_INFO : TS_LICENSING_PDU
+{
+    uint PreferredKeyExchangeAlg where ValidationCheck(InRange<KeyExchangeAlg>(value), this, DiagnosisLevel.Error, 
+        () => Format(INFRASTRUCTURE_STR_CHECK_VALUE, ["RDPELE", "PreferredKeyExchangeAlg", INFRASTRUCTURE_STR_MESSAGE, "CLIENT_LICENSE_INFO", INFRASTRUCTURE_STR_MUST, "KEY_EXCHANGE_ALG_RSA(0x00000001)", DecToHexFormat(value)]));
+    uint PlatformId;
+    binary ClientRandom with BinaryEncoding{Length = 32};
+    LICENSE_BINARY_BLOB EncryptedPreMasterSecret; // WBlobType == LicenseBinaryBlobWBlobType.BBRandomBlob
+    LICENSE_BINARY_BLOB LicenseInfo; // WBlobType == LicenseBinaryBlobWBlobType.BBDataBlob
+    LICENSE_BINARY_BLOB EncryptedHWID;
+    array<byte> MACData with BinaryEncoding{Length = 16};
+
+    override string ToString()
+    {
+        return "Client License Information"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType")
+            + ", PreferredKeyExchangeAlg: " + DecToHexFormat(PreferredKeyExchangeAlg)
+            + ", PlatformId: " + DecToHexFormat(PlatformId);
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.4   Server Platform Challenge (SERVER_PLATFORM_CHALLENGE)
+message SERVER_PLATFORM_CHALLENGE : TS_LICENSING_PDU
+{
+    uint ConnectFlags;
+    LICENSE_BINARY_BLOB EncryptedPlatformChallenge;
+    array<byte> MACData with BinaryEncoding{Length = 16};
+    override string ToString()
+    {
+        return "Server Platform Challenge"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType");
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.5   Client Platform Challenge Response (CLIENT_PLATFORM_CHALLENGE_RESPONSE)
+message CLIENT_PLATFORM_CHALLENGE_RESPONSE : TS_LICENSING_PDU
+{
+    LICENSE_BINARY_BLOB EncryptedPlatformChallengeResponse;
+    LICENSE_BINARY_BLOB EncryptedHWID; // WBlobType == LicenseBinaryBlobWBlobType.BBEncryptedDataBlob
+    array<byte> MACData with BinaryEncoding{Length = 16};
+
+    override string ToString()
+    {
+        return "Client Platform Challenge Response"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType");
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.6   Server Upgrade License (SERVER_UPGRADE_LICENSE)
+message SERVER_UPGRADE_LICENSE : TS_LICENSING_PDU
+{
+    LICENSE_BINARY_BLOB EncryptedLicenseInfo;
+    array<byte> MACData with BinaryEncoding{Length = 16};
+
+    override string ToString()
+    {
+        return "Server Upgrade License"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType");
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.7   Server New License (SERVER_NEW_LICENSE)
+message SERVER_NEW_LICENSE : TS_LICENSING_PDU
+{
+    LICENSE_BINARY_BLOB EncryptedLicenseInfo;
+    array<byte> MACData with BinaryEncoding{Length = 16};
+
+    override string ToString()
+    {
+        return "Server New License"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType");
+    }
+}
+
+// -----------------------------------------------------------------
+// 2.2.2.7.1   License Error Message (LICENSE_ERROR_MESSAGE)
+message LICENSE_ERROR_MESSAGE : TS_LICENSING_PDU
+{
+    RDPBCGR.LICENSE_ERROR_MESSAGE LicensingMessage;
+
+    override string ToString()
+    {
+        return "License Error Message"
+            + ", bMsgType: " + EnumToString(preamble.bMsgType, "RDPBCGR.LicensePreambleBMsgType")
+            + ", dwErrorCode: " + EnumToString(LicensingMessage.dwErrorCode, "RDPBCGR.LicenseErrorMessageDwErrorCode")
+            + ", dwStateTransition: " + EnumToString(LicensingMessage.dwStateTransition, "RDPBCGR.LicenseErrorMessageDwStateTransition");
+    }
+}

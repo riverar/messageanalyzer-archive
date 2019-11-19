@@ -1,0 +1,1677 @@
+protocol HTTP2 with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Hypertext Transfer Protocol",
+    ShortName = "HTTP2",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+        [
+            new Reference{Name = "RFC 7540"},
+            new Reference{Name = "RFC 7541"},
+            new Reference{Name = "MS-HTTP2E", Version = "1.0", Date = "06/30/2015", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class=RevisionClass.Major, Version="382080", Date="10/13/2015"}
+        ]
+};
+
+using Standard;
+using TCP;
+using Utility;
+using Configurations;
+using HTTP;
+using CoreNetworkingResources;
+
+/////////////////////////////////////////////////
+// Endpoint and actor
+endpoint Server
+    over HttpForwarder
+    accepts ClientConnectionPreface
+    accepts DATA issues DATA
+    accepts HEADERS issues HEADERS
+    accepts PRIORITY issues PRIORITY
+    accepts RST_STREAM issues RST_STREAM
+    accepts SETTINGS issues SETTINGS
+    accepts PUSH_PROMISE issues PUSH_PROMISE
+    accepts PING issues PING
+    accepts GOAWAY issues GOAWAY
+    accepts WINDOW_UPDATE issues WINDOW_UPDATE
+    accepts CONTINUATION issues CONTINUATION;
+
+// Process TCP segments from different actors(Socks, WsMan, TCP)
+// Decode HTTP1 or HTTP2 accordingly and dispatch to appropriate endpoint.
+endpoint HttpForwarder
+    over tcp:TCP.Server
+    accepts TCP.Segment issues TCP.Segment
+{
+    HTTPVersion httpVersion = HTTPVersion.Unknown;
+    // HTTP1 decoding variables
+    HTTP.ConnectionContext context = null;
+    HttpDecodingHelper http1Helper = null;
+    // HTTP2 decoding variables 
+    Http2DecodingHelper http2Helper = null;
+
+    process this accepts s:Segment
+    {
+        if (httpVersion == HTTPVersion.Unknown) 
+        {
+            DetectHttpVersion();
+        }
+        if (httpVersion == HTTPVersion.HTTPv1) // HTTP 1
+        {
+            EnsureHttpV1Initialized();
+            http1Helper.TryDecode(s, MessageDirection.Accepts);
+        }
+        else if (httpVersion == HTTPVersion.HTTPv2) // HTTP 2
+        {
+            EnsureHttpV2Initialized();
+            http2Helper.TryDecode(s, MessageDirection.Accepts);
+        }
+        else
+        {
+            ThrowDecodingException("HTTP2");
+        }
+    }
+
+    process this issues s:Segment
+    {
+        if (httpVersion == HTTPVersion.Unknown) 
+        {
+            DetectHttpVersion();
+        }
+        if (httpVersion == HTTPVersion.HTTPv1) // HTTP 1
+        {
+            EnsureHttpV1Initialized();
+            http1Helper.TryDecode(s, MessageDirection.Issues);
+        }
+        else if (httpVersion == HTTPVersion.HTTPv2) // HTTP 2
+        {
+            EnsureHttpV2Initialized();
+            http2Helper.TryDecode(s, MessageDirection.Issues);
+        }
+        else
+        {
+            ThrowDecodingException("HTTP2");
+        }
+    }
+    ~endpoint(HttpForwarder server)
+    {
+        if (http1Helper != null)
+            http1Helper.ClearInDestructor();
+        if (http2Helper != null)
+            http2Helper.ClearInDestructor();
+    }
+
+    void EnsureHttpV1Initialized()
+    {
+        if (http1Helper == null)
+        {
+            context = new HTTP.ConnectionContext();
+            http1Helper = new HttpDecodingHelper().InitializeHttpHelper(context, endpoint HTTP.Server over this, true, null, CheckUpgradeHeaderField);
+        }
+    }
+
+    void EnsureHttpV2Initialized()
+    {
+        if (http2Helper == null)
+        {
+            http2Helper = new Http2DecodingHelper().InitializeHttp2Helper(endpoint HTTP2.Server over this);
+        }
+    }
+
+    void DetectHttpVersion()
+    {
+        if (tcp.NegotiatedAppNameByTLS is appName:string && appName != null)
+        {
+            if (appName.IndexOf("h2") == 0)
+            {
+                httpVersion = HTTPVersion.HTTPv2;
+            }
+            else
+            {   
+                httpVersion = HTTPVersion.HTTPv1;
+            }
+        }
+        else
+        {
+            httpVersion = HTTPVersion.HTTPv1;
+        }
+        // In 'Upgrade' scenario, 'httpVersion' will be update in 'CheckUpgradeHeaderField' function, skip checking this case in this function.
+    }
+
+    // Update 'httpVersion' for "Upgrade" scenario.
+    // This function is registered to HTTP.DecodingCache, it will be called after decoding HTTP Response message.
+    void CheckUpgradeHeaderField(HttpContract.Response res)
+    {   
+        if (res.StatusCode == 101 && "Upgrade" in res.Headers.Keys && res.Headers["Upgrade"] is v:array<string>)
+        {
+            if (v.Count > 0 && v[0].IndexOf("h2c") == 0)
+            {
+                httpVersion = HTTPVersion.HTTPv2;
+                EnsureHttpV2Initialized();
+
+                // Copy remaining data in HTTPv1 cache to HTTPv2 cache for response direction.
+                Http2DecodingCache http2IssueCache = http2Helper.IssuesCache as Http2DecodingCache;
+                HttpDecodingCache<HttpContract.Response> http1IssueCache = http1Helper.IssuesCache as HttpDecodingCache<HttpContract.Response>;
+                http2IssueCache.Buffer = http1IssueCache.Buffer.Segment(http1IssueCache.HeaderLength);
+                http1IssueCache.Buffer = null;
+                http2IssueCache.Origins = http1IssueCache.Origins;
+                http1Helper = null;
+                // Try to decode remaining data to HTTP2
+                http2IssueCache.TryDecodeAndDispatchMessage();
+            }
+        }
+    }
+}
+
+// Combine HTTP and HTTP2 actors into single actor.
+autostart actor HTTPOverTCP(TCP.Server server)
+{
+    HttpConfiguration config = GetConfigurableValue<HttpConfiguration>();
+    // null --- has not determined yet.
+    // false -- already knew it's not HTTP.
+    // true --- already know it is HTTP.
+    bool? isHttp = null;
+    // only for HTTP v1 auto-detection, remember the server port during auto-detect for HTTP1
+    ushort? detectedServerPort = null;
+    process server accepts s:Segment where IsHTTPConnection(s, server)
+    {
+        MessageDirection dir = GetDirection(s);
+        if (dir == MessageDirection.Accepts)
+        {
+            dispatch endpoint HttpForwarder over server accepts s;
+        }
+        else if (dir == MessageDirection.Issues)
+        {
+            dispatch endpoint HttpForwarder over server issues s;
+        }
+    }
+
+    process server issues s:Segment where IsHTTPConnection(s, server)
+    {   
+        MessageDirection dir = GetDirection(s);
+        if (dir == MessageDirection.Accepts)
+        {
+            dispatch endpoint HttpForwarder over server accepts s;
+        }
+        else if (dir == MessageDirection.Issues)
+        {
+            dispatch endpoint HttpForwarder over server issues s;
+        }
+    }
+
+    bool IsHTTPConnection(Segment s, TCP.Server server)
+    {
+        if (isHttp == false)
+            return false;
+        else if (isHttp == true)
+            return true;
+        else // Unknown
+        {
+            if (s.SourcePort in DefaultPorts || s.DestinationPort in DefaultPorts || 
+                s.SourcePort in config.HttpPorts || s.DestinationPort in config.HttpPorts ||
+                s.SourcePort in config.HttpsPorts || s.DestinationPort in config.HttpsPorts ||
+                s.SourcePort == detectedServerPort || s.DestinationPort == detectedServerPort ||
+                /* 
+                 * Auto detect user customized port number for HTTP1.
+                 * E.g.: WSDAPI uses TCP port 5357 for HTTP traffic. http://msdn.microsoft.com/en-us/library/windows/desktop/bb736556(v=vs.85).aspx
+                 *     But not all TCP message with port 5357 is HTTP message, please refer to bug#70127.
+                 */
+                AutoDetectHTTPv1(s))
+            {
+                isHttp = true;
+                return true;
+            }
+            else
+            {
+                isHttp = false;
+                return false;
+            }
+        }
+    }
+
+    bool AutoDetectHTTPv1(Segment s)
+    {
+        if (RequestLineToDetectRequest(s.Payload) != nothing) // request
+        {
+            detectedServerPort = s.DestinationPort;
+            return true;
+        }
+        else if (StatusLine(s.Payload) != nothing)  // response
+        {
+            detectedServerPort = s.SourcePort;
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    MessageDirection GetDirection(Segment s)
+    {
+        if (s.SourcePort in DefaultPorts || s.SourcePort in config.HttpPorts || s.SourcePort in config.HttpsPorts || s.SourcePort == detectedServerPort)
+        {
+            return MessageDirection.Issues;
+        }
+        else
+        {
+            return MessageDirection.Accepts;
+        }
+    }
+}
+
+pattern HTTPVersion = enum byte
+{
+    Unknown,
+    HTTPv1,
+    HTTPv2,
+};
+
+/////////////////////////////////////////////////
+// Decoding cache and helper
+type Http2DecodingHelper : TCPDecodingHelper
+{
+    Http2DecodingHelper InitializeHttp2Helper(HTTP2.Server server)
+    {
+        array<NameValuePair> staticTables = HTTP2.StaticTable;
+        
+        AcceptsCache = new Http2DecodingCache().Initialize(server, MessageDirection.Accepts, ref staticTables);
+        IssuesCache = new Http2DecodingCache().Initialize(server, MessageDirection.Issues, ref staticTables);
+        return this;
+    }
+}
+
+type Http2DecodingCache : TCPDecodingCache
+{
+    // For one TCP connection after HTTP2 protocol is negotiated, 
+    // the first HTTP2 frame sent by the client in the connection is 'ClientConnectionPreface'.
+    // 'null' -- initial value, indicates it's not sure whether ClientConnectionPreface frame decoded or not.
+    // 'true' -- it's sure the DC is decoding ClientConnectionPreface frame, after perform 'IsHttp2Message' function.
+    // 'false' -- it's sure the DC is not decoding ClientConnectionPreface frame, after perform 'IsHttp2Message' function.
+    bool? decodingClientConnectionPreface = null;
+    TableContainer TableContainer = null;
+
+    Http2DecodingCache Initialize(any endpoint ept, MessageDirection direction, ref array<NameValuePair> staticTables)
+    {
+        base.Initialize("HTTP2", ept, direction, IsHttp2Message, IsSufficientForSingleHttp2Msg, DecodeSingleHttp2Msg, 
+            (binary bin) => BinaryDecoder<IncompleteFrame>(bin) as optional any message);
+        TableContainer = new TableContainer{DynamicTables = new DoublyLinkList(), StaticTables = staticTables};
+        return this;
+    }
+
+    bool? IsHttp2Message(binary bin)
+    {
+        if (decodingClientConnectionPreface == null)
+        {
+            if (bin.Count < 24)
+                return null;
+            if (bin.Segment(0, 24) == MagicBinary)
+            {
+                decodingClientConnectionPreface = true;
+                return true;
+            }
+            else
+            {
+                decodingClientConnectionPreface = false;
+            }
+        }
+
+        if (bin.Count < 6)
+            return null;
+        return InRange<FrameType>(bin[3]) && // frame type
+            (bin[5] & 0x80) == 0; // Reserved bit
+    }
+
+    uint? IsSufficientForSingleHttp2Msg(binary bin)
+    {
+        if (decodingClientConnectionPreface == true)
+        {
+            if (bin.Count > 24)
+                return 0;
+            else
+                return 24;
+        }
+        else
+        {
+            if (bin.Count < 3)
+                return null;
+            uint payloadLen = (bin[0] << 16) + (bin[1] << 8) + bin[2] as uint;
+            return payloadLen + 9 <= bin.Count ? 0 : payloadLen + 9; // The 9 octets of the frame header are not included in Length field
+        }
+    }
+
+    optional any message DecodeSingleHttp2Msg(stream s)
+    {
+        if (decodingClientConnectionPreface == true)
+        {
+            decodingClientConnectionPreface = false;
+            return DecodeMsg<ClientConnectionPreface>(s);
+        }
+        else
+        {
+            byte msgType = s.PeekByte(24); // It's safe without checking length.
+            switch (msgType)
+            {
+                case FrameType.DATA =>
+                    return DecodeMsg<DATA>(s);
+                case FrameType.HEADERS => 
+                    switch (s)
+                    {
+                        case headers:HEADERS from BinaryDecoder<HEADERS> =>
+                            if (headers.Headers is bin:binary) 
+                            {
+                                headers.Headers = DecoderHeadersAndUpdateTables(bin, TableContainer);
+                            }
+                            return headers as any message;
+                        default =>
+                            return nothing;
+                    }
+                case FrameType.PRIORITY => 
+                    return DecodeMsg<PRIORITY>(s);
+                case FrameType.RST_STREAM => 
+                    return DecodeMsg<RST_STREAM>(s);
+                case FrameType.SETTINGS => 
+                    switch (s)
+                    {
+                        case settings:SETTINGS from BinaryDecoder<SETTINGS> =>
+                            // http://tools.ietf.org/html/rfc7541#section-4.3
+                            //    Whenever the maximum size for the dynamic table is reduced, entries
+                            //    are evicted from the end of the dynamic table until the size of the
+                            //    dynamic table is less than or equal to the maximum size.
+                            if (settings.SETTINGS is arr:array<SETTING> && arr.Count > 0)
+                            {
+                                foreach (SETTING setting in arr)
+                                {
+                                    if (setting.Identifier == Parameters.SETTINGS_HEADER_TABLE_SIZE)
+                                    {
+                                        int v = setting.Value as int;
+                                        TableContainer.DynamicTables.OnLimitChanging(v);
+                                    }
+                                }
+                            }
+                            return settings as any message;
+                        default =>
+                           return nothing;
+                    }
+                case FrameType.PUSH_PROMISE => 
+                    switch (s)
+                    {
+                        case push:PUSH_PROMISE from BinaryDecoder<PUSH_PROMISE> =>
+                            if (push.Headers is bin:binary) 
+                            {
+                                push.Headers = DecoderHeadersAndUpdateTables(bin, TableContainer);
+                            }
+                            return push as any message;
+                        default =>
+                            return nothing;
+                    }
+                case FrameType.PING => 
+                    return DecodeMsg<PING>(s);
+                case FrameType.GOAWAY => 
+                    return DecodeMsg<GOAWAY>(s);
+                case FrameType.WINDOW_UPDATE => 
+                    return DecodeMsg<WINDOW_UPDATE>(s);
+                case FrameType.CONTINUATION => 
+                    switch (s)
+                    {
+                        case continuation:CONTINUATION from BinaryDecoder<CONTINUATION> =>
+                            if (continuation.Headers is bin:binary) 
+                            {
+                                continuation.Headers = DecoderHeadersAndUpdateTables(bin, TableContainer);
+                            }
+                            return continuation as any message;
+                        default =>
+                            return nothing;
+                    }
+                default =>
+                    return nothing;
+            }
+        }
+    }
+
+    override void ClearInDestructor()
+    {
+        decodingClientConnectionPreface = null;
+        TableContainer = null;
+        base.ClearInDestructor();
+    }
+}
+
+optional any message DecodeMsg<T>(stream s)
+{
+    if (BinaryDecoder<T>(s) is t:T)
+    {
+        return t as any message;
+    }
+    else
+    {
+        return nothing;
+    }
+}
+
+int GetPatternBitWidth(byte v)
+{
+    if ((v & 0x80) == 0x80) return 1;
+    else if ((v & 0xC0) == 0x40) return 2;
+    else if ((v & 0xE0) == 0) return 4;
+    return 0;
+}
+
+array<HeaderField> DecoderHeadersAndUpdateTables(binary bin, TableContainer tableContainer)
+{
+    stream s = bin;
+    array<HeaderField> headerFields = [];
+    while (s.RemainingByteLength > 1)
+    {
+        byte curByte = s.CurrentByte;
+        int patternBitWidth = GetPatternBitWidth(curByte);
+        if (BinaryDecoder<HeaderField[patternBitWidth]>(s) is headerField:HeaderField)
+        {
+            NameValuePair pair;
+            if (headerField.Index.Value is index:int && index > 0)
+            {
+                pair = tableContainer.RetrieveTables(index);
+            }
+            else
+            {
+                pair = new NameValuePair();
+            }
+            if (headerField.Name != nothing)
+            {
+                pair.Name = headerField.Name.ToString();
+            }
+            if (headerField.Value != nothing)
+            {
+                pair.Value = headerField.Value.ToString();
+            }
+            headerField.Representation = pair;
+
+            // 6.2.1.  Literal Header Field with Incremental Indexing
+            if (patternBitWidth == 2 && headerField.Pattern == 1)
+            {
+                tableContainer.InsertDynamicTable(pair.Clone());
+            }
+        }
+        else
+        {
+            break;
+        }
+        headerFields += [headerField];
+    }
+    return headerFields;
+}
+
+//-------------------------------------------
+// Message and Data Types
+pattern FrameType = enum byte
+{
+    DATA            = 0x00,
+    HEADERS         = 0x01,
+    PRIORITY        = 0x02,
+    RST_STREAM      = 0x03,
+    SETTINGS        = 0x04,
+    PUSH_PROMISE    = 0x05,
+    PING            = 0x06,
+    GOAWAY          = 0x07,
+    WINDOW_UPDATE   = 0x08,
+    CONTINUATION    = 0x09,
+};
+
+// 3.5.  HTTP/2 Connection Preface
+// The first HTTP2 frame send by Client.
+message ClientConnectionPreface
+{
+    string Data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 24};
+
+    override string ToString()
+    {
+        return "Client connection preface";
+    }
+}
+const binary MagicBinary = $[505249202a20485454502f322e300d0a0d0a534d0d0a0d0a];
+
+// 6.1.  DATA
+// type=0x0
+message DATA
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    DATA_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    optional [|(Flags & DATA_Flags.PADDED) > 0|] byte PadLength;
+    binary Data with BinaryEncoding{Length = GetDataLength()};
+    optional [|PadLength != nothing|] binary Padding with BinaryEncoding{Length = (PadLength != nothing) ? (PadLength as byte) : 0};
+
+    uint GetDataLength()
+    {
+        if (PadLength is padLen:byte)
+        {
+            return Length - 1 - padLen;
+        }
+        else
+        {
+            return Length;
+        }
+    }
+
+    override string ToString()
+    {
+        return "DATA, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<DATA_Flags>(Flags) +
+            ", Length: " + Length.ToString();
+    }
+}
+
+pattern DATA_Flags = flags byte
+{
+    END_STREAM      = 0x01,
+    PADDED          = 0x08,
+    ...
+};
+
+// 6.2.  HEADERS
+// type=0x1
+message HEADERS
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    HEADERS_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    optional [|(Flags & HEADERS_Flags.PADDED) > 0|] byte PadLength;
+    optional [|(Flags & HEADERS_Flags.PRIORITY) > 0|] byte E with BinaryEncoding{Width = 1};
+    optional [|(Flags & HEADERS_Flags.PRIORITY) > 0|] uint StreamDependency with BinaryEncoding{Width = 31};
+    optional [|(Flags & HEADERS_Flags.PRIORITY) > 0|] byte Weight;
+    (binary | array<HeaderField>) Headers with BinaryEncoding{Length = GetDataLength()};
+    optional [|PadLength != nothing|] binary Padding with BinaryEncoding{Length = PadLength != nothing ? (PadLength as byte) : 0};
+
+    uint GetDataLength()
+    {
+        uint length = Length;
+        if (PadLength is padLen:byte)
+        {
+            length = length - 1 - padLen;
+        }
+        if ((Flags & HEADERS_Flags.PRIORITY) > 0)
+        {
+            length = length - 5;
+        }
+        return length;
+    }
+
+    override string ToString()
+    {
+        return "HEADERS, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<HEADERS_Flags>(Flags) +
+            ", Length: " + Length.ToString();
+    }
+}
+
+pattern HEADERS_Flags = flags byte
+{
+    END_STREAM      = 0x01,
+    END_HEADERS     = 0x04,
+    PADDED          = 0x08,
+    PRIORITY        = 0x20,
+    ...
+};
+
+// 6.3.  PRIORITY
+// type=0x2
+message PRIORITY
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    PRIORITY_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    bool E with BinaryEncoding{Width = 1};
+    uint StreamDependency with BinaryEncoding{Width = 31};
+    byte Weight;
+
+    override string ToString()
+    {
+        return "PRIORITY, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<PRIORITY_Flags>(Flags) +
+            ", StreamDependency: " + StreamDependency.ToString() +
+            ", Weight: " + Weight.ToString() +
+            ", Length: " + Length.ToString();
+    }
+}
+
+pattern PRIORITY_Flags = flags byte
+{
+    ...
+};
+
+// 6.4.  RST_STREAM
+// type=0x3
+message RST_STREAM
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    RST_STREAM_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    ErrorCodes ErrorCode;
+
+    override string ToString()
+    {
+        return "RST_STREAM, ErrorCode: " + EnumToStringInSummary<ErrorCodes>(ErrorCode) +
+            ", StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<RST_STREAM_Flags>(Flags);
+    }
+}
+
+pattern RST_STREAM_Flags = flags byte
+{
+    ...
+};
+
+// 6.5.  SETTINGS
+// type=0x4
+message SETTINGS 
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    SETTINGS_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    array<SETTING> SETTINGS with BinaryEncoding{WidthForComposedType = Length * 8};
+
+    override string ToString()
+    {
+        return "SETTINGS, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<SETTINGS_Flags>(Flags);
+    }
+}
+
+pattern SETTINGS_Flags = flags byte
+{
+    ACK = 0x01,
+    ...
+};
+
+type SETTING
+{
+    Parameters Identifier;
+    ([|Identifier == Parameters.TLS_RENEG_PERMITTED|] TLS_RENEG_PERMITTED_value | uint) Value;
+
+    override string ToString()
+    {
+        return EnumToStringInSummary<Parameters>(Identifier) + ": " + Value.ToString();
+    }
+}
+
+pattern Parameters = enum ushort
+{
+    SETTINGS_HEADER_TABLE_SIZE          = 0x1,
+    SETTINGS_ENABLE_PUSH                = 0x2,
+    SETTINGS_MAX_CONCURRENT_STREAMS     = 0x3,
+    SETTINGS_INITIAL_WINDOW_SIZE        = 0x4,
+    SETTINGS_MAX_FRAME_SIZE             = 0x5, 
+    SETTINGS_MAX_HEADER_LIST_SIZE       = 0x6,
+    // [MS-HTTP2E]
+    TLS_RENEG_PERMITTED                 = 0x10,
+    ...
+};
+
+// [MS-HTTP2E]
+pattern TLS_RENEG_PERMITTED_value = flags uint
+{
+    C  = 0x01,
+    S  = 0x02,
+    ...
+};
+
+// 6.6.  PUSH_PROMISE
+// type=0x5
+message PUSH_PROMISE
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    PUSH_PROMISE_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    optional [|(Flags & PUSH_PROMISE_Flags.PADDED) > 0|] byte PadLength;
+    byte Reserved2 with BinaryEncoding{Width = 1};
+    uint PromisedStreamID with BinaryEncoding{Width = 31};
+    (binary | array<HeaderField>)  Headers with BinaryEncoding{Length = GetDataLength()};
+    optional [|PadLength != nothing|] binary Padding with BinaryEncoding{Length = PadLength != nothing ? (PadLength as byte) : 0};
+
+    uint GetDataLength()
+    {
+        uint length = Length - 4;
+        if (PadLength is padLen:byte)
+        {
+            return length - 1 - padLen;
+        }
+        else
+        {
+            return length;
+        }
+    }
+
+    override string ToString()
+    {
+        return "PUSH_PROMISE, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<PUSH_PROMISE_Flags>(Flags) +
+            ", PromisedStreamID: " + PromisedStreamID.ToString() +
+            ", Length: " + Length.ToString();
+    }
+}
+
+pattern PUSH_PROMISE_Flags = flags byte
+{
+    END_HEADERS = 0x04,
+    PADDED      = 0x08,
+    ...
+};
+
+// 6.7.  PING
+// type=0x6
+message PING
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    PING_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    binary OpaqueData with BinaryEncoding{Length = 8};
+
+    override string ToString()
+    {
+        return "PING, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<PING_Flags>(Flags);
+    }
+}
+
+pattern PING_Flags = flags byte
+{
+    ACK = 0x01,
+    ...
+};
+
+// 6.8.  GOAWAY
+// type=0x7
+message GOAWAY
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    GOAWAY_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    byte Reserved2 with BinaryEncoding{Width = 1};
+    uint LastStreamID with BinaryEncoding{Width = 31};
+    ErrorCodes ErrorCode;
+    optional [|Length - 8 > 0|] binary AdditionalDebugData with BinaryEncoding{Length = Length - 8};
+
+    override string ToString()
+    {
+        return "GOAWAY, ErrorCodes: " + EnumToStringInSummary<ErrorCodes>(ErrorCode) + 
+            ", StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<GOAWAY_Flags>(Flags) +
+            ", LastStreamID: " + LastStreamID.ToString();
+    }
+}
+
+pattern GOAWAY_Flags = flags byte
+{
+    ...
+};
+
+// 6.9.  WINDOW_UPDATE
+// type=0x8
+message WINDOW_UPDATE
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    WINDOW_UPDATE_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    byte Reserved2 with BinaryEncoding{Width = 1};
+    uint WindowSizeIncrement with BinaryEncoding{Width = 31};
+
+    override string ToString()
+    {
+        return "WINDOW_UPDATE, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<WINDOW_UPDATE_Flags>(Flags) +
+            ", WindowSizeIncrement: " + WindowSizeIncrement.ToString();
+    }
+}
+
+pattern WINDOW_UPDATE_Flags = flags byte
+{
+    ...
+};
+
+// 6.10.  CONTINUATION
+// type=0x9
+message CONTINUATION
+{
+    uint Length with BinaryEncoding{Width = 24};
+    FrameType Type;
+    CONTINUATION_Flags Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    (binary | array<HeaderField>)  Headers with BinaryEncoding{Length = Length};
+
+    override string ToString()
+    {
+        return "CONTINUATION, StreamId: " + StreamIdentifier.ToString() + 
+            ", Flags: " + EnumToString<CONTINUATION_Flags>(Flags);
+    }
+}
+
+pattern CONTINUATION_Flags = flags byte
+{
+    END_HEADERS = 0x04,
+    ...
+};
+
+pattern ErrorCodes = enum uint
+{
+    NO_ERROR            = 0x0,
+    PROTOCOL_ERROR      = 0x1,
+    INTERNAL_ERROR      = 0x2,
+    FLOW_CONTROL_ERROR  = 0x3,
+    SETTINGS_TIMEOUT    = 0x4,
+    STREAM_CLOSED       = 0x5,
+    FRAME_SIZE_ERROR    = 0x6,
+    REFUSED_STREAM      = 0x7,
+    CANCEL              = 0x8,
+    COMPRESSION_ERROR   = 0x9,
+    CONNECT_ERROR       = 0xa,
+    ENHANCE_YOUR_CALM   = 0xb,
+    INADEQUATE_SECURITY = 0xc,
+    HTTP_1_1_REQUIRED   = 0xd,
+    ...
+};
+
+type HeaderField[int PatternWidth]
+{
+    byte Pattern with BinaryEncoding{Width = PatternWidth} with DisplayInfo{ToText = PatternDescription};
+    Interger[8 - PatternWidth] Index;
+    optional [|Index.Value == 0|] String Name;
+    optional [|!(PatternWidth == 1 && Pattern == 1)|] String Value;
+    NameValuePair Representation with Encoding{Ignore = true};
+
+    override string ToString()
+    {
+        if (Representation != null)
+        {
+            return Representation.ToString();
+        }
+        else
+        {
+            return "";
+        }
+    }
+
+    string PatternDescription(any obj)
+    {
+        byte p = obj as byte;
+        if (p == 1 && PatternWidth == 1)
+        {
+            return "Indexed Header Field";
+        }
+        else if (p == 1 && PatternWidth == 2)
+        {
+            if (Index.Value > 0)
+            {
+                return "Literal Header Field with Incremental Indexing -- Indexed Name";
+            }
+            else
+            {
+                return "Literal Header Field with Incremental Indexing -- New Name";
+            }
+        }
+        else if (p == 0 && PatternWidth == 4)
+        {
+            if (Index.Value > 0)
+            {
+                return "Literal Header Field without Indexing -- Indexed Name";
+            }
+            else
+            {
+                return "Literal Header Field without Indexing -- New Name";
+            }
+        }
+        else if (p == 1 && PatternWidth == 4)
+        {
+            if (Index.Value > 0)
+            {
+                return "Literal Header Field Never  Indexing -- Indexed Name";
+            }
+            else
+            {
+                return "Literal Header Field Never  Indexing -- New Name";
+            }
+        }
+        else
+        {
+            return "";
+        }
+    }
+}
+
+type NameValuePair
+{
+    string Name;
+    string Value;
+
+    override string ToString()
+    {
+        return Name + " : " + Value;
+    }
+
+    NameValuePair Clone()
+    {
+        return new NameValuePair{Name = this.Name, Value = this.Value};
+    }
+
+    // RFC 7541, section 4.1
+    // The size of an entry is the sum of its name's length in octets (as defined in Section 5.2), its value's length in octets, and 32.
+    // The size of an entry is calculated using the length of its name and value without any Huffman encoding applied.
+    int GetSize()
+    {
+        return Name.Count + Value.Count + 32;
+    }
+}
+
+message IncompleteFrame
+{
+    uint Length with BinaryEncoding{Width = 24};
+    byte Type;
+    byte Flags;
+    byte Reserved with BinaryEncoding{Width = 1};
+    uint StreamIdentifier with BinaryEncoding{Width = 31};
+
+    binary Payload with BinaryEncoding{MaxLength = Length};
+
+    override string ToString()
+    {
+        return "[Incomplete]Frame, StreamId: " + StreamIdentifier.ToString() + 
+            ", Length: " + Length.ToString();
+    }
+}
+
+////////////////////////////////////////
+// Header compression
+
+// Integer representation.
+/* are used to represent name indexes, header field indexes, or
+   string lengths.  An integer representation can start anywhere within
+   an octet. 
+
+     0   1   2   3   4   5   6   7
+   +---+---+---+---+---+---+---+---+
+   | ? | ? | ? |       Value       |
+   +---+---+---+-------------------+
+<Integer Value Encoded within the Prefix (Shown for N = 5)>
+
+     0   1   2   3   4   5   6   7
+   +---+---+---+---+---+---+---+---+
+   | ? | ? | ? | 1   1   1   1   1 |
+   +---+---+---+-------------------+
+   | 1 |    Value-(2^N-1) LSB      |
+   +---+---------------------------+
+                  ...
+   +---+---------------------------+
+   | 0 |    Value-(2^N-1) MSB      |
+   +---+---------------------------+
+< Integer Value Encoded after the Prefix (Shown for N = 5)>
+*/
+type Interger[int PrefixBitCount]
+{
+    int Value with Encoding{Decoder = IntergerDecoder};
+
+    optional int IntergerDecoder(stream s)
+    {
+        int originalPos = s.BitPosition;
+        assert PrefixBitCount <= 8;
+        int prefix = s.PeekByte(s.BitPosition) >> (8 - PrefixBitCount);
+        if (prefix < (0xFF >> (8 - PrefixBitCount))) // 2^PrefixBitCount - 1
+        {
+            // consume stream
+            BinaryDecoder<Bits[PrefixBitCount]>(s);
+            return prefix;
+        }
+        else
+        {
+            int ret = (0xFF >> (8 - PrefixBitCount));
+            int octetsCount = 0;
+            byte curByte;
+            do
+            {
+                curByte = s.PeekByte(s.BitPosition + PrefixBitCount + octetsCount * 8);
+                ret += (((curByte & 0x7F) as int) << (octetsCount * 7));
+                octetsCount++;
+            } while ((curByte & 0x80) == 0x80);
+            BinaryDecoder<Bits[octetsCount * 8 + PrefixBitCount]>(s);
+            return ret;
+        }
+    }
+
+    override string ToString()
+    {
+        return Value as string;
+    }
+}
+
+type Bits[int BitWidth]
+{
+    array<byte> Bits with BinaryEncoding{WidthForComposedType = BitWidth};
+}
+
+// String representation
+/*
+     0   1   2   3   4   5   6   7
+   +---+---+---+---+---+---+---+---+
+   | H |    String Length (7+)     |
+   +---+---------------------------+
+   |  String Data (Length octets)  |
+   +-------------------------------+
+    <String Literal Representation>
+*/
+
+type String
+{
+    bool H with BinaryEncoding{Width = 1};
+    Interger[7] Length;
+    string Value with BinaryEncoding{Length = Length.Value}
+                with Encoding{SourcePattern = TypeOf<binary>(), Decoder = StringDecoder};
+    optional string StringDecoder(binary bin)
+    {
+        if (!H)
+        {
+            return BinaryStringDecoder(bin, TextEncoding.ASCII);
+        }
+        else
+        {
+            return HuffmanDecoder(bin);
+        }
+    }
+    override string ToString()
+    {
+        return Value;
+    }
+}
+
+///////////////////////////////////////////
+// Utility for Table management
+
+/*
+    <----------  Index Address Space ---------->
+    <-- Static  Table -->  <-- Dynamic Table -->
+    +---+-----------+---+  +---+-----------+---+
+    | 1 |    ...    | s |  |s+1|    ...    |s+k|
+    +---+-----------+---+  +---+-----------+---+
+                            ^                   |
+                            |                   V
+                    Insertion Point      Dropping Point
+*/
+type TableContainer
+{
+    array<NameValuePair> StaticTables = null;
+    // Client and server sides maintain dynamic table separately.
+    DoublyLinkList DynamicTables = null;
+
+    // Get cached header by index.
+    NameValuePair RetrieveTables(int index) // index is 1-based.
+    {
+        if (index <= StaticTableLength)
+        {
+            return StaticTables[index - 1].Clone();
+        }
+        else
+        {
+            int dynamicPos = index - StaticTableLength;
+            if (dynamicPos <= DynamicTables.NodeCount)
+            {
+                return DynamicTables.FindByIndex(dynamicPos - 1).Clone();
+            }
+            else
+            {
+                ValidationCheck(false, null, "HTTP2: Index of header fields exceeds the table boundary.");
+                return null;
+            }
+        }
+    }
+
+    // Insert header to dynamic table
+    void InsertDynamicTable(NameValuePair v)
+    {
+        DynamicTables.AddFirst(v);
+    }
+}
+
+// Generate static table based on  http://tools.ietf.org/html/rfc7541#appendix-A
+const int StaticTableLength = 61;
+const array<NameValuePair> StaticTable = 
+    [
+        new NameValuePair{Name = ":authority"},
+        new NameValuePair{Name = ":method", Value = "GET"},
+        new NameValuePair{Name = ":method", Value = "POST"},
+        new NameValuePair{Name = ":path", Value = "/"},
+        new NameValuePair{Name = ":path", Value = "/index.html"},
+        new NameValuePair{Name = ":scheme", Value = "http"},
+        new NameValuePair{Name = ":scheme", Value = "https"},
+        new NameValuePair{Name = ":status", Value = "200"},
+        new NameValuePair{Name = ":status", Value = "204"},
+        new NameValuePair{Name = ":status", Value = "206"},
+        new NameValuePair{Name = ":status", Value = "304"},
+        new NameValuePair{Name = ":status", Value = "400"},
+        new NameValuePair{Name = ":status", Value = "404"},
+        new NameValuePair{Name = ":status", Value = "500"},
+        new NameValuePair{Name = "accept-charset"},
+        new NameValuePair{Name = "accept-encoding", Value = "gzip, deflate"},
+        new NameValuePair{Name = "accept-language"},
+        new NameValuePair{Name = "accept-ranges"},
+        new NameValuePair{Name = "accept"},
+        new NameValuePair{Name = "access-control-allow-origin"},
+        new NameValuePair{Name = "age"},
+        new NameValuePair{Name = "allow"},
+        new NameValuePair{Name = "authorization"},
+        new NameValuePair{Name = "cache-control"},
+        new NameValuePair{Name = "content-disposition"},
+        new NameValuePair{Name = "content-encoding"},
+        new NameValuePair{Name = "content-language"},
+        new NameValuePair{Name = "content-length"},
+        new NameValuePair{Name = "content-location"},
+        new NameValuePair{Name = "content-range"},
+        new NameValuePair{Name = "content-type"},
+        new NameValuePair{Name = "cookie"},
+        new NameValuePair{Name = "date"},
+        new NameValuePair{Name = "etag"},
+        new NameValuePair{Name = "expect"},
+        new NameValuePair{Name = "expires"},
+        new NameValuePair{Name = "from"},
+        new NameValuePair{Name = "host"},
+        new NameValuePair{Name = "if-match"},
+        new NameValuePair{Name = "if-modified-since"},
+        new NameValuePair{Name = "if-none-match"},
+        new NameValuePair{Name = "if-range"},
+        new NameValuePair{Name = "if-unmodified-since"},
+        new NameValuePair{Name = "last-modified"},
+        new NameValuePair{Name = "link"},
+        new NameValuePair{Name = "location"},
+        new NameValuePair{Name = "max-forwards"},
+        new NameValuePair{Name = "proxy-authenticate"},
+        new NameValuePair{Name = "proxy-authorization"},
+        new NameValuePair{Name = "range"},
+        new NameValuePair{Name = "referer"},
+        new NameValuePair{Name = "refresh"},
+        new NameValuePair{Name = "retry-after"},
+        new NameValuePair{Name = "server"},
+        new NameValuePair{Name = "set-cookie"},
+        new NameValuePair{Name = "strict-transport-security"},
+        new NameValuePair{Name = "transfer-encoding"},
+        new NameValuePair{Name = "user-agent"},
+        new NameValuePair{Name = "vary"},
+        new NameValuePair{Name = "via"},
+        new NameValuePair{Name = "www-authenticate"},
+    ];
+
+type LinkListNode
+{
+    NameValuePair Value;
+    LinkListNode Previous;
+    LinkListNode Next;
+}
+
+type DoublyLinkList
+{
+    LinkListNode Head = null;
+    LinkListNode Rear = null;
+    int NodeCount = 0;
+    int Size = 0;
+    // section 6.5.2. The initial value is 4,096 octets.
+    // The limit may change during data exchange.
+    int SizeLimit = 4096;
+
+    // Insert at beginning
+    void AddFirst(NameValuePair v)
+    {
+        LinkListNode newNode = new LinkListNode{Value = v};
+        int curSize = v.GetSize();
+        if (Head == null)
+        {
+            Head = newNode;
+            Rear = newNode;
+        }
+        else
+        {
+            // remove last node if size exceeds limit
+            while (Size + curSize > SizeLimit)
+            {
+                RemoveLast();
+            }
+
+            newNode.Next = Head;
+            Head.Previous = newNode;
+            Head = newNode;
+        }
+        Size += curSize;
+        NodeCount++;
+    }
+
+    // Remove at the end
+    void RemoveLast()
+    {
+        if (Rear == null || Rear.Previous == null)
+        {
+            Head = null;
+            Rear = null;
+            NodeCount = 0;
+            Size = 0;
+        }
+        else
+        {
+            Size -= Rear.Value.GetSize();
+            Rear = Rear.Previous;
+            Rear.Next = null;
+            NodeCount--;
+        }
+    }
+
+    // Called when see 'SETTINGS_HEADER_TABLE_SIZE' parameter in SETTINGS frame
+    void OnLimitChanging(int newLimit)
+    {
+        if (newLimit < SizeLimit)
+        {
+            while (Size < newLimit)
+            {
+                RemoveLast();
+            }
+        }
+        SizeLimit = newLimit;
+    }
+
+    NameValuePair FindByIndex(int index) // index is 0-based value
+    {
+        assert index < NodeCount;
+
+        LinkListNode cur = Head;
+        for (int i = 0; i < index; i++)
+        {
+            cur = cur.Next;
+        }
+        return cur.Value;
+    }
+}
+
+///////////////////////////////////////////
+// Utility for Huffman decoding
+
+// Entry decoder function to decode compressed binary specified by HPACK
+optional string HuffmanDecoder(binary bin)
+{
+    return HuffmanTree.Decompress(bin);
+}
+
+type HuffmanTree
+{
+    // Root node of Huffman tree.
+    static Node root = null;
+    // Decompress binary based on the Huffman tree.
+    static optional string Decompress(binary bin)
+    {
+        if (root == null)
+        {
+            CreatHuffmanTree();
+        }
+        Node curNode = root;
+        array<char> decodedRet = [];
+        for (int i = 0; i < bin.Count; i++)
+        {
+            byte curByte = bin[i];
+            for (int j = 0; j < 8; j++)
+            {
+                bool isTrue = ((0x80 >> j) & curByte) > 0;
+                if (isTrue)
+                {
+                    curNode = curNode.Left;
+                }
+                else
+                {
+                    curNode = curNode.Right;
+                }
+                if (curNode == null)
+                {
+                    ValidationCheck(false, null, HTTP2_REACH_LEAF_NODE_UNEXPECTEDLY);
+                    return decodedRet as string;
+                }
+                if (curNode.Value != null)
+                {
+                    decodedRet += [curNode.Value as char];
+                    curNode = root;
+                }
+            }
+        }
+        return decodedRet as string;
+    }
+
+    // Generate Huffman tree.
+    internal static void CreatHuffmanTree()
+    {
+        root = new Node();
+        foreach (Pair<array<bool>, char> pair in GenerateHuffmanCharTable())
+        {
+            Node cur = root;
+            array<bool> key = pair.Key;
+            for (int i = 0; i < key.Count; i++)
+            {
+                if (key[i])
+                {
+                    // Traversal left child node if true
+                    if (cur.Left == null)
+                        cur.Left = new Node();
+                    cur = cur.Left;
+                }
+                else
+                {
+                    // Traversal right child node if false
+                    if (cur.Right == null)
+                        cur.Right = new Node();
+                    cur = cur.Right;
+                }
+            }
+            // Assign value to leaf node.
+            cur.Value = pair.Value;
+        }
+    }
+
+    // https://tools.ietf.org/html/rfc7541#appendix-B
+    internal static map<array<bool>, char> GenerateHuffmanCharTable()
+    {
+        // 0 ~31 and 127 ~ 255 are non-printable char.
+        return
+        {
+            [T,T,T,T,T,T,T,T,T,T,F,F,F] -> ' ',                                              //        (  0) |11111111|11000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F,F] -> ' ',                          //        (  1) |11111111|11111111|1011000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                //        (  2) |11111111|11111111|11111110|0010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                //        (  3) |11111111|11111111|11111110|0011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                //        (  4) |11111111|11111111|11111110|0100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                //        (  5) |11111111|11111111|11111110|0101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                //        (  6) |11111111|11111111|11111110|0110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                //        (  7) |11111111|11111111|11111110|0111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                //        (  8) |11111111|11111111|11111110|1000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                        //        (  9) |11111111|11111111|11101010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F] -> ' ',            //        ( 10) |11111111|11111111|11111111|111100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                //        ( 11) |11111111|11111111|11111110|1001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                //        ( 12) |11111111|11111111|11111110|1010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T] -> ' ',            //        ( 13) |11111111|11111111|11111111|111101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                //        ( 14) |11111111|11111111|11111110|1011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                //        ( 15) |11111111|11111111|11111110|1100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                //        ( 16) |11111111|11111111|11111110|1101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                //        ( 17) |11111111|11111111|11111110|1110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T] -> ' ',                //        ( 18) |11111111|11111111|11111110|1111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F] -> ' ',                //        ( 19) |11111111|11111111|11111111|0000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T] -> ' ',                //        ( 20) |11111111|11111111|11111111|0001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F] -> ' ',                //        ( 21) |11111111|11111111|11111111|0010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F] -> ' ',            //        ( 22) |11111111|11111111|11111111|111110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T] -> ' ',                //        ( 23) |11111111|11111111|11111111|0011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F] -> ' ',                //        ( 24) |11111111|11111111|11111111|0100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T] -> ' ',                //        ( 25) |11111111|11111111|11111111|0101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F] -> ' ',                //        ( 26) |11111111|11111111|11111111|0110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T] -> ' ',                //        ( 27) |11111111|11111111|11111111|0111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F] -> ' ',                //        ( 28) |11111111|11111111|11111111|1000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T] -> ' ',                //        ( 29) |11111111|11111111|11111111|1001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F] -> ' ',                //        ( 30) |11111111|11111111|11111111|1010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T] -> ' ',                //        ( 31) |11111111|11111111|11111111|1011
+            [F,T,F,T,F,F] -> ' ',                                                            //   ( 32) |010100
+            [T,T,T,T,T,T,T,F,F,F] -> '!',                                                    // '!' ( 33) |11111110|00
+            [T,T,T,T,T,T,T,F,F,T] -> '"',                                                    // '"' ( 34) |11111110|01
+            [T,T,T,T,T,T,T,T,T,F,T,F] -> '#',                                                // '#' ( 35) |11111111|1010
+            [T,T,T,T,T,T,T,T,T,T,F,F,T] -> '$',                                              // '$' ( 36) |11111111|11001
+            [F,T,F,T,F,T] -> '%',                                                            // '%' ( 37) |010101
+            [T,T,T,T,T,F,F,F] -> '&',                                                        // '&' ( 38) |11111000
+            [T,T,T,T,T,T,T,T,F,T,F] -> '\'',                                                 // ''' ( 39) |11111111|010
+            [T,T,T,T,T,T,T,F,T,F] -> '(',                                                    // '(' ( 40) |11111110|10
+            [T,T,T,T,T,T,T,F,T,T] -> ')',                                                    // ')' ( 41) |11111110|11
+            [T,T,T,T,T,F,F,T] -> '*',                                                        // '*' ( 42) |11111001
+            [T,T,T,T,T,T,T,T,F,T,T] -> '+',                                                  // '+' ( 43) |11111111|011
+            [T,T,T,T,T,F,T,F] -> ',',                                                        // ',' ( 44) |11111010
+            [F,T,F,T,T,F] -> '-',                                                            // '-' ( 45) |010110
+            [F,T,F,T,T,T] -> '.',                                                            // '.' ( 46) |010111
+            [F,T,T,F,F,F] -> '/',                                                            // '/' ( 47) |011000
+            [F,F,F,F,F] -> '0',                                                              // '0' ( 48) |00000
+            [F,F,F,F,T] -> '1',                                                              // '1' ( 49) |00001
+            [F,F,F,T,F] -> '2',                                                              // '2' ( 50) |00010
+            [F,T,T,F,F,T] -> '3',                                                            // '3' ( 51) |011001
+            [F,T,T,F,T,F] -> '4',                                                            // '4' ( 52) |011010
+            [F,T,T,F,T,T] -> '5',                                                            // '5' ( 53) |011011
+            [F,T,T,T,F,F] -> '6',                                                            // '6' ( 54) |011100
+            [F,T,T,T,F,T] -> '7',                                                            // '7' ( 55) |011101
+            [F,T,T,T,T,F] -> '8',                                                            // '8' ( 56) |011110
+            [F,T,T,T,T,T] -> '9',                                                            // '9' ( 57) |011111
+            [T,F,T,T,T,F,F] -> ':',                                                          // ':' ( 58) |1011100
+            [T,T,T,T,T,F,T,T] -> ';',                                                        // ';' ( 59) |11111011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,F,F] -> '<',                                          // '<' ( 60) |11111111|1111100
+            [T,F,F,F,F,F] -> '=',                                                            // '=' ( 61) |100000
+            [T,T,T,T,T,T,T,T,T,F,T,T] -> '>',                                                // '>' ( 62) |11111111|1011
+            [T,T,T,T,T,T,T,T,F,F] -> '?',                                                    // '?' ( 63) |11111111|00
+            [T,T,T,T,T,T,T,T,T,T,F,T,F] -> '@',                                              // '@' ( 64) |11111111|11010
+            [T,F,F,F,F,T] -> 'A',                                                            // 'A' ( 65) |100001
+            [T,F,T,T,T,F,T] -> 'B',                                                          // 'B' ( 66) |1011101
+            [T,F,T,T,T,T,F] -> 'C',                                                          // 'C' ( 67) |1011110
+            [T,F,T,T,T,T,T] -> 'D',                                                          // 'D' ( 68) |1011111
+            [T,T,F,F,F,F,F] -> 'E',                                                          // 'E' ( 69) |1100000
+            [T,T,F,F,F,F,T] -> 'F',                                                          // 'F' ( 70) |1100001
+            [T,T,F,F,F,T,F] -> 'G',                                                          // 'G' ( 71) |1100010
+            [T,T,F,F,F,T,T] -> 'H',                                                          // 'H' ( 72) |1100011
+            [T,T,F,F,T,F,F] -> 'I',                                                          // 'I' ( 73) |1100100
+            [T,T,F,F,T,F,T] -> 'J',                                                          // 'J' ( 74) |1100101
+            [T,T,F,F,T,T,F] -> 'K',                                                          // 'K' ( 75) |1100110
+            [T,T,F,F,T,T,T] -> 'L',                                                          // 'L' ( 76) |1100111
+            [T,T,F,T,F,F,F] -> 'M',                                                          // 'M' ( 77) |1101000
+            [T,T,F,T,F,F,T] -> 'N',                                                          // 'N' ( 78) |1101001
+            [T,T,F,T,F,T,F] -> 'O',                                                          // 'O' ( 79) |1101010
+            [T,T,F,T,F,T,T] -> 'P',                                                          // 'P' ( 80) |1101011
+            [T,T,F,T,T,F,F] -> 'Q',                                                          // 'Q' ( 81) |1101100
+            [T,T,F,T,T,F,T] -> 'R',                                                          // 'R' ( 82) |1101101
+            [T,T,F,T,T,T,F] -> 'S',                                                          // 'S' ( 83) |1101110
+            [T,T,F,T,T,T,T] -> 'T',                                                          // 'T' ( 84) |1101111
+            [T,T,T,F,F,F,F] -> 'U',                                                          // 'U' ( 85) |1110000
+            [T,T,T,F,F,F,T] -> 'V',                                                          // 'V' ( 86) |1110001
+            [T,T,T,F,F,T,F] -> 'W',                                                          // 'W' ( 87) |1110010
+            [T,T,T,T,T,T,F,F] -> 'X',                                                        // 'X' ( 88) |11111100
+            [T,T,T,F,F,T,T] -> 'Y',                                                          // 'Y' ( 89) |1110011
+            [T,T,T,T,T,T,F,T] -> 'Z',                                                        // 'Z' ( 90) |11111101
+            [T,T,T,T,T,T,T,T,T,T,F,T,T] -> '[',                                              // '[' ( 91) |11111111|11011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F] -> '\\',                                 // '\' ( 92) |11111111|11111110|000
+            [T,T,T,T,T,T,T,T,T,T,T,F,F] -> ']',                                              // ']' ( 93) |11111111|11100
+            [T,T,T,T,T,T,T,T,T,T,T,T,F,F] -> '^',                                            // '^' ( 94) |11111111|111100
+            [T,F,F,F,T,F] -> '_',                                                            // '_' ( 95) |100010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,F,T] -> '`',                                          // '`' ( 96) |11111111|1111101
+            [F,F,F,T,T] -> 'a',                                                              // 'a' ( 97) |00011
+            [T,F,F,F,T,T] -> 'b',                                                            // 'b' ( 98) |100011
+            [F,F,T,F,F] -> 'c',                                                              // 'c' ( 99) |00100
+            [T,F,F,T,F,F] -> 'd',                                                            // 'd' (100) |100100
+            [F,F,T,F,T] -> 'e',                                                              // 'e' (101) |00101
+            [T,F,F,T,F,T] -> 'f',                                                            // 'f' (102) |100101
+            [T,F,F,T,T,F] -> 'g',                                                            // 'g' (103) |100110
+            [T,F,F,T,T,T] -> 'h',                                                            // 'h' (104) |100111
+            [F,F,T,T,F] -> 'i',                                                              // 'i' (105) |00110
+            [T,T,T,F,T,F,F] -> 'j',                                                          // 'j' (106) |1110100
+            [T,T,T,F,T,F,T] -> 'k',                                                          // 'k' (107) |1110101
+            [T,F,T,F,F,F] -> 'l',                                                            // 'l' (108) |101000
+            [T,F,T,F,F,T] -> 'm',                                                            // 'm' (109) |101001
+            [T,F,T,F,T,F] -> 'n',                                                            // 'n' (110) |101010
+            [F,F,T,T,T] -> 'o',                                                              // 'o' (111) |00111
+            [T,F,T,F,T,T] -> 'p',                                                            // 'p' (112) |101011
+            [T,T,T,F,T,T,F] -> 'q',                                                          // 'q' (113) |1110110
+            [T,F,T,T,F,F] -> 'r',                                                            // 'r' (114) |101100
+            [F,T,F,F,F] -> 's',                                                              // 's' (115) |01000
+            [F,T,F,F,T] -> 't',                                                              // 't' (116) |01001
+            [T,F,T,T,F,T] -> 'u',                                                            // 'u' (117) |101101
+            [T,T,T,F,T,T,T] -> 'v',                                                          // 'v' (118) |1110111
+            [T,T,T,T,F,F,F] -> 'w',                                                          // 'w' (119) |1111000
+            [T,T,T,T,F,F,T] -> 'x',                                                          // 'x' (120) |1111001
+            [T,T,T,T,F,T,F] -> 'y',                                                          // 'y' (121) |1111010
+            [T,T,T,T,F,T,T] -> 'z',                                                          // 'z' (122) |1111011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,F] -> '{',                                          // '{' (123) |11111111|1111110
+            [T,T,T,T,T,T,T,T,T,F,F] -> '|',                                                  // '|' (124) |11111111|100
+            [T,T,T,T,T,T,T,T,T,T,T,T,F,T] -> '}',                                            // '}' (125) |11111111|111101
+            [T,T,T,T,T,T,T,T,T,T,T,F,T] -> '~',                                              // '~' (126) |11111111|11101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F] -> ' ',                //        (127) |11111111|11111111|11111111|1100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                                //        (128) |11111111|11111110|0110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T,F] -> ' ',                            //        (129) |11111111|11111111|010010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                                //        (130) |11111111|11111110|0111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                                //        (131) |11111111|11111110|1000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T,T] -> ' ',                            //        (132) |11111111|11111111|010011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F,F] -> ' ',                            //        (133) |11111111|11111111|010100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F,T] -> ' ',                            //        (134) |11111111|11111111|010101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F,T] -> ' ',                          //        (135) |11111111|11111111|1011001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T,F] -> ' ',                            //        (136) |11111111|11111111|010110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T,F] -> ' ',                          //        (137) |11111111|11111111|1011010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T,T] -> ' ',                          //        (138) |11111111|11111111|1011011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,F] -> ' ',                          //        (139) |11111111|11111111|1011100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,T] -> ' ',                          //        (140) |11111111|11111111|1011101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,F] -> ' ',                          //        (141) |11111111|11111111|1011110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                        //        (142) |11111111|11111111|11101011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,T] -> ' ',                          //        (143) |11111111|11111111|1011111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                        //        (144) |11111111|11111111|11101100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                        //        (145) |11111111|11111111|11101101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T,T] -> ' ',                            //        (146) |11111111|11111111|010111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,F] -> ' ',                          //        (147) |11111111|11111111|1100000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                        //        (148) |11111111|11111111|11101110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,T] -> ' ',                          //        (149) |11111111|11111111|1100001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                          //        (150) |11111111|11111111|1100010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                          //        (151) |11111111|11111111|1100011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                          //        (152) |11111111|11111111|1100100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,F] -> ' ',                              //        (153) |11111111|11111110|11100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F,F] -> ' ',                            //        (154) |11111111|11111111|011000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                          //        (155) |11111111|11111111|1100101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F,T] -> ' ',                            //        (156) |11111111|11111111|011001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                          //        (157) |11111111|11111111|1100110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                          //        (158) |11111111|11111111|1100111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T] -> ' ',                        //        (159) |11111111|11111111|11101111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T,F] -> ' ',                            //        (160) |11111111|11111111|011010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,T] -> ' ',                              //        (161) |11111111|11111110|11101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                                //        (162) |11111111|11111110|1001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T,T] -> ' ',                            //        (163) |11111111|11111111|011011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,F] -> ' ',                            //        (164) |11111111|11111111|011100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                          //        (165) |11111111|11111111|1101000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                          //        (166) |11111111|11111111|1101001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,F] -> ' ',                              //        (167) |11111111|11111110|11110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                          //        (168) |11111111|11111111|1101010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F,T] -> ' ',                            //        (169) |11111111|11111111|011101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,F] -> ' ',                            //        (170) |11111111|11111111|011110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F] -> ' ',                        //        (171) |11111111|11111111|11110000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,T] -> ' ',                              //        (172) |11111111|11111110|11111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,T] -> ' ',                            //        (173) |11111111|11111111|011111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                          //        (174) |11111111|11111111|1101011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                          //        (175) |11111111|11111111|1101100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,F] -> ' ',                              //        (176) |11111111|11111111|00000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,T] -> ' ',                              //        (177) |11111111|11111111|00001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,F] -> ' ',                            //        (178) |11111111|11111111|100000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                              //        (179) |11111111|11111111|00010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                          //        (180) |11111111|11111111|1101101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,T] -> ' ',                            //        (181) |11111111|11111111|100001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                          //        (182) |11111111|11111111|1101110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T] -> ' ',                          //        (183) |11111111|11111111|1101111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                                //        (184) |11111111|11111110|1010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                            //        (185) |11111111|11111111|100010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                            //        (186) |11111111|11111111|100011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                            //        (187) |11111111|11111111|100100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F] -> ' ',                          //        (188) |11111111|11111111|1110000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                            //        (189) |11111111|11111111|100101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                            //        (190) |11111111|11111111|100110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T] -> ' ',                          //        (191) |11111111|11111111|1110001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,F] -> ' ',                    //        (192) |11111111|11111111|11111000|00
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,T] -> ' ',                    //        (193) |11111111|11111111|11111000|01
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                                //        (194) |11111111|11111110|1011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T] -> ' ',                                  //        (195) |11111111|11111110|001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                            //        (196) |11111111|11111111|100111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F] -> ' ',                          //        (197) |11111111|11111111|1110010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                            //        (198) |11111111|11111111|101000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                      //        (199) |11111111|11111111|11110110|0
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                    //        (200) |11111111|11111111|11111000|10
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                    //        (201) |11111111|11111111|11111000|11
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                    //        (202) |11111111|11111111|11111001|00
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,F] -> ' ',                  //        (203) |11111111|11111111|11111011|110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T,T] -> ' ',                  //        (204) |11111111|11111111|11111011|111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                    //        (205) |11111111|11111111|11111001|01
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T] -> ' ',                        //        (206) |11111111|11111111|11110001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                      //        (207) |11111111|11111111|11110110|1
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F] -> ' ',                                  //        (208) |11111111|11111110|010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                              //        (209) |11111111|11111111|00011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                    //        (210) |11111111|11111111|11111001|10
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,F] -> ' ',                  //        (211) |11111111|11111111|11111100|000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F,T] -> ' ',                  //        (212) |11111111|11111111|11111100|001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                    //        (213) |11111111|11111111|11111001|11
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,F] -> ' ',                  //        (214) |11111111|11111111|11111100|010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F] -> ' ',                        //        (215) |11111111|11111111|11110010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                              //        (216) |11111111|11111111|00100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                              //        (217) |11111111|11111111|00101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                    //        (218) |11111111|11111111|11111010|00
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                    //        (219) |11111111|11111111|11111010|01
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T] -> ' ',                //        (220) |11111111|11111111|11111111|1101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,T,T] -> ' ',                  //        (221) |11111111|11111111|11111100|011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,F] -> ' ',                  //        (222) |11111111|11111111|11111100|100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,F,T] -> ' ',                  //        (223) |11111111|11111111|11111100|101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                                //        (224) |11111111|11111110|1100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T] -> ' ',                        //        (225) |11111111|11111111|11110011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                                //        (226) |11111111|11111110|1101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                              //        (227) |11111111|11111111|00110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                            //        (228) |11111111|11111111|101001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                              //        (229) |11111111|11111111|00111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                              //        (230) |11111111|11111111|01000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T] -> ' ',                          //        (231) |11111111|11111111|1110011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                            //        (232) |11111111|11111111|101010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                            //        (233) |11111111|11111111|101011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                      //        (234) |11111111|11111111|11110111|0
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T] -> ' ',                      //        (235) |11111111|11111111|11110111|1
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F] -> ' ',                        //        (236) |11111111|11111111|11110100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T] -> ' ',                        //        (237) |11111111|11111111|11110101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                    //        (238) |11111111|11111111|11111010|10
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F] -> ' ',                          //        (239) |11111111|11111111|1110100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                    //        (240) |11111111|11111111|11111010|11
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,F] -> ' ',                  //        (241) |11111111|11111111|11111100|110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                    //        (242) |11111111|11111111|11111011|00
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                    //        (243) |11111111|11111111|11111011|01
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,T,T,T] -> ' ',                  //        (244) |11111111|11111111|11111100|111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,F] -> ' ',                  //        (245) |11111111|11111111|11111101|000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,F,T] -> ' ',                  //        (246) |11111111|11111111|11111101|001
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,F] -> ' ',                  //        (247) |11111111|11111111|11111101|010
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,F,T,T] -> ' ',                  //        (248) |11111111|11111111|11111101|011
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F] -> ' ',                //        (249) |11111111|11111111|11111111|1110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,F] -> ' ',                  //        (250) |11111111|11111111|11111101|100
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,F,T] -> ' ',                  //        (251) |11111111|11111111|11111101|101
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                  //        (252) |11111111|11111111|11111101|110
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,T] -> ' ',                  //        (253) |11111111|11111111|11111101|111
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,F,F,F] -> ' ',                  //        (254) |11111111|11111111|11111110|000
+            [T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,T,F,T,T,T,F] -> ' ',                    //        (255) |11111111|11111111|11111011|10
+        };
+    }
+}
+
+const bool T = true;
+const bool F = false; 
+
+type Node
+{
+    char? Value;
+    Node Right;
+    Node Left;
+}

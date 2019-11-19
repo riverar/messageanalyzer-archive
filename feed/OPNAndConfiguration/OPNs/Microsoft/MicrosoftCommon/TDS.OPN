@@ -1,0 +1,3666 @@
+protocol TDS with
+BinaryEncodingDefaults{Endian = Endian.Little},
+Documentation
+{
+    ProtocolName = "Tabular Data Stream Protocol",
+    ShortName = "TDS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+    new Reference{Name = "MS-TDS", Version = "25.0", Date = "09/12/2018", ProgramName = ProgramName.MCPP},
+    ],
+    RevisionSummary =
+    [
+    new Revision{Class=RevisionClass.Major, Version="381978", Date="10/08/2015"}
+    ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using IANA;
+using Diagnostics;
+using MicrosoftCommonResources;
+using TLS;
+using SSL;
+using GSSAPI;
+using GSSAPIKRB5;
+using NLMP;
+using Configurations;
+
+// Keep Information for Gssapi, Kerberos, NLMP messages.
+annotation string TabularResult#KeyInformation;
+
+endpoint Server
+    over ReassemblyServer | over TCP.Server
+    accepts PreLogin issues PreLogin
+    accepts Login7
+    accepts FederatedAuthenticationToken
+    accepts SQLBatch
+    accepts SQLCommandWithBinaryData
+    accepts RPC
+    accepts Attention
+    accepts TransactionManager
+    issues TabularResult
+    provides VirtualOperations;
+
+endpoint ReassemblyServer
+    over tcpServer:TCP.Server
+    accepts TDSMessage issues TDSMessage
+{
+    // package type with message
+    map<byte, array<TDSMessage>> TDSMessageMap = {};
+    uint TDSVersion = 0xFFFFFFFF;
+
+    process this accepts p:TDSMessage
+    {
+        ReassembleTDSMessage(p, AcceptDispatcher, ref TDSMessageMap, TDSVersion);
+    }
+    
+    process this issues p:TDSMessage
+    {
+        ReassembleTDSMessage(p, IssueDispatcher, ref TDSMessageMap, TDSVersion);
+    }
+    
+    void AcceptDispatcher(TDSMessage p)
+    {
+        dispatch endpoint Server over tcpServer accepts p;
+    }
+    
+    void IssueDispatcher(TDSMessage p)
+    {
+        dispatch endpoint Server over tcpServer issues p;
+    }
+
+    // destructor
+    ~endpoint(ReassemblyServer server)
+    {
+        TDSVersion = 0xFFFFFFFF;
+        if (TDSMessageMap.Keys.Count > 0)
+        {
+            foreach (byte packetType in TDSMessageMap.Keys)
+            {
+                HandleInsufficientData(ref TDSMessageMap, packetType);
+            }
+        }
+        TDSMessageMap = {};
+    }
+}
+
+const string SQLBatchInsufficientMessage = Format(TDS_INSUFFICIENT_DATA, "SQLBatch");
+const string SQLCommandWithBinaryDataInsufficientMessage = Format(TDS_INSUFFICIENT_DATA, "SQLCommandWithBinaryData");
+const string RPCInsufficientMessage = Format(TDS_INSUFFICIENT_DATA, "RPC");
+const string TransactionManagerInsufficientMessage = Format(TDS_INSUFFICIENT_DATA, "TransactionManager");
+const string TabularResultInsufficientMessage = Format(TDS_INSUFFICIENT_DATA, "TabularResult");
+
+internal void HandleInsufficientData(ref map<byte, array<TDSMessage>> tdsMessageMap, byte packetType)
+{
+    string insufficientMessage = null;
+    switch (packetType)
+    {
+        case 0x01 =>
+            insufficientMessage = SQLBatchInsufficientMessage;
+        case 0x07 =>
+            insufficientMessage = SQLCommandWithBinaryDataInsufficientMessage;
+        case 0x03 =>
+            insufficientMessage = RPCInsufficientMessage;
+        case 0x0E =>
+            insufficientMessage = TransactionManagerInsufficientMessage;
+        case 0x04 =>
+            insufficientMessage = TabularResultInsufficientMessage;
+        default =>
+            insufficientMessage = "";
+    }
+    foreach (TDSMessage msg in tdsMessageMap[packetType])
+    {
+        ReportInsufficientData(msg, DiagnosisLevel.Error, insufficientMessage);
+        DisplayTopLevelMessage(msg);
+    }
+    tdsMessageMap[packetType] = [];
+}
+
+internal void ReassembleTDSMessage(TDSMessage n, void(TDSMessage) dispatcher, ref map<byte, array<TDSMessage>> tdsMessageMap, uint tdsVersion)
+{
+    // if next start message comes before endofmessage of previous message, that means the previos message endofmessage missed
+    // report InsufficientData and clean the Map
+    if (n.PacketID == 1 && tdsMessageMap.Keys[n.PacketType])
+    {
+        HandleInsufficientData(ref tdsMessageMap, n.PacketType);
+    }
+
+    AddTDSMessageMap(ref tdsMessageMap, n.PacketType, n);
+    if ((n.Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)
+    {
+        array<TDSMessage> tdsMessageArray = tdsMessageMap[n.PacketType];
+        TDSMessage msg = null;
+        switch (n.PacketType)
+        {
+            case 0x01 =>
+                msg = SQLBatchAssembler(n, tdsMessageArray, tdsVersion);
+            case 0x07 =>
+                msg = SQLCommandWithBinaryDataAssembler(n, tdsMessageArray, tdsVersion);
+            case 0x03 =>
+                msg = RPCAssembler(n, tdsMessageArray, tdsVersion);
+            case 0x0E =>
+                msg = TransactionManagerAssembler(n, tdsMessageArray, tdsVersion);
+            case 0x04 =>
+                msg = TabularResultAssembler(n, tdsMessageArray, tdsVersion);
+            default =>
+                msg = new TDSMessage();
+        }
+        dispatcher(msg);
+        tdsMessageMap = tdsMessageMap.Remove(n.PacketType);
+    }
+}
+
+internal SQLBatch SQLBatchAssembler(TDSMessage fragment, array<TDSMessage> tdsMessageArray, uint tdsVersion)
+{
+    SQLBatch msg = new SQLBatch{};
+    msg.PacketType = fragment.PacketType;
+    msg.Status = fragment.Status;
+    msg.Length = 0;
+    msg.SPID = fragment.SPID;
+    msg.PacketID = 0;
+    msg.Window = fragment.Window;
+    binary data = $[];
+    ushort allDataLength = 0;
+                    
+    foreach (TDSMessage tdsMsg in tdsMessageArray)
+    {
+        SQLBatch tempmsg = tdsMsg as SQLBatch;
+        msg.Length = (msg.Length + tempmsg.Length) as ushort;
+        allDataLength = (allDataLength + tempmsg.Length - 8) as ushort;
+        msg.Origins += [tempmsg];
+        data += (tempmsg.SQLBatchPacketData as binary);
+    }
+    bool hasAllHeaders = HasAllHeaders(data, tdsVersion);
+
+    if (BinaryDecoder<SQLBatchPacketData[(allDataLength + 8) as ushort, hasAllHeaders]>(data) is m:SQLBatchPacketData)
+    {
+        msg.SQLBatchPacketData = m;
+    }
+    else
+    {
+        msg.SQLBatchPacketData = data;
+        ValidationCheckDecodingFailure(msg, "TDS", "SQLBatchPacketData");
+    }
+    msg.SourceData = data;
+    return msg;
+}
+
+internal SQLCommandWithBinaryData SQLCommandWithBinaryDataAssembler(TDSMessage fragment, array<TDSMessage> tdsMessageArray, uint tdsVersion)
+{
+    SQLCommandWithBinaryData msg = new SQLCommandWithBinaryData{};
+    msg.PacketType = fragment.PacketType;
+    msg.Status = fragment.Status;
+    msg.Length = 0;
+    msg.SPID = fragment.SPID;
+    msg.PacketID = 0;
+    msg.Window = fragment.Window;
+    binary data = $[];
+
+    foreach (TDSMessage TDSmsg in tdsMessageArray)
+    {
+        SQLCommandWithBinaryData tempmsg = TDSmsg as SQLCommandWithBinaryData;
+        msg.Length = (msg.Length + tempmsg.Length) as ushort;
+        msg.Origins += [tempmsg];
+        data += (tempmsg.SQLCommandPacketData as binary);
+    }
+           
+    if (BinaryDecoder<BulkLoadBCP[tdsVersion]>(data) is m:BulkLoadBCP)
+    {
+        msg.SQLCommandPacketData = m;
+    }
+    else
+    {
+        msg.SQLCommandPacketData = data;
+        ValidationCheckDecodingFailure(msg, "TDS", "SQLCommandPacketData");
+    }
+    msg.SourceData = data;
+    return msg;
+}
+
+internal RPC RPCAssembler(TDSMessage fragment, array<TDSMessage> tdsMessageArray, uint tdsVersion)
+{
+    RPC msg = new RPC{};
+    msg.PacketType = fragment.PacketType;
+    msg.Status = fragment.Status;
+    msg.Length = 0;
+    msg.SPID = fragment.SPID;
+    msg.PacketID = 0;
+    msg.Window = fragment.Window;
+    binary data = $[];
+    ushort allDataLength = 0;
+
+    foreach (TDSMessage TDSmsg in tdsMessageArray)
+    {
+        RPC tempmsg = TDSmsg as RPC;
+        msg.Length = (msg.Length + tempmsg.Length) as ushort;
+        allDataLength = (allDataLength + tempmsg.Length - 8) as ushort;
+        msg.Origins += [tempmsg];
+        data += (tempmsg.RPCPacketData as binary);
+    }
+            
+    bool hasAllHeaders = HasAllHeaders(data, tdsVersion);
+           
+    if (BinaryDecoder<RPCRequest[(allDataLength + 8) as ushort, hasAllHeaders]>(data) is m:RPCRequest)
+    {
+        msg.RPCPacketData = m;
+    }
+    else
+    {
+        msg.RPCPacketData = data;
+        ValidationCheckDecodingFailure(msg, "TDS", "RPCPacketData");
+    }
+    msg.SourceData = data;
+    return msg;
+}
+
+internal TransactionManager TransactionManagerAssembler(TDSMessage fragment, array<TDSMessage> tdsMessageArray, uint tdsVersion)
+{
+    TransactionManager msg = new TransactionManager{};
+    msg.PacketType = fragment.PacketType;
+    msg.Status = fragment.Status;
+    msg.Length = 0;
+    msg.SPID = fragment.SPID;
+    msg.PacketID = 0;
+    msg.Window = fragment.Window;
+    binary data = $[];
+
+    foreach (TDSMessage TDSmsg in tdsMessageArray)
+    {
+        TransactionManager tempmsg = TDSmsg as TransactionManager;
+        msg.Length = (msg.Length + tempmsg.Length) as ushort;
+        msg.Origins += [tempmsg];
+        data += (tempmsg.TransactionManagerPacketData as binary);
+    }
+    // msg.SQLBatchPacketData = data;
+    bool hasAllHeaders = HasAllHeaders(data, tdsVersion);
+
+    if (BinaryDecoder<TransMgrReq[hasAllHeaders]>(data) is m:TransMgrReq)
+    {
+        msg.TransactionManagerPacketData = m;
+    }
+    else
+    {
+        msg.TransactionManagerPacketData = data;
+        ValidationCheckDecodingFailure(msg, "TDS", "TransactionManagerPacketData");
+    }
+    msg.SourceData = data;
+    return msg;
+}
+
+internal TabularResult TabularResultAssembler(TDSMessage fragment, array<TDSMessage> tdsMessageArray, uint tdsVersion)
+{
+    TabularResult msg = new TabularResult{};
+    msg.PacketType = fragment.PacketType;
+    msg.Status = fragment.Status;
+    msg.Length = 0;
+    msg.SPID = fragment.SPID;
+    msg.PacketID = 0;
+    msg.Window = fragment.Window;
+    binary data = $[];
+
+    foreach (TDSMessage TDSmsg in tdsMessageArray)
+    {
+        TabularResult tempmsg = TDSmsg as TabularResult;
+        msg.Length = (msg.Length + tempmsg.Length) as ushort;
+        msg.Origins += [tempmsg];
+        data += (tempmsg.TabularResultBinaryData as binary);
+    }
+
+    optional array<TabularResultPacketDataPattern> m = TabularResultPacketDataDecoder(data, tdsVersion, msg);
+    if (m != nothing)
+    {
+        msg.TabularResultPacketData = m as array<TabularResultPacketDataPattern>;
+        msg.TabularResultBinaryData = nothing;
+    }
+    else
+    {
+        msg.TabularResultPacketData = nothing;
+        msg.TabularResultBinaryData = data;
+        ValidationCheckDecodingFailure(msg, "TDS", "TabularResultPacketData");
+    }
+    msg.SourceData = data;
+    return msg;
+}
+
+void AddTDSMessageMap(ref map<byte, array<TDSMessage>> tdsMessageMap, byte key, TDSMessage msg)
+{
+    if (tdsMessageMap.Keys[key])
+        tdsMessageMap[key] += [msg];
+    else
+        tdsMessageMap[key] = [msg];
+}
+
+// Identifies that whether it's TDS protocol Header
+bool IsTDSMessage(binary data)
+{
+    // 8 is TDS Header's length
+    return data.Count >= 8 && BinaryDecoder<TDSMessage>(data.Segment(0, 8)) != nothing;
+}
+
+const set<byte> TypeNeedReassemble = {0x01, 0x07, 0x03, 0x0E, 0x04}; // SQLBatch, SQLCommandWithBinaryData, RPC, TransactionManager, TabularResult
+
+internal bool NeedTDSReassemble(TDSMessage msg)
+{
+    return msg.PacketType in TypeNeedReassemble && (msg.PacketID != 1 || ((msg.Status & HeaderStatusFlags.EndOfMessage) != HeaderStatusFlags.EndOfMessage));
+}
+
+/*
+ * There are two kinds TDS message sequence:
+ *          1. Encrypted all                      |      2. Partial encrypted
+ *===================================TDS.PreLoginOperation========================
+ *                                   + TDS.PreLoginOperation
+ *                                     -> TDS.PreLogin
+ *                                         + TCP.Segment
+ *                                     <- TDS.TabularResult
+ *                                         + TCP.Segment
+ *============================3 or 4 TLS Handshake / ChangeCipherSpec=============
+ *                                  -> TLS.RecordLayers
+ *                                      +TDS.PreLogin
+ *                                         + TCP.Segment
+ *                                  <- TLS.RecordLayers
+ *                                     + TDS.PreLogin
+ *                                         + TCP.Segment
+ *  -                               > TLS.RecordLayers
+ *                                     + TDS.PreLogin
+ *                                         + TCP.Segment
+ *                                  <- TLS.RecordLayers
+ *                                      + TDS.PreLogin
+ *                                         + TCP.Segment
+ *======================================TDS.Login7Operation=========================
+ *    + TDS.Login7Operation                       |     + TDS.Login7Operation
+ *      -> TDS.Login7                             |       -> TDS.Login7
+ *          + TCP.Segment                         |           + TCP.Segment
+ *              + TLS.RecordLayers                |               + TLS.RecordLayers
+ *                  + TCP.Segment                 |                   + TCP.Segment
+ *      <- TDS.TabularResult                      |       <- TDS.TabularResult
+ *          + TCP.Segment                         |           + TCP.Segment
+ *              + TLS.RecordLayers                |
+ *                  + TCP.Segment                 |
+ *=====================================other TDS messages==============================
+ *    + TDS.SQLBatchOperation                     |     + TDS.SQLBatchOperation 
+ *      -> TDS.SQLBatch                           |       -> TDS.SQLBatch
+ *          + TCP.Segment                         |           + TCP.Segment
+ *              + TLS.RecordLayers                |       <- TDS.TabularResult
+ *                  + TCP.Segment                 |           + TCP.Segment
+ *      <- TDS.TabularResult                      |       ...
+ *          + TCP.Segment                         |
+ *              + TLS.RecordLayers                |
+ *                  + TCP.Segment                 |
+ *          ...                                   |
+ *=======================================================================================
+*/
+
+autostart actor TDSOverTCP(TCP.Server server)
+{
+    TDSDecodingHelper TdsHelper = null;
+    TDSConfiguration config = GetConfigurableValue<TDSConfiguration>();
+    // TDS process rule
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.TDS || s.DestinationPort in config.Ports
+    {
+        InitializeHelperIfNot();
+        TdsHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    process server issues s:TCP.Segment where s.SourcePort == Port.TDS || s.SourcePort in config.Ports
+    {
+        InitializeHelperIfNot();
+        TdsHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    // TDS process rule
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        (s.SourcePort == Port.TDS || s.SourcePort in config.Ports)
+    {
+        InitializeHelperIfNot();
+        TdsHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && 
+        (s.DestinationPort == Port.TDS || s.DestinationPort in config.Ports)
+    {
+        InitializeHelperIfNot();
+        TdsHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    void InitializeHelperIfNot()
+    {
+        if (TdsHelper == null)
+        {
+            TdsHelper = new TDSDecodingHelper();
+            TdsHelper.InitializeTDSHelper(server);
+        }
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (TdsHelper != null)
+        {
+            TdsHelper.ClearInDestructor();
+            TdsHelper = null;
+        }
+    }
+}
+
+type TDSDecodingHelper : TCPDecodingHelper
+{
+    SessionContext Context = new SessionContext();
+
+    void InitializeTDSHelper(TCP.Server server)
+    {
+        TDSDecodingCache acceptsCache= null;
+        TDSDecodingCache issuesCahce = null;
+        InitializeTDSDecodingCachePair(ref acceptsCache, ref issuesCahce, server, Context);
+        AcceptsCache = acceptsCache;
+        IssuesCache = issuesCahce;
+    }
+}
+
+void InitializeTDSDecodingCachePair(ref TDSDecodingCache acceptsCache, ref TDSDecodingCache issuesCahce, any endpoint ept, SessionContext context)
+{
+    acceptsCache = new TDSDecodingCache();
+    acceptsCache.InitializeTDSDecodingCache(ept, MessageDirection.Accepts, context);
+        
+    issuesCahce = new TDSDecodingCache();
+    issuesCahce.InitializeTDSDecodingCache(ept, MessageDirection.Issues, context);
+}
+
+type TDSDecodingCache : TCPDecodingCache
+{
+    SessionContext Context;
+    
+    override void DispatchMessage(any message anyMsg)
+    {
+        if (anyMsg is msg:TDSMessage)
+        {
+            if (Direction is MessageDirection.Accepts)
+            {
+                if (NeedTDSReassemble(msg))
+                {
+                    ReassemblyServer s = endpoint ReassemblyServer over EPT;
+                    s.TDSVersion = Context.TdsVersion;
+                    dispatch s accepts msg;
+                }
+                else
+                {
+                    dispatch (endpoint Server over EPT) accepts msg;
+                }
+            }
+            else
+            {
+                if (NeedTDSReassemble(msg))
+                {
+                    ReassemblyServer s = endpoint ReassemblyServer over EPT;
+                    s.TDSVersion = Context.TdsVersion;
+                    dispatch s issues msg;
+                }
+                else
+                {
+                    dispatch (endpoint Server over EPT) issues msg;
+                }
+            }
+        }
+    }
+
+    void InitializeTDSDecodingCache(any endpoint ept, MessageDirection direction, SessionContext context)
+    {
+        base.Initialize("TDS", ept, direction, IsTDSMessageNullable, IsCompleteTDS, DecodeTDS, DecodeIncompleteTDSMessage);
+        Context = context;
+    }
+
+    optional any message DecodeIncompleteTDSMessage(binary bin)
+    {
+        return BinaryDecoder<PartialTDSMessage>(bin);
+    }
+
+    uint? IsCompleteTDS(binary bin)
+    {
+        if (bin.Count < 4)
+        {
+            return null;
+        }
+        uint expectedLen = ((bin[2] as uint) << 8) + bin[3] as uint;
+        return expectedLen <= bin.Count ? 0 : expectedLen;
+    }
+    
+    bool? IsTDSMessageNullable(binary data)
+    {
+        if (data.Count < 8)
+        {
+            return null;
+        }
+        // data[0] is PacketType where value 0x00 ~ 0x12, data[1] is Status, data[7] is Window where value == 0
+        return data[0] < 0x13 && data[1] is HeaderStatusFlags && data[7] == 0;
+    }
+
+    override void ClearInDestructor()
+    {
+        Context.Reset();
+        base.ClearInDestructor();
+    }
+
+    optional any message DecodeTDS(stream s)
+    {
+        ushort msgLength = PeekUShort(s, s.BitPosition + 16, Endian.Big);
+        optional any message msg = nothing;
+        switch (s.CurrentByte)
+        {
+            case 0x01 =>
+                msg = DecodeSQLBatchMessage(s, msgLength, Context);
+            case 0x03 =>
+                msg = DecodeRPCMessage(s, msgLength, Context);
+            case 0x04 =>
+                // DecodeMessage<TabularResult[noRefVersion]>(Dispatcher, "TabularResult");
+                // generic don't support pass parameter like this: TabularResult[noRefVersion]
+                // need to merge to generic method after pef bug 68712 fixed
+                int startBytePosition = s.BytePosition;
+                uint noRefVersion = Context.TdsVersion;
+                var optionalMSG = BinaryDecoder<TabularResult[noRefVersion]>(s);
+
+                if (optionalMSG != nothing)
+                {
+                    int stopBytePosition = s.BytePosition;
+                    // If msgLength is greater than consumed byte count, bypass remaining bytes.
+                    if (msgLength > (stopBytePosition - startBytePosition))
+                    {
+                        BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+                    }
+                }
+                msg = optionalMSG;
+            case 0x06 =>
+                msg = DecodeMessage<Attention>(s, "Attention", msgLength);
+            case 0x07 =>
+                // DecodeMessage<SQLCommandWithBinaryData[noRefVersion]>(Dispatcher, "SQLCommandWithBinaryData");
+                // generic don't support pass parameter like this
+                // need to merge to generic method after pef bug 68712 fixed
+                int startBytePosition = s.BytePosition;
+                uint noRefVersion = Context.TdsVersion;
+                var optionalMSG = BinaryDecoder<SQLCommandWithBinaryData[noRefVersion]>(s);
+
+                if (optionalMSG != nothing)
+                {
+                    int stopBytePosition = s.BytePosition;
+                    // If msgLength is greater than consumed byte count, bypass remaining bytes.
+                    if (msgLength > (stopBytePosition - startBytePosition))
+                    {
+                        BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+                    }
+                }
+                msg = optionalMSG;
+            case 0x08 =>
+                msg = DecodeMessage<FederatedAuthenticationToken>(s, "FederatedAuthenticationToken", msgLength);
+            case 0x0E =>
+                msg = DecodeTransactionManagerMessage(s, msgLength, Context);
+            case 0x10 =>
+                msg = DecodeLogin7Message(s, msgLength, Context);
+            case 0x12 =>
+                msg = DecodeMessage<PreLogin>(s, "PreLogin", msgLength);
+            default =>
+                ValidationCheck(false, null, DiagnosisLevel.Warning, "TDS: Unknown packet type (" + DecToHexFormat(s.CurrentByte) + ").");
+        }
+        return msg;
+    }
+
+    optional T DecodeMessage<T>(stream s, string messageName, ushort msgLength)
+    {
+        int startBytePosition = s.BytePosition;
+        optional T optionalMSG = BinaryDecoder<T>(s);
+
+        if (optionalMSG != nothing)
+        {
+            int stopBytePosition = s.BytePosition;
+            // If msgLength is greater than consumed byte count, bypass remaining bytes.
+            if (msgLength > (stopBytePosition - startBytePosition))
+            {
+                BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+            }
+        }
+        return optionalMSG;
+    }
+    
+    optional any message DecodeLogin7Message(stream s, ushort msgLength, SessionContext context)
+    {
+        int startBytePosition = s.BytePosition;
+        var optionalMSG = BinaryDecoder<Login7>(s);
+
+        if (optionalMSG != nothing)
+        {
+            Login7 msg = optionalMSG as Login7;
+            context.TdsVersion = msg.Login7PacketData.TDSVersion;
+            int stopBytePosition = s.BytePosition;
+            // If msgLength is greater than consumed byte count, bypass remaining bytes.
+            if (msgLength > (stopBytePosition - startBytePosition))
+            {
+                BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+            }
+        }
+        return optionalMSG;
+    }
+
+    // need to merge to generic method after pef bug 68712 fixed
+    optional any message DecodeRPCMessage(stream s, ushort msgLength, SessionContext context)
+    {
+        bool hasAllHeaders = true;
+        // Get TDS tdsVersion failed, use header type to decide hasAllHeaders value
+        if (context.TdsVersion == 0xFFFFFFFF)
+        {
+            if (s.ByteLength < 18)
+            {
+                hasAllHeaders = false;
+                context.TdsVersion = 0x71000001;
+            }
+            else
+            {
+                binary headerType = PeekBytes(s, s.BitPosition + 128, 2);
+                // IF headerType is not in {1,2,3}, RPC message don't contain AllHeaders field
+                hasAllHeaders = (headerType == $[0100]) || (headerType == $[0200]) || (headerType == $[0300]);
+
+                // if hasAllHeaders is true, means the TDS version is bigger or equal than TDS 7.2, use the latest TDS version(SQL 2012)
+                // if hasAllHeaders is false, means the TDS version is smaller than TDS 7.2, use the TDS version 7.1(SQL 2000)
+                context.TdsVersion = hasAllHeaders ? 0x74000004 : 0x71000001;
+            }
+        }
+        else if (context.TdsVersion >= 0x72090002)
+        {
+            hasAllHeaders = true;
+        }
+        else
+        {
+            hasAllHeaders = false;
+        }
+
+        int startBytePosition = s.BytePosition;
+        var optionalMSG = BinaryDecoder<RPC[hasAllHeaders]>(s);
+
+        if (optionalMSG != nothing)
+        {
+            int stopBytePosition = s.BytePosition;
+            // If msgLength is greater than consumed byte count, bypass remaining bytes.
+            if (msgLength > (stopBytePosition - startBytePosition))
+            {
+                BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+            }
+        }
+        return optionalMSG;
+    }
+
+    // need to merge to generic method after pef bug 68712 fixed
+    optional any message DecodeSQLBatchMessage(stream s, ushort msgLength, SessionContext context)
+    {
+        bool hasAllHeaders = true;
+
+        // Get TDS version failed, use header type to decide hasAllHeaders value
+        if (context.TdsVersion == 0xFFFFFFFF)
+        {
+            if (s.ByteLength < 18)
+            {
+                hasAllHeaders = false;
+                context.TdsVersion = 0x71000001;
+            }
+            else
+            {
+                binary headerType = PeekBytes(s, s.BitPosition + 128, 2);
+                // IF headerType is not in {1,2,3}, RPC message don't contain AllHeaders field
+                hasAllHeaders = (headerType == $[0100]) || (headerType == $[0200]) || (headerType == $[0300]);
+
+                // if hasAllHeaders is true, means the TDS version is bigger or equal than TDS 7.2, use the latest TDS version(SQL 2012)
+                // if hasAllHeaders is false, means the TDS version is smaller than TDS 7.2, use the TDS version 7.1(SQL 2000)
+                context.TdsVersion = hasAllHeaders ? 0x74000004 : 0x71000001;
+            }
+        }
+        else if (context.TdsVersion >= 0x72090002)
+        {
+            hasAllHeaders = true;
+        }
+        else
+        {
+            hasAllHeaders = false;
+        }
+
+        int startBytePosition = s.BytePosition;
+        var optionalMSG = BinaryDecoder<SQLBatch[hasAllHeaders]>(s);
+
+        if (optionalMSG != nothing)
+        {
+            int stopBytePosition = s.BytePosition;
+            // If msgLength is greater than consumed byte count, bypass remaining bytes.
+            if (msgLength > (stopBytePosition - startBytePosition))
+            {
+                BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+            }
+        }
+        return optionalMSG;
+    }
+
+    // need to merge to generic method after pef bug 68712 fixed
+    optional any message DecodeTransactionManagerMessage(stream s, ushort msgLength, SessionContext context)
+    {
+        bool hasAllHeaders = true;
+
+        // Get TDS version failed, use header type to decide hasAllHeaders value
+        if (context.TdsVersion == 0xFFFFFFFF)
+        {
+            if (s.ByteLength < 18)
+            {
+                hasAllHeaders = false;
+                context.TdsVersion = 0x71000001;
+            }
+            else
+            {
+                binary headerType = PeekBytes(s, s.BitPosition + 128, 2);
+                // IF headerType is not in {1,2,3}, RPC message don't contain AllHeaders field
+                hasAllHeaders = (headerType == $[0100]) || (headerType == $[0200]) || (headerType == $[0300]);
+
+                // if hasAllHeaders is true, means the TDS version is bigger or equal than TDS 7.2, use the latest TDS version(SQL 2012)
+                // if hasAllHeaders is false, means the TDS version is smaller than TDS 7.2, use the TDS version 7.1(SQL 2000)
+                context.TdsVersion = hasAllHeaders ? 0x74000004 : 0x71000001;
+            }
+        }
+        else if (context.TdsVersion >= 0x72090002)
+        {
+            hasAllHeaders = true;
+        }
+        else
+        {
+            hasAllHeaders = false;
+        }
+
+        int startBytePosition = s.BytePosition;
+        var optionalMSG = BinaryDecoder<TransactionManager[hasAllHeaders]>(s);
+
+        if (optionalMSG != nothing)
+        {
+            int stopBytePosition = s.BytePosition;
+            // If msgLength is greater than consumed byte count, bypass remaining bytes.
+            if (msgLength > (stopBytePosition - startBytePosition))
+            {
+                BinaryDecoder<Blob[(msgLength - stopBytePosition + startBytePosition) as uint]>(s);
+            }
+        }
+        return optionalMSG;
+    }
+}
+
+autostart actor SSLTLSOverTDS(Server server)
+{
+    TLS.SessionContext ClientContext = null;
+    TLS.SessionContext ServerContext = null;
+    TLS.Server EPT;
+        
+    process server accepts s:TDS.PreLogin where (s.SSL_PAYLOAD is bin:binary)
+    {
+        TryDecodingAndDispatchingMessage(s, bin, MessageDirection.Accepts);
+    }
+        
+    process server issues s:TDS.PreLogin where (s.SSL_PAYLOAD is bin:binary)
+    {
+        TryDecodingAndDispatchingMessage(s, bin, MessageDirection.Issues);
+    }
+
+    void TryDecodingAndDispatchingMessage(TDS.PreLogin s, binary bin, MessageDirection direction)
+    {
+        if (ClientContext == null || ServerContext == null)
+        {
+            if (server.GetTransport<TCP.Server>() is tcp1:TCP.Server && tcp1 != null) // server is over TCP, no reassembly for PreLogin message
+            {
+                EPT = endpoint TLS.Server over (endpoint TCP.EncryptionServer[tcp1.ClientAddress, tcp1.ServerAddress, tcp1.ClientPort, tcp1.ServerPort]);
+                if (s.Origins != null && s.Origins[0] is seg:TCP.Segment)
+                {
+                    InitializeTLSServerFromTCP(seg, direction, DispathDecrytedMessageBack, EPT);
+                }
+            }
+            else
+            {
+                DisplayTopLevelMessage(s);
+            }
+            InitializeContextPair(ref ClientContext, ref ServerContext);
+        }
+        
+        TLS.SessionContext context;
+        if (direction == MessageDirection.Accepts)
+        {
+            context = ClientContext;
+        }
+        else
+        {
+            context = ServerContext;
+        }
+        
+        if (TLS.IsTlsHeader(bin))
+        {
+            TLS.TryDecodingAndDispatchingTLSMessage(bin, context, EPT, direction);
+        }
+        else
+        {
+            SSL.TryDecodingAndDispatchingSSLMessage(bin, context, EPT, direction);
+        }
+    }
+
+    void DispathDecrytedMessageBack(binary bin, TLS.RecordLayers rls, TLS.Server server, MessageDirection direction)
+    {
+        if (rls.Origins[0] is segfirst:TCP.Segment &&
+            GetLastDataSegment(rls.Origins) is seglast:TCP.Segment)
+        {
+            DispathBackToTCP(bin, server, direction, segfirst, seglast);
+        }
+    }
+}
+
+array<any> DecodeNBCROWAllColumnData(array<byte> nullBitmap, COLMETADATA colMetaDataTemp, stream payloadStream, string fieldName, string messageName)
+{
+    array<any> colMetaRowTemp = [];
+    byte currentByte;
+    array<ColumnData> columnDataTemp = colMetaDataTemp.ColumnDataArray as array<ColumnData>;
+    for (int index = 0, int currentBytePos = 0; index < colMetaDataTemp.Count; index++, currentBytePos++)
+    {
+        if (index % 8 == 0)
+        {
+            currentByte = nullBitmap[index / 8];
+            currentBytePos = 0;
+        }
+        if ((currentByte & (1 << currentBytePos)) > 0)
+        {
+            continue;
+        }
+
+        if (!DecodeColumnData(ref colMetaRowTemp, columnDataTemp[index], payloadStream))
+        {
+            colMetaRowTemp += [BinaryDecoder<Blob[payloadStream.RemainingByteLength as uint]>(payloadStream)];
+            ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_INCOMPLETE_DECODING, fieldName, messageName, "ValueData"));
+            return colMetaRowTemp;
+        }
+    }
+    return colMetaRowTemp;
+}
+
+array<any> DecodeAllColumnData(COLMETADATA colMetaDataTemp, stream payloadStream, string fieldName, string messageName)
+{
+    array<any> colMetaRowTemp = [];
+    array<ColumnData> columnDataTemp = colMetaDataTemp.ColumnDataArray as array<ColumnData>;
+    for (int index = 0; index < colMetaDataTemp.Count; index++ )
+    {
+        if (!DecodeColumnData(ref colMetaRowTemp, columnDataTemp[index], payloadStream))
+        {
+            colMetaRowTemp += [BinaryDecoder<Blob[payloadStream.RemainingByteLength as uint]>(payloadStream)];
+            ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_INCOMPLETE_DECODING, fieldName, messageName, "ValueData"));
+            return colMetaRowTemp;
+        }
+    }
+    return colMetaRowTemp;
+}
+
+bool DecodeColumnData(ref array<any> results, ColumnData columnData, stream payloadStream)
+{
+    uint plpLength = 0;
+
+    TYPE_INFO typeInfoTemp = columnData.TYPE_INFO;
+
+    switch (typeInfoTemp.TypeInfoType)
+    {
+        case 0xA5 =>
+            plpLength = typeInfoTemp.BigVarbinVarlen as uint;
+        case 0xA7 =>
+            plpLength = (typeInfoTemp.BigVarCHRData as BigVarCHRData).BigVarCHRLen as uint;
+        case 0xE7 =>
+            plpLength = (typeInfoTemp.NVarCharData as NVarCharData).NVarCharVarLen as uint;
+        case 0xF1 =>
+            plpLength = 0xFFFF;
+        case 0xF0 =>
+            plpLength = 0xFFFF;
+        default =>
+            plpLength = 0;
+    }
+
+    if (BinaryDecoder<ValueData[typeInfoTemp.TypeInfoType, plpLength as uint, true]>(payloadStream) is v:ValueData)
+    {
+        results += [v];
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+array<any> DecodeAltRowData(array<ALTMETADATA> storedAltMetaDataArrayTemp, ALTROW altRowTemp, stream payloadStream, string fieldName, string messageName)
+{
+    array<any> altRowDataTemp = [];
+
+    foreach (ALTMETADATA a in storedAltMetaDataArrayTemp)
+    {
+        if (a.ID == altRowTemp.ID)
+        {
+            for (int index = 0; index < a.Count; index++ )
+            {
+                uint plpLength = 0;
+                array<ComputeData> computeDataTemp = a.ComputeDataArray as array<ComputeData>;
+                TYPE_INFO typeInfoTemp = computeDataTemp[index].TypeInfo;
+
+                switch (typeInfoTemp.TypeInfoType)
+                {
+                    case 0xA5 =>
+                        plpLength =typeInfoTemp.BigVarbinVarlen as uint;
+                    case 0xA7 =>
+                        plpLength = (typeInfoTemp.BigVarCHRData as BigVarCHRData).BigVarCHRLen as uint;
+                    case 0xE7 =>
+                        plpLength = (typeInfoTemp.NVarCharData as NVarCharData).NVarCharVarLen as uint;
+                    case 0xF1 =>
+                        plpLength = 0xFFFF;
+                    case 0xF0 =>
+                        plpLength = 0xFFFF;
+                    default =>
+                        plpLength = 0;
+                }
+
+                if (BinaryDecoder<ValueData[typeInfoTemp.TypeInfoType, plpLength as uint, true]>(payloadStream) is v:ValueData)
+                {
+                    altRowDataTemp += [v];
+                }
+                else
+                {
+                    altRowDataTemp += [BinaryDecoder<Blob[payloadStream.RemainingByteLength as uint]>(payloadStream)];
+                    ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_INCOMPLETE_DECODING, fieldName, messageName, "ValueData"));
+                    return  altRowDataTemp;
+                }
+            }
+        }
+    }
+    return  altRowDataTemp;
+}
+
+// -------------------------------------virtual operations--------------------------------------------- //
+contract VirtualOperations
+{
+    issues virtual operation PreLoginOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        out string AuthenticationMethod = ki != nothing ? GetAuthInfoFromSummary(ki.ToString()) : "";
+        
+        override string ToString()
+        {
+            return "PreLoginOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status) + (AuthenticationMethod != "" ? ", Authentication: " + AuthenticationMethod : "");
+        }
+    }
+    =
+    accepts PreLogin{PacketType is var pt, Status is var s}
+    issues TabularResult{#KeyInformation is var ki};
+    
+    issues virtual operation Login7Operation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        out string AuthenticationMethod = ki != nothing ? GetAuthInfoFromSummary(ki.ToString()) : "";
+        
+        override string ToString()
+        {
+            return "Login7Operation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status) + (AuthenticationMethod != "" ? ", Authentication: " + AuthenticationMethod : "");
+        }
+    }
+    =
+    accepts Login7{PacketType is var pt, Status is var s}
+    issues TabularResult{#KeyInformation is var ki};
+    
+    issues virtual operation SQLBatchOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        
+        override string ToString()
+        {
+            return "SQLBatchOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status);
+        }
+    }
+    =
+    accepts SQLBatch{PacketType is var pt, Status is var s}
+    issues TabularResult{};
+    
+    issues virtual operation SQLCommandWithBinaryDataOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        
+        override string ToString()
+        {
+            return "SQLCommandWithBinaryDataOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status);
+        }
+    }
+    =
+    accepts SQLCommandWithBinaryData{PacketType is var pt, Status is var s}
+    issues TabularResult{};
+    
+    issues virtual operation RPCOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        
+        override string ToString()
+        {
+            return "RPCOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status);
+        }
+    }
+    =
+    accepts RPC{PacketType is var pt, Status is var s}
+    issues TabularResult{};
+    
+    issues virtual operation AttentionOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        
+        override string ToString()
+        {
+            return "AttentionOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status);
+        }
+    }
+    =
+    accepts Attention{PacketType is var pt, Status is var s}
+    issues TabularResult{};
+    
+    issues virtual operation TransactionManagerOperation
+    {
+        in byte PacketType = pt;
+        HeaderStatusFlags Status = s;
+        
+        override string ToString()
+        {
+            return "TransactionManagerOperation, PacketType:" + TDSPacketTypeToString(PacketType) + ", Status:" + StatusToString(Status);
+        }
+    }
+    =
+    accepts TransactionManager{PacketType is var pt, Status is var s}
+    issues TabularResult{};
+}
+
+// -------------------------------------Message--------------------------------------------- //
+
+// 2.2.3.1   Packet Header
+message TDSMessage
+{
+    (byte where (value > 0x00 && value < 0x13)) PacketType with DisplayInfo{ToText = TDSPacketTypeToString};
+    HeaderStatusFlags Status with DisplayInfo{ToText = StatusToString};
+    ushort Length with BinaryEncoding{Endian = Endian.Big};
+    ushort SPID  with BinaryEncoding{Endian = Endian.Big};
+    byte PacketID;
+    byte Window where value == 0;
+
+    override string ToString()
+    {
+        string summary = "";
+
+        summary += "Status: " + ((Status == 0) ? "NormalMessage" : StatusToString(Status));
+        summary += ", Length: " + Length.ToString();
+        summary += ", SPID: " + SPID.ToString();
+        summary += ", PacketID: " + PacketID.ToString();
+        return summary;
+    }
+}
+
+// Only define to handle partial message parsing.
+message PartialTDSMessage : TDSMessage
+{
+    binary PartialPayloadData;
+
+    override string ToString()
+    {
+        return "PartialTDSMessage, " + base.ToString();
+    }
+};
+
+// 2.2.1.1   Pre-Login
+message PreLogin : TDSMessage
+{
+    invariant (PacketType == 0x12);
+
+    optional PreLoginPacketData PreLoginPacketData;
+    optional [|PreLoginPacketData == nothing|] binary SSL_PAYLOAD with BinaryEncoding{MaxLength = (Length - 8)};
+
+    override string ToString()
+    {
+        return "PreLogin, " + base.ToString();
+    }
+}
+
+// 2.2.1.2   Login
+message Login7 : TDSMessage
+{
+    invariant (PacketType == 0x10);
+
+    Login7Packet Login7PacketData;
+
+    override string ToString()
+    {
+        return "Login, " + base.ToString();
+    }
+}
+
+// 2.2.1.3 Federated Authentication Token
+message FederatedAuthenticationToken : TDSMessage
+{
+    invariant (PacketType == 0x08);
+
+    FederatedAuthenticationTokenData FederatedAuthenticationTokenData;
+
+    override string ToString()
+    {
+        return "FederatedAuthenticationToken, " + base.ToString();
+    }
+}
+
+// 2.2.1.4   SQL Batch
+message SQLBatch[bool HasAllHeaders] : TDSMessage
+{
+    invariant (PacketType == 0x01);
+
+    ([|(PacketID == 1) && ((Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)|] SQLBatchPacketData[Length, HasAllHeaders] | binary) SQLBatchPacketData;
+
+    override string ToString()
+    {
+        return "SQLBatch, " + base.ToString();
+    }
+}
+
+// 2.2.1.5   Bulk Load
+message SQLCommandWithBinaryData[uint TDSVersion] : TDSMessage
+{
+    invariant (PacketType == 0x07);
+
+    ([|(PacketID == 1) && ((Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)|] BulkLoadBCP[TDSVersion] | binary) SQLCommandPacketData;
+
+    override string ToString()
+    {
+        return "SQLCommandWithBinaryData, " + base.ToString();
+    }
+}
+
+// 2.2.1.6   Remote Procedure Call
+message RPC[bool HasAllHeaders] : TDSMessage
+{
+    invariant (PacketType == 0x03);
+
+    ([|(PacketID == 1) && ((Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)|] RPCRequest[Length, HasAllHeaders] | binary) RPCPacketData;
+
+    override string ToString()
+    {
+        return "RPC, " + base.ToString();
+    }
+}
+
+// 2.2.1.7   Attention
+message Attention : TDSMessage
+{
+    invariant (PacketType == 0x06);
+
+    override string ToString()
+    {
+        return "Attention, " + base.ToString();
+    }
+}
+
+// 2.2.1.8   Transaction Manager Request
+message TransactionManager[bool HasAllHeaders]  : TDSMessage
+{
+    invariant (PacketType == 0x0E);
+
+    ([|(PacketID == 1) && ((Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)|] TransMgrReq[HasAllHeaders] | binary) TransactionManagerPacketData;
+
+    override string ToString()
+    {
+        return "TransMgrReq, " + base.ToString();
+    }
+}
+
+// 2.2.2   Server Messages
+message TabularResult[uint TDSVersion] : TDSMessage
+{
+    invariant (PacketType == 0x04);
+
+    optional [|(PacketID == 1) && ((Status & HeaderStatusFlags.EndOfMessage) == HeaderStatusFlags.EndOfMessage)|] 
+        array<TabularResultPacketDataPattern> TabularResultPacketData 
+        with Encoding{Decoder = TabularResultPacketDataDecoder, SourcePattern = TypeOf<binary>()},
+            BinaryEncoding{Length = Length - 8};
+    optional [|(PacketID != 1) || ((Status & HeaderStatusFlags.EndOfMessage) != HeaderStatusFlags.EndOfMessage)|] binary TabularResultBinaryData;
+    
+    optional array<TabularResultPacketDataPattern> TabularResultPacketDataDecoder(stream payloadStream)
+    {
+        return TabularResultPacketDataDecoder(payloadStream, TDSVersion, this);
+    }
+    
+    override string ToString()
+    {
+        return "TabularResult, " + base.ToString() + (this#KeyInformation != nothing ? ", Authentication: " + (this#KeyInformation as string) : "");
+    }
+}
+
+pattern TabularResultPacketDataPattern = [|stream.RemainingByteLength() >= 1|]
+    ([|CurrentByte(stream) == PacketDataToken.OFFSET|] OFFSET |
+    [|CurrentByte(stream) == PacketDataToken.RETURNSTATUS|] RETURNSTATUS |
+    [|CurrentByte(stream) == PacketDataToken.COLMETADATA|] COLMETADATA |
+    [|CurrentByte(stream) == PacketDataToken.ALTMETADATA|] ALTMETADATA |
+    [|CurrentByte(stream) == PacketDataToken.TABNAME|] TABNAME |
+    [|CurrentByte(stream) == PacketDataToken.COLINFO|] COLINFO |
+    [|CurrentByte(stream) == PacketDataToken.ORDER|] ORDER |
+    [|CurrentByte(stream) == PacketDataToken.ERROR|] ERROR |
+    [|CurrentByte(stream) == PacketDataToken.INFO|] INFO |
+    [|CurrentByte(stream) == PacketDataToken.LOGINACK|] LOGINACK |
+    [|CurrentByte(stream) == PacketDataToken.FEATUREEXTACK|] FEATUREEXTACK |
+    [|CurrentByte(stream) == PacketDataToken.ROW|] ROW |
+    [|CurrentByte(stream) == PacketDataToken.ALTROW|] ALTROW |
+    [|CurrentByte(stream) == PacketDataToken.ENVCHANGE|] ENVCHANGE |
+    [|CurrentByte(stream) == PacketDataToken.SESSIONSTATE|] SESSIONSTATE |
+    [|CurrentByte(stream) == PacketDataToken.DONE|] DONE |
+    [|CurrentByte(stream) == PacketDataToken.DONEPROC|] DONEPROC |
+    [|CurrentByte(stream) == PacketDataToken.DONEINPROC|] DONEINPROC |
+    PreLoginPacketData
+);
+
+pattern PacketDataToken = enum byte
+{
+    ALTMETADATA = 0x88,
+    ALTROW = 0xD3,
+    COLINFO = 0xA5,
+    COLMETADATA = 0x81,
+    DONE = 0xFD,
+    DONEINPROC = 0xFF,
+    DONEPROC = 0xFE,
+    ENVCHANGE = 0xE3,
+    ERROR = 0xAA,
+    FEATUREEXTACK = 0xAE,
+    FEDAUTHINFO = 0xEE,
+    INFO = 0xAB,
+    LOGINACK = 0xAD,
+    NBCROW = 0xD2,
+    OFFSET = 0x78,
+    ORDER = 0xA9,
+    RETURNSTATUS = 0x79,
+    RETURNVALUE = 0xAC,
+    ROW = 0xD1,
+    SESSIONSTATE = 0xE4,
+    SSPI = 0xED,
+    TABNAME = 0xA4,
+    TVPROW = 0x01,
+    ...
+};
+
+// 2.2.6.3 Federated Authentication Token
+type FederatedAuthenticationTokenData
+{
+    uint DataLen;
+    L_VARBYTE FedAuthToken;
+    array<Nonce> Nonce;
+}
+
+// 2.2.6.5   PRELOGIN
+type PreLoginPacketData
+{
+    array<PRELOGIN_OPTION> PRELOGIN_OPTIONs;
+    (byte where value == 0xFF) PL_OPTION_TOKEN;
+    optional array<PL_OPTION_DATA> PL_OPTION_DATA with Encoding{Decoder = PLOptionDataDecoder};
+
+    optional array<PL_OPTION_DATA> PLOptionDataDecoder(stream payloadStream)
+    {
+        array<PL_OPTION_DATA> plOptionDataTemp = [];
+
+        for (int index = 0; index < PRELOGIN_OPTIONs.Count; index++ )
+        {
+            PRELOGIN_OPTION preLoginOptionWithIndex = PRELOGIN_OPTIONs[index];
+            ushort length = preLoginOptionWithIndex.PL_OPTION_LENGTH as ushort;
+            if (length != 0)
+            {
+                switch (preLoginOptionWithIndex.PL_OPTION_TOKEN)
+                {
+                    case 0x00 =>
+                        plOptionDataTemp += [BinaryDecoder<VersionData>(payloadStream)];
+                    case 0x01 =>
+                        plOptionDataTemp += [BinaryDecoder<B_FENCRYPTION>(payloadStream)];
+                    case 0x02 =>
+                        plOptionDataTemp += [BinaryDecoder<InstOptData[length]>(payloadStream)];
+                    case 0x03 =>
+                        plOptionDataTemp += [BinaryDecoder<UL_THREADID>(payloadStream)];
+                    case 0x04 =>
+                        plOptionDataTemp += [BinaryDecoder<B_MARS>(payloadStream)];
+                    case 0x05 =>
+                        plOptionDataTemp += [BinaryDecoder<TRACEID>(payloadStream)];
+                    case 0x06 =>
+                        plOptionDataTemp += [BinaryDecoder<B_FEDAUTHREQUIRED>(payloadStream)];
+                    case 0x07 =>
+                        plOptionDataTemp += [BinaryDecoder<NONCE>(payloadStream)];
+                    default =>
+                        return nothing;
+                }
+            }
+        }
+
+        return plOptionDataTemp;
+    }
+}
+
+type PRELOGIN_OPTION
+{
+    PL_OPTION_TOKEN PL_OPTION_TOKEN where value in {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06};
+    ushort PL_OFFSET with BinaryEncoding{Endian = Endian.Big};
+    ushort PL_OPTION_LENGTH with BinaryEncoding{Endian = Endian.Big};
+}
+
+type VersionData
+{
+    uint UL_VERSION;
+    ushort US_SUBBUILD;
+}
+
+pattern B_FENCRYPTION = byte with DisplayInfo{ToText = TDSEncryptOptionsToString};
+
+// pattern cannot support parameter
+type InstOptData[ushort Length]
+{
+    string B_INSTVALIDITY with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Length};
+}
+
+pattern UL_THREADID = uint;
+
+pattern B_MARS = enum byte
+{
+    off = 0x00,
+    on  = 0x01,
+    ...
+};
+
+type TRACEID
+{
+    guid GUID_CONNID;
+    binary ACTIVITYID with BinaryEncoding{Length = 20};
+}
+
+pattern B_FEDAUTHREQUIRED = byte;
+
+pattern NONCE = Nonce;
+
+pattern PL_OPTION_DATA = (VersionData | B_FENCRYPTION | InstOptData | UL_THREADID | B_MARS | TRACEID | B_FEDAUTHREQUIRED | NONCE);
+
+// 2.2.6.4   LOGIN7
+type Login7Packet
+{
+    uint Length;
+    uint TDSVersion with DisplayInfo{ToText = TDSVersionToString};
+    uint PacketSize;
+    uint ClientProgVer;
+    uint ClientPID;
+    uint ConnectionID;
+    OptionFlags1 OptionFlags1;
+    OptionFlags2 OptionFlags2;
+    TypeFlags TypeFlags;
+    OptionFlags3 OptionFlags3;
+    uint ClientTimZone;
+    uint ClientLCID;
+    OffsetLength[OptionFlags3.fExtension] OffsetLength;
+    
+    // The variable portion of this message. A stream of bytes in the order shown, indicates the offset (from the start of the message) and length of various parameters:
+    // the message is Stream Name:LOGIN7 and not contains the header
+    optional [|OffsetLength.cchHostName > 0|] string HostName where ValidationCheck((OffsetLength.cchHostName == 0 || HostName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "HostName", "Login7Packet", "OffsetLength.cchHostName")) 
+        with Encoding{Offset = OffsetLength.IbHostname}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchHostName};
+    optional [|OffsetLength.cchUserName > 0|] string UserName where ValidationCheck((OffsetLength.cchUserName == 0 || UserName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "UserName", "Login7Packet", "OffsetLength.cchUserName")) 
+        with Encoding{Offset = OffsetLength.IbUserName}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchUserName};
+    optional [|OffsetLength.cchPassword > 0|] array<byte> Password where ValidationCheck((OffsetLength.cchPassword == 0 || Password != nothing), 
+        null, DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "Password", "Login7Packet", "OffsetLength.cchPassword")) 
+        with Encoding{Offset = OffsetLength.IbPassword}, BinaryEncoding{Length = OffsetLength.cchPassword * 2};
+    optional [|OffsetLength.cchAppName > 0|] string AppName where ValidationCheck((OffsetLength.cchAppName == 0 || AppName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "AppName", "Login7Packet", "OffsetLength.cchAppName")) 
+        with Encoding{Offset = OffsetLength.IbAppName}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchAppName};
+    optional [|OffsetLength.cchServerName > 0|] string ServerName where ValidationCheck((OffsetLength.cchServerName == 0 || ServerName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "ServerName", "Login7Packet", "OffsetLength.cchServerName")) 
+        with Encoding{Offset = OffsetLength.IbServerName}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchServerName};
+    optional [|OffsetLength.cbUnused != nothing && (OffsetLength.cbUnused as ushort) > 0 && OffsetLength.ibUnused != nothing|] string Unused 
+        where ValidationCheck(OffsetLength.cbUnused == nothing || (OffsetLength.cbUnused as ushort) == 0 || Unused != nothing, null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "Unused", "Login7Packet", "OffsetLength.cbUnused")) 
+        with Encoding{Offset = (OffsetLength.cbUnused == nothing ? 0 : (OffsetLength.ibUnused as ushort))}, 
+        BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = (OffsetLength.cbUnused == nothing ? 0 : (OffsetLength.cbUnused as ushort))};
+    optional [|OffsetLength.cbExtension != nothing && (OffsetLength.cbExtension as ushort) > 0 && OffsetLength.ibExtension != nothing|] uint Extension 
+        where ValidationCheck(OffsetLength.cbExtension == nothing || (OffsetLength.cbExtension as ushort) == 0 || Extension != nothing, null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "Extension", "Login7Packet", "OffsetLength.cbExtension")) 
+        with Encoding{Offset = (OffsetLength.cbExtension == nothing ? 0 : (OffsetLength.ibExtension as ushort))};
+    optional [|OffsetLength.cchCltIntName > 0|] string CltIntName where ValidationCheck((OffsetLength.cchCltIntName == 0 || CltIntName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "CltIntName", "Login7Packet", "OffsetLength.cchCltIntName")) 
+        with Encoding{Offset = OffsetLength.ibCltIntName}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchCltIntName};
+    optional [|OffsetLength.cchLanguage > 0|] string Language where ValidationCheck((OffsetLength.cchLanguage == 0 || Language != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "Language", "Login7Packet", "OffsetLength.cchLanguage")) 
+        with Encoding{Offset = OffsetLength.ibLanguage}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchLanguage};
+    optional [|OffsetLength.cchDatabase > 0|] string Database where ValidationCheck((OffsetLength.cchDatabase == 0 || Database != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "Database", "Login7Packet", "OffsetLength.cchDatabase")) 
+        with Encoding{Offset = OffsetLength.ibDatabase}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchDatabase};
+    optional [|OffsetLength.cchAtchDBFile > 0|] string AttachDbFileName where ValidationCheck((OffsetLength.cchAtchDBFile == 0 || AttachDbFileName != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "HostName", "Login7Packet", "OffsetLength.AttachDbFileName")) 
+        with Encoding{Offset = OffsetLength.ibAtchDBFile}, BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OffsetLength.cchAtchDBFile};
+    optional [|OffsetLength.cchChangePassword > 0|] array<byte> ChangePassword where ValidationCheck((OffsetLength.cchChangePassword == 0 || ChangePassword != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "ChangePassword", "Login7Packet", "OffsetLength.cchChangePassword")) 
+        with Encoding{Offset = OffsetLength.ibChangePassword}, BinaryEncoding{Length = OffsetLength.cchChangePassword * 2};
+    optional [|(OffsetLength.cbSSPI == 0xFFFF) && (OffsetLength.cbSSPILong > 0)|] array<byte> SSPIWithsbLong 
+        where ValidationCheck((OffsetLength.cbSSPI != 0xFFFF || OffsetLength.cbSSPILong == 0 || SSPIWithsbLong != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "SSPIWithsbLong", "Login7Packet", "OffsetLength.cbSSPILong")) 
+        with Encoding{Offset = OffsetLength.ibSSPI}, BinaryEncoding{Length = OffsetLength.cbSSPILong};
+    optional [|(OffsetLength.cbSSPI != 0xFFFF) && (OffsetLength.cbSSPI > 0)|] array<byte> SSPIWithsb 
+        where ValidationCheck((OffsetLength.cbSSPI == 0xFFFF || OffsetLength.cbSSPI == 0 || SSPIWithsb != nothing), null, 
+        DiagnosisLevel.Warning, () => Format(TDS_VALUE_NOT_NULL, "SSPIWithsb", "Login7Packet", "OffsetLength.cbSSPI")) 
+        with Encoding{Offset = OffsetLength.ibSSPI}, BinaryEncoding{Length = OffsetLength.cbSSPI};
+    optional [|OptionFlags3.fExtension == 1 && Extension != nothing && (Extension as uint) > 0|] FeatureExt FeatureExt with Encoding{Offset = (Extension == nothing ? 0 : (Extension as uint))};
+}
+
+type OptionFlags1
+{
+    fSetLang fSetLang with BinaryEncoding{Width = 1};
+    fDatabase fDatabase with BinaryEncoding{Width = 1};
+    fUseDB fUseDB with BinaryEncoding{Width = 1};
+    fDumpLoad fDumpLoad with BinaryEncoding{Width = 1};
+    fFloat fFloat with BinaryEncoding{Width = 2}, 
+        Encoding{Decoder = PatternDecoder<fFloat>, SourceConverter = Reverse2BitsByte, SourcePattern = TypeOf<byte>()};
+    fChar fChar with BinaryEncoding{Width = 1};
+    fByteorder fByteorder with BinaryEncoding{Width = 1};
+}
+
+type OptionFlags2
+{
+    fIntSecurity fIntSecurity with BinaryEncoding{Width = 1};
+    fUserType fUserType with BinaryEncoding{Width = 3}, 
+        Encoding{Decoder = PatternDecoder<fUserType>, SourceConverter = Reverse3BitsByte, SourcePattern = TypeOf<byte>()};
+    byte fCacheConnect with BinaryEncoding{Width = 1};
+    byte fTransBoundary with BinaryEncoding{Width = 1};
+    fODBC fODBC with BinaryEncoding{Width = 1};
+    fLanguage fLanguage with BinaryEncoding{Width = 1};
+}
+
+type TypeFlags
+{
+    byte FRESERVEDBIT with BinaryEncoding{Width = 2};
+    byte fReadOnlyIntent with BinaryEncoding{Width = 1};
+    fOLEDB fOLEDB with BinaryEncoding{Width = 1};
+    fSQLType fSQLType with BinaryEncoding{Width = 4},
+        Encoding{Decoder = PatternDecoder<fSQLType>, SourceConverter = ConverterForfSQLType, SourcePattern = TypeOf<byte>()};
+}
+
+type OptionFlags3
+{
+    byte FRESERVEDBIT with BinaryEncoding{Width = 3};
+    fExtension fExtension with BinaryEncoding{Width = 1};
+    fUnknownCollationHandling fUnknownCollationHandling with BinaryEncoding{Width = 1};
+    fUserInstance fUserInstance with BinaryEncoding{Width = 1};
+    fSendYukonBinaryXML fSendYukonBinaryXML with BinaryEncoding{Width = 1};
+    fChangePassword fChangePassword with BinaryEncoding{Width = 1};
+}
+
+type OffsetLength[fExtension F]
+{
+    ushort IbHostname;
+    ushort cchHostName;
+    ushort IbUserName;
+    ushort cchUserName;
+    ushort IbPassword;
+    ushort cchPassword;
+    ushort IbAppName;
+    ushort cchAppName;
+    ushort IbServerName;
+    ushort cchServerName;
+    optional [|F == 0|] ushort ibUnused;
+    optional [|F == 0|] ushort cbUnused;
+    optional [|F == 1|] ushort ibExtension;
+    optional [|F == 1|] ushort cbExtension;
+    ushort ibCltIntName;
+    ushort cchCltIntName;
+    ushort ibLanguage;
+    ushort cchLanguage;
+    ushort ibDatabase;
+    ushort cchDatabase;
+    array<byte> ClientID with BinaryEncoding{Length = 6};
+    ushort ibSSPI;
+    ushort cbSSPI;
+    ushort ibAtchDBFile;
+    ushort cchAtchDBFile;
+    ushort ibChangePassword;
+    ushort cchChangePassword;
+    uint cbSSPILong;
+}
+
+type FeatureExt
+{
+    optional array<FeatureOpt> FeatureOpt;
+    byte TERMINATOR where ValidationCheckValue(value == 0xFF, null, true, ReferenceType.Type, "TDS", "TERMINATOR", "FeatureExt", "0xFF", value);
+}
+
+type FeatureOpt
+{
+    FeatureOptFeatureId FeatureId;
+    uint FeatureDataLen;
+    ([|FeatureId == FeatureOptFeatureId.SESSIONRECOVERY|] optional [|FeatureDataLen > 0|] FeatureDataSessionRecovery | 
+    [|FeatureId == FeatureOptFeatureId.FEDAUTH|] FedAuthData[FeatureDataLen] | 
+    [|FeatureId == FeatureOptFeatureId.COLUMNENCRYPTION|] ColumnEncryptionData
+    )FeatureData with BinaryEncoding{WidthForComposedType = (FeatureDataLen * 8) as int};
+}
+
+type FeatureDataSessionRecovery
+{
+    SessionRecoveryData InitSessionRecoveryData;
+    SessionRecoveryData SessionRecoveryDataToBe;
+}
+
+pattern FeatureOptFeatureId = enum byte
+{
+    SESSIONRECOVERY = 0x01,
+    FEDAUTH = 0x02,
+    COLUMNENCRYPTION = 0x04,
+    GLOBALTRANSACTIONS = 0x05,
+    TERMINATOR = 0xFF,
+    ...
+};
+
+type SessionRecoveryData
+{
+    uint Length;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] RecoveryDatabase;
+    RecoveryCollation RecoveryCollation;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] RecoveryLanguage;
+    array<SessionStateData> SessionStateDataSet with BinaryEncoding{WidthForComposedType = (Length - RecoveryDatabase.BYTELEN * 2 - RecoveryCollation.RecoveryCollationLength -
+                                                                                            RecoveryLanguage.BYTELEN * 2 - 3) * 8 as int};
+}
+
+type FedAuthData[uint Length]
+{
+    Options Options;
+    L_VARBYTE FedAuthToken;
+    optional [|Options.bFedAuthLibrary == OptionsbFedAuthLibrary.LiveIDCompactToken|]SignedData[Length - 5 - FedAuthToken.LONGLEN] SignedData;
+    optional [|Options.bFedAuthLibrary == OptionsbFedAuthLibrary.SecurityToken|]OtherData OtherData;
+}
+
+type Options
+{
+    OptionsbFedAuthLibrary bFedAuthLibrary with BinaryEncoding{Width = 7};
+    byte fFedAuthEcho with BinaryEncoding{Width = 1};
+    optional [|bFedAuthLibrary == OptionsbFedAuthLibrary.ADAL|] OptionsWorkFlow WorkFlow;
+}
+
+pattern OptionsbFedAuthLibrary = enum byte
+{
+    LiveIDCompactToken = 0x00,
+    SecurityToken = 0x01,
+    ADAL = 0x02,
+    ...
+};
+
+pattern OptionsWorkFlow = enum byte
+{
+    $"Username/password" = 0x01,
+    Integrated = 0x02,
+    ...
+};
+
+type SignedData[uint Length]
+{
+    Nonce Nonce;
+    binary ChannelBindingToken with BinaryEncoding{Length = Length - 64};
+    binary Signature with BinaryEncoding{Length = 32};
+}
+
+type OtherData
+{
+    Nonce Nonce;
+}
+
+pattern Nonce = binary with BinaryEncoding{Length = 32};
+
+type ColumnEncryptionData
+{
+    // uint Length; //TDI
+    byte ColumnEncryptionVersion;
+}
+
+type RecoveryCollation
+{
+    byte RecoveryCollationLength;
+    optional [|RecoveryCollationLength != 0|] binary RecoveryCollationData with BinaryEncoding{Length = RecoveryCollationLength};
+}
+
+type SQLBatchPacketData[ushort HeaderLength, bool HasAllHeaders]
+{
+    optional [|HasAllHeaders|] AllHeaders AllHeaders;
+    array<L_VARBYTE> EnclavePackage;
+    string SQLText with BinaryEncoding{TextEncoding = TextEncoding.Unicode, 
+        Length = (HeaderLength - 8 - (HasAllHeaders ? (AllHeaders as AllHeaders).TotalLength : 0)) / 2};
+}
+
+// 2.2.5.3   Packet Data Stream Headers - ALL_HEADERS Rule Definition
+type AllHeaders
+{
+    uint TotalLength where value > 4;
+    array<Header> Headers with BinaryEncoding{WidthForComposedType = (TotalLength - 4) * 8 as int};
+}
+
+type Header
+{
+    uint HeaderLength;
+    HeaderType HeaderType;
+    ([|HeaderType == 1|]  QueryNotifications[HeaderLength]
+    |[|HeaderType == 2|]  TransactionDescriptor
+    |[|HeaderType == 3|]  TraceActivity) HeaderData;
+}
+
+type QueryNotifications[uint HeaderLength]
+{
+    ushort NotifyIdLength;
+    string NotifyId with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = NotifyIdLength};
+    ushort SSBDeploymentLength;
+    string SSBDeployment with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = SSBDeploymentLength};
+    optional [|((NotifyIdLength + SSBDeploymentLength) * 2 + 4) != HeaderLength|] ulong NotifyTimeout;
+}
+
+type TransactionDescriptor
+{
+    ulong TransactionDescriptor;
+    uint OutstandingRequestCount;
+}
+
+// 2.2.5.3.3 Trace Activity Header
+type TraceActivity
+{
+    array<byte> ActivityId with BinaryEncoding{Length = 16};
+    ulong ActivitySequence;
+}
+
+// 2.2.6.1   Bulk Load BCP
+type BulkLoadBCP[uint TDSVersion]
+{
+    COLMETADATA[(TDSVersion >= 0x72090002)] BulkLoad_METADATA;
+    optional array<ROW> BulkLoad_ROW with Encoding{Decoder = BulkLoad_ROWDecoder};
+    optional DONE[(TDSVersion >= 0x72090002)] BulkLoad_DONE;
+
+    optional array<ROW> BulkLoad_ROWDecoder(stream payloadStream)
+    {
+        array<ROW> bulkLoadRowTemp = [];
+
+        while (payloadStream.CurrentByte != 0xFD)
+        {
+            optional ROW rowTempOptional = BinaryDecoder<ROW>(payloadStream);
+            if (rowTempOptional == nothing)
+            {
+                return nothing;
+            }
+            ROW rowTemp = rowTempOptional as ROW;
+            rowTemp.AllColumnData = DecodeAllColumnData(BulkLoad_METADATA, payloadStream, "SQLCommandWithBinaryData", "SQLCommandPacketData");
+            bulkLoadRowTemp += [rowTemp];
+        }
+        
+        return bulkLoadRowTemp;
+    }
+}
+
+// 2.2.7.4   COLMETADATA
+type COLMETADATA[bool IsUintUserType]
+{
+    byte TokenType where ValidationCheckValue(value == 0x81, null, false, ReferenceType.Type, "TDS", "TokenType", "COLMETADATA", "0x81", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Count;
+    // CekTable CekTable; // not supported by SQL Server according to TD but these fileds are not optional in TD, wait for PG's reply
+    optional [|Count != 0xFFFF && Count != 0|] array<ColumnData[IsUintUserType]> ColumnDataArray with BinaryEncoding{Length = Count};
+}
+
+type CekTable
+{
+    ushort EkValueCount;
+    optional array<EK_INFO> EK_INFO with BinaryEncoding{Length = EkValueCount};
+}
+
+type EK_INFO
+{
+    uint DatabaseId;
+    uint CekId;
+    uint CekVersion;
+    ulong CekMDVersion;
+    byte Count;
+    optional array<EncryptionKeyValue> EncryptionKeyValue;
+}
+
+type EncryptionKeyValue
+{
+    US_VARBYTE EncryptedKey;
+    B_VARCHAR KeyStoreName;
+    US_VARCHAR KeyPath;
+    B_VARCHAR AsymmetricAlgo;
+}
+
+type ColumnData[bool IsUintUserType]
+{
+    ([|IsUintUserType|] uint | ushort) UserType;
+    ColumnDataFlags Flags;
+    TYPE_INFO TYPE_INFO;
+    optional [|(TYPE_INFO.TypeInfoType == 0x22) || (TYPE_INFO.TypeInfoType == 0x23) || (TYPE_INFO.TypeInfoType == 0x63)|] TableName TableName;
+    // not supported by SQL Server according to TD but these fileds are not optional in TD, wait for PG's reply
+    //ColumnDataCryptoMetaData[IsUintUserType] CryptoMetaData;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0xFF, true] ColName;
+}
+
+type TableName
+{
+    byte NumParts;
+    optional [|NumParts != 0|] array<US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true]> PartNames with BinaryEncoding{Length = NumParts};
+}
+
+type ColumnDataCryptoMetaData[bool IsUintUserType]
+{
+    ushort Ordinal;
+    ([|IsUintUserType|] uint | ushort) UserType;
+    TYPE_INFO BaseTypeInfo;
+    byte EncryptionAlgo;
+    optional B_VARCHAR AlgoName;
+    byte EncryptionAlgoType;
+    byte NormVersion;
+}
+
+type ColumnDataFlags
+{
+    fNullableUnknown fNullableUnknown with BinaryEncoding{Width = 1};
+    fKey fKey with BinaryEncoding{Width = 1};
+    fHidden fHidden with BinaryEncoding{Width = 1};
+    byte usReserved3 with BinaryEncoding{Width = 1};
+    fEncrypted fEncrypted with BinaryEncoding{Width = 1};
+    fSparseColumnSet fSparseColumnSet with BinaryEncoding{Width = 1};
+    byte FRESERVEDBIT with BinaryEncoding{Width = 1};
+    fFixedLenCLRType fFixedLenCLRType with BinaryEncoding{Width = 1};
+    usReservedODBC usReservedODBC with BinaryEncoding{Width = 2}, 
+        Encoding{Decoder = PatternDecoder<usReservedODBC>, SourceConverter = Reverse2BitsByte, SourcePattern = TypeOf<byte>()};
+    fComputed fComputed with BinaryEncoding{Width = 1};
+    fIdentity fIdentity with BinaryEncoding{Width = 1};
+    usUpdateable usUpdateable with BinaryEncoding{Width = 2}, 
+        Encoding{Decoder = PatternDecoder<usUpdateable>, SourceConverter = Reverse2BitsByte, SourcePattern = TypeOf<byte>()};
+    fCaseSen fCaseSen with BinaryEncoding{Width = 1};
+    fNullable fNullable with BinaryEncoding{Width = 1};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+optional byte Reverse2BitsByte(byte num)
+{
+    switch (num)
+    {
+        case 1 => // 01B
+            return 2;
+        case 2 => // 10B
+            return 1;
+        default =>
+            return num;
+    }
+}
+
+optional byte Reverse3BitsByte(byte num)
+{
+    switch (num)
+    {
+        case 1 => // 001B -> 100B
+            return 4;
+        case 3 => // 011B ->110B
+            return 6;
+        case 4 => // 100B ->001B
+            return 1;
+        case 6 => // 110B ->011B
+            return 3;
+        default =>
+            return num;
+    }
+}
+
+optional byte ConverterForfSQLType(byte num)
+{
+    switch (num)
+    {
+        case 8 => // 1000B -> 0001B
+            return 1;
+        default => // more values to be converted if needed
+            return num;
+    }
+}
+
+// 2.2.5.6   Type Info Rule Definition
+type TYPE_INFO
+{
+    byte TypeInfoType with DisplayInfo{ToText = TypeInfoTypeToString};
+    optional [|TypeInfoType == 0x24|] byte GuidVarlen;
+    optional [|TypeInfoType == 0x26|] byte IntnVarlen;
+    optional [|TypeInfoType == 0x37|] DecimalData DecimalData;
+    optional [|TypeInfoType == 0x3F|] NumericData NumericData;
+    optional [|TypeInfoType == 0x68|] byte BitnVarlen;
+    optional [|TypeInfoType == 0x6A|] DecimalnData DecimalnData;
+    optional [|TypeInfoType == 0x6C|] NumericnData NumericnData;
+    optional [|TypeInfoType == 0x6D|] byte FltnVarlen;
+    optional [|TypeInfoType == 0x6E|] byte MoneynVarlen;
+    optional [|TypeInfoType == 0x6F|] byte DateTimnVarlen;
+    optional [|TypeInfoType == 0x2F|] byte CharVarlen;
+    optional [|TypeInfoType == 0x27|] byte VarcharVarlen;
+    optional [|TypeInfoType == 0x2D|] byte BinaryVarlen;
+    optional [|TypeInfoType == 0x25|] byte VarBinaryVarlen;
+    optional [|TypeInfoType == 0xA5|] ushort BigVarbinVarlen;
+    optional [|TypeInfoType == 0xA7|] BigVarCHRData BigVarCHRData;
+    optional [|TypeInfoType == 0xAD|] ushort BigBinaryVarlen;
+    optional [|TypeInfoType == 0xAF|] BigCharData BigCharData;
+    optional [|TypeInfoType == 0xE7|] NVarCharData NVarCharData;
+    optional [|TypeInfoType == 0xEF|] NcharData NcharData;
+    optional [|TypeInfoType == 0xF1|] XMLInfo XMLInfo;
+    optional [|TypeInfoType == 0xF0|] UDTInfo UDTInfo;
+    optional [|TypeInfoType == 0x23|] TextData TextData;
+    optional [|TypeInfoType == 0x22|] ImageData ImageData;
+    optional [|TypeInfoType == 0x63|] NTextData NTextData;
+    optional [|TypeInfoType == 0x62|] uint SSVariantVarlen;
+    optional [|TypeInfoType == 0x29|] TimeNType TimeNType;
+    optional [|TypeInfoType == 0x2A|] DateTime2NType DateTime2NType;
+    optional [|TypeInfoType == 0x2B|] DateTimeOffSetNType DateTimeOffSetNType;
+}
+
+type DecimalData
+{
+    byte DecimalVarlen;
+    byte DecimalPrecision;
+    byte DecimalScale;
+}
+
+type NumericData
+{
+    byte NumericVarlen;
+    byte NumericPrecision;
+    byte NumericScale;
+};
+
+type DecimalnData
+{
+    byte DecimalnVarlen;
+    byte DecimalnPrecision;
+    byte DecimalnScale;
+};
+
+type NumericnData
+{
+    byte NumericnVarlen;
+    byte NumericnPrecision;
+    byte NumericnScale;
+};
+
+type BigVarCHRData
+{
+    ushort BigVarCHRLen;
+    array<byte> BigVarchrCollation with BinaryEncoding{Length = 5};
+};
+
+type BigCharData
+{
+    ushort BigCharVarlen;
+    array<byte> BigCharCollation with BinaryEncoding{Length = 5};
+};
+
+type NVarCharData
+{
+    ushort NVarCharVarLen;
+    array<byte> NvarCharCollation with BinaryEncoding{Length = 5};
+};
+
+type NcharData
+{
+    ushort NcharVarlen;
+    array<byte> NcharCollation with BinaryEncoding{Length = 5};
+};
+
+type XMLInfo
+{
+    byte SchemaPreSent;
+    optional [|SchemaPreSent == 0x01|] SchemaInfo SchemaInfo;
+}
+
+type SchemaInfo
+{
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] DBName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] OwningSchema;
+    US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] XMLSchemaCollection;
+}
+
+type UDTInfo
+{
+    ushort MAXByteSize;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] DBName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] SchemaName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] TypeName;
+    US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] AssemblyQualifiedName;
+}
+
+type TextData
+{
+    uint TextVarlen;
+    array<byte> TextCollation with BinaryEncoding{Length = 5};
+};
+
+type ImageData
+{
+    uint ImageVarlen;
+}
+
+type NTextData
+{
+    uint NTextVarlen;
+    array<byte> NTextCollation with BinaryEncoding{Length = 5};
+};
+
+type TimeNType
+{
+    byte NumericnScale;
+}
+
+type DateTime2NType
+{
+    byte NumericnScale;
+}
+
+type DateTimeOffSetNType
+{
+    byte NumericnScale;
+}
+
+// 2.2.7.19   ROW
+type ROW
+{
+    byte TokenType where ValidationCheckValue(value == 0xD1, null, false, ReferenceType.Type, "TDS", "TokenType", "ROW", "0xD1", value) with DisplayInfo{ToText = TokenTypeToString};
+    optional any AllColumnData with Encoding{Ignore = true};
+}
+
+// 2.2.5.7   Data Buffer Stream Tokens
+type ValueData[byte TypeInfoType, uint PlpLength, bool IsRowData]
+{
+    // 2.2.5.4.1   Fixed-Length Data Types
+    optional [|TypeInfoType == 0x30|] byte INT1Value;
+    optional [|TypeInfoType == 0x32|] byte BITValue;
+    optional [|TypeInfoType == 0x34|] ushort INT2Value;
+    optional [|TypeInfoType == 0x38|] uint INT4Value;
+    optional [|TypeInfoType == 0x3A|] DateTime4 DateTime4Value;
+    optional [|TypeInfoType == 0x3B|] uint FLT4Value;
+    optional [|TypeInfoType == 0x3C|] ulong MoneyNValue;
+    optional [|TypeInfoType == 0x3D|] DateTime DateTimeValue;
+    optional [|TypeInfoType == 0x3E|] ulong FLT8Value;
+    optional [|TypeInfoType == 0x7A|] int Money4Value;
+    optional [|TypeInfoType == 0x7F|] ulong INT8Value;
+
+    // 2.2.5.4.2   Variable-Length Data Types
+    optional [|TypeInfoType == 0x24|] GuidVarByte GuidVarByteValue;
+    optional [|TypeInfoType == 0x26|] INTNVarByte INTNVarByteValue;
+    optional [|TypeInfoType == 0x37|] DecimalVarByte DecimalVarByteData;
+    optional [|TypeInfoType == 0x3F|] NumericVarByte NumericVarByteData;
+    optional [|TypeInfoType == 0x68|] BitnVarByte BitnVarByteData;
+    optional [|TypeInfoType == 0x6A|] DecimalnVarByte DecimalnVarByteData;
+    optional [|TypeInfoType == 0x6C|] NumericnVarByte NumericnVarByteData;
+    optional [|TypeInfoType == 0x6D|] FltnVarByte FltnVarByteData;
+    optional [|TypeInfoType == 0x6E|] MoneyNVarByte MoneyNVarByteData;
+    optional [|TypeInfoType == 0x6F|] DateTimNVarByte DateTimNVarByteData;
+    optional [|TypeInfoType == 0x2F|] CharVarByte CharVarByteData;
+    optional [|TypeInfoType == 0x27|] VarCharVarByte VarCharVarByteData;
+    optional [|TypeInfoType == 0x28|] DateNVarByte DateNVarByteData;
+    optional [|TypeInfoType == 0x29|] TimeNVarByte TimeNVarByteData;
+    optional [|TypeInfoType == 0x2A|] DateTime2NVarByte DateTime2NVarByteData;
+    optional [|TypeInfoType == 0x2B|] DateTimeOffSetNVarByte DateTimeOffSetNVarByteData;
+    optional [|TypeInfoType == 0x2D|] BinaryVarByte BinaryVarByteData;
+    optional [|TypeInfoType == 0x25|] VarBinaryVarByte VarBinaryVarByteData;
+    optional [|TypeInfoType == 0xA5|] PLPVarType[PlpLength, DisplayStyleFlags.BinaryData] BigVarBinaryData;
+    optional [|TypeInfoType == 0xA7|] PLPVarType[PlpLength, DisplayStyleFlags.ASCIIString] BigVarCharData;
+    optional [|TypeInfoType == 0xAD|] PLPVarType[PlpLength, DisplayStyleFlags.BinaryData] BigBinaryData;
+    optional [|TypeInfoType == 0xAF|] PLPVarType[PlpLength, DisplayStyleFlags.ASCIIString] BigCharData;
+    optional [|TypeInfoType == 0xE7|] PLPVarType[PlpLength, DisplayStyleFlags.UnicodeString] NVarCharData;
+    optional [|TypeInfoType == 0xEF|] PLPVarType[PlpLength, DisplayStyleFlags.UnicodeString] NCharData;
+    optional [|TypeInfoType == 0xF1|] PLPVarType[PlpLength, DisplayStyleFlags.BinaryData] XMLInfoData;
+    optional [|TypeInfoType == 0xF0|] PLPVarType[PlpLength, DisplayStyleFlags.BinaryData] UDTInfoData;
+    optional [|TypeInfoType == 0x23|] TextVarByte[IsRowData] TextVarByteData;
+    optional [|TypeInfoType == 0x22|] ImageVarByte[IsRowData] ImageVarByteData;
+    optional [|TypeInfoType == 0x63|] NTextVarByte[IsRowData] NTextVarByteData;
+    optional [|TypeInfoType == 0x62|] SSVariantVarByte SSVariantVarByteData;
+}
+
+type DateTime4
+{
+    ushort days;
+    ushort minutes;
+    
+    override string ToString()
+    {
+        return CreateDateTime(1900, 1, 1).AddDays(days as double).AddMinutes(minutes as double).ToString("MM/dd/yyyy HH:mm:ss.fffffff K");
+    }
+}
+
+type DateTime
+{
+    int days;
+    uint threeHurdredsCountPerSecond;
+    
+    override string ToString()
+    {
+        if (days >= 0)
+        {
+            return CreateDateTime(1900, 1, 1).AddDays(days as double).AddSeconds((threeHurdredsCountPerSecond / 300) as double).ToString("MM/dd/yyyy HH:mm:ss.fffffff K");
+        }else
+        {
+            return CreateDateTime(1753, 1, 1).AddDays((days * (-1)) as double).AddSeconds((threeHurdredsCountPerSecond / 300) as double).ToString("MM/dd/yyyy HH:mm:ss.fffffff K");
+        }
+    }
+}
+
+type GuidVarByte
+{
+    byte GuidVarLen where ValidationCheckEnumValue(value in {0x00, 0x10}, null, false, ReferenceType.Type, "TDS", "GuidVarLen", "GuidVarByte", "0x01, 0x10", value);
+    optional [|GuidVarLen != 0x00|] guid TraceGuid with BinaryEncoding{Length = GuidVarLen};
+}
+
+type INTNVarByte
+{
+    byte INTNVarLen where ValidationCheckEnumValue(value in {0x00, 0x01, 0x02, 0x04, 0x08}, null, false, ReferenceType.Type, "TDS", "INTNVarLen", "INTNVarByte", "0x01, 0x02, 0x04, 0x08", value);
+    binary INTNVarValue with BinaryEncoding{Length = (INTNVarLen)};
+}
+
+type DecimalVarByte
+{
+    byte DecimalVarLen;
+    optional [|DecimalVarLen != 0|] binary DecimalVarValue with BinaryEncoding{Length = (DecimalVarLen)};
+}
+
+type NumericVarByte
+{
+    byte NumericVarLen;
+    optional [|NumericVarLen != 0|] binary NumericVarValue with BinaryEncoding{Length = NumericVarLen};
+}
+
+type BitnVarByte
+{
+    byte BitnVarLen where ValidationCheckEnumValue(value in {0x00, 0x01}, null, false, ReferenceType.Type, "TDS", "BitnVarLen", "BitnVarByte", "0x00, 0x01", value);
+    optional [|BitnVarLen != 0|] binary BitnVarValue with BinaryEncoding{Length = BitnVarLen};
+}
+
+type DecimalnVarByte
+{
+    byte DecimalnVarLen;
+    optional [|DecimalnVarLen != 0|] binary DecimalnVarValue with BinaryEncoding{Length = DecimalnVarLen};
+}
+
+type NumericnVarByte
+{
+    byte NumericnVarLen;
+    optional [|NumericnVarLen != 0|] binary NumericnVarValue with BinaryEncoding{Length = NumericnVarLen};
+}
+
+type FltnVarByte
+{
+    byte FltnVarLen where ValidationCheckEnumValue(value in {0x04, 0x08}, null, false, ReferenceType.Type, "TDS", "FltnVarLen", "FltnVarByte", "0x04, 0x08", value);
+    optional [|FltnVarLen != 0|] binary FltnVarValue with BinaryEncoding{Length = FltnVarLen};
+}
+
+type MoneyNVarByte
+{
+    byte MoneynVarLen where ValidationCheckEnumValue(value in {0x04, 0x08}, null, false, ReferenceType.Type, "TDS", "MoneynVarLen", "MoneyNVarByte", "0x04, 0x08", value);
+    optional [|MoneynVarLen != 0|] binary MoneynVarValue with BinaryEncoding{Length = MoneynVarLen};
+}
+
+type DateTimNVarByte
+{
+    byte DateTimnVarLen where ValidationCheckEnumValue(value in {0x04, 0x08}, null, false, ReferenceType.Type, "TDS", "DateTimnVarLen", "DateTimNVarByte", "0x04, 0x08", value);
+    optional [|DateTimnVarLen != 0|] binary DateTimnVarValue with BinaryEncoding{Length = DateTimnVarLen};
+}
+
+type CharVarByte
+{
+    byte CharVarLen;
+    optional [|CharVarLen != 0|] string CharVarValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = CharVarLen};
+}
+
+type VarCharVarByte
+{
+    byte VarCharVarLen;
+    optional [|VarCharVarLen != 0|] string VarCharVarValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = VarCharVarLen};
+}
+
+type DateNVarByte
+{
+    byte DateNVarLen where ValidationCheckEnumValue(value in {0x00, 0x03}, null, false, 
+        ReferenceType.Type, "TDS", "DateNVarLen", "DateNVarByte", "0x00, 0x03", value);
+    optional [|DateNVarLen != 0x00|] binary DateNVarValue with BinaryEncoding{Length = DateNVarLen};
+}
+
+type TimeNVarByte
+{
+    byte TimeNVarLen where ValidationCheckEnumValue(value in {0x03, 0x04, 0x05}, null, false, 
+        ReferenceType.Type, "TDS", "TimeNVarLen", "TimeNVarByte", "0x03, 0x04, 0x05", value);
+    optional [|TimeNVarLen != 0x00|] binary TimeNVarValue with BinaryEncoding{Length = TimeNVarLen};
+}
+
+type DateTime2NVarByte
+{
+    byte DateTime2NVarLen where ValidationCheckEnumValue(value in {0x06, 0x07, 0x08}, null, false, 
+        ReferenceType.Type, "TDS", "DateTime2NVarLen", "DateTime2NVarByte", "0x06, 0x07, 0x08", value);
+    optional [|DateTime2NVarLen != 0x00|] binary DateTime2NVarValue with BinaryEncoding{Length = DateTime2NVarLen};
+}
+
+type DateTimeOffSetNVarByte
+{
+    byte DateTimeOffSetNVarLen where ValidationCheckEnumValue(value in {0x08, 0x09, 0x0A}, null, false, 
+        ReferenceType.Type, "TDS", "DateTimeOffSetNVarLen", "DateTimeOffSetNVarByte", "0x08, 0x09, 0x0A", value);
+    optional [|DateTimeOffSetNVarLen != 0x00|] binary DateTimeOffSetNVarValue with BinaryEncoding{Length = DateTimeOffSetNVarLen};
+}
+
+type BinaryVarByte
+{
+    byte BinaryVarLen;
+    optional [|BinaryVarLen != 0|] binary BinaryVarValue with BinaryEncoding{Length = BinaryVarLen};
+}
+
+type VarBinaryVarByte
+{
+    byte VarBinaryVarLen;
+    optional [|VarBinaryVarLen != 0|] binary VarBinaryVarValue with BinaryEncoding{Length = VarBinaryVarLen};
+}
+
+// 2.2.5.2.3   Data Type Dependent Data Streams
+//Partially Length-prefixed Bytes
+type PLPVarType[uint DataLength, DisplayStyleFlags DisplayStyle]
+{
+    optional ([|DataLength == 0xFFFF|] PLPBody[DisplayStyle]
+               |[|DataLength != 0xFFFF|] US_VARCHAR[DisplayStyle, 0xFFFF, false]) PLPTypeData;
+}
+
+type US_VARCHAR[DisplayStyleFlags DisplayStyle, ushort EndToken, bool FullLength]
+{
+    ushort USHORTLEN;
+    optional [|!(USHORTLEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.BinaryData)|] binary BinaryValue with BinaryEncoding{Length = USHORTLEN};
+    optional [|!(USHORTLEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.ASCIIString)|] string ASCIIStringValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = USHORTLEN};
+    optional [|!(USHORTLEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.UnicodeString) && FullLength|] string UnicodeStringValueFL with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = USHORTLEN};
+    optional [|!(USHORTLEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.UnicodeString) && !FullLength|] string UnicodeStringValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = (USHORTLEN / 2)};
+}
+
+type B_VARCHAR[DisplayStyleFlags DisplayStyle, byte EndToken, bool FullLength]
+{
+    byte BYTELEN;
+    optional [|!(BYTELEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.BinaryData)|] binary BinaryValue with BinaryEncoding{Length = BYTELEN};
+    optional [|!(BYTELEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.ASCIIString)|] string ASCIIStringValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = BYTELEN};
+    optional [|!(BYTELEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.UnicodeString) && FullLength|] string UnicodeStringValueFL with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = BYTELEN};
+    optional [|!(BYTELEN in {0, EndToken}) && (DisplayStyle == DisplayStyleFlags.UnicodeString) && !FullLength|] string UnicodeStringValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = (BYTELEN / 2)};
+}
+
+type B_VARBYTE
+{
+    byte BYTELEN;
+    binary Data with BinaryEncoding{Length = BYTELEN};
+}
+
+type L_VARBYTE
+{
+    uint LONGLEN;
+    binary Data with BinaryEncoding{Length = LONGLEN};
+}
+
+type US_VARBYTE
+{
+    ushort USHORTLEN;
+    binary Data with BinaryEncoding{Length = USHORTLEN};
+}
+
+type PLPBody[DisplayStyleFlags DisplayStyle]
+{
+    ulong Length;
+    optional [|Length != 0xFFFFFFFFFFFFFFFF|] PLPChunkWithoutLimitLength[DisplayStyle] Data;
+}
+
+type PLPChunkWithoutLimitLength[DisplayStyleFlags DisplayStyle]
+{
+    optional ([|DisplayStyle == DisplayStyleFlags.BinaryData|] array<PLPBinaryChunk> 
+               |[|DisplayStyle == DisplayStyleFlags.ASCIIString|] array<PLPASCIIStringChunk>
+               |[|DisplayStyle == DisplayStyleFlags.UnicodeString|] array<PLPUnicodeStringChunk>) PLPChunkData;
+    uint PLPTerminator where ValidationCheckValue(value == 0x00000000, null, true, ReferenceType.Type, "TDS", "PLPTerminator", "PLPChunkWithoutLimitLength", "0x00000000", value);
+}
+
+type PLPBinaryChunk
+{
+    (uint where value != 0x00000000) PLPChunkLength;
+    binary data with BinaryEncoding{Length = PLPChunkLength};
+}
+
+type PLPASCIIStringChunk
+{
+    (uint where value != 0x00000000) PLPChunkLength;
+    string data with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = PLPChunkLength};
+}
+
+type PLPUnicodeStringChunk
+{
+    (uint where value != 0x00000000) PLPChunkLength;
+    string data with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = (PLPChunkLength / 2)};
+}
+
+type TextVarByte[bool IsRowData]
+{
+    optional ([|IsRowData == true|] LobWithTextPointer[VarByteTypeEnum.Text]
+              |[|IsRowData == false|]LobWithoutTextPointer[VarByteTypeEnum.Text]) TextVarByteValue;
+}
+
+type ImageVarByte[bool IsRowData]
+{
+    optional ([|IsRowData == true|] LobWithTextPointer[VarByteTypeEnum.Image]
+              |[|IsRowData == false|]LobWithoutTextPointer[VarByteTypeEnum.Image]) ImageVarByteValue;
+}
+
+type NTextVarByte[bool IsRowData]
+{
+    optional ([|IsRowData == true|] LobWithTextPointer[VarByteTypeEnum.NText]
+              |[|IsRowData == false|]LobWithoutTextPointer[VarByteTypeEnum.NText]) NTextVarByteValue;
+}
+
+type LobWithTextPointer[VarByteTypeEnum VarByteType]
+{
+    byte TextPointerLength;
+    optional [|TextPointerLength != 0|] string TextPointer with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = TextPointerLength};
+    optional [|TextPointerLength != 0|] array<byte> Timestamp with BinaryEncoding{Length = 8};
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.Text)|] uint TextVarLen;
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.Text)|] string TextValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = TextVarLen as uint};
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.Image)|] uint ImageVarLen;
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.Image)|] binary ImageValue with BinaryEncoding{Length = ImageVarLen as uint};
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.NText)|] uint NTextVarLen;
+    optional [|(TextPointerLength != 0) && (VarByteType == VarByteTypeEnum.NText)|] string NTextValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = NTextVarLen / 2 as uint};
+}
+
+type LobWithoutTextPointer[VarByteTypeEnum VarByteType]
+{
+    optional [|VarByteType == VarByteTypeEnum.Text|]uint TextVarLen;
+    optional [|(TextVarLen != 0xFFFFFFFF) && (TextVarLen != 0) && (VarByteType == VarByteTypeEnum.Text)|] string TextValue with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = TextVarLen as uint};
+    optional [|VarByteType == VarByteTypeEnum.Image|]uint ImageVarLen;
+    optional [|(ImageVarLen != 0xFFFFFFFF) && (ImageVarLen != 0) && (VarByteType == VarByteTypeEnum.Image)|] binary ImageValue with BinaryEncoding{Length = ImageVarLen as uint};
+    optional [|VarByteType == VarByteTypeEnum.NText|]uint NTextVarLen;
+    optional [|(NTextVarLen != 0xFFFFFFFF) && (NTextVarLen != 0) && (VarByteType == VarByteTypeEnum.NText)|] string NTextValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = NTextVarLen / 2 as uint};
+}
+
+type SSVariantVarByte
+{
+    uint SSVariantVarLen;
+    optional [|SSVariantVarLen != 0|] binary SSVariantValue with BinaryEncoding{Length = SSVariantVarLen};
+}
+
+// 2.2.7.5   DONE
+type DONE[bool IsULongLong]
+{
+    byte TokenType where ValidationCheckValue(value == 0xFD, null, false, ReferenceType.Type, "TDS", "TokenType", "DONE", "0xFD", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Status;
+    ushort CurCMD;
+    ([|IsULongLong|] ulong | uint) DoneRowCount; // DoneRowCount     =   LONG / ULONGLONG;  (Changed to ULONGLONG in TDS 7.2)
+}
+
+// 2.2.6.6   RPC Request
+type RPCRequest[ushort Length, bool HasAllHeaders]
+{
+    // According to TD, there must have AllHeaders. But according to capture file, there may no AllHeaders, see bug 68373
+    optional [|HasAllHeaders|] AllHeaders AllHeaders;
+    array<RPCReqBatch> RPCReqBatchArray with BinaryEncoding{WidthForComposedType = (Length - 8 - (HasAllHeaders ? (AllHeaders as AllHeaders).TotalLength : 0)) * 8 as int};
+}
+
+type RPCReqBatch
+{
+    ([|stream.RemainingByteLength >= 2 && stream.PeekUShort(stream.BitPosition, Endian.Big) == 0xFFFF|]ProcIDSwitchAndID | 
+    US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true]
+    ) NameLenProcID;
+    RPCReqBatchOptionFlags OptionFlags;
+    array<L_VARBYTE> EnclavePackage;
+    array<ParameterData> ParameterData;
+    optional [|value == 0xFF|] byte BatchFlag;
+    optional [|value == 0xFE|] byte NoExecFlag;
+}
+
+type ProcIDSwitchAndID
+{
+    (ushort where value == 0xFFFF) ProcIDSwitch;
+    ProcIDPatt ProcID;
+}
+
+pattern ProcIDPatt = enum ushort
+{
+    Sp_Cursor = 1,
+    Sp_CursorOpen = 2,
+    Sp_CursorPrepare = 3,
+    Sp_CursorExecute = 4,
+    Sp_CursorPrepExec = 5,
+    Sp_CursorUnprepare = 6,
+    Sp_CursorFetch = 7,
+    Sp_CursorOption = 8,
+    Sp_CursorClose = 9,
+    Sp_ExecuteSql = 10,
+    Sp_Prepare = 11,
+    Sp_Execute = 12,
+    Sp_PrepExec = 13,
+    Sp_PrepExecRpc = 14,
+    Sp_Unprepare = 15,
+    ...
+};
+
+type ParameterData
+{
+    ParamMetaData ParamMetaData;
+    optional [|ParamMetaData.TYPE_INFO != nothing|] ParamLenData[ParamMetaData.TYPE_INFO as TYPE_INFO] ParamLenData;
+    optional [|(ParamMetaData.StatusFlag & StatusFlags.fEncrypted) == StatusFlags.fEncrypted|] ParamCipherInfo ParamCipherInfo;
+}
+
+type ParamMetaData
+{
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0xFE, true] B_VARCHAR;
+    StatusFlags StatusFlag;
+    optional [|RemainingByteLength(stream) > 0 && (CurrentByte(stream) != 0xF3)|] TYPE_INFO TYPE_INFO;
+    optional [|((StatusFlags.fByRefValue & StatusFlag) == 0) && ((StatusFlags.fDefaultValue & StatusFlag) == 0) && 
+        RemainingByteLength(stream) > 0 && (CurrentByte(stream) == 0xF3)|] TVP_TYPE_INFO TVP_TYPE_INFO;
+}
+
+type ParamLenData[TYPE_INFO TypeInfo]
+{
+    ( [|TypeInfo.TypeInfoType == 0xA5|] ValueData[0xA5, TypeInfo.BigVarbinVarlen as uint, false]
+    | [|TypeInfo.TypeInfoType == 0xA7|] ValueData[0xA7, (TypeInfo.BigVarCHRData as BigVarCHRData).BigVarCHRLen as uint, false]
+    | [|TypeInfo.TypeInfoType == 0xE7|] ValueData[0xE7, (TypeInfo.NVarCharData as NVarCharData).NVarCharVarLen as uint, false]
+    | [|TypeInfo.TypeInfoType == 0xF1 || TypeInfo.TypeInfoType == 0xF0|]ValueData[TypeInfo.TypeInfoType, 0xFFFF as uint, false]
+    | ValueData[TypeInfo.TypeInfoType, 0x00 as uint, false]) ValueData;
+}
+
+type ParamCipherInfo
+{
+    TYPE_INFO TYPE_INFO;
+    byte EncryptionAlgo;
+    optional [|EncryptionAlgo == 0|] B_VARCHAR AlgoName;
+    byte EncryptionType;
+    uint DatabaseId;
+    uint CekId;
+    ulong CekVersion;
+    byte NormVersion;
+}
+
+type TVP_TYPE_INFO
+{
+    byte TVPTYPE where ValidationCheckValue(value == 0xF3, null, false, ReferenceType.Type, "TDS", "TVPTYPE", "TVP_TYPE_INFO", "0xF3", value);
+    TVP_TYPENAME TVP_TYPENAME;
+    TVP_COLMETADATA TVP_COLMETADATA;
+    optional [|(BitPosition(stream) < BitLength(stream)) && (CurrentByte(stream) == 0x10)|] TVP_ORDER_UNIQUE TVP_ORDER_UNIQUE;
+    optional [|(BitPosition(stream) < BitLength(stream)) && (CurrentByte(stream) == 0x11)|] TVP_COLUMN_ORDERING TVP_COLUMN_ORDERING;
+    byte TVP_COLMETADATA_END_TOKEN where value == 0x00;
+    optional [|CurrentByte(stream) != 0x00|] array<TVP_ROW[TVP_COLMETADATA]> TVP_ROWs;
+    byte TVP_ROW_END_TOKEN where value == 0x00;
+}
+
+type TVP_ROW[TVP_COLMETADATA TVPColmetaData]
+{
+    byte TVP_ROW_TOKEN where value == 0x01;
+    array<B_VARBYTE> AllColumnData with BinaryEncoding{Length = GetTVP_COLMETADATANonDefaultLen(TVPColmetaData)};
+}
+
+uint GetTVP_COLMETADATANonDefaultLen(TVP_COLMETADATA tvpColmetaData)
+{
+    uint cnt = 0;
+    if (tvpColmetaData.TvpColumnMetaDatas is metaDataArr:array<TvpColumnMetaData>)
+    {
+        foreach (TvpColumnMetaData metaData in metaDataArr)
+        {
+            if (metaData.Flag.fDefault == 0)
+            {
+                cnt++;
+            }
+        }
+    }
+    return cnt;
+}
+
+type TVP_COLUMN_ORDERING
+{
+    byte TVP_COLUMN_ORDERING_TOKEN;
+    ushort Count;
+    array<ushort> ColNum with BinaryEncoding{Length = Count as uint};
+}
+
+type TVP_ORDER_UNIQUE
+{
+    byte TVP_ORDER_UNIQUE_TOKEN;
+    ushort Count;
+    array<ColNumOrderUniqueFlags> ColNumOrderUniqueFlags with BinaryEncoding{Length = Count as uint};
+}
+
+type ColNumOrderUniqueFlags
+{
+    ushort ColNum;
+    OrderUniqueFlags OrderUniqueFlags;
+}
+
+type TVP_COLMETADATA
+{
+    ushort Count with DisplayInfo{ToText = TVP_COLMETADATACountToString};
+    optional [|!(Count in {0x0000, 0xFFFF})|] array<TvpColumnMetaData> TvpColumnMetaDatas with BinaryEncoding{Length = Count as uint};
+}
+
+type TvpColumnMetaData
+{
+    uint UserType;
+    TVP_COLMETADATAFlags Flag;
+    TYPE_INFO TYPE_INFO;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0xFF, true] ColName;
+}
+
+type TVP_COLMETADATAFlags
+{
+    fNullable fNullable with BinaryEncoding{Width = 1};
+    fCaseSen fCaseSen with BinaryEncoding{Width = 1};
+    usUpdateable usUpdateable with BinaryEncoding{Width = 2}, 
+        Encoding{Decoder = PatternDecoder<usReservedODBC>, SourceConverter = Reverse2BitsByte, SourcePattern = TypeOf<byte>()};
+    fIdentity fIdentity with BinaryEncoding{Width = 1};
+    fComputed fComputed with BinaryEncoding{Width = 1};
+    usReservedODBC usReservedODBC with BinaryEncoding{Width = 2}, 
+        Encoding{Decoder = PatternDecoder<usReservedODBC>, SourceConverter = Reverse2BitsByte, SourcePattern = TypeOf<byte>()};
+    fFixedLenCLRType fFixedLenCLRType with BinaryEncoding{Width = 1};
+    fDefault fDefault with BinaryEncoding{Width = 1};
+    byte FRESERVEDBIT with BinaryEncoding{Width = 6};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+type TVP_TYPENAME
+{
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] DbName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] OwningSchema;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] TypeName;
+}
+
+type TransMgrReq[bool HasAllHeaders]
+{
+    optional [|HasAllHeaders|] AllHeaders AllHeaders;
+    RequestType RequestType;
+    optional ([|RequestType == 0|] TMGETDTCADDRESS
+             |[|RequestType == 1|] TMPROPAGATEXACT
+             |[|RequestType == 5|] TMBEGINXACT
+             |[|RequestType == 7|] TMCOMMITXACT
+             |[|RequestType == 8|] TMROLLBACKXACT
+             |[|RequestType == 9|] TMSAVEXACT)RequestPayloadData;
+}
+
+type TMGETDTCADDRESS
+{
+    ushort RequestPayloadLength;
+    optional [|RequestPayloadLength != 0|] binary RequestPayload with BinaryEncoding{Length = RequestPayloadLength};
+}
+
+type TMPROPAGATEXACT
+{
+    ushort RequestPayloadLength;
+    optional [|RequestPayloadLength != 0|] binary RequestPayload with BinaryEncoding{Length = RequestPayloadLength};
+}
+
+type TMBEGINXACT
+{
+    byte IsolationLevel;
+    byte BeginXACTNameLength;
+    optional [|BeginXACTNameLength != 0|] binary BeginXACTName with BinaryEncoding{Length = BeginXACTNameLength};
+}
+
+type TMSAVEXACT
+{
+    byte XACTSavePointNameLength;
+    optional [|XACTSavePointNameLength != 0|] binary XACTSavePointName with BinaryEncoding{Length = XACTSavePointNameLength};
+}
+
+type TMCOMMITXACT
+{
+    byte XACTNameLength;
+    optional [|XACTNameLength != 0|] binary XACTName with BinaryEncoding{Length = XACTNameLength};
+    byte XACRFlags;
+    byte IsolationLevel;
+    byte BeginXACTNameLength;
+    optional [|BeginXACTNameLength != 0|] binary BeginXACTName with BinaryEncoding{Length = BeginXACTNameLength};
+}
+
+type TMROLLBACKXACT
+{
+    byte XACTNameLength;
+    optional [|XACTNameLength != 0|] string XACTName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = XACTNameLength};
+    byte XACRFlags;
+    byte IsolationLevel;
+    byte BeginXACTNameLength;
+    optional [|BeginXACTNameLength != 0|] binary BeginXACTName with BinaryEncoding{Length = BeginXACTNameLength};
+}
+
+// 2.2.7.7   DONEPROC
+type DONEPROC[bool IsULongLong]
+{
+    byte TokenType where ValidationCheckValue(value == 0xFE, null, false, ReferenceType.Type, "TDS", "TokenType", "DONEPROC", "0xFE", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Status;
+    ushort CurCmd;
+    ([|IsULongLong|] ulong | uint) DoneRowCount; // DoneRowCount     =   LONG / ULONGLONG;  (Changed to ULONGLONG in TDS 7.2)
+}
+
+// 2.2.7.20 SSPI
+type SSPI
+{
+    byte TokenType where ValidationCheckValue(value == 0xED, null, false, ReferenceType.Type, "TDS", "TokenType", "SSPI", "0xED", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort SSPIBufferLength;
+    (binary | GssapiType | KerberosToken | NlmpMessage) SSPIBuffer with BinaryEncoding{Length = SSPIBufferLength};
+}
+
+// 2.2.7.8   ENVCHANGE
+type ENVCHANGE
+{
+    byte TokenType where ValidationCheckValue(value == 0xE3, null, false, ReferenceType.Type, "TDS", "TokenType", "ENVCHANGE", "0xE3", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    EnvValueData EnvValueData;
+}
+
+type EnvValueData
+{
+    byte Type with DisplayInfo{ToText = EnvChangeTypeToString};
+    ([|Type == 0x07|] SqlCollationDataEnv
+    |[|Type in {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x11}|] TransactionDataEnv
+    |ValueDataEnv) Data;
+}
+
+type SqlCollationDataEnv
+{
+    byte NewValueLength;
+    optional [|NewValueLength != 0|] binary NewValue with BinaryEncoding{Length = NewValueLength, Endian = Endian.Big};
+    byte OldValueLength;
+    optional [|OldValueLength != 0|] binary OldValue with BinaryEncoding{Length = OldValueLength, Endian = Endian.Big};
+}
+
+type TransactionDataEnv
+{
+    byte NewValueLength;
+    optional [|NewValueLength != 0|] binary NewValue with BinaryEncoding{Length = NewValueLength};
+    byte OldValueLength;
+    optional [|OldValueLength != 0|] binary OldValue with BinaryEncoding{Length = OldValueLength};
+}
+
+type ValueDataEnv
+{
+    byte NewValueLength;
+    optional [|NewValueLength != 0|] string NewValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = NewValueLength};
+    byte OldValueLength;
+    optional [|OldValueLength != 0|] string OldValue with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = OldValueLength};
+}
+
+static string EnvChangeTypeToString(any input)
+{
+    if (!(input is byte))
+        return "Type is not byte";
+    byte data = input as byte;
+    switch (data)
+    {
+        case 1 => return "Database(" + data.ToString() + ")";
+        case 2 => return "EndOfMessage(" + data.ToString() + ")";
+        case 3 => return "Character set(" + data.ToString() + ")";
+        case 4 => return "Packet size(" + data.ToString() + ")";
+        case 5 => return "Unicode data sorting local id(" + data.ToString() + ")";
+        case 6 => return "Unicode data sorting comparison flags(" + data.ToString() + ")";
+        case 7 => return "SQL Collation(" + data.ToString() + ")";
+        case 8 => return "Begin Transaction(" + data.ToString() + ")";
+        case 9 => return "Commit Transaction(" + data.ToString() + ")";
+        case 10 => return "ollback Transaction(" + data.ToString() + ")";
+        case 11 => return "Enlist DTC Transaction(" + data.ToString() + ")";
+        case 12 => return "Defect Transaction(" + data.ToString() + ")";
+        case 13 => return "Real Time Log Shipping(" + data.ToString() + ")";
+        case 15 => return "Promote Transaction(" + data.ToString() + ")";
+        case 16 => return "Transaction Manager Address(" + data.ToString() + ")";
+        case 17 => return "Transaction Manager Address(" + data.ToString() + ")";
+        case 18 => return "Sp_resetconnection Completion Acknowledgement(" + data.ToString() + ")";
+        case 19 => return "Name of user instance started per login request(" + data.ToString() + ")";
+        default => return "InvalidEnvChangeType(" + data.ToString() + ")";
+    }
+}
+
+// 2.2.7.11   INFO
+type INFO
+{
+    byte TokenType where ValidationCheckValue(value == 0xAB, null, false, ReferenceType.Type, "TDS", "TokenType", "INFO", "0xAB", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    uint Number;
+    byte State;
+    byte Class;
+    US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] MsgText;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] ServerName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] ProcName;
+    optional ([|(Length - MsgText.USHORTLEN * 2 - ServerName.BYTELEN * 2 - ProcName.BYTELEN * 2 - 10) == 4|] uint
+             |[|(Length - MsgText.USHORTLEN * 2 - ServerName.BYTELEN * 2 - ProcName.BYTELEN * 2 - 10) == 2|] ushort) LineNumber;
+}
+
+// 2.2.7.12   LOGINACK
+type LOGINACK
+{
+    byte TokenType where ValidationCheckValue(value == 0xAD, null, false, ReferenceType.Type, "TDS", "TokenType", "LOGINACK", "0xAD", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    byte Interface;
+    uint TDSVersion with BinaryEncoding{Endian = Endian.Big}, DisplayInfo{ToText = TDSVersionToString};
+    byte ProgNameLength;
+    optional [|ProgNameLength != 0|] string ProgName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = ProgNameLength};
+    ProgVersion ProgVersion;
+}
+
+type ProgVersion
+{
+    byte MajorVer;
+    byte MinorVer;
+    byte BuildNumHi;
+    byte BuildNumLow;
+}
+
+// 2.2.7.6   DONEINPROC
+type DONEINPROC[bool IsULongLong]
+{
+    byte TokenType where ValidationCheckValue(value == 0xFF, null, false, ReferenceType.Type, "TDS", "TokenType", "DONEINPROC", "0xFF", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Status;
+    ushort CurCmd;
+    ([|IsULongLong|] ulong | uint) DoneRowCount; // DoneRowCount     =   LONG / ULONGLONG;  (Changed to ULONGLONG in TDS 7.2)
+}
+
+// 2.2.7.17   RETURNSTATUS
+type RETURNSTATUS
+{
+    byte TokenType where ValidationCheckValue(value == 0x79, null, false, ReferenceType.Type, "TDS", "TokenType", "RETURNSTATUS", "0x79", value) with DisplayInfo{ToText = TokenTypeToString};
+    uint Value;
+}
+
+// 2.2.7.18   RETURNVALUE
+type RETURNVALUE[bool IsUintUserType]
+{
+    byte TokenType where ValidationCheckValue(value == 0xAC, null, false, ReferenceType.Type, "TDS", "TokenType", "RETURNVALUE", "0xAC", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort ParamOrdinal;
+    byte ParamNameLength;
+    optional [|ParamNameLength != 0|] string RowParamName with BinaryEncoding{TextEncoding = TextEncoding.Unicode, Length = ParamNameLength};
+    byte Status;
+    ([|IsUintUserType|] uint | ushort) UserType;
+    RETURNVALUEFlags Flags;
+    TYPE_INFO TypeInfo;
+    // not supported by SQL Server according to TD but these fileds are not optional in TD, wait for PG's reply
+    //RETURNVALUECryptoMetaData[IsUintUserType] CryptoMetaData;
+    ([|TypeInfo.TypeInfoType == 0xA5|]ValueData[TypeInfo.TypeInfoType, TypeInfo.BigVarbinVarlen as uint, false]
+    |[|TypeInfo.TypeInfoType == 0xA7|]ValueData[TypeInfo.TypeInfoType, (TypeInfo.BigVarCHRData as BigVarCHRData).BigVarCHRLen as uint, false]
+    |[|TypeInfo.TypeInfoType == 0xE7|]ValueData[TypeInfo.TypeInfoType, (TypeInfo.NVarCharData as NVarCharData).NVarCharVarLen as uint, false]
+    |[|TypeInfo.TypeInfoType == 0xF1 || TypeInfo.TypeInfoType == 0xF0|]ValueData[TypeInfo.TypeInfoType, 0xFFFF as uint, false]    
+    |[|!(TypeInfo.TypeInfoType in {0xA5, 0xA7, 0xE7, 0xF1, 0xF0})|]ValueData[TypeInfo.TypeInfoType, 0x00 as uint, false]) ValueData;
+}
+
+type RETURNVALUECryptoMetaData[bool IsUintUserType]
+{
+    ([|IsUintUserType|] uint | ushort) UserType;
+    TYPE_INFO BaseTypeInfo;
+    byte EncryptionAlgo;
+    optional B_VARCHAR AlgoName;
+    EncryptionAlgoType EncryptionAlgoType;
+    byte NormVersion;
+}
+
+pattern EncryptionAlgoType = enum byte
+{
+    Deterministic = 0x01,
+    Randomized = 0x02,
+    ...
+};
+
+type RETURNVALUEFlags
+{
+    fNullable fNullable with BinaryEncoding{Width = 1};
+    fCaseSen fCaseSen with BinaryEncoding{Width = 1};
+    usUpdateable usUpdateable with BinaryEncoding{Width = 2};
+    fIdentity fIdentity with BinaryEncoding{Width = 1};
+    fComputed fComputed with BinaryEncoding{Width = 1};
+    usReservedODBC usReservedODBC with BinaryEncoding{Width = 2};
+    fFixedLenCLRType fFixedLenCLRType with BinaryEncoding{Width = 1};
+    // should be the original 7-bit Reserved field replaced by 3 new fields, but TD keeps the original Reversed field, should be a TDI
+    byte usReserved2 with BinaryEncoding{Width = 2}; 
+    fEncrypted fEncrypted with BinaryEncoding{Width = 1};
+    byte usReserved3 with BinaryEncoding{Width = 4};
+} with BinaryEncoding{WidthForComposedType = 16, DecodeAsUnit = true};
+
+// 2.2.7.21   TABNAME
+type TABNAME
+{
+    byte TokenType where ValidationCheckValue(value == 0xA4, null, false, ReferenceType.Type, "TDS", "TokenType", "TABNAME", "0xA4", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    AllTableNames[Length] AllTableNames;
+}
+
+type AllTableNames[ushort Length]
+{
+    array<TableName> TableName with BinaryEncoding{WidthForComposedType = Length * 8};
+}
+
+// 2.2.7.3   COLINFO
+type COLINFO
+{
+    byte TokenType where ValidationCheckValue(value == 0xA5, null, false, ReferenceType.Type, "TDS", "TokenType", "COLINFO", "0xA5", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    optional [|Length != 0|] array<CpLProperty> CpLPropertyArray with BinaryEncoding{WidthForComposedType = Length * 8};
+}
+
+type CpLProperty
+{
+    byte ColNum;
+    byte TableNum;
+    byte Status;
+    optional [|Status in {0x20}|] B_VARCHAR[DisplayStyleFlags.UnicodeString, 0xFF, true] ColName;
+}
+
+// 2.2.7.14 NBCROW
+type NBCROW[int ColCnt]
+{
+    byte TokenType where ValidationCheckValue(value == 0xD2, null, false, ReferenceType.Type, "TDS", "TokenType", "NBCROW", "0xD2", value) with DisplayInfo{ToText = TokenTypeToString};
+    array<byte> NullBitmap with BinaryEncoding{Length = (ColCnt - 1) / 8 + 1};
+    optional any AllColumnData with Encoding{Ignore = true};
+}
+
+type NBCROWColumnData
+{
+    B_VARBYTE Data;
+}
+
+type NBCROWTextPointerTimestamp
+{
+    B_VARBYTE TextPointer;
+    binary Timestamp with BinaryEncoding{Length = 8};
+}
+
+// 2.2.7.15   OFFSET
+type OFFSET
+{
+    byte TokenType where ValidationCheckValue(value == 0x78, null, false, ReferenceType.Type, "TDS", "TokenType", "OFFSET", "0x78", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Identifier;
+    ushort OffSetLen;
+}
+
+// 2.2.7.15   ORDER
+type ORDER
+{
+    byte TokenType where ValidationCheckValue(value == 0xA9, null, false, ReferenceType.Type, "TDS", "TokenType", "ORDER", "0xA9", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    array<ushort> ColNum with BinaryEncoding{Length = (Length / 2) };
+}
+
+// 2.2.7.9   ERROR
+type ERROR
+{
+    byte TokenType where ValidationCheckValue(value == 0xAA, null, false, ReferenceType.Type, "TDS", "TokenType", "ERROR", "0xAA", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Length;
+    uint Number;
+    byte State;
+    byte Class;
+    US_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] MsgText;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] ServerName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0, true] ProcName;
+    optional ([|(Length - MsgText.USHORTLEN * 2 - ServerName.BYTELEN * 2 - ProcName.BYTELEN * 2 - 10) == 4|] uint
+             |[|(Length - MsgText.USHORTLEN * 2 - ServerName.BYTELEN * 2 - ProcName.BYTELEN * 2 - 10) == 2|] ushort) LineNumber;
+}
+
+// 2.2.7.10   FEATUREEXTACK
+type FEATUREEXTACK
+{
+    byte TokenType where ValidationCheckValue(value == 0xAE, null, false, ReferenceType.Type, "TDS", "TokenType", "FEATUREEXTACK", "0xAE", value) with DisplayInfo{ToText = TokenTypeToString};
+    FeatureAckOpt FeatureAckOpt;
+    byte TERMINATOR where ValidationCheckValue(value == 0xFF, null, true, ReferenceType.Type, "TDS", "TERMINATOR", "FEATUREEXTACK", "0xFF", value);
+}
+
+type FeatureAckOpt
+{
+    FeatureAckOptFeatureId FeatureId;
+    uint FeatureAckDataLen;
+    optional [|FeatureAckDataLen > 0|]
+    ([|FeatureId == FeatureAckOptFeatureId.FEDAUTH|] 
+        ([|FeatureAckDataLen == 64|]FeatureAckDataFEDAUTHLiveIDCompact | 
+        [|FeatureAckDataLen == 32|]Nonce |
+        binary) |
+    [|FeatureId == FeatureAckOptFeatureId.SESSIONRECOVERY|] array<SessionStateData> |
+    binary
+    )FeatureAckData with BinaryEncoding{WidthForComposedType = (FeatureAckDataLen * 8) as int};
+}
+
+type FeatureAckDataFEDAUTHLiveIDCompact
+{
+    Nonce Nonce;
+    binary Signature with BinaryEncoding{Length = 32};
+}
+
+pattern FeatureAckOptFeatureId = enum byte
+{
+    SESSIONRECOVERY = 0x01,
+    FEDAUTH = 0x02,
+    COLUMNENCRYPTION = 0x04,
+    GLOBALTRANSACTIONS = 0x05,
+    TERMINATOR = 0xFF,
+    ...
+};
+
+// 2.2.7.11   FEDAUTHINFO
+type FEDAUTHINFO
+{
+    byte TokenType where ValidationCheckValue(value == 0xEE, null, false, ReferenceType.Type, "TDS", "TokenType", "FEDAUTHINFO", "0xEE", value) with DisplayInfo{ToText = TokenTypeToString};
+    uint TokenLength;
+    uint CountOfInfoIDs;
+    array<FedAuthInfoOpt> FedAuthInfoOpt with BinaryEncoding{Length = CountOfInfoIDs};
+    binary FedAuthInfoData; // TDI
+}
+
+type FedAuthInfoOpt
+{
+    FedAuthInfoOptFedAuthInfoID FedAuthInfoID;
+    uint FedAuthInfoDataLen;
+    uint FedAuthInfoDataOffset;
+}
+
+pattern FedAuthInfoOptFedAuthInfoID = enum byte
+{
+    Reserved = 0x00,
+    STSURL = 0x01,
+    SPN = 0x02,
+    ...
+};
+
+// 2.2.7.20   SESSIONSTATE
+type SESSIONSTATE
+{
+    byte TokenType where ValidationCheckValue(value == 0xE4, null, false, ReferenceType.Type, "TDS", "TokenType", "SESSIONSTATE", "0xE4", value) with DisplayInfo{ToText = TokenTypeToString};
+    uint Length;
+    uint SeqNo;
+    byte Status with DisplayInfo{ToText = (any v) => (((v as byte) >> 7 == 1) ? ("Recoverable") : (DecToHexFormat(v as byte))) };
+    array<SessionStateData> SessionStateDataSet with BinaryEncoding{WidthForComposedType = (Length - 5) * 8 as int };
+}
+
+type SessionStateData
+{
+    byte StateId;
+    StateLenUnion StateLen;
+    optional [|StateLen.GetLength() != 0|] binary StateValue with BinaryEncoding{Length = StateLen.GetLength()};
+}
+
+type StateLenUnion
+{
+    byte length1;
+    optional [|length1 == 0xFF|] ushort length2;
+    
+    uint GetLength()
+    {
+        if (length1 != 0xFF)
+            return length1 as uint;
+        else if (length2 == nothing)
+            return length2 as uint;
+        else
+            return 0;
+    }
+}
+
+// 2.2.7.1   ALTMETADATA
+type ALTMETADATA
+{
+    byte TokenType where ValidationCheckValue(value == 0x88, null, false, ReferenceType.Type, "TDS", "TokenType", "ALTMETADATA", "0x88", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort Count;
+    ushort ID;
+    byte ByCols;
+    array<ushort> ColNum with BinaryEncoding{Length = ByCols};
+    array<ComputeData> ComputeDataArray with BinaryEncoding{Length = Count};
+}
+
+type ComputeData
+{
+    byte Op;
+    ushort Operand;
+    uint UserType;
+    ColumnDataFlags Flags;
+    TYPE_INFO TypeInfo;
+    optional [|TypeInfo.TypeInfoType in {0x22, 0x23, 0x63}|] TableName TableName;
+    B_VARCHAR[DisplayStyleFlags.UnicodeString, 0xFF, true] ColName;
+}
+
+// 2.2.7.2   ALTROW
+type ALTROW
+{
+    byte TokenType where ValidationCheckValue(value == 0xD3, null, false, ReferenceType.Type, "TDS", "TokenType", "ALTROW", "0xD3", value) with DisplayInfo{ToText = TokenTypeToString};
+    ushort ID;
+    optional any AltRowData with Encoding{Ignore = true};
+}
+
+pattern PL_OPTION_TOKEN = enum byte
+{
+    VERSION = 0x00,
+    ENCRYPTION = 0x01,
+    INSTOPT = 0x02,
+    THREADID = 0x03,
+    MARS = 0x04,
+    TRACEID = 0x05,
+    TERMINATOR = 0xFF,
+    ...
+};
+
+pattern RequestType = enum ushort
+{
+    TM_GET_DTC_ADDRESS = 0,
+    TM_PROPAGATE_XACT = 1,
+    TM_BEGIN_XACT = 5,
+    TM_PROMOTE_XACT = 6,
+    TM_COMMIT_XACT = 7,
+    TM_ROLLBACK_XACT = 8,
+    TM_SAVE_XACT = 9,
+    ...
+};
+
+pattern HeaderType = enum ushort
+{
+    QueryNotificationsHeader = 0x0001,
+    TransactionDescriptorHeader = 0x0002,
+    TraceActivityHeader = 0x0003,
+    ...
+};
+
+pattern DisplayStyleFlags = enum byte
+{
+    BinaryData = 0,
+    ASCIIString = 1,
+    UnicodeString = 2,
+    ...
+};
+
+pattern VarByteTypeEnum = enum uint
+{
+    Text = 0,
+    Image = 1,
+    NText = 2,
+    ...
+};
+
+pattern fByteorder = enum byte
+{
+    ORDER_X86 = 0,
+    ORDER_68000 = 1,
+    ...
+};
+
+pattern fChar = enum byte
+{
+    CHARSET_ASCII = 0,
+    CHARSET_EBDDIC = 1,
+    ...
+};
+
+pattern fFloat = enum byte
+{
+    FLOAT_IEEE_754 = 0,
+    FLOAT_VAX = 1,
+    ND5000 = 2,
+    ...
+};
+
+pattern fDumpLoad = enum byte
+{
+    DUMPLOAD_ON = 0,
+    DUMPLOAD_OFF = 1,
+    ...
+};
+
+pattern fUseDB = enum byte
+{
+    USE_DB_OFF = 0,
+    USE_DB_ON = 1,
+    ...
+};
+
+pattern fDatabase = enum byte
+{
+    INIT_DB_WARN = 0,
+    INIT_DB_FATAL = 1,
+    ...
+};
+
+pattern fSetLang = enum byte
+{
+    SET_LANG_OFF = 0,
+    SET_LANG_ON = 1,
+    ...
+};
+
+pattern fLanguage = enum byte
+{
+    INIT_LANG_WARN = 0,
+    INIT_LANG_FATAL = 1,
+    ...
+};
+
+pattern fODBC = enum byte
+{
+    ODBC_OFF = 0,
+    ODBC_ON = 1,
+    ...
+};
+
+pattern fUserType = enum byte
+{
+    USER_NORMAL = 0,
+    USER_SERVER = 1,
+    USER_REMUSER = 2,
+    USER_SQLREPL = 3,
+    ...
+};
+
+pattern fIntSecurity = enum byte
+{
+    INTEGRATED_SECURTY_OFF = 0,
+    INTEGRATED_SECURTY_ON = 1,
+    ...
+};
+
+pattern fSQLType = enum byte
+{
+    SQL_DFLT = 0,
+    SQL_TSQL = 1,
+    ...
+};
+
+pattern fOLEDB = enum byte
+{
+    OLEDB_OFF = 0,
+    OLEDB_ON = 1,
+    ...
+};
+
+pattern fChangePassword = enum byte
+{
+    NoChangeRequest = 0,
+    RequestChange = 1,
+    ...
+};
+
+pattern fSendYukonBinaryXML = enum byte
+{
+    RESERVED = 0,
+    ReturnedAsBinaryXML = 1,
+    ...
+};
+
+pattern fUserInstance = enum byte
+{
+    RESERVED = 0,
+    SeparateProcessToBeSpawnedAsUserInstance = 1,
+    ...
+};
+
+pattern fUnknownCollationHandling = enum byte
+{
+    RestrictTheCollations = 0,
+    SendAnyCollation = 1,
+    ...
+};
+
+pattern fExtension = enum byte
+{
+    ExtensionFieldsNotUsed = 0,
+    ExtensionFieldsUsed = 1,
+    ...
+};
+
+pattern fNullable = enum byte
+{
+    RESERVED = 0,
+    Nullable = 1,
+    ...
+};
+
+pattern fCaseSen = enum byte
+{
+    RESERVED = 0,
+    XMLDataType = 1,
+    ...
+};
+
+pattern usUpdateable = enum byte
+{
+    ReadOnly = 0,
+    ReadAndWrite = 1,
+    Unknown = 2,
+    ...
+};
+
+pattern fIdentity = enum byte
+{
+    RESERVED = 0,
+    Identity = 1,
+    ...
+};
+
+pattern fComputed = enum byte
+{
+    RESERVED = 0,
+    COMPUTED = 1,
+    ...
+};
+
+pattern usReservedODBC = enum byte
+{
+    RESERVED = 0,
+    ODBC = 1,
+    ...
+};
+
+pattern fFixedLenCLRType = enum byte
+{
+    RESERVED = 0,
+    FixedLenCLRType = 1,
+    ...
+};
+
+pattern fSparseColumnSet = enum byte
+{
+    RESERVED = 0,
+    SparseColumnSet = 1,
+    ...
+};
+
+pattern fHidden = enum byte
+{
+    RESERVED = 0,
+    HiddenPrimaryKeyCreated = 1,
+    ...
+};
+
+pattern fKey = enum byte
+{
+    RESERVED = 0,
+    PrimaryKey = 1,
+    ...
+};
+
+pattern fDefault = enum byte
+{
+    RESERVED = 0,
+    Column = 1,
+    ...
+};
+
+pattern fNullableUnknown = enum byte
+{
+    RESERVED = 0,
+    unknown = 1,
+    ...
+};
+
+pattern fEncrypted = enum byte
+{
+    RESERVED = 0,
+    Encrypted = 1,
+    ...
+};
+
+pattern RPCReqBatchOptionFlags = flags ushort
+{
+    fWithRecomp = 0x01,
+    fNoMetaData = 0x02,
+    fReuseMetaData = 0x04,
+    ...
+};
+
+pattern StatusFlags = flags byte
+{
+    fByRefValue = 0x01,
+    fDefaultValue = 0x02,
+    fEncrypted = 0x08,
+    ...
+};
+
+pattern HeaderStatusFlags = flags byte
+{
+    EndOfMessage = 0x01,
+    IgnoreThisEvent = 0x02,
+    RESETCONNECTION = 0x08,
+    RESETCONNECTIONSKIPTRAN = 0x10
+    ...
+};
+
+pattern OrderUniqueFlags = flags byte
+{
+    fOrderAsc   = 0x01,
+    fOrderDesc  = 0x02,
+    fUnique     = 0x04,
+    ...
+};
+
+type SessionContext
+{
+    uint TdsVersion;
+    bool HasPreloginProcessed;
+    
+    SessionContext()
+    {
+        Reset();
+    }
+    
+    void Reset()
+    {
+        // use the biggest version product as the default version
+        // if the TDS version is 0xFFFFFFFF, it means get TDS version failed
+        // The behavior use tdsVersion >= XX, so the default behavior is the same with the latest version
+        TdsVersion = 0xFFFFFFFF;
+        HasPreloginProcessed = false;
+    }
+}
+
+string StatusToString(any data)
+{
+    byte packetStatus = data as byte;
+    if (packetStatus == 0)
+    {
+        return "NormalMessage(0x00)";
+    }
+    
+    return EnumToString(packetStatus, "TDS.HeaderStatusFlags");
+}
+
+static string TDSPacketTypeToString(any input)
+{
+    byte data = input as byte;
+    switch (data)
+    {
+        case 0x01 => return "SQLBatch(" + data.ToString() + ")";
+        case 0x02 => return "Pre-TDS7Login(" + data.ToString() + ")";
+        case 0x03 => return "RPC(" + data.ToString() + ")";
+        case 0x04 => return "TabularResult(" + data.ToString() + ")";
+        case 0x05 => return "Unused(" + data.ToString() + ")";
+        case 0x06 => return "AttentionSignal(" + data.ToString() + ")";
+        case 0x07 => return "BulkLoadData(" + data.ToString() + ")";
+        case 0x08 => return "Unused(" + data.ToString() + ")";
+        case 0x09 => return "Unused(" + data.ToString() + ")";
+        case 0x0A => return "Unused(" + data.ToString() + ")";
+        case 0x0B => return "Unused(" + data.ToString() + ")";
+        case 0x0C => return "Unused(" + data.ToString() + ")";
+        case 0x0D => return "Unused(" + data.ToString() + ")";
+        case 0x0E => return "TransactionManagerRequest(" + data.ToString() + ")";
+        case 0x0F => return "Unused(" + data.ToString() + ")";
+        case 0x10 => return "TDS7Login(" + data.ToString() + ")";
+        case 0x11 => return "SSPI(" + data.ToString() + ")";
+        case 0x12 => return "Pre-Login(" + data.ToString() + ")";
+        default => return "InvalidPacketType(" + data.ToString() + ")";
+    }
+}
+
+static string TokenTypeToString(any input)
+{
+    byte data = input as byte;
+    switch (data)
+    {
+        case 0x00 => return "PRELOGIN(" + data.ToString() + ")";
+        case 0x01 => return "TVPROW(" + data.ToString() + ")";
+        case 0x02 => return "PRELOGIN(" + data.ToString() + ")";
+        case 0x03 => return "PRELOGIN(" + data.ToString() + ")";
+        case 0x14 => return "PRELOGIN(" + data.ToString() + ")";
+        case 0x16 => return "PRELOGIN(" + data.ToString() + ")";
+        case 0x78 => return "OFFSET(" + data.ToString() + ")";
+        case 0x79 => return "RETURNSTATUS(" + data.ToString() + ")";
+        case 0x81 => return "COLMETADATA(" + data.ToString() + ")";
+        case 0x88 => return "ALTMETADATA(" + data.ToString() + ")";
+        case 0xA4 => return "TABNAME(" + data.ToString() + ")";
+        case 0xA5 => return "COLINFO(" + data.ToString() + ")";
+        case 0xA9 => return "ORDER(" + data.ToString() + ")";
+        case 0xAA => return "ERROR(" + data.ToString() + ")";
+        case 0xAB => return "INFO(" + data.ToString() + ")";
+        case 0xAC => return "RETURNVALUE(" + data.ToString() + ")";
+        case 0xAD => return "LOGINACK(" + data.ToString() + ")";
+        case 0xAE => return "FEATUREEXTACK(" + data.ToString() + ")";
+        case 0xD1 => return "ROW(" + data.ToString() + ")";
+        case 0xD2 => return "NBCROW(" + data.ToString() + ")";
+        case 0xD3 => return "ALTROW(" + data.ToString() + ")";
+        case 0xE3 => return "ENVCHANGE(" + data.ToString() + ")";
+        case 0xE4 => return "SESSIONSTATE(" + data.ToString() + ")";
+        case 0xED => return "SSPI(" + data.ToString() + ")";
+        case 0xEE => return "FEDAUTHINFO(" + data.ToString() + ")";
+        case 0xFD => return "DONE(" + data.ToString() + ")";
+        case 0xFE => return "DONEPROC(" + data.ToString() + ")";
+        case 0xFF => return "DONEINPROC(" + data.ToString() + ")";
+        default => return "UndefinedTokenType(" + data.ToString() + ")";
+    }
+}
+
+static string TDSEncryptOptionsToString(any input)
+{
+    byte data = input as byte;
+    switch (data)
+    {
+        case 0x00 => return "EncryptOff(" + data.ToString() + ")";
+        case 0x01 => return "EncryptOn(" + data.ToString() + ")";
+        case 0x02 => return "EncryptNotSup(" + data.ToString() + ")";
+        case 0x03 => return "EncryptReq(" + data.ToString() + ")";
+        case 0x04 => return "EncryptLogin(" + data.ToString() + ")";
+        default => return "UndefinedEncryptOption(" + data.ToString() + ")";
+    }
+}
+
+// Product             TDSVersion           TDSVersion Value
+//SQL Server 7.0        7.0                     0x07000000
+//SQL Server 2000       7.1                0x07010000
+//SQL Server 2000 SP1   7.1 Revision 1          0x71000001
+//SQL Server 2005       7.2                     0x72090002
+//SQL Server 2008       7.3.A                   0x730A0003
+//SQL Server 2008 R2    7.3.B                   0x730B0003
+//SQL Server 2012       7.4                     0x74000004
+static string TDSVersionToString(any input)
+{
+    uint data = input as uint;
+    switch (data)
+    {
+        case 0x07000000 => return "7.0(" + DecToHexFormat(data) + ")";
+        case 0x07010000 => return "7.1(" + DecToHexFormat(data) + ")";
+        case 0x71000001 => return "7.1 Revision 1(" + DecToHexFormat(data) + ")";
+        case 0x72090002 => return "7.2(" + DecToHexFormat(data) + ")";
+        case 0x730A0003 => return "7.3.A(" + DecToHexFormat(data) + ")";
+        case 0x730B0003 => return "7.3.B(" + DecToHexFormat(data) + ")";
+        case 0x74000004 => return "7.4(" + DecToHexFormat(data) + ")";
+        default => return "UndefinedTDSversion(" + DecToHexFormat(data) + ")";
+    }
+}
+
+static string TypeInfoTypeToString(any input)
+{
+    byte data = input as byte;
+    switch (data)
+    {
+        case 0x1F => return "NULLTYPE(" + data.ToString() + ")";
+        case 0x30 => return "INT1TYPE(" + data.ToString() + ")";
+        case 0x32 => return "BITTYPE(" + data.ToString() + ")";
+        case 0x34 => return "INT2TYPE(" + data.ToString() + ")";
+        case 0x38 => return "INT4TYPE(" + data.ToString() + ")";
+        case 0x3A => return "DATETIM4TYPE(" + data.ToString() + ")";
+        case 0x3B => return "FLT4TYPE(" + data.ToString() + ")";
+        case 0x3C => return "MONEYTYPE(" + data.ToString() + ")";
+        case 0x3D => return "DATETIMETYPE(" + data.ToString() + ")";
+        case 0x3E => return "FLT8TYPE(" + data.ToString() + ")";
+        case 0x7A => return "MONEY4TYPE(" + data.ToString() + ")";
+        case 0x7F => return "INT8TYPE(" + data.ToString() + ")";
+        case 0x24 => return "GUIDTYPE(" + data.ToString() + ")";
+        case 0x26 => return "INTNTYPE(" + data.ToString() + ")";
+        case 0x37 => return "DECIMALTYPE(" + data.ToString() + ")";
+        case 0x3F => return "NUMERICTYPE(" + data.ToString() + ")";
+        case 0x68 => return "BITNTYPE(" + data.ToString() + ")";
+        case 0x6A => return "DECIMALN(" + data.ToString() + ")";
+        case 0x6C => return "NUMERICNTYPE(" + data.ToString() + ")";
+        case 0x6D => return "FLTNTYPE(" + data.ToString() + ")";
+        case 0x6E => return "MONEYNTYPE(" + data.ToString() + ")";
+        case 0x6F => return "DATETIMNTYPE(" + data.ToString() + ")";
+        case 0x2F => return "CHARTYPE(" + data.ToString() + ")";
+        case 0x27 => return "VARCHARTYPE(" + data.ToString() + ")";
+        case 0x28 => return "DATENTYPE(" + data.ToString() + ")";
+        case 0x29 => return "TIMENTYPE(" + data.ToString() + ")";
+        case 0x2A => return "DATETIME2NTYPE(" + data.ToString() + ")";
+        case 0x2B => return "DATETIMEOFFSETNTYPE(" + data.ToString() + ")";
+        case 0x2D => return "BINARYTYPE(" + data.ToString() + ")";
+        case 0x25 => return "VARBINARYTYPE(" + data.ToString() + ")";
+        case 0xA5 => return "BIGVARBINTYPE(" + data.ToString() + ")";
+        case 0xA7 => return "BIGVARCHRTYPE(" + data.ToString() + ")";
+        case 0xAD => return "BIGBINARYTYPE(" + data.ToString() + ")";
+        case 0xAF => return "BIGCHARTYPE(" + data.ToString() + ")";
+        case 0xE7 => return "NVARCHARTYPE(" + data.ToString() + ")";
+        case 0xEF => return "NCHARTYPE(" + data.ToString() + ")";
+        case 0xF1 => return "XMLTYPE(" + data.ToString() + ")";
+        case 0xF0 => return "UDTTYPE(" + data.ToString() + ")";
+        case 0x23 => return "TEXTTYPE(" + data.ToString() + ")";
+        case 0x22 => return "IMAGETYPE(" + data.ToString() + ")";
+        case 0x63 => return "NTEXTTYPE(" + data.ToString() + ")";
+        case 0x62 => return "SSVARIANTTYPE(" + data.ToString() + ")";
+        default => return "UnrecognizedTypeInfoType(" + data.ToString() + ")(" + data.ToString() + ")";
+    }
+}
+
+string TVP_COLMETADATACountToString(any input)
+{
+    ushort data = input as ushort;
+    switch (data)
+    {
+        case 0xFFFF => return "TVP_NULL_TOKEN(" + DecToHexFormat(data) + ")";
+        default => return "Count(" + data.ToString() + ")";
+    }
+}
+
+optional array<TabularResultPacketDataPattern> TabularResultPacketDataDecoder(stream payloadStream, uint tdsVersion, any message msg)
+{
+    array<TabularResultPacketDataPattern> tabularResultPacketDataTemp = [];
+    optional COLMETADATA storedColMeteData = nothing;
+    array<ALTMETADATA> storedAltMetaDataArray = [];
+
+    while (payloadStream.BytePosition < payloadStream.ByteLength)
+    {
+        switch (payloadStream.CurrentByte)
+        {
+            case (0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x14 | 0x14) =>
+                if (!TryDecodeSingleALTMETADATA<PreLoginPacketData>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "PreLoginPacketData");
+            case PacketDataToken.OFFSET =>
+                if (!TryDecodeSingleALTMETADATA<OFFSET>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "OFFSET");
+            case PacketDataToken.RETURNSTATUS =>
+                if (!TryDecodeSingleALTMETADATA<RETURNSTATUS>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "RETURNSTATUS");
+            case PacketDataToken.COLMETADATA =>
+                storedColMeteData = BinaryDecoder<COLMETADATA[(tdsVersion >= 0x72090002)]>(payloadStream);
+                if (storedColMeteData != nothing)
+                    tabularResultPacketDataTemp += [storedColMeteData];
+                else 
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "COLMETADATA");
+            case PacketDataToken.ALTMETADATA =>
+                    optional ALTMETADATA storedAltMetaDataOptional = BinaryDecoder<ALTMETADATA>(payloadStream);
+                if (storedAltMetaDataOptional == nothing)
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ALTMETADATA");
+                ALTMETADATA storedAltMetaData = storedAltMetaDataOptional as ALTMETADATA;
+                storedAltMetaDataArray += [storedAltMetaData];
+                tabularResultPacketDataTemp += [storedAltMetaData];
+            case PacketDataToken.TABNAME =>
+                if (!TryDecodeSingleALTMETADATA<TABNAME>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "TABNAME");
+            case PacketDataToken.COLINFO =>
+                if (!TryDecodeSingleALTMETADATA<COLINFO>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "COLINFO");
+            case PacketDataToken.ORDER =>
+                if (!TryDecodeSingleALTMETADATA<ORDER>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ORDER");
+            case PacketDataToken.ERROR =>
+                if (!TryDecodeSingleALTMETADATA<ERROR>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ERROR");
+            case PacketDataToken.INFO =>
+                if (!TryDecodeSingleALTMETADATA<INFO>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "INFO");
+            case PacketDataToken.RETURNVALUE =>
+                if (!TryDecodeSingleALTMETADATA<RETURNVALUE[(tdsVersion >= 0x72090002)]>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "RETURNVALUE");
+            case PacketDataToken.LOGINACK =>
+                if (!TryDecodeSingleALTMETADATA<LOGINACK>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "LOGINACK");
+            case PacketDataToken.FEATUREEXTACK =>
+                if (!TryDecodeSingleALTMETADATA<FEATUREEXTACK>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "FEATUREEXTACK");
+            case PacketDataToken.FEDAUTHINFO =>
+                if (!TryDecodeSingleALTMETADATA<FEDAUTHINFO>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "FEDAUTHINFO");
+            case PacketDataToken.NBCROW =>
+                if (storedColMeteData == nothing)
+                {
+                    ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_MISSING_ELEMENT, "TabularResultPacketData", "TabularResult", "COLMETADATA"));
+                    return tabularResultPacketDataTemp;
+                }
+                optional NBCROW nbcrowTempOptional = BinaryDecoder<NBCROW[(storedColMeteData as COLMETADATA).Count]>(payloadStream);
+                if (nbcrowTempOptional == nothing)
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "NBCROW");
+                NBCROW nbcrowTemp = nbcrowTempOptional as NBCROW;
+                nbcrowTemp.AllColumnData = DecodeNBCROWAllColumnData(nbcrowTemp.NullBitmap, storedColMeteData as COLMETADATA, payloadStream, "TabularResultPacketData", "TabularResult");
+                tabularResultPacketDataTemp += [nbcrowTemp];
+            case PacketDataToken.ROW =>
+                if (storedColMeteData == nothing)
+                {
+                    ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_MISSING_ELEMENT, "TabularResultPacketData", "TabularResult", "COLMETADATA"));
+                    return tabularResultPacketDataTemp;
+                }
+                optional ROW rowTempOptional = BinaryDecoder<ROW>(payloadStream);
+                if (rowTempOptional == nothing)
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ROW");
+                ROW rowTemp = rowTempOptional as ROW;
+                rowTemp.AllColumnData = DecodeAllColumnData(storedColMeteData as COLMETADATA, payloadStream, "TabularResultPacketData", "TabularResult");
+                tabularResultPacketDataTemp += [rowTemp];
+            case PacketDataToken.ALTROW =>
+                if (storedAltMetaDataArray == nothing)
+                {
+                    ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_MISSING_ELEMENT, "ALTMETADATA"));
+                    return tabularResultPacketDataTemp;
+                }
+                optional ALTROW altRowTempOptional = BinaryDecoder<ALTROW>(payloadStream);
+                if (altRowTempOptional == nothing)
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ALTROW");
+                ALTROW altRowTemp = altRowTempOptional as ALTROW;
+                altRowTemp.AltRowData = DecodeAltRowData(storedAltMetaDataArray, altRowTemp, payloadStream, "TabularResultPacketData", "TabularResult");
+                tabularResultPacketDataTemp += [altRowTemp];
+            case PacketDataToken.ENVCHANGE =>
+                if (!TryDecodeSingleALTMETADATA<ENVCHANGE>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "ENVCHANGE");
+            case PacketDataToken.SESSIONSTATE =>
+                if (!TryDecodeSingleALTMETADATA<SESSIONSTATE>(payloadStream, ref tabularResultPacketDataTemp))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "SESSIONSTATE");
+            case PacketDataToken.DONE =>
+                //if (!TryDecodeSingleALTMETADATA<DONE[(tdsVersion >= 0x72090002)]>(payloadStream, ref tabularResultPacketDataTemp))
+                // generic don't support
+                // need to merge to generic method after pef bug 68712 fixed
+                var data = BinaryDecoder<DONE[(tdsVersion >= 0x72090002)]>(payloadStream);
+                if (data != nothing)
+                {
+                    tabularResultPacketDataTemp += [data];
+                }
+                else 
+                return ReturnIncompleteData(ref tabularResultPacketDataTemp, "DONE");
+            case PacketDataToken.DONEPROC =>
+                //if (!TryDecodeSingleALTMETADATA<DONEPROC[(tdsVersion >= 0x72090002)]>(payloadStream, ref tabularResultPacketDataTemp))
+                // generic don't support
+                // need to merge to generic method after pef bug 68712 fixed
+                var data = BinaryDecoder<DONEPROC[(tdsVersion >= 0x72090002)]>(payloadStream);
+                if (data != nothing)
+                {
+                    tabularResultPacketDataTemp += [data];
+                }
+                else 
+                return ReturnIncompleteData(ref tabularResultPacketDataTemp, "DONEPROC");
+            case PacketDataToken.DONEINPROC =>
+                //if (!TryDecodeSingleALTMETADATA<DONEINPROC[(tdsVersion >= 0x72090002)]>(payloadStream, ref tabularResultPacketDataTemp))
+                // generic don't support
+                // need to merge to generic method after pef bug 68712 fixed
+                var data = BinaryDecoder<DONEINPROC[(tdsVersion >= 0x72090002)]>(payloadStream);
+                if (data != nothing)
+                {
+                    tabularResultPacketDataTemp += [data];
+                }
+                else 
+                return ReturnIncompleteData(ref tabularResultPacketDataTemp, "DONEINPROC");
+            case PacketDataToken.SSPI =>
+                if (!TryDecodeSSPI(payloadStream, ref tabularResultPacketDataTemp, msg))
+                    return ReturnIncompleteData(ref tabularResultPacketDataTemp, "SSPI");
+            default =>
+                ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_UNKNOWN_TYPE, DecToHexFormat(payloadStream.CurrentByte)));
+                return tabularResultPacketDataTemp;
+        }
+    }
+    return tabularResultPacketDataTemp;
+}
+
+bool TryDecodeSSPI(stream s, ref array<TabularResultPacketDataPattern> arr, any message msg)
+{
+    if (BinaryDecoder<SSPI>(s) is sspi:SSPI)
+    {
+        if (sspi.SSPIBuffer is bin:binary)
+        {
+            if (IsGSSAPIByCheckingTag(bin))
+            {
+                if (DecodeGssapiAndSetAnnotation(bin, msg) is gssapi:GssapiType) // There are 3bytes before SSPIBuffer
+                {
+                    sspi.SSPIBuffer = gssapi;
+                    if (msg is tabular:TabularResult)
+                    {
+                        tabular#KeyInformation = GetSummaryInfo(gssapi);
+                    }
+                }
+            }
+            else if (IsGssapiKrb(bin))
+            {
+                if (BinaryDecoder<KerberosToken>(bin) is krb5:KerberosToken)
+                {
+                    sspi.SSPIBuffer = krb5;
+                    msg#Embedded = {"Kerberos" -> ""};
+                    if (msg is tabular:TabularResult)
+                    {
+                        tabular#KeyInformation = GetSummaryInfo(krb5);
+                    }
+                }
+            }
+            else if (IsNLMP(bin))
+            {
+                if (NlmpDecoder(bin) is nlmp:NlmpMessage)
+                {
+                    sspi.SSPIBuffer = nlmp;
+                    msg#Embedded = {"NLMP" -> ""};
+                    if (msg is tabular:TabularResult)
+                    {
+                        tabular#KeyInformation = GetSummaryInfo(nlmp);
+                    }
+                }
+            }
+        }
+        arr += [sspi];
+        return true;
+    }
+    else 
+    {
+        return false;
+    }
+}
+
+bool TryDecodeSingleALTMETADATA<T>(stream s, ref array<TabularResultPacketDataPattern> arr)
+{
+    var data = BinaryDecoder<T>(s);
+    if (data != nothing)
+    {
+        arr += [data];
+        return true;
+    }
+    else 
+    {
+        return false;
+    }
+}
+
+optional array<TabularResultPacketDataPattern> ReturnIncompleteData(ref array<TabularResultPacketDataPattern> incompleteData, string decodingFailType)
+{
+    ValidationCheck(false, null, DiagnosisLevel.Warning, () => Format(TDS_STR_REPORT_INCOMPLETE_DECODING, "TabularResultPacketData", "TabularResult", decodingFailType));
+    return incompleteData;
+}
+
+bool HasAllHeaders(binary data, uint tdsVersion)
+{
+    bool hasAllHeaders = true;
+
+    // Get TDS version failed, use header type to decide hasAllHeaders value
+    if (tdsVersion == 0xFFFFFFFF)
+    {
+        if (data.Count < 18)
+        {
+            hasAllHeaders = false;
+        }
+        else
+        {
+            binary headerType = data.Segment(8, 2);
+            // IF headerType is not in {1,2,3}, RPC message don't contain AllHeaders field
+            hasAllHeaders = (headerType == $[0100]) || (headerType == $[0200]) || (headerType == $[0300]);
+
+            // if hasAllHeaders is true, means the TDS version is bigger or equal than TDS 7.2, use the latest TDS version(SQL 2012)
+            // if hasAllHeaders is false, means the TDS version is smaller than TDS 7.2, use the TDS version 7.1(SQL 2000)
+            /*tdsVersion = hasAllHeaders ? 0x74000004 : 0x71000001;*/
+        }
+    }
+    else if (tdsVersion >= 0x72090002)
+    {
+        hasAllHeaders = true;
+    }
+    else
+    {
+        hasAllHeaders = false;
+    }
+    
+    return hasAllHeaders;
+}
+
+uint get PayloadLength(this TDSMessage s)
+{
+    return GetTCPPayloadsLength(s);
+}

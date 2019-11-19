@@ -1,0 +1,608 @@
+protocol IPv4
+    with BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Internet Protocol version 4",
+    ShortName = "IPv4",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 781"},
+            new Reference{Name = "RFC 791"},
+            new Reference{Name = "RFC 1108"},
+            new Reference{Name = "RFC 1063"},
+            new Reference{Name = "RFC 1122"},
+            new Reference{Name = "RFC 1393"},
+            new Reference{Name = "RFC 1475"},
+            new Reference{Name = "RFC 1770"},
+            new Reference{Name = "RFC 2113"},
+            new Reference{Name = "RFC 2003"}
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382950", Date = "11/30/2015"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+using Ethernet;
+using SolarisIPNET;
+using IP1394;
+using Reassembly;
+
+// There is no client/server concept of roles in IPv4
+endpoint Node
+    over ReassemblyNode
+    accepts Datagram;
+
+endpoint ReassemblyNode[binary LocalIPv4Address, binary RemoteIPv4Address]
+    accepts Datagram
+{
+    IPv4ReassemblyHelper reassemblyHelper = new IPv4ReassemblyHelper{EPT = endpoint IPv4.Node over this, Direction = MessageDirection.Accepts};
+    
+    process this accepts d:Datagram
+    {
+        reassemblyHelper.Reassemble(d);
+    }
+    
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        reassemblyHelper.ClearInDestructor();
+    }
+};
+
+autostart actor IPv4OverIP1394(IP1394.Node node)
+{
+    process node accepts f:IP1394.Frame where (f#EthernetType != nothing) && (f#EthernetType == 0x0800) 
+    {
+        switch (f.Payload)
+        {
+            case d:Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPv4");
+        }
+    }
+}
+
+autostart actor IPv4OverIPv4(IPv4.Node node)
+{
+    process node accepts p:IPv4.Datagram where p.Protocol == ProtocolType.IPv4
+    {
+        switch (p.Payload)
+        {
+            case d:Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPinIP");
+        }
+    }
+}
+
+autostart actor IPv4OverEthernet(Ethernet.Node node)
+{
+    process node accepts f:Ethernet.Frame where f.LengthOrType == 2048
+    {
+        switch (f.MacClientData)
+        {
+            case d:Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default => 
+                ThrowDecodingException("IPv4");
+        }
+    }
+}
+
+autostart actor IPv4OverIPNET(SolarisIPNET.Node node)
+{
+    process node accepts f:SolarisIPNET.Frame where f.Family == SolarisIPNET.AddressFamilyIPv4
+    {
+        switch (f.Payload)
+        {
+            case d:Datagram from BinaryDecoder =>
+                DispatchIPv4DatagramToReassemblyNode(d);
+            default =>
+                ThrowDecodingException("IPv4");
+        }
+    }
+}
+
+void DispatchIPv4DatagramToReassemblyNode(Datagram d)
+{
+    DispatchIPv4DatagramToReassemblyNode(d, null);
+}
+
+void DispatchIPv4DatagramToReassemblyNode(Datagram d, any endpoint lowerEP)
+{
+    binary localIPv4Addr;
+    binary remoteIPv4Addr;
+    GetLocalAndRemoteAddress(d.DestinationAddress.FlatAddress, d.SourceAddress.FlatAddress, out localIPv4Addr, out remoteIPv4Addr);
+
+    if (lowerEP == null)
+    {
+        dispatch (endpoint ReassemblyNode[localIPv4Addr, remoteIPv4Addr]) accepts d;
+    }
+    else
+    {
+        dispatch (endpoint ReassemblyNode[localIPv4Addr, remoteIPv4Addr] over lowerEP) accepts d;
+    }
+}
+
+void GetLocalAndRemoteAddress(binary addr1, binary addr2, out binary localAddr, out binary remoteAddr)
+{
+    if (addr1 < addr2)
+    {
+        localAddr = addr1;
+        remoteAddr = addr2;
+    }
+    else
+    {
+        localAddr = addr2;
+        remoteAddr = addr1;
+    }
+}
+
+type IPv4ReasembleCache
+{
+    bool LastFragmentArrived;
+    map<ushort, Datagram> OffsetMap;
+}
+
+type IPv4ReassemblyHelper : ReassemblyHelper<Datagram>
+{   
+    map<ulong, IPv4ReasembleCache> fragments = {};
+
+    override bool IsCompleteMessage(Datagram d)
+    {
+        return IsCompleteDatagram(d);
+    }
+    
+    override void Add(Datagram d)
+    {
+        if (!((d.Identification as ulong) in fragments))
+        {
+            // This is the first arrived fragment
+            map<ushort, Datagram> offsetMap = {};
+            offsetMap[d.FragmentOffset] = d;
+            fragments[d.Identification] = new IPv4ReasembleCache{LastFragmentArrived = (d.MF == 0), OffsetMap = offsetMap};
+        }
+        else
+        {
+            // This is a follow up fragment
+            map<ushort, Datagram> offsetMap = fragments[d.Identification].OffsetMap;
+            if (d.FragmentOffset in offsetMap)
+            {
+                ErrorCodeIf(true, d, DiagnosisLevel.Warning, "IPv4: Duplicate IPv4 Datagram");
+                DisplayTopLevelMessage(d);
+                return;
+            }
+            else
+            {
+                offsetMap[d.FragmentOffset] = d;
+                fragments[d.Identification].OffsetMap = offsetMap;
+                if (d.MF == 0)
+                {
+                    fragments[d.Identification].LastFragmentArrived = true;
+                }
+            }
+        }
+    }
+    
+    override bool IsAllFragmentsArrived(Datagram d)
+    {
+        return fragments[d.Identification].LastFragmentArrived && 
+                IsFragmentsSequentialCompleted<Datagram>(
+                    GetSorted(d),
+                    (Datagram f) => f.FragmentOffset == 0, // Function to identify the first fragment
+                    (Datagram f) => f.MF == 0, // Function to identify the last fragment 
+                    (Datagram f) => f.FragmentOffset * 8, // Function to get the sequence token of current fragment
+                    (Datagram f) => f.FragmentOffset * 8 + f.TotalLength - f.IHL * 4);
+    }
+    
+    override array<Datagram> GetSorted(Datagram d)
+    {
+        return fragments[d.Identification].OffsetMap.Values.Sort();
+    }
+    
+    override optional Datagram GetMessageFromFragments(array<Datagram> sortedDatagrams)
+    {
+        Datagram msg = new Datagram{};
+        binary sourceData = $[];
+        foreach (var frag in sortedDatagrams)
+        {
+            if (frag.FragmentOffset == 0)
+            {
+                msg.Version = frag.Version;
+                msg.IHL = frag.IHL;
+                msg.DifferentiatedServices = frag.DifferentiatedServices;
+                msg.TotalLength = frag.TotalLength;
+                msg.Identification = frag.Identification;
+                msg.DF = 1;
+                msg.MF = 0;
+                msg.FragmentOffset = frag.FragmentOffset;
+                msg.TTL = frag.TTL;
+                msg.Protocol = frag.Protocol;
+                msg.Checksum = frag.Checksum;
+                msg.SourceAddress = frag.SourceAddress;
+                msg.DestinationAddress = frag.DestinationAddress;
+                msg.Payload = frag.Payload;
+            }
+            else
+            {
+                msg.TotalLength = (msg.TotalLength + frag.GetPayloadLength()) as ushort;
+                msg.Payload += frag.Payload;
+            }
+            msg.Origins += [frag];
+            sourceData += (frag.SourceData as binary);
+        }
+        msg.SourceData = sourceData;
+            
+        // set fields offset
+        msg.AssignFieldEncodingInfo("Version", 0, 4);
+        msg.AssignFieldEncodingInfo("IHL", 4, 4);
+        msg.AssignFieldEncodingInfo("DifferentiatedServices", 8, 8);
+        msg.AssignFieldEncodingInfo("TotalLength", 16, 16);
+        msg.AssignFieldEncodingInfo("Identification", 32, 16);
+        msg.AssignFieldEncodingInfo("Reserved", 48, 1);
+        msg.AssignFieldEncodingInfo("DF", 49, 1);
+        msg.AssignFieldEncodingInfo("MF", 50, 1);
+        msg.AssignFieldEncodingInfo("FragmentOffset", 51, 13);
+        msg.AssignFieldEncodingInfo("TTL", 64, 8);
+        msg.AssignFieldEncodingInfo("Protocol", 72, 8);
+        msg.AssignFieldEncodingInfo("Checksum", 80, 16);
+        msg.AssignFieldEncodingInfo("SourceAddress", 96, 32);
+        msg.AssignFieldEncodingInfo("DestinationAddress", 128, 32);
+        if (msg.IHL * 4 - 20 > 0)
+        {
+            msg.AssignFieldEncodingInfo("Options", 160, (msg.IHL * 4 - 20) * 8);
+        }
+        msg.AssignFieldEncodingInfo("Payload", 160 + (msg.IHL * 4 - 20) * 8, msg.Payload.Count * 8);
+        return msg;
+    }
+    
+    override void ClearAfterSuccess(Datagram d)
+    {
+        fragments = fragments.Remove(d.Identification);
+    }
+    
+    override void ClearInDestructor()
+    {
+        foreach (IPv4ReasembleCache cache in fragments.Values)
+        {
+            if (cache.OffsetMap != null)
+            {
+                foreach (Datagram datagram in cache.OffsetMap.Values)
+                {
+                    ReportInsufficientData(datagram, DiagnosisLevel.Error, "IPv4: Incomplete IPv4 payload for full reassembly, due to missing contiguous messages.");
+                    DisplayTopLevelMessage(datagram);
+                }
+            }
+        }
+        fragments = {};
+    }
+}
+
+bool IsCompleteDatagram(Datagram m)
+{
+    return m.FragmentOffset == 0 && m.MF == 0;
+}
+
+int get PayloadLength(this IPv4.Datagram d)
+{
+    return d.Payload.Count;
+}
+
+message Datagram : IComparable<Datagram>
+{
+    (byte where value == 4) Version with BinaryEncoding{Width = 4};
+    byte IHL with BinaryEncoding{Width = 4};
+    DifferentiatedServicesField DifferentiatedServices;
+    // TotalLength == 0 means offloading, otherwise TotalLength should >= 20.
+    ushort TotalLength where ValidationCheck(value == 0 || value >= 20, this, DiagnosisLevel.Error, "IPv4: The TotalLength field in message Datagram must be at least 20, not " + (value as string) + ".");
+    ushort Identification;
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, false, ReferenceType.Message, "IPv4", "Reserved", "Datagram", value) with BinaryEncoding{Width = 1};
+    byte DF with BinaryEncoding{Width = 1}; // Don't Fragment
+    byte MF with BinaryEncoding{Width = 1}; // More Fragments
+    ushort FragmentOffset with BinaryEncoding{Width = 13};
+    byte TTL;
+    ProtocolType Protocol;
+    ushort Checksum;
+    IPv4Address  SourceAddress with Visualization{AliasName = "Address"};
+    IPv4Address  DestinationAddress with Visualization{AliasName = "Address"};
+    optional [|IHL > 5|] array<IPv4Option> Options with BinaryEncoding{WidthForComposedType = (IHL * 4 - 20) * 8};
+    binary Payload with BinaryEncoding{MaxLength = TotalLength >= 20 ? (TotalLength - IHL * 4) : (65535 - IHL * 4)};
+
+    // Get payload length to calculate total length for new reassembled fragment
+    ushort GetPayloadLength()
+    {
+        if (Payload == null)
+        {
+            return 0;
+        }
+        if (TotalLength < IHL * 4)
+        {
+            return Payload.Count as ushort;
+        }
+        return (TotalLength - IHL * 4) as ushort;
+    }
+
+    override string ToString()
+    {
+        string summary;
+        if (!(IsCompleteDatagram(this)))
+        {
+            summary = "Fragment, Offset: " + (FragmentOffset * 8 as string) + ", ";
+        }
+        else if (this.Origins.Count > 1)
+        {
+            summary = "Reassembled, FrameCount: " + (this.Origins.Count as string) + ", ";
+        }
+        summary += "Next Protocol: " + Protocol.Name +
+            ", Packet ID: " + (Identification as string) +
+            ", Total Length: " + (TotalLength as string);
+        return summary;
+    }
+    
+    int CompareTo(Datagram other)
+    {
+        return this.FragmentOffset - other.FragmentOffset;
+    }
+}
+
+IPv4Address get Source(this IPv4.Datagram ipv4Datagram)
+{
+    return ipv4Datagram.SourceAddress;
+}
+
+IPv4Address get Destination(this IPv4.Datagram ipv4Datagram)
+{
+    return ipv4Datagram.DestinationAddress;
+}
+
+string get Network(this IPv4.Datagram d)
+{
+    string src = GetAlias("Utility.IPv4Address", d.SourceAddress, this) ?? d.SourceAddress.ToString();
+    string dst = GetAlias("Utility.IPv4Address", d.DestinationAddress, this) ?? d.DestinationAddress.ToString();
+    return (d.SourceAddress.Octets > d.DestinationAddress.Octets ? (dst + " - " + src) : (src + " - " + dst));
+}
+
+long get NetworkKey(this IPv4.Datagram d)
+{
+    int src = d.SourceAddress.IPv4ToInt;
+    int dst = d.DestinationAddress.IPv4ToInt;
+
+    return src > dst ? ((src as long) + ((dst as long) << 32)) : ((dst as long) + ((src as long) << 32));
+}
+
+type DifferentiatedServicesField
+{
+    byte DSCP with BinaryEncoding{Width = 6},
+        Documentation
+            {Description = "differentiated services codepoint"};
+    byte ECT with BinaryEncoding{Width = 1},
+        Documentation
+            {Description = "The ECN-Capable Transport bit. The ECT bit set to 0 indicates that the transport protocol will ignore the CE bit. This is the default value for the ECT bit.  The ECT bit set to 1 indicates that the transport protocol is willing and able to participate in ECN."};
+    byte CE with BinaryEncoding{Width = 1},
+        Documentation
+            {Description = "The default value for the CE bit is 0. The router sets the CE bit to 1 to indicate congestion to the end nodes. The CE bit in a packet header should never be reset by a router from 1 to 0."};
+}
+
+pattern IPv4Option = [|RemainingBitLength(stream) >= 8|] 
+                         ([|CurrentByte(stream) == OptionTypeByte.EndofOptionsList|] EndofOptionsList                                |
+                         [|CurrentByte(stream) == OptionTypeByte.NOP|] NOP                                                          |
+                         [|CurrentByte(stream) == OptionTypeByte.Security|] Security                                                |
+                         [|CurrentByte(stream) == OptionTypeByte.LooseSourceRecordRoute|] LooseSourceRecordRoute                    |
+                         [|CurrentByte(stream) == OptionTypeByte.TimeStamp|] TimeStamp                                              | 
+                         [|CurrentByte(stream) == OptionTypeByte.ExtendedSecurity|] ExtendedSecurity                                |
+                         [|CurrentByte(stream) == OptionTypeByte.RecordRoute|] RecordRoute                                          |
+                         [|CurrentByte(stream) == OptionTypeByte.SteamIdentifier|] SteamIdentifier                                  |
+                         [|CurrentByte(stream) == OptionTypeByte.StrictSourceRoute|] StrictSourceRoute                              |
+                         [|CurrentByte(stream) == OptionTypeByte.MTUProbe|] MTUProbe                                                |
+                         [|CurrentByte(stream) == OptionTypeByte.MTUReply|] MTUReply                                                |
+                         [|CurrentByte(stream) == OptionTypeByte.ExtendedInternetProtocol|] ExtendedInternetProtocol                |
+                         [|CurrentByte(stream) == OptionTypeByte.Traceroute|] Traceroute                                            |
+                         [|CurrentByte(stream) == OptionTypeByte.AddressExtension|] AddressExtension                                |
+                         [|CurrentByte(stream) == OptionTypeByte.RouterAlert|] RouterAlert                                          |
+                         [|CurrentByte(stream) == OptionTypeByte.SelectiveDirectedBroadcastMode|] SelectiveDirectedBroadcastMode    |
+                         [|(CurrentByte(stream) & 0x60) != 0|] UnknownOption                                                        |
+                         binary);
+
+type OptionType 
+{
+    bool Copied with BinaryEncoding{Width = 1},
+        Documentation
+            {Description = "The copied flag indicates that this option is copied into all fragments on fragmentation. 0 = not copied, 1 = copied"};
+    byte Class with BinaryEncoding{Width = 2},
+        Documentation
+            {Description = "The option classes are: 0 = control, 1 = reserved for future use, 2 = debugging and measurement, 3 = reserved for future use."};
+    byte Option with BinaryEncoding{Width = 5},
+        Documentation
+            {Description = "The option number."};
+}
+
+// RFC 791
+type EndofOptionsList
+{
+    OptionType Type;
+}
+
+// RFC 791
+type NOP
+{
+    OptionType Type;
+}
+
+// RFC 791 and 1108
+type Security
+{
+    OptionType Type;
+    (byte where value == 11) Length;
+    ushort Security;
+    ushort Compartments;
+    ushort HandlingRestrictions;
+    binary TransmissionControlCode with BinaryEncoding{Length = 3};
+}
+
+// RFC 791
+type LooseSourceRecordRoute
+{
+    OptionType Type;
+    (byte where value >= 3) Length;
+    byte Pointer;
+    array<IPv4Address> Route with BinaryEncoding{Length = ((Length - 3) / 4)};
+}
+
+// RFC 791 and 781
+type TimeStamp
+{
+    OptionType Type;
+    (byte where value <= 40 && value >= 4) Length;
+    (byte where value >= 5) Pointer;
+    byte Overflow with BinaryEncoding{Width = 4};
+    byte Flag with BinaryEncoding{Width = 4};
+    ([|Flag == 0|] array<Timestamp> |
+     array<TimestampWithAddress>) Timestamp with BinaryEncoding{WidthForComposedType = ((Length - 4) * 8) as int};
+}
+
+type Timestamp
+{
+    uint Time;
+}
+
+type TimestampWithAddress
+{
+    IPv4Address IPAddress;
+    uint Time;
+}
+
+// RFC 1108
+type ExtendedSecurity
+{
+    OptionType Type;
+    (byte where value < 32 && value >= 3) Length;
+    byte FormatCode;
+    binary AdditionalSecurityInfo with BinaryEncoding{Length = (Length - 3)};
+}
+
+// RFC 791
+type RecordRoute
+{
+    OptionType Type;
+    (byte where value >= 3) Length;
+    (byte where value >= 4 && value <= 255) Pointer;
+    array<IPv4Address> RouteData with BinaryEncoding{Length = ((Length - 3) / 4)};
+}
+
+// RFC 791 and 1122
+type SteamIdentifier
+{
+    OptionType Type;
+    (byte where value == 4) Length;
+    ushort StreamID;
+}
+
+// RFC 791
+type StrictSourceRoute
+{
+    OptionType Type;
+    (byte where value >= 3) Length;
+    (byte where value >= 4 && value <= 255) Pointer;
+    array<IPv4Address> Route with BinaryEncoding{Length = ((Length - 3) / 4)};
+}
+
+// RFC 1063
+type MTUProbe
+{
+    OptionType Type;
+    (byte where value == 4) Length;
+    ushort MTUValue;
+}
+
+// RFC 1063
+type MTUReply
+{
+    OptionType Type;
+    (byte where value == 4) Length;
+    ushort MTUValue;
+}
+
+// RFC 1385
+type ExtendedInternetProtocol
+{
+    OptionType Type;
+    (byte where value >= 2) Length;
+    binary EIPExtension with BinaryEncoding{Length = (Length - 2)};
+}
+
+// RFC 1393
+type Traceroute
+{
+    OptionType Type;
+    (byte where value == 12) Length;
+    ushort IDNumber;
+    ushort OutboundHopCount;
+    ushort ReturnHopCount;
+    uint OriginatorIPAddress;
+}
+
+// RFC 1475
+type AddressExtension
+{
+    OptionType Type;
+    (byte where value == 10) Length;
+    uint SourceIPv7AD with BinaryEncoding{Width = 24};
+    byte Source7thByte;
+    binary DestinationIPv7AD with BinaryEncoding{Length = 3};
+    byte Destination7thByte;
+}
+
+// RFC 2113
+type RouterAlert
+{
+    OptionType Type;
+    (byte where value == 4) Length;
+    ushort RouterAlertValue;
+}
+
+// RFC 1770
+type SelectiveDirectedBroadcastMode
+{
+    OptionType Type;
+    (byte where value >= 6 && value <= 38) Length;
+    array<IPv4Address> IPAdress with BinaryEncoding{Length = ((Length - 2) / 4)};
+}
+
+type UnknownOption
+{
+    OptionType Type;
+    byte Length;
+    optional [|Length > 2|] binary Data with BinaryEncoding{Length = (Length - 2)};
+}
+
+// pattern for decoding options
+pattern OptionTypeByte = enum byte
+{
+    EndofOptionsList = 0x00,
+    NOP = 0x01,
+    Security = 0x82,
+    LooseSourceRecordRoute = 0x83,
+    TimeStamp = 0x44,
+    ExtendedSecurity = 0x85,
+    RecordRoute = 0x07,
+    SteamIdentifier = 0x88,
+    StrictSourceRoute = 0x89,
+    MTUProbe = 0x0B,
+    MTUReply = 0x0C,
+    ExtendedInternetProtocol = 0x8A,
+    Traceroute = 0x52,
+    AddressExtension = 0x93,
+    RouterAlert = 0x94,
+    SelectiveDirectedBroadcastMode = 0x95,
+    ...
+};

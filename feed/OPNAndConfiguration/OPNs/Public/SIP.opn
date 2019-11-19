@@ -1,0 +1,1487 @@
+protocol SIP with 
+StreamEncodingDefaults{Encoding = TextEncoding.ASCII}, 
+Documentation
+{
+    ProtocolName = "Session Initiation Protocol",
+    ShortName = "SIP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3261"},
+            new Reference{Name = "RFC 3265"},
+            new Reference{Name = "RFC 3311"},
+            new Reference{Name = "RFC 3428"},
+            new Reference{Name = "RFC 3515"},
+            new Reference{Name = "RFC 3892"},
+            new Reference{Name = "RFC 3903"},
+            new Reference{Name = "RFC 5626"},
+            new Reference{Name = "RFC 6086"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class=RevisionClass.Major, Version="381980", Date="10/13/2015"}
+        ]
+};
+
+using UDP;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using HTTP;
+using Utility;
+using IANA;
+using InfrastructureResources;
+
+const string MODULE_NAME = "SIP";
+
+/*
+ * RFC 3265     NOTIFY method
+ * RFC 3311     UPDATE method
+ * RFC 3428     MESSAGE method
+ * RFC 3515     REFER method
+ * RFC 3892     Referred-By
+ * RFC 3903     PUBLISH method
+ * RFC 6086     INFO method
+ */
+
+endpoint Server over TCP.Server | over UDP.Host
+    accepts mutable SIP.Request issues mutable SIP.Response
+    // Request of "Notify" method and its response have a contrary direction with 
+    // normal messages (server receives request and issues respones).
+    issues mutable SIP.Request accepts mutable SIP.Response
+    accepts mutable KeepAliveOverTcpPing issues mutable KeepAliveOverTcpPong;
+
+const binary SIPBinary = $[534950];
+autostart actor SIPServerOverUDP(UDP.Host host)
+{
+    // May have the case that both client and server make use of the same port 5060
+    // So look ahead to see if it begins with "SIP" to distinguish request and response message.
+    process host accepts d:UDP.Datagram where (d.DestinationPort == IANA.Port.SIP || d.SourcePort == IANA.Port.SIP) && d.Payload.Count >= 3 && d.Payload.Segment(0, 3) != SIPBinary // request
+    {
+        stream s = d.Payload;
+        if (KeepAlivePingCRLF(s) is ping:KeepAliveOverTcpPing)
+        {
+            ping.Origins = [d];
+            dispatch (endpoint SIP.Server over host) accepts ping;
+        }
+        else
+        {
+            if (SIP.RequestHeader(s) is requestHeader:SIP.SIPRequestHeaderType)
+            {
+                requestHeader.Headers = SIP.ParseHeaderFields(requestHeader.Headers);
+                int headerLength = s.BytePosition;
+                if (TryDecodeRequestBody(requestHeader, d.Payload, 0, headerLength, false) is request:SIP.Request)
+                {
+                    dispatch (endpoint SIP.Server over host) accepts request;
+                }
+                else
+                {
+                    SIP.Request incompleteRequest = TryDecodeRequestBody(requestHeader, d.Payload, 0, headerLength, true) as SIP.Request;
+                    ReportInsufficientData(incompleteRequest, DiagnosisLevel.Error, "SIP: Incomplete Request payload.");
+                    DisplayTopLevelMessage(incompleteRequest);
+                }
+            }
+            else
+            {
+                ThrowDecodingException("SIP", "Request", UTILITY_PARSE_ERROR, ["Request Header"]);
+            }
+        }
+    }
+
+    process host accepts d:UDP.Datagram where (d.SourcePort == IANA.Port.SIP || d.DestinationPort == IANA.Port.SIP) && d.Payload.Count >= 3 && d.Payload.Segment(0, 3) == SIPBinary // response
+    {
+        stream s = d.Payload;
+        if (KeepAlivePongCRLF(s) is pong:KeepAliveOverTcpPong)
+        {
+            pong.Origins = [d];
+            dispatch (endpoint SIP.Server over host) issues pong;
+        }
+        else
+        {
+            if (SIP.ResponseHeader(s) is responseHeader:SIP.SIPResponseHeaderType)
+            {
+                responseHeader.Headers = SIP.ParseHeaderFields(responseHeader.Headers);
+                int headerLength = s.BytePosition;
+                if (TryDecodeResponseBody(responseHeader, d.Payload, 0, headerLength, false) is response:SIP.Response)
+                {
+                    dispatch (endpoint SIP.Server over host) issues response;
+                }
+                else
+                {
+                    SIP.Response incompleteResponse = TryDecodeResponseBody(responseHeader, d.Payload, 0, headerLength, true) as SIP.Response;
+                    ReportInsufficientData(incompleteResponse, DiagnosisLevel.Error, "SIP: Incomplete Response payload.");
+                    DisplayTopLevelMessage(incompleteResponse);
+                }
+            }
+            else
+            {
+                ThrowDecodingException("SIP", "Response", UTILITY_PARSE_ERROR, ["Response Header"]);
+            }
+        }
+    }
+}
+
+autostart actor SIPServerOverTCP(TCP.Server server)
+{
+    SIPOverTCPDecodingHelper decodingHelper = null;
+    
+    process server accepts s:TCP.Segment where s.DestinationPort == IANA.Port.SIP || s.DestinationPort == IANA.Port.SIPS // request
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new SIPOverTCPDecodingHelper();
+            decodingHelper.InitializeSIPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment where s.SourcePort == IANA.Port.SIP || s.SourcePort == IANA.Port.SIPS // response
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new SIPOverTCPDecodingHelper();
+            decodingHelper.InitializeSIPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    // Below rules are added in case that TCP mistakes the Client for Server by port number for the trace without TCP 3-way handshake.
+    process server accepts s:TCP.Segment where server.isMissingThreeWayHandshake && (s.SourcePort == IANA.Port.SIP || s.SourcePort == IANA.Port.SIPS) // response
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new SIPOverTCPDecodingHelper();
+            decodingHelper.InitializeSIPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    process server issues s:TCP.Segment where server.isMissingThreeWayHandshake && (s.DestinationPort == IANA.Port.SIP || s.DestinationPort == IANA.Port.SIPS) // request
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new SIPOverTCPDecodingHelper();
+            decodingHelper.InitializeSIPOverTCPDecodingHelper(server);
+        }
+
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+type SIPOverTCPDecodingHelper : TCP.TCPDecodingHelper
+{
+    void InitializeSIPOverTCPDecodingHelper(TCP.Server server)
+    {
+        SIPOverTCPDecodingCache acceptsCache = new SIPOverTCPDecodingCache();
+        acceptsCache.InitializeSIPOverTCPDecodingCache(MessageDirection.Accepts, server);
+        AcceptsCache = acceptsCache;
+
+        SIPOverTCPDecodingCache issuesCache = new SIPOverTCPDecodingCache();
+        issuesCache.InitializeSIPOverTCPDecodingCache(MessageDirection.Issues, server);
+        IssuesCache = issuesCache;
+    }
+}
+
+// According to RFC 3261 section 7.5 Framing SIP Messages: 
+// Implementations processing SIP messages over stream-oriented transports MUST ignore any CRLF appearing before the start-line [H4.1].
+type SIPOverTCPDecodingCache: TCP.TCPDecodingCache
+{
+    // Server can send Request of "Notify" method. Its direction is contrary with normal messages, which means server issues request and accecpts respones.
+    // To support this scenario, we have two header in each direction's cache
+    optional SIP.SIPRequestHeaderType RequestHeader = nothing;
+    optional SIP.SIPResponseHeaderType ResponseHeader = nothing;
+    int HeaderLength = 0;
+    int LengthOfCRLFBeforeSIPHeader = 0;
+
+    bool IsRequest = true;
+
+    void ResetContext()
+    {
+        RequestHeader = nothing;
+        ResponseHeader = nothing;
+        HeaderLength = 0;
+        LengthOfCRLFBeforeSIPHeader = 0;
+        IsRequest = true;
+    }
+
+    void InitializeSIPOverTCPDecodingCache(MessageDirection messageDirection, TCP.Server server)
+    {
+        base.Initialize(
+            "SIP",
+            endpoint SIP.Server over server,
+            messageDirection,
+            IsSIP,
+            IsSufficientForSIP,
+            DecodeSIPMessage,
+            DecodeSIPIncompleteMessage);
+    }
+
+    bool? IsSIP(binary buffer)
+    {
+        stream s = buffer;
+        if (Direction == MessageDirection.Accepts) // change the order of Method(buffer) and SipVersion(buffer) to improve performance
+        {
+            if ((RequestHeader != nothing) || (ResponseHeader != nothing))
+            {
+                return true;
+            }
+
+            if (MethodWithCRLF(buffer) != nothing) // for most case, accept direction will match Method
+            {
+                return true;
+            }
+            else if (SipVersionStart(buffer) != nothing)
+            {
+                IsRequest = false;
+                return true;
+            }
+            else if (CRLFS(s) != nothing && RemainingBitLength(s) == 0)
+            {
+                ResetAfterSucceed(null); // if CRLF is at the end of a frame, clear the buffer
+                return null;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if ((ResponseHeader != nothing) || (RequestHeader != nothing))
+            {
+                return true;
+            }
+            if (SipVersionStart(buffer) != nothing) // for most case, issue direction will match SipVersion
+            {
+                IsRequest = false;
+                return true;
+            }
+            else if (MethodWithCRLF(buffer) != nothing)
+            {
+                return true;
+            }
+            else if (CRLFS(s) != nothing && RemainingBitLength(s) == 0)
+            {
+                ResetAfterSucceed(null); // if CRLF is at the end of a frame, clear the buffer
+                return null;
+            }
+            else
+            {
+                return false;
+            }
+        }
+    }
+
+    uint? IsSufficientForSIP(binary buffer)
+    {
+        uint? result = null;
+        stream s = buffer;
+        if (IsRequest)
+        {
+            if (RequestHeader is header1:SIP.SIPRequestHeaderType) // header is ready
+            {
+                result = IsSufficientForSIPBody(header1.Headers); // HeaderLength > 0
+            }
+            else // header is not ready, decode header firstly
+            {
+                if (CRLFS(s) != nothing)
+                {
+                    LengthOfCRLFBeforeSIPHeader = s.BytePosition;
+                }
+
+                RequestHeader = SIP.RequestHeader(s);
+                if (RequestHeader is header2:SIP.SIPRequestHeaderType) // if decoding header succeed
+                {
+                    header2.Headers = SIP.ParseHeaderFields(header2.Headers);
+                    HeaderLength = s.BytePosition; // set HeaderLength
+                    result = IsSufficientForSIPBody(header2.Headers);
+                }
+                else // if decoding header fail, wait enough data to decode header
+                {
+                    result = null;
+                }
+            }
+        }
+        else
+        {
+            if (ResponseHeader is header1:SIP.SIPResponseHeaderType) // header is ready, check length
+            {
+                result = IsSufficientForSIPBody(header1.Headers); // HeaderLength > 0
+            }
+            else // header is not ready, decode header firstly
+            {
+                if (CRLFS(s) != nothing)
+                {
+                    LengthOfCRLFBeforeSIPHeader = s.BytePosition;
+                }
+
+                ResponseHeader = SIP.ResponseHeader(s);
+                if (ResponseHeader is header2:SIP.SIPResponseHeaderType) // if decoding header succeed
+                {
+                    header2.Headers = SIP.ParseHeaderFields(header2.Headers);
+                    HeaderLength = s.BytePosition; // set HeaderLength
+                    result = IsSufficientForSIPBody(header2.Headers);
+                }
+                else // if decoding header fail, wait enough data to decode header
+                {
+                    result = null;
+                }
+            }
+        }
+        return result;
+    }
+
+    uint? IsSufficientForSIPBody(map<string, any> headers)
+    {
+        if ("Content-Length" in headers)
+        {
+            uint bodyLength = headers["Content-Length"] as uint;
+            if (BufferCount() >= HeaderLength + bodyLength)
+            {
+                return 0;
+            }
+            else
+            {
+                return (HeaderLength + bodyLength) as uint;
+            }
+        }
+        else // No body
+        {
+            return 0;
+        }
+    }
+
+    override void TryDecodeAndDispatchMessage()
+    {
+        stream s = Buffer;
+        if (Direction == MessageDirection.Accepts)
+        {
+             // SIP Keep-alive over TCP ping message
+            if (KeepAlivePingCRLF(s) is ping:KeepAliveOverTcpPing && RemainingBitLength(s) == 0)
+            {
+                ping.Origins = Origins;
+                DispatchMessage(ping);
+                CompleteMessages.Add(ping, BufferStartSequenceNumber, BufferEndSequenceNumber);
+                ResetAfterSucceed(null);
+            }
+            else
+            {
+                base.TryDecodeAndDispatchMessage();
+            }
+        }
+        else
+        {
+            // SIP Keep-alive over TCP pong message
+            if (KeepAlivePongCRLF(s) is pong:KeepAliveOverTcpPong && RemainingBitLength(s) == 0)
+            {
+                pong.Origins = Origins;
+                DispatchMessage(pong);
+                CompleteMessages.Add(pong, BufferStartSequenceNumber, BufferEndSequenceNumber);
+                ResetAfterSucceed(null);
+            }
+            else
+            {
+                base.TryDecodeAndDispatchMessage();
+            }
+        }
+    }
+
+    optional any message DecodeSIPMessage(stream s)
+    {
+        optional any message result = nothing;
+        if (RequestHeader is requestHeader:SIP.SIPRequestHeaderType) // for request
+        {
+            result  = TryDecodeRequestBody(requestHeader, s, LengthOfCRLFBeforeSIPHeader, HeaderLength, false);
+            ResetContext();
+        }
+        else if (ResponseHeader is responseHeader:SIP.SIPResponseHeaderType) // for response
+        {
+            result  = TryDecodeResponseBody(responseHeader, s, LengthOfCRLFBeforeSIPHeader, HeaderLength, false);
+            ResetContext();
+        }
+        return result;
+    }
+
+    optional any message DecodeSIPIncompleteMessage(binary buffer)
+    {
+        optional any message result = nothing;
+        if (RequestHeader is requestHeader:SIP.SIPRequestHeaderType) // for request
+        {
+            result  = TryDecodeRequestBody(requestHeader, buffer, LengthOfCRLFBeforeSIPHeader, HeaderLength, true);
+        }
+        else if (ResponseHeader is responseHeader:SIP.SIPResponseHeaderType) // for response
+        {
+            result  = TryDecodeResponseBody(responseHeader, buffer, LengthOfCRLFBeforeSIPHeader, HeaderLength, true);
+        }
+        else
+        {
+            var lines = IncompletePayloadLine(buffer);
+            if (lines != nothing)
+            {
+                var msg = new IncompletePayload{PayloadLines = lines as array<string>};
+                msg.SourceData = buffer;
+                result = msg;
+            }
+        }
+        ResetContext();
+        return result;
+    }
+
+    override void ClearExceptionally()
+    {
+        ResetContext();
+        base.ClearExceptionally();
+    }
+}
+
+optional SIP.Request TryDecodeRequestBody(SIP.SIPRequestHeaderType requestHeader, stream s, int LengthOfCRLFBeforeSIPHeader, int headerLength, bool dealWithIncompleteMessage)
+{
+    binary body = $[];
+    if ("Content-Length" in requestHeader.Headers)
+    {
+        int length = (requestHeader.Headers["Content-Length"] as uint) as int;
+        var remainingLength = RemainingByteLength(s) - headerLength;
+        if (remainingLength < length)
+        {
+            if (dealWithIncompleteMessage)
+            {
+                length = remainingLength;
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        body = s.PeekBytes(headerLength * 8, length);
+    }
+
+    SIP.Request request = new SIP.Request
+    {
+        Method = requestHeader.Method, 
+        Uri = requestHeader.Uri, 
+        Version = requestHeader.Version, 
+        Headers = requestHeader.Headers, 
+        Body = (body.Count == 0 ? nothing : body)
+    };
+
+    int bodyLength = (request.Body != nothing) ? body.Count : 0;
+    AssociateRequest(request, LengthOfCRLFBeforeSIPHeader, headerLength, bodyLength, s.PeekBytes(s.BitPosition));
+
+    BinaryDecoder<Blob[(headerLength + bodyLength) as uint]>(s); // consume stream for Reset
+    return request;
+}
+
+optional SIP.Response TryDecodeResponseBody(SIP.SIPResponseHeaderType responseHeader, stream s, int LengthOfCRLFBeforeSIPHeader, int headerLength, bool dealWithIncompleteMessage)
+{
+    binary body = $[];
+    if ("Content-Length" in responseHeader.Headers)
+    {
+        int length = (responseHeader.Headers["Content-Length"] as uint) as int;
+        var remainingLength = RemainingByteLength(s) - headerLength;
+        if (remainingLength < length)
+        {
+            if (dealWithIncompleteMessage)
+            {
+                length = remainingLength;
+            }
+            else
+            {
+                return nothing;
+            }
+        }
+        body = s.PeekBytes(headerLength * 8, length);
+    }
+
+    SIP.Response response = new SIP.Response
+    {
+        Version = responseHeader.Version, 
+        StatusCode = responseHeader.StatusCode, 
+        ReasonPhrase = responseHeader.ReasonPhrase, 
+        Headers = responseHeader.Headers, 
+        Body = (body.Count == 0 ? nothing : body)
+    };
+
+    int bodyLength = (response.Body != nothing) ? body.Count : 0;
+    AssociateReponse(response, LengthOfCRLFBeforeSIPHeader, headerLength, bodyLength, s.PeekBytes(s.BitPosition));
+
+    BinaryDecoder<Blob[(headerLength + bodyLength) as uint]>(s); // consume stream for Reset
+    return response;
+}
+
+void AssociateRequest(SIP.Request request, int startPosition, int headerLength, int bodyLength, binary sourceData)
+{
+    int pointer = startPosition;
+    request.AssignFieldEncodingInfo("Method", pointer * 8, request.Method.Count * 8);
+    pointer += request.Method.Count + 1; // 0x20 after Method.
+    request.AssignFieldEncodingInfo("Uri", pointer * 8, request.Uri.Count * 8);
+    pointer += request.Uri.Count + 1; // 0x20 after Uri
+    request.AssignFieldEncodingInfo("Version", pointer * 8, 8 * request.Version.VersionLength);
+    pointer += request.Version.VersionLength + 2; // "0x0D0A" after Version.
+    request.AssignFieldEncodingInfo("Headers", pointer * 8, (headerLength * 8 - pointer * 8));
+    pointer = headerLength;
+
+    if (request.Body != nothing)
+    {
+        request.AssignFieldEncodingInfo("Body", pointer * 8, bodyLength * 8);
+    }
+
+    // Set SourceData
+    request.SourceData = sourceData;
+}
+
+void AssociateReponse(SIP.Response response, int startPosition, int headerLength, int bodyLength, binary sourceData)
+{
+    int pointer = startPosition;
+    response.AssignFieldEncodingInfo("Version", pointer * 8, response.Version.VersionLength * 8);
+    pointer += response.Version.VersionLength + 1; // 0x20 after Version.
+    response.AssignFieldEncodingInfo("StatusCode", pointer * 8, 24);
+    pointer += 4; // 0x20 after StatusCode.
+    response.AssignFieldEncodingInfo("ReasonPhrase", pointer * 8, response.ReasonPhrase.Count * 8);
+    pointer += response.ReasonPhrase.Count + 2; // "0x0D0A" after ReasonPhrase.
+    response.AssignFieldEncodingInfo("Headers", pointer * 8, (headerLength * 8 - pointer * 8));
+    pointer = headerLength;
+
+    if (response.Body != nothing)
+    {
+        response.AssignFieldEncodingInfo("Body", pointer * 8, bodyLength * 8);
+    }
+    // Set SourceData
+    response.SourceData = sourceData;
+}
+
+map<string, any> ParseHeaderFields(map<string, any> headers)
+{
+    set<string> keys = headers.Keys;
+
+    if (keys["Accept"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Accept", ref headers, null, SIP.HeaderFieldParamterers);
+    }
+    if (keys["Accept-Encoding"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Accept-Encoding", ref headers, null, SIP.HeaderFieldParamterers);
+    }
+    if (keys["Accept-Language"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Accept-Language", ref headers, null, SIP.HeaderFieldParamterers);
+    }
+    if (keys["Alert-Info"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Alert-Info", ref headers, null, SIP.AlertInfo);
+    }
+    if (keys["Allow"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Allow", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Authorization"])
+    {
+        HTTP.ParseHeaderValue<HTTP.Credentials>(MODULE_NAME, "Authorization", ref headers, SIP.Authorization, null);
+    }
+    if (keys["Proxy-Authorization"])
+    {
+        HTTP.ParseHeaderValue<HTTP.Credentials>(MODULE_NAME, "Proxy-Authorization", ref headers, SIP.Authorization, null);
+    }
+    if (keys["Call-ID"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Call-ID", ref headers, SIP.CallId, null);
+    }
+    if (keys["i"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "i", ref headers, SIP.CallId, null);
+    }
+    if (keys["Call-Info"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Call-Info", ref headers, null, SIP.CallInfo);
+    }
+    if (keys["Contact"])
+    {
+        HTTP.ParseHeaderValue<array<SIP.HeaderFieldType> | string>(MODULE_NAME, "Contact", ref headers, SIP.Contact, null);
+    }
+    if (keys["m"])
+    {
+        HTTP.ParseHeaderValue<array<SIP.HeaderFieldType> | string>(MODULE_NAME, "m", ref headers, SIP.Contact, null);
+    }
+    if (keys["Content-Disposition"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Content-Disposition", ref headers, SIP.HeaderFieldParamterer, null);
+    }
+    if (keys["Content-Encoding"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Content-Encoding", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["e"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "e", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Content-Language"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Content-Language", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Content-Length"])
+    {
+        HTTP.ParseHeaderValue<uint>(MODULE_NAME, "Content-Length", ref headers, SIP.ContentLength, null);
+    }
+    if (keys["l"])
+    {
+        HTTP.ParseHeaderValue<uint>(MODULE_NAME, "l", ref headers, SIP.ContentLength, null);
+    }
+    if (keys["Content-Type"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Content-Type", ref headers, SIP.ContentType, null);
+    }
+    if (keys["c"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "c", ref headers, SIP.ContentType, null);
+    }
+    if (keys["CSeq"])
+    {
+        HTTP.ParseHeaderValue<SIP.CSeq>(MODULE_NAME, "CSeq", ref headers, SIP.CSeqSyntax, null);
+    }
+    if (keys["Error-Info"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Error-Info", ref headers, null, SIP.ErrorInfo);
+    }
+    if (keys["Expires"])
+    {
+        HTTP.ParseHeaderValue<uint>(MODULE_NAME, "Expires", ref headers, SIP.Expires, null);
+    }
+    if (keys["From"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "From", ref headers, SIP.HeaderFieldParamtererStartWithNameAddrAndAddrSpec, null);
+    }
+    if (keys["f"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "f", ref headers, SIP.HeaderFieldParamterer, null);
+    }
+    if (keys["In-Reply-To"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "In-Reply-To", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Max-Forwards"])
+    {
+        HTTP.ParseHeaderValue<uint>(MODULE_NAME, "Max-Forwards", ref headers, SIP.MaxForwards, null);
+    }
+    if (keys["Min-Expires"])
+    {
+        HTTP.ParseHeaderValue<uint>(MODULE_NAME, "Min-Expires", ref headers, SIP.MinExpires, null);
+    }
+    if (keys["WWW-Authenticate"])
+    {
+        HTTP.ParseHeaderValue<HTTP.Challenge>(MODULE_NAME, "WWW-Authenticate", ref headers, SIP.WWWAuthenticate, null);
+    }
+    if (keys["Proxy-Authenticate"])
+    {
+        HTTP.ParseHeaderValue<HTTP.Challenge>(MODULE_NAME, "Proxy-Authenticate", ref headers, SIP.ProxyAuthenticate, null);
+    }
+    if (keys["Proxy-Require"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Proxy-Require", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Record-Route"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Record-Route", ref headers, null, SIP.RecordRoute);
+    }
+    if (keys["Reply-To"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Reply-To", ref headers, SIP.HeaderFieldParamtererStartWithNameAddrAndAddrSpec, null);
+    }
+    if (keys["Require"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Require", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Retry-After"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Retry-After", ref headers, SIP.RetryAfter, null);
+    }
+    if (keys["Route"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "Route", ref headers, null, SIP.Route);
+    }
+    if (keys["Server"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Server", ref headers, null, SIP.Serverr);
+    }
+    if (keys["Supported"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Supported", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["To"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "To", ref headers, SIP.HeaderFieldParamtererStartWithNameAddrAndAddrSpec, null);
+    }
+    if (keys["t"])
+    {
+        HTTP.ParseHeaderValue<SIP.HeaderFieldType>(MODULE_NAME, "t", ref headers, SIP.HeaderFieldParamterer, null);
+    }
+    if (keys["Unsupported"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Unsupported", ref headers, null, SIP.HeaderFieldStringArray);
+    }
+    if (keys["Via"])
+    {
+        HTTP.ParseHeaderValue<SIP.ViaParam>(MODULE_NAME, "Via", ref headers, null, SIP.Via);
+    }
+    if (keys["v"])
+    {
+        HTTP.ParseHeaderValue<SIP.ViaParam>(MODULE_NAME, "v", ref headers, null, SIP.Via);
+    }
+    if (keys["Warning"])
+    {
+        HTTP.ParseHeaderValue<string>(MODULE_NAME, "Warning", ref headers, null, SIP.Warning);
+    }
+    return headers;
+}
+
+// SIP Keep Alive syntax
+syntax KeepAlivePingCRLF = s: (s1:CRLF s2:CRLF => (s1 + s2))+ => new SIP.KeepAliveOverTcpPing{Ping = ConvertStringArrayToString(s)};
+syntax KeepAlivePongCRLF = s: CRLF => new SIP.KeepAliveOverTcpPong{Pong = s};
+
+// Keep-alive message request
+message KeepAliveOverTcpPing
+{
+    string Ping with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        return "Keep Alive On Tcp Ping";
+    }
+}
+
+// Keep-alive message response
+message KeepAliveOverTcpPong
+{
+    string Pong with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    override string ToString()
+    {
+        return "Keep Alive On Tcp Pong";
+    }
+}
+
+pattern SipHeadersType = map<string, HTTP.HttpHeaderFieldValueType | SIP.CSeq | HTTP.Challenge | array<SIP.ViaParam> | SIP.HeaderFieldType | array<SIP.HeaderFieldType> | uint>;
+
+message Request
+{
+    string Method;
+    string Uri;
+    VersionType Version;
+    SipHeadersType Headers;
+    optional binary Body;
+    
+    override string ToString()
+    {
+        return "Request, Method: " + Method + ", Uri: " + Uri + 
+            ", Version: SIP/" + Version.ToString();
+    }
+
+    HeaderFieldType GetSIPContentType()
+    {
+        return ("Content-Type" in Headers && Headers["Content-Type"] is HeaderFieldType) ? (Headers["Content-Type"] as HeaderFieldType) : null;
+    }    
+}
+
+message Response
+{
+    VersionType Version;
+    uint StatusCode;
+    string ReasonPhrase;
+    SipHeadersType Headers;
+    optional binary Body;
+        
+    override string ToString()
+    {
+        return "Response, Version: SIP/" + Version.ToString() + ", StatCode: " + 
+            (StatusCode.ToString()) + ", ReasonPhrase: " + ReasonPhrase;
+    }
+
+    HeaderFieldType GetSIPContentType()
+    {
+        return ("Content-Type" in Headers && Headers["Content-Type"] is HeaderFieldType) ? (Headers["Content-Type"] as HeaderFieldType) : null;
+    }    
+}
+
+message IncompletePayload
+{
+    array<string> PayloadLines;
+        
+    override string ToString()
+    {
+        return "Incomplete SIP Payload";
+    }
+}
+syntax IncompletePayloadLine    = (s:regex{[^\r\n]*} (CRLF | CR | LF)* => s)*;
+// syntax SipMessage       = Request | Response;
+
+syntax RequestHeader    = line:RequestLine
+                            headers:(header:MessageHeader CRLF => header)*
+                            CRLF
+                            => new SIP.SIPRequestHeaderType 
+                                    { 
+                                        Method = line.Method, 
+                                        Uri = line.Uri, 
+                                        Version = line.Version, 
+                                        Headers = MergeHeaders(headers)
+                                    };
+type SIPRequestHeaderType
+{
+    string Method;
+    string Uri;
+    VersionType Version;
+    map<string, any> Headers;
+}
+
+syntax MessageHeader    = k:FieldName HColon v:(FieldValue?)
+                                => new KeyValuePair{Key = FieldNameToPascal(k), Value = (v.Count == 0 ? "" : v[0])};
+syntax FieldName        = Token;
+syntax FieldValue       = s:regex{[^\r\n]*} => s.Trim();
+
+const array<char> FieldNameSeparator = ['-'];
+const set<string> FieldNameToPascalExceptionCase = {"extension-header", "i", "m", "e", "l", "c", "f", "t", "v"};
+string FieldNameToPascal(string str)
+{
+    string result = "";
+    string strToLower = str.ToLower();
+    // Keep lower
+    if (FieldNameToPascalExceptionCase[strToLower])
+    {
+        result = strToLower;
+    }
+    // Deal with special case
+    else if (strToLower == "cseq")
+    {
+        result = "CSeq";
+    }
+    else if (strToLower == "www-authenticate")
+    {
+        result = "WWW-Authenticate";
+    }
+    else if (strToLower == "call-id")
+    {
+        result = "Call-ID";
+    }
+    // To pascal
+    else
+    {
+        array<string> strArray = str.Split(FieldNameSeparator);
+        int index;
+        for (index = 0; index < strArray.Count - 1; index++)
+        {
+            result += strArray[index].ToPascal();
+            result += "-";
+        }
+        if (strArray.Count > 0)
+            result += strArray[index].ToPascal();
+    }
+    return result;
+}
+
+string ToPascal(this string str)
+{
+    return (str.Count > 0) ? ((str[0].ToUpper() as string) + str.Segment(1).ToLower()) : str;
+}
+// syntax Request          = RequestLine MessageHeader* CRLF MessageBody?;
+
+syntax RequestLine      = method:Method SP uri:RequestUri SP version:SipVersion CRLF
+                                => new RequestLineType
+                                        {
+                                            Method = method, 
+                                            Uri = uri, 
+                                            Version = version
+                                        };
+type RequestLineType
+{
+    string Method;
+    string Uri;
+    VersionType Version;
+}
+
+syntax ResponseHeader           = line:StatusLine
+                                    headers:(header:MessageHeader CRLF => header)*
+                                    CRLF
+                                    => new SIPResponseHeaderType 
+                                        { 
+                                            Version = line.Version, 
+                                            StatusCode = line.Status, 
+                                            ReasonPhrase = line.Reason, 
+                                            Headers = MergeHeaders(headers), 
+                                        };
+
+type SIPResponseHeaderType
+{
+    VersionType Version;
+    uint StatusCode;
+    string ReasonPhrase;
+    map<string, any> Headers;
+}
+
+type VersionType
+{
+    uint Major;
+    uint Minor;
+    
+    override string ToString()
+    {
+        return (Major.ToString()) + "." + (Minor.ToString());
+    }
+}
+
+ushort get VersionLength(this VersionType version)
+{
+    // SIP/2.0
+    return 7;
+}
+
+syntax StatusLine       = s1:SipVersion SP s2:StatusCode SP s3:ReasonPhrase CRLF
+                            => new StatusLineType
+                                {
+                                    Version = s1,
+                                    Status = s2 as uint,
+                                    Reason = s3
+                                };
+
+type StatusLineType
+{
+    VersionType Version;
+    uint Status;
+    string Reason;
+}
+
+// syntax ----------------------------------------------
+
+syntax AlphaNum     = Alpha | Digit;
+
+syntax Reserved     = regex{[;/?:@&=+$,]};
+// syntax Unreserved   = s:(Alpha | Mark) => s;
+syntax Unreserved   = AlphaNum | Mark;
+
+syntax Mark         = regex{[_!~*'()\\-\\.]};
+syntax Escaped      = s1:"%" s2:HexDig s3:HexDig => (s1 + s2 + s3);
+
+// syntax LWS          = (WSP* CRLF)? WSP+;
+// syntax LWS          = regex{( *\r\n)? +};
+syntax LWS          = regex{[\x20\t]*(\r\n)?[\x20\t]+};
+syntax SWS          = LWS?;
+
+syntax HColon       = regex{[\x20\t]*} ":" SWS => ":";
+
+syntax UTF8NonAscii    = regex{[\xC0-\xDF][\x80-\xBF]} 
+                        | regex{[\xE0-\xEF][\x80-\xBF]{2}}
+                        | regex{[\xF0-\xF7][\x80-\xBF]{3}}
+                        | regex{[\xF8-\xFB][\x80-\xBF]{4}}
+                        | regex{[\xFC-\xFD][\x80-\xBF]{5}};
+                        
+syntax UTF8Cont        = regex{[\x80-\xBF]};
+
+syntax LHex             = Digit | regex{[\x61-\x66]};
+
+syntax Token            = regex{[0-9a-zA-Z!#%&`*+._'|~\x5E\x2D\x24]+};
+syntax Seperators       = regex{[()<>@,;:\\\\\\"/?={}\x20\t]};
+syntax Word             = s:(AlphaNum | regex{[!%*_+`'~()<>:/?{}\\-\\.\\x5C[\\]]} | DQuote)+ 
+                            => ConvertStringArrayToString(s);
+
+syntax Star             = SWS "*" SWS       => "*";
+syntax Slash            = SWS "/" SWS       => "/";
+syntax Equal            = SWS "=" SWS       => "=";
+syntax LParen           = SWS "(" SWS       => "(";
+syntax RParen           = SWS ")" SWS       => ")";
+syntax RAQuot           = ">" SWS           => ">";
+syntax LAQuot           = SWS "<"           => "<";
+syntax Comma            = SWS "," SWS       => ",";
+syntax Semi             = SWS ";" SWS       => ";";
+syntax Colon            = SWS ":" SWS       => ":";
+syntax LDQuot           = SWS s:DQuote      => s;
+syntax RDQuot           = s:DQuote SWS      => s;
+
+syntax Comment          = LParen (CText | QuotedPair | Comment)* RParen;
+syntax CText            = regex{[\x21-\x27\x2A-\x5A\x5D\x5B\x5E-\x7E]} | UTF8NonAscii | LWS;
+
+syntax QuotedString     = SWS DQuote s:(QDText | QuotedPair)* DQuote => ConvertStringArrayToString(s);
+syntax QDText           = LWS 
+                        | s1:regex{[\x21\x23-\x5A\x5D\x5B\x5E-\x7E]} => s1
+                        | s2:UTF8NonAscii => s2;
+
+syntax QuotedPair       = s1:"\\" s2:regex{[\x00-\x09\x0B-\x0C\x0E-\x7E]} => (s1 + s2);
+
+syntax SipUri           = s1:"sip:" s2:UserInfo? s3:HostPort s4:UriParameters s5:Headers?
+                            => (s1 + (s2.Count == 0 ? "" : s2[0]) + s3 + s4 + (s5.Count == 0 ? "" : s5[0]));
+syntax SipsUri          = s1:"sips:" s2:UserInfo? s3:HostPort s4:UriParameters s5:Headers?
+                            => (s1 + (s2.Count == 0 ? "" : s2[0]) + s3 + s4 + (s5.Count == 0 ? "" : s5[0]));
+                            
+syntax UserInfo         = s1:(User | TelphoneSubscriber) s2:(s21:":" s22:Password => (s21 + s22))? s3:"@"
+                            => (s1 + (s2.Count == 0 ? "" : s2[0]) + s3);
+
+// ----------RFC2806
+syntax TelphoneSubscriber   = GlobalPhoneNumber | LocalPhoneNumber;
+syntax GlobalPhoneNumber    = s1:"+" s2:BasePhoneNumber 
+                            s3:IsdnSubAddress? s4:PostDial? 
+                            s5:(AreaSpecifer | ServiceProvider | FutureExtension)*
+                            => (s1 + s2 + (s3.Count == 0 ? "" : s3[0]) + (s4.Count == 0 ? "" : s4[0]) + ConvertStringArrayToString(s5));
+syntax BasePhoneNumber      = s:PhoneDigit+ => ConvertStringArrayToString(s);
+syntax LocalPhoneNumber     = s1:(PhoneDigit | DtmfDigit | PauseCharacter)+ 
+                                s2:IsdnSubAddress? s3:PostDial? 
+                                s4:AreaSpecifer 
+                                s5:(AreaSpecifer | ServiceProvider | FutureExtension)*
+                                => (s2[0] + (s2.Count == 0 ? "" : s2[0]) + (s3.Count == 0 ? "" : s3[0]) + s4 + ConvertStringArrayToString(s5));
+syntax IsdnSubAddress       = s1:";isub=" s2:PhoneDigit+  => (s1 + ConvertStringArrayToString(s2));
+syntax PostDial             = s1:";isub=" s2:(PhoneDigit | DtmfDigit | PauseCharacter)+ => (s1 + ConvertStringArrayToString(s2));
+syntax AreaSpecifer         = s1:";" s2:PhoneContextTag s3:"=" s4:PhoneContextIdent => (s1 + s2 + s3 + s4);
+syntax PhoneContextTag      = "phone-context";
+syntax PhoneContextIdent    = NetworkPrefix | PrivatePrefix;
+syntax NetworkPrefix        = GlobalNetworkPrefix | LocalNetworkPrefix;
+syntax GlobalNetworkPrefix  = s1:"+" s2:PhoneDigit+ => (s1 + ConvertStringArrayToString(s2));
+syntax LocalNetworkPrefix   = s:(PhoneDigit | DtmfDigit | PauseCharacter)+ => ConvertStringArrayToString(s);
+syntax PrivatePrefix        = regex{[\x21\x22\x24-\x27\x2C\x2F\x3A\x3C-\x40\x45-\x4F\x51-\x56\x58-\x60\x65-\x6F\x71-\x76\x78-\x7E][\x21-\x3A\x3C-\x7E]*};
+// syntax PrivatePrefix        = regex{[!\"$%&',/:<=>?@E-OQ-VXYZ[\x5C\\]\\^_`e-oq-vxyz{\\|}~][\x21-\x3A\x3C-\7E]*};
+syntax ServiceProvider      = s1:";" s2:ProviderTag s3:"=" s4:ProviderHostname => (s1 + s2 + s3 + s4);
+syntax ProviderTag          = "tsp";
+syntax ProviderHostname     = DomainName;
+syntax FutureExtension      = s1:";" s2:TokenChars
+                                s3:(s31:"=" s32:( t1:(t11:TokenChars t12:(t121:"?" t122:TokenChars => (t121 + t122))? 
+                                                                            => (t11 + (t12.Count == 0 ? "" : t12[0]))
+                                                        )  => t1
+                                                 | t2:QuotedString => t2) => (s31 + s32)
+                                    )?   // QuotedString seems be redefinded.
+                                => (s1 + s2 + (s3.Count == 0 ? "" : s3[0]));
+// syntax TokenChar            = regex{[\x21\x23-\x27\x2A\x2B\x2D\x2E\x30-\x39\x41-\x5A\x5E-\x7A\x7C\x7E]};
+syntax TokenChars           = regex{[!#$%&'*+\\-\\.0-9A-Za-z\\|~]+};
+syntax TokenChar            = regex{[!#$%&'*+\\-\\.0-9A-Za-z\\|~]};
+syntax PhoneDigit           = Digit | VisualSeparator;
+syntax VisualSeparator      = regex{[\\-\\.()]};
+syntax PauseCharacter       = OneSecondPause | WaitForDialTone;
+syntax OneSecondPause       = "p";
+syntax WaitForDialTone      = "w";
+syntax DtmfDigit            = regex{[*#ABCD]};
+// ------- End rfc2806
+
+syntax User             = s:(s1:(Unreserved | Escaped | UserUnreserved) => s1)+ => ConvertStringArrayToString(s);
+syntax UserUnreserved   = regex{[&=+$,;?/]};
+syntax Password         = s:(s1:(Unreserved | Escaped | regex{[&=+$,]}) => s1)* => ConvertStringArrayToString(s);
+
+syntax HostPort         = s1:Host s2:(s21:":" s22:Port => (s21 + s22))? => (s1 + (s2.Count == 0 ? "" : s2[0]));
+syntax Host             = HostName | IPv4Address | IPv6Reference;
+// To revise
+syntax HostName         = /*s1:(s11:DomainLabel s12:"." => (s11 + s12))* s2:TopLabel s3:"."?*/
+                            s1:DomainLabel s2:(s21:"." s22:DomainLabel => (s21 + s22))* => (s1 + ConvertStringArrayToString(s2));
+                            // => (ConvertStringArrayToString(s1) + s2 + (s3.Count == 0 ? "" : s3[0]));
+syntax DomainLabel      = /*s1:AlphaNum => s1
+                        |*/ s2:(s21:AlphaNum s22:(AlphaNum | "-")* /*s23:AlphaNum*/ => (s21 + ConvertStringArrayToString(s22) /*+ s23*/)) => s2;
+syntax TopLabel         = /*s1:Alpha => s1
+                        | */s2:(s21:Alpha s22:(AlphaNum | "-")* /*s23:AlphaNum*/ => (s21 + ConvertStringArrayToString(s22) /*+ s238*/)) => s2;
+// syntax IPv4Address      = Digit{1,3} "." Digit{1,3} "." Digit{1,3} "." Digit{1,3};
+syntax IPv4Address      = s1:Digits s2:"." s3:Digits s4:"." s5:Digits s6:"." s7:Digits => (s1 + s2 + s3 + s4 + s5 + s6 + s7);
+syntax IPv6Reference    = s1:"[" s2:IPv6Address s3:"]" => (s1 + s2 + s3);
+syntax IPv6Address      = s1:HexPart s2:(s21:":" s22:IPv4Address => (s21 + s22))? => (s1 + (s2.Count == 0 ? "" : s2[0]));
+syntax HexPart          = s1:HexSeq => s1
+                        | s2:(s21:HexSeq s22:"::" s23:HexSeq? => (s21 + s22 + (s23.Count == 0 ? "" : s23[0]))) => s2
+                        | s3:(s31:"::" s32:HexSeq? => (s31 + (s32.Count == 0 ? "" : s32[0]))) => s3;
+syntax HexSeq           = s1:Hex4 s2:(s22:":" s23:Hex4 => (s22 + s23))* => (s1 + ConvertStringArrayToString(s2));
+
+syntax Hex4             = regex{[0-9A-Fa-f]{1,4}};
+syntax Port             = s:Digit+ => ConvertStringArrayToString(s);
+
+syntax UriParameters    = s:(s1:";" s2:UriParameter => (s1 + s2))* => ConvertStringArrayToString(s);
+syntax UriParameter     = TransportParam | UserParam | MethodParam | TTLParam | MAddrParam | OtherParam;
+syntax TransportParam   = s1:"transport=" s2:("udp" | "tcp" | "sctp" | "tls" | OtherTransport) => (s1 + s2);
+syntax OtherTransport   = Token;
+syntax UserParam        = s1:"user=" s2:("phone" | "ip" | OtherUser) => (s1 + s2);
+syntax OtherUser        = Token;
+syntax MethodParam      = s1:"method=" s2:Method => (s1 + s2);
+syntax TTLParam         = s1:"ttl=" s2:TTL => (s1 + s2);
+syntax MAddrParam       = s1:"maddr=" s2:Host => (s1 + s2);
+//syntax LRParam          = "lr";
+syntax OtherParam       = s1:PName s2:(s21:"=" s22:PValue => (s21 + s22))? => (s1 + (s2.Count == 0 ? "" : s2[0]));
+syntax PName            = s:ParamChar+ => ConvertStringArrayToString(s);
+syntax PValue           = s:ParamChar+ => ConvertStringArrayToString(s);
+syntax ParamChar        = ParamUnreserved | Unreserved | Escaped;
+syntax ParamUnreserved  = regex{[\\[\\]/:&+$]};
+
+syntax Headers          = s1:"?" s2:Header s3:(s31:"&" s32:Header => (s31 + s32))* => (s1 + s2 + ConvertStringArrayToString(s3));
+syntax Header           = s1:HName s2:"=" s3:HValue => (s1 + s2 + s3);
+syntax HName            = s:(ParamUnreserved | Unreserved | Escaped)+ => ConvertStringArrayToString(s);
+syntax HValue           = s:(ParamUnreserved | Unreserved | Escaped)* => ConvertStringArrayToString(s);
+syntax HNVUnreserved    = regex{[\\[\\]/?:+$]};
+
+syntax RequestUri       = SipUri | SipsUri | AbsoluteUri;
+syntax AbsoluteUri      = s1:Schema s2:":" s3:(HierPart | OpaquePart) => (s1 + s2 + s3);
+syntax HierPart         = s1:(NetPath | AbsPath) s2:(s21:"?" s22:Query => (s21 + s22))? => (s1 + (s2.Count == 0 ? "" : s2[0]));
+syntax NetPath          = s1:"//" s2:Authority s3:AbsPath? => (s1 + s2 + (s3.Count == 0 ? "" : s3[0]));
+syntax AbsPath          = s1:"/" s2:PathSegments => (s1 + s2);
+syntax OpaquePart       = s1:UricNoSlash s2:Uric*  => (s1 + ConvertStringArrayToString(s2));
+syntax Uric             = Reserved | Unreserved | Escaped;
+syntax UricNoSlash      = Unreserved | Escaped | regex{[;?:@&=+$,]};
+syntax PathSegments     = s1:Segment s2:(s21:"/" s22:Segment => (s21 + s22))*
+                            => (s1 + ConvertStringArrayToString(s2));
+syntax Segment          = s1:PChar* s2:(s21:";" s22:Param => (s21 + s22))*
+                            => (ConvertStringArrayToString(s1) + ConvertStringArrayToString(s2));
+syntax Param            = s:PChar* => ConvertStringArrayToString(s);
+syntax PChar            = Unreserved | Escaped | regex{[:@&=+$,]};
+syntax Schema           = s1:Alpha s2:(Alpha | Digit | "+" | "-" | ".")*
+                            => (s1 + ConvertStringArrayToString(s2));
+syntax Authority        = Srvr | RegName;
+syntax Srvr             = s:(s1:(s11:UserInfo s12:"@" => (s11 + s12))? s2:HostPort => ((s1.Count == 0 ? "" : s1[0]) + s2))? 
+                            => (s.Count == 0 ? "" :s[0]);
+syntax RegName          = Unreserved | Escaped | regex{[$,;:@&=+]};
+syntax Query            = s:Uric* => ConvertStringArrayToString(s);
+syntax SipVersion       = "SIP" "/" s1:Digits "." s2:Digits
+                            => new VersionType
+                                {
+                                    Major = s1 as uint,
+                                    Minor = s2 as uint
+                                };
+syntax SipVersionStart  = CRLF* s:"SIP" => s;
+
+// FixMe: Add stronger restrict for "Method" syntax to help pre-check if valid reqeust message.
+syntax Method           = "INVITE" | "ACK" | "OPTIONS" | "BYE" | "CANCEL" | "REGISTER" | "UPDATE" | "MESSAGE" | "REFER" 
+                            | "INFO" | "SERVICE" | "NOTIFY" | "SUBSCRIBE" | "BENOTIFY";
+                             // | ExtensionMethod) => s;
+syntax MethodWithCRLF   = CRLF* s:Method => s;
+syntax ExtensionMethod  = Token;
+
+syntax StatusCode       = Informational | Redirection | Success | ClientError | ServerError | GlobalFailure | ExtensionCode;
+syntax ExtensionCode    = s:Digit+ => ConvertStringArrayToString(s);   // Digit{3};
+syntax ReasonPhrase     = s:(Reserved | Unreserved | Escaped | UTF8NonAscii | UTF8Cont | SP | HTab)* => ConvertStringArrayToString(s);
+
+syntax Informational    = "100" | "180" | "181" | "182" | "183";
+syntax Success          = "200";
+syntax Redirection      = "300" | "301" | "302" | "305" | "380";
+syntax ClientError      = "400" | "401" | "402" | "403" | "404" | "405" | "406" | "407" | "408"
+                        | "410" | "413" | "414" | "415" | "416" | "420" | "421" | "423" | "480" | "412"
+                        | "481" | "482" | "483" | "484" | "485" | "486" | "487" | "488" | "491" | "493";
+
+syntax ServerError      = "500" | "501" | "502" | "503" | "504" | "505" | "513";
+
+syntax GlobalFailure    = "600" | "603" | "604" | "606";
+
+// Header feilds ------------------------------
+syntax Authorization    = HTTP.DigestCredentials | HTTP.OtherCredentials;
+syntax CallId           = w1:Word w2:(w21:"@" w22:Word => (w21 + w22))? => (w1 + (w2.Count == 0 ? "" : w2[0]));
+syntax DeltaSeconds     = s:Digits => (s as uint);
+syntax ContentLength    = s:Digits => (s as uint);
+syntax ContentType      = s:MediaType => new HeaderFieldType
+                                            {
+                                                Value = s.Value, 
+                                                Parameters = ((s.Parameters != nothing && s.Parameters as map<string, optional string> == {}) ? nothing : s.Parameters)
+                                            };
+syntax MediaType        = s1:MType s2:Slash s3:MSubType s4:(Semi s5:MParameter => s5)*
+                            => new HeaderFieldType
+                                    {
+                                        Value = (s1 + s2 + s3),
+                                        Parameters = ConvertArrayToMap(s4)
+                                    };
+syntax MType            = DiscreteType | CompositeType;
+syntax DiscreteType     = "text" | "image" | "audio" | "video" | "application" | ExtensionToken;
+syntax CompositeType    = "message" | "multipart" | ExtensionToken;
+syntax ExtensionToken   = IETFToken | XToken;
+syntax IETFToken        = Token;
+syntax XToken           = s1:"x-" s2:Token => (s1 + s2);
+syntax MSubType         = ExtensionToken | IANAToken;
+syntax IANAToken        = Token;
+syntax MParameter       = s1:MAttribute Equal s2:MValue => {s1 -> s2};
+syntax MAttribute       = Token;
+syntax MValue           = Token | QuotedString;
+
+syntax CSeqSyntax       = s1:Digits LWS s2:Method
+                            => new CSeq
+                                   {
+                                       SequenceNumber = (s1 as uint),
+                                       Method = s2
+                                   };
+type CSeq
+{
+    uint SequenceNumber;
+    string Method;
+}
+
+syntax Expires          = DeltaSeconds;
+syntax MaxForwards      = s:Digits => (s as uint);
+syntax MinExpires       = DeltaSeconds;
+syntax ProxyAuthenticate = Challenge;
+syntax WWWAuthenticate  = Challenge;
+syntax Challenge        = HTTP.DigestChallenge | HTTP.OtherChallenge;
+syntax RetryAfter       = s1:DeltaSeconds Comment? sn:(regex{(\x20)*;(\x20)*} sn1:Parameter => sn1)*
+                             => new HeaderFieldType
+                                {
+                                    Value = s1 as string, 
+                                    Parameters = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                };
+syntax Serverr          = t0:regex{[^"\r\n\x20\t]*} ts:(LWS tn:regex{[^"\r\n\x20\t]*} => tn)* => ([t0] + ts); // Name conflict
+syntax TTL              = s:Digit+ => ConvertStringArrayToString(s);  // Digit{1,3}
+syntax AddrSpec         = SipUri | SipsUri | AbsoluteUri;
+syntax Uri              = AbsoluteUri | AbsPath; // Error?
+syntax Via              = s:ViaParamSyntax sn:(Comma sn1:ViaParamSyntax => sn1)* => ([s] + sn);
+syntax ViaParamSyntax   = sp:regex{[^;\x20\t\r\n]+} LWS sb:regex{[^;\x20\t\r\n]+} sn:(Semi sn1:Parameter => sn1)*
+                            => new ViaParam
+                                {
+                                    SentProtocol = sp,
+                                    SentBy = sb,
+                                    ViaParams = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                };
+type ViaParam
+{
+    string SentProtocol;
+    string SentBy;
+    optional map<string, optional string> ViaParams;
+}
+syntax Contact          = Star | (s:HeaderFieldParamtererStartWithNameAddrAndAddrSpec sn:(Comma sn1:HeaderFieldParamtererStartWithNameAddrAndAddrSpec => sn1)* => ([s] + sn));
+syntax RecordRoute      = s:HeaderFieldParamtererStartWithNameAddr sn:(Comma sn1:HeaderFieldParamtererStartWithNameAddr => sn1)* => ([s] + sn);
+syntax Route            = RecordRoute;
+syntax AlertInfo        = s:HeaderFieldParamtererStartWithAbsoluteUri sn:(Comma sn1:HeaderFieldParamtererStartWithAbsoluteUri => sn1)* => ([s] + sn);
+syntax CallInfo         = AlertInfo;
+syntax ErrorInfo        = AlertInfo;
+syntax Warning          = s0:WarningValue sn:(Comma sn1:WarningValue => sn1)* => ([s0] + sn);
+syntax WarningValue     = s1:WarnCode s2:SP s3:WarnAgent s4:SP s5:WarnText => (s1 + s2 + s3 + s4 + s5);
+syntax WarnCode         = regex{[0-9]{3}};
+syntax WarnAgent        = HostPort | Pseudonym;
+syntax WarnText         = QuotedString;
+syntax Pseudonym        = Token;
+
+syntax HeaderFieldStringArray                            = regex{[\r\n\x20\t]*"?} t0:regex{[^",\r\n\x20\t]*} ts:(regex{"?[\r\n\x20\t]*,[\r\n\x20\t]*"?} tn:regex{[^",\r\n\x20\t]*} => tn)*
+                                                            => ([t0] + ts);
+syntax HeaderFieldParamterers                            = s:HeaderFieldParamterer sn:(regex{(\x20)*,(\x20)*} sn1:HeaderFieldParamterer => sn1)*
+                                                            => ([s] + sn);
+syntax HeaderFieldParamterer                             = Spaces s:regex{[^;,\x20]+} sn:(regex{(\x20)*;(\x20)*} sn1:Parameter => sn1)*
+                                                            => new HeaderFieldType
+                                                               {
+                                                                   Value = s,
+                                                                   Parameters = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                                               };
+syntax HeaderFieldParamtererStartWithAbsoluteUri         = s1:LAQuot s2:AbsoluteUri s3:RAQuot sn:(regex{(\x20)*;(\x20)*} sn1:Parameter => sn1)*
+                                                             => new HeaderFieldType
+                                                                 {
+                                                                     Value = s1 + s2 + s3,
+                                                                     Parameters = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                                                 };
+syntax HeaderFieldParamtererStartWithNameAddrAndAddrSpec = s:(NameAddr | AddrSpec) sn:(regex{(\x20)*;(\x20)*} sn1:Parameter => sn1)*
+                                                             => new HeaderFieldType
+                                                                 {
+                                                                     Value = s,
+                                                                     Parameters = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                                                 };
+syntax HeaderFieldParamtererStartWithNameAddr            = s:NameAddr sn:(regex{(\x20)*;(\x20)*} sn1:Parameter => sn1)*
+                                                             => new HeaderFieldType
+                                                                 {
+                                                                     Value = s,
+                                                                     Parameters = (sn.Count == 0 ? nothing : ConvertArrayToMap(sn))
+                                                                 };
+syntax Parameter                                         = s1:Attribute s2:("=" s21:ParameterValue => s21)?
+                                                            => new KeyValuePair{Key = s1, Value = s2.Count == 0 ? "" : s2[0]};
+syntax Attribute                                         = regex{[^=]*};
+syntax ParameterValue                                    = s:regex{("[^"]*")|([^;,\r\n\x20]*)} => (s.Count >= 2 && s[0] == '"' ? s.Segment(1, s.Count - 2) : s);
+syntax NameAddr                                          = s1:DisplayName? s2:LAQuot s3:AddrSpec s4:RAQuot => ((s1.Count == 0 ? "" : s1[0]) + s2 + s3 + s4);
+syntax DisplayName                                       = QuotedString | s:(s1:Token s2:LWS => (s1 + s2))* => ConvertStringArrayToString(s);
+
+type HeaderFieldType
+{
+    string Value;
+    optional map<string, optional string> Parameters;
+
+    override string ToString()
+    {
+        string summary = Value;
+        if (Parameters != nothing)
+        {
+            var paramMap = Parameters as map<string, optional string>;
+            foreach (var key in paramMap.Keys)
+            {
+                summary += ";" + key;
+                summary += (paramMap[key] == nothing ? "" : "=" + (paramMap[key] as string));
+            }
+        }
+        return summary;
+    }
+}
+
+syntax HexDig           = regex{[0-9A-Fa-f]};
+syntax HTab             = "\t";
+syntax Quote            = "\x22";
+syntax DQuote           = Quote;
+
+////-------------------------------------
+// Copied from HTTP.opn, remove in the future.
+syntax Digit                = regex{[0-9]};
+syntax Digits               = regex{[0-9]+};
+syntax SP                   = " ";
+syntax Spaces               = regex{[\x20]*}; // SP*
+syntax CRLF                 = "\r\n";
+syntax CRLFS                = regex{(\r\n)+};
+pattern CR                  = "\r";
+pattern LF                  = "\n";
+
+// SSDP
+syntax DomainName           = s0:SubDomain s2:(s1:("." SubDomain) => s1)* => (s0 + ConvertStringArrayToString(s2));
+syntax SubDomain            = s0:LetDig s1:LdhStr? => (s0 + (s1.Count == 0 ? "" : s1[0]));
+syntax LetDig               = Alpha | Digit;
+syntax LdhStr               = s1:(s0:(Alpha | Digit | "-") => s0)* s2:LetDig => (ConvertStringArrayToString(s1) + s2);
+syntax UpAlpha              = regex{[A-Z]};
+syntax LoAlpha              = regex{[a-z]};
+syntax Alpha                = UpAlpha | LoAlpha;
+
+/* 
+--------------------------------------------
+Like HTTP's header, considering syntax performance, we don't decode with the accurate syntax and we just use some common syntax, which like HeaderFieldParamterers, HeaderFieldStringArray
+Comment these code, and if we need the accurate syntax, we can come back to these syntax
+--------------------------------------------
+*/ 
+//syntax Accept           = AcceptRange (Comma AcceptRange)*;
+//syntax AcceptRange      = MediaRange (Semi AcceptParam)*;
+//syntax MediaRange       = ("*/*" | (MType Slash "*") | (MType Slash MSubType)) (Semi MParameter)*;
+//syntax AcceptParam      = ("q" Equal QValue) | GenericParam;
+// syntax QValue           = ("0" ("." Digit{0,3})?) | ("1" ("." Digit{0,3})?);
+//syntax QValue           = ("0" ("." Digit+)?) | ("1" ("." Digit+)?);
+//syntax GenericParam     = Token (Equal GenValue)?;
+//syntax GenValue         = Token | Host | QuotedString;
+//syntax AcceptEncoding   = Encoding (Semi AcceptParam)*;
+//syntax Encoding         = ContentCoding | "*";
+//syntax ContentCoding  = Token;
+//syntax AcceptLanguage   = Language (Comma Language)*;
+//syntax Language         = LanguageRange (Semi AcceptParam)*;
+// syntax LanguageRange    = (Alpha{1,8} ("-" Alpha{1,8})*) | "*";
+//syntax LanguageRange    = (Alpha+ ("-" Alpha+)*) | "*";
+//syntax Allow            = Method (Comma Method)*;
+//syntax Credentials      = ("Digest" LWS DigestResponse) | OtherResponse;
+//syntax DigestResponse   = DigResp (Comma DigResp)*;
+//syntax DigResp          = UserName | Realm | Nonce | DigestUri | DResponse | Algorithm | CNonce | Opaque | MessageQOp | NonceCount | AuthParam;
+//syntax UserName         = "username" Equal LDQuot DigestUriValue RDQuot;
+//syntax UserNameValue    = QuotedString;
+//syntax DigestUri        = "uri" Equal LDQuot DigestUriValue RDQuot;
+//syntax DigestUriValue   = RequestUri; // Equal to RequestUri in HTTP/1.1
+//syntax MessageQOp       = "qop" Equal QOpValue;
+//syntax CNonce           = "cnonce" Equal CNonceValue;
+//syntax CNonceValue      = NonceValue;
+//syntax NonceCount       = "nc" Equal NCValue;
+//syntax NCValue          = LHex+;    // LHex{8}
+//syntax DResponse        = "response" Equal RequestDigest;
+//syntax RequestDigest    = LDQuot LHex+ RDQuot;  // LDQuot LHex{32} RDQuot;
+//syntax QuthParam        = AuthParamName Equal (Token | QuotedString);
+//syntax AuthParamName    = Token;
+//syntax OtherResponse    = AuthScheme LWS AuthParam (Comma AuthParam)*;
+//syntax AuthScheme       = Token;
+//syntax AuthenticationInfo   = AInfo (Comma AInfo)*;
+//syntax AInfo            = NextNonce | MessageQOp | ResponseAuth | CNonce | NonceCount;
+//syntax NextNonce        = "nextnonce" Equal NonceValue;
+//syntax ResponseAuth     = "rspauth" Equal ResponseDigest;
+//syntax ResponseDigest   = LDQuot    LHex* RDQuot;
+//syntax InfoParam        = ("purpose" Equal ("icon" | "info" | "card" | Token)) | GenericParam;
+//syntax Contact          = (Star | (ContactParam (Comma ContactParam)*));
+//syntax ContactParams    = CPQ | CPExpires | ContactExtension;
+//syntax CPQ              = "q" Equal QValue;
+//syntax CPExpires        = "expires" Equal DeltaSeconds;
+//syntax ContactExtension = GenericParam;
+//syntax ContentDisposition   = DispType (Semi DispParam)*;
+//syntax DispType         = "render" | "session" | "icon" | "alert" | DispExtensionToken;
+//syntax DispParam        = HandlingParam | GenericParam;
+//syntax HandlingParam    = "handling" Equal ("optional" | "required" | OtherHandling);
+//syntax OtherHandling    = Token;
+//syntax DispExtensionToken   = Token;
+//syntax ContentEncoding  = ContentCoding (Comma ContentCoding)*;
+//syntax ContentLanguage  = LanguageTag (Comma LanguageTag)*;
+//syntax LanguageTag      = PrimaryTag ("-" SubTag)*;
+//syntax PrimaryTag       = Alpha+; // Alpah{1,8};
+//syntax SubTag           = Alpha+; // Alpah{1,8};
+//syntax Date             = SipDate;
+//syntax SipDate          = Rfc1123Date;
+//syntax Rfc1123Date      = WKDay "," SP Date1 SP Time SP "GMT";
+//syntax Date1            = Digit2 SP Month SP Digit4;
+//syntax Time             = Digit2 ":" Digit2 ":" Digit2;
+//syntax WKDay            = "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun";
+//syntax Month            = "Jan" | "Feb" | "Mar" | "Apr" | "May" | "Jun" | "Jul"
+                            //| "Aug" | "Sep" | "Oct" | "Nov" | "Dec";
+//syntax Digit2           = regex{[0-9]{2}};
+//syntax Digit4           = regex{[0-9]{4}};
+//syntax ErrorUri         = LAQuot AbsoluteUri RAQuot (Semi GenericParam)*;
+//syntax From             = FromSpec;   // ("From" | "f")
+//syntax FromParam        = TagParam | GenericParam;
+//syntax TagParam         = "tag" Equal Token;
+//syntax InReplyTo        = CallId (Comma CallId)*;
+//syntax MIMEVersion      = Digit+ "." Digit+;
+//syntax Orgnization      = TextUTF8Trim?;
+//syntax Priority         = PriorityValue;
+//syntax PriorityValue    = "emergency" | "urgent" | "normal" | "non-urgent" | OtherPriority;
+//syntax OtherPriority    = Token;
+//syntax OtherChallenge   = AuthScheme LWS AuthParam (Comma AuthParam)*;
+//syntax DigestCln        = Realm | Domain | Nonce | Opaque | Stale | Algorithm | QOpOptions | AuthParam;
+//syntax AuthParam            = s1:regex{[^=]*} s2:"=" s3:(Token | QuotedString | "=") => (s1 + s2 + s3);
+//syntax Realm            = "realm" Equal RealmValue;
+//syntax RealmValue       = QuotedString;
+//syntax Domain           = "domain" Equal LDQuot Uri (SP+ Uri)* RDQuot;
+//syntax Nonce            = "nonce" Equal NonceValue;
+//syntax NonceValue       = QuotedString;
+//syntax Opaque           = "opaque" Equal QuotedString;
+//syntax Stale            = "stale" Equal ("true" | "false");
+//syntax Algorithm        = "algorithm" Equal ("MD5" | "MD5-sess" | Token);
+//syntax QOpOptions       = "qop" Equal LDQuot QOpValue ("," QOpValue)* RDQuot;
+//syntax QOpValue         = "auth" | "auth-int" | Token;
+//syntax ProxyAuthentication  = Credentials;
+//syntax ProxyRequire     = OptionTag (Comma OptionTag)*;
+//syntax OptionTag        = Token;
+//syntax RecRoute         = NameAddr (Semi RRParam)*;
+//syntax RRParam          = GenericParam;
+//syntax ReplyTo          = RplyToSpec;
+//syntax RplyToParam      = GenericParam;
+//syntax Require          = OptionTag (Comma OptionTag)*;
+//syntax RetryParam       = ("duration" Equal DeltaSeconds) | GenericParam;
+//syntax Route            = RouteParam (Comma RouteParam)*;
+//syntax RouteParam       = NameAddr (Semi RRParam)*;
+//syntax ServerVal        = Product | Comment;
+//syntax Product          = Token (Slash ProductVersion)?;
+//syntax ProductVersion   = Token;
+//syntax Subject          = TextUTF8Trim?;   // ("Subject" | "s")
+//syntax Supported        = (OptionTag (Comma OptionTag)*)?;
+//syntax TimeStamp        = Digit+ ("." Digit*)? (LWS Delay)?;
+//syntax Delay            = Digit* ("." Digit*)?;
+//syntax To               = (NameAddr | AddrSpec) (Semi ToParam)*;    // ("To" | "t")
+//syntax ToParam          = TagParam | GenericParam;
+//syntax UnSupported      = OptionTag (Comma OptionTag)*;
+//syntax UserAgent        = ServerVal (LWS ServerVal)*;
+//syntax ViaParams        = ViaTTL | ViaMAddr | ViaReceived | ViaBranch | ViaExtension;
+//syntax ViaTTL           = "ttl" Equal TTL;
+//syntax ViaMAddr         = "maddr" Equal Host;
+//syntax ViaReceived      = "received" Equal (IPv4Address | IPv6Address);
+//syntax ViaBranch        = "branch" Equal Token;
+//syntax ViaExtension     = GenericParam;
+//syntax SentProtocol     = ProtocolName Slash ProtocolVersion Slash Transport;
+//syntax ProtocolName     = "SIP" | Token;
+//syntax ProtocolVersion  = Token;
+//syntax Transport        = "UDP" | "TCP" | "TLS" | "SCTP" | OtherTransport;
+//syntax SentBy           = Host (Colon Port)?;
+
+//// rfc 3892
+//syntax ReferredBy       = ReferredUri (Semi (ReferredByIdParam | GenericParam))*;
+//syntax ReferredUri      = (NameAddr | AddrSpec);
+//syntax ReferredByIdParam    = "cid" Equal SipCleanMsgId;
+//syntax SipCleanMsgId    = LDQuot DotAtom "@" (DotAtom | Host)  RDQuot;
+//syntax DotAtom          = Atom ("." Atom)*;
+//syntax Atom             = (AlphaNum | regex{[-!%*_+'`~]})+;
+
+//// rfc 3903
+//syntax SipETag          = EntiltyTag;
+//syntax SipIfMatch       = EntiltyTag;
+//syntax EntiltyTag       = Token;
+
+//// rfc 6086
+//syntax InfoPacket       = InfoPacketType;
+//syntax RecvInfo         = InfoPacketList;
+//syntax InfoPacketList   = InfoPacketType (Comma InfoPacketType)*;
+//syntax InfoPacketType   = InfoPacketName (Semi InfoPacketName)*;
+//syntax InfoPacketName   = Token;
+//syntax InfoPacketParam  = GenericParam;
+//syntax ExtensionHeader  = HeaderName HColon HeaderValue;
+//syntax HeaderName       = Token;
+//syntax HeaderValue      = (TextUTF8Char | UTF8Cont | LWS)*;
+//syntax MessageBody      = HTTP.Octet*;
+//syntax LiteralString = s:regex{[\x00-\x7F]*} => s with StreamEncoding{Encoding = TextEncoding.ASCII};
+//syntax TextUTF8Trim   = TextUTF8Char* (LWS* TextUTF8Char)*;
+//syntax TextUTF8Char    = regex{[\x21-\x7E]} | UTF8NonAscii;

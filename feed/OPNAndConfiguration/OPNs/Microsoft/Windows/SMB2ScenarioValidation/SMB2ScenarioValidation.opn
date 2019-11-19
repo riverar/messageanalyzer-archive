@@ -1,0 +1,2231 @@
+protocol SMB2ScenarioValidation;
+
+using ScenarioValidationUtility;
+using SMB;
+using SMBTransport;
+using NBTSS;
+using SMB2;
+using Diagnostics;
+using ERREF;
+using Standard;
+using IANA;
+using DTYP;
+using Utility;
+using SRVS;
+
+// ---------------------------------------------My Sequence Validation--------------------------------------------- //
+ScenarioValidation validationForReceivingAnyMessage = new VerifyTheCreditChargeAndThePayloadSize(
+    new VerifyTheSignature(
+    new VerifyTheSequenceNumber(
+    new VerifyTheConnectionState(
+    new ReceivingAnyMessage(
+    new HandlingCompoundedRequests(
+    new UnhandledCase(
+    new EmptyScenarioValidation())))))));
+
+ScenarioValidation validationForOtherMessages = new SendingAnyOutgoingMessage(new VerifyTheTreeConnect(new VerifyTheSession(validationForReceivingAnyMessage)));
+ScenarioValidation validationForSMBNegotiate = new SendingAnyOutgoingMessage(new ReceivingAnSMBComNegotiate(validationForReceivingAnyMessage));
+ScenarioValidation validationForSMB2Negotiate = new SendingAnyOutgoingMessage(new ReceivingAnSMB2NegotiateRequest(validationForReceivingAnyMessage));
+ScenarioValidation validationForSMB2SessionSetup = new SendingAnyOutgoingMessage(new ReceivingAnSMB2SessionSetupRequest(validationForReceivingAnyMessage));
+ScenarioValidation validationForSMB2Logoff = new SendingAnyOutgoingMessage(new ReceivingAnSMB2LogoffRequest(new VerifyTheSession(validationForReceivingAnyMessage)));
+ScenarioValidation validationForSMB2TreeConnect = new SendingAnyOutgoingMessage(new ReceivingAnSMB2TreeConnectRequest(new VerifyTheSession(validationForReceivingAnyMessage)));
+ScenarioValidation validationForSMB2TreeDisconnect = new SendingAnyOutgoingMessage(new ReceivingAnSMB2TreeDisconnectRequest(new VerifyTheTreeConnect(new VerifyTheSession(validationForReceivingAnyMessage))));
+
+type UnhandledCase: ScenarioValidationDecorator
+{
+    UnhandledCase(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    static const set<uint> NotFullCoveredStatusForAnyMessage= {
+        STATUS_SERVER_UNAVAILABLE, // 3.3.4.4 Sending an Error Response
+        STATUS_FILE_NOT_AVAILABLE, // 3.3.4.4 Sending an Error Response
+        STATUS_SHARE_UNAVAILABLE, // 3.3.4.4 Sending an Error Response
+        STATUS_INSUFFICIENT_RESOURCES, // 3.3.4.2 Sending an Interim Response for an Asynchronous Operation
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForAnyMessage);
+    };
+}
+
+// 3.3.4.1 Sending Any Outgoing Message
+type SendingAnyOutgoingMessage: ScenarioValidationDecorator
+{
+    const uint MaxLength = 69632; // 68*1024
+    const set<ushort> commandSet = {SMB2.SMB2PacketHeaderCommand.SMB2Read, SMB2.SMB2PacketHeaderCommand.SMB2Write, SMB2.SMB2PacketHeaderCommand.SMB2Ioctl, SMB2.SMB2PacketHeaderCommand.SMB2QueryDirectory, SMB2.SMB2PacketHeaderCommand.SMB2QueryInfo, SMB2.SMB2PacketHeaderCommand.SMB2SetInfo};
+
+    SendingAnyOutgoingMessage(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert request != null && smb2Response != null && transportConnection != null && config != null;
+
+        LogLine(SMB2_SendingAnyOutgoingMessage);
+
+        var encryptData = config.EncryptData;
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            if (GetSMB2RequestFileID(smb2Request) is fileId:SMB2.SMB2Fileid)
+            {
+                if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+                {
+                    // TODO: open
+                }
+            }
+
+            if (smb2Response.Header.CreditCharge != smb2Request.Header.CreditCharge)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnyOutgoingMessage_1, null, null);
+            }
+
+            // 3.3.4.1.1 Signing the Message
+            var responseSessionId = smb2Response.Header.SessionId;
+            var responseTreeId = smb2Response.Header.TreeId;
+            bool shouldSignForThisResponse = false;
+            if (IsBitSetInFlag(smb2Request.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+            {
+                if (responseSessionId != 0)
+                {
+                    Session session = null;
+                    if (responseSessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys)
+                    {
+                        session = globalMap[transportConnection.ServerGuid].GlobalSessionTable[responseSessionId];
+                    }
+                    if (responseSessionId in transportConnection.SessionTable.Keys)
+                    {
+                        session = transportConnection.SessionTable[responseSessionId];
+                    }
+                    if (session != null)
+                    {
+                        if (responseTreeId == 0 && session.SigningRequired == true)
+                        {
+                            shouldSignForThisResponse = true;
+                            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || smb2Response.Header.Signature == $[00000000000000000000000000000000])
+                            {
+                                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnyOutgoingMessage_2, null, null);
+                            }
+                        }
+                        if (responseTreeId != 0 && session.SigningRequired == true && 
+                            (encryptData == 0 || globalMap[transportConnection.ServerGuid].EncryptData == false || IsBitNotSetInFlag(transportConnection.ClientCapabilities, SMB2NegotiateRequestCapabilities.SMB2GlobalCapEncryption)))
+                        {
+                            shouldSignForThisResponse = true;
+                            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || smb2Response.Header.Signature == $[00000000000000000000000000000000])
+                            {
+                                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnyOutgoingMessage_3, null, null);
+                            }
+                        }
+                    }
+                }
+
+                if (!IsAnInterimResponse(smb2Response))
+                {
+                    shouldSignForThisResponse = true;
+                    if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || smb2Response.Header.Signature == $[00000000000000000000000000000000])
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnyOutgoingMessage_4, null, null);
+                    }
+                }
+            }
+
+            if (!shouldSignForThisResponse && !IsFinalSessionSetupResponse(smb2Response) && IsBitSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnyOutgoingMessage_5, null, null);
+            }
+
+            if (IsAnInterimResponse(smb2Response))
+            {
+                return sendingAnInterimResponse.CheckAndUpdate(abstractDataModel, configs, msgs);
+            }
+            else if (smb2Response is errorRes:SMB2.Messages.ErrorResponse)
+            {
+                return sendingAnErrorResponse.CheckAndUpdate(abstractDataModel, configs, msgs);
+            }
+            else
+            {
+                return sendingASuccessResponse.CheckAndUpdate(abstractDataModel, configs, msgs);
+            }
+        }
+        return true;
+    }
+
+    bool IsFinalSessionSetupResponse(SMB2.SMB2Response smb2Response)
+    {
+        if (smb2Response is sessRes:SMB2.Messages.SessionSetupResponse && sessRes.Header.Status is err:ERREF.NTSTATUS && err.Value == STATUS_SUCCESS)
+        {
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+}
+
+// 3.3.4.2 Sending an Interim Response for an Asynchronous Operation
+ScenarioValidation sendingAnInterimResponse = new SendingAnInterimResponse(new EmptyScenarioValidation());
+type SendingAnInterimResponse: ScenarioValidationDecorator
+{
+    SendingAnInterimResponse(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert request != null && smb2Response != null && transportConnection != null && config != null;
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            LogLine(SMB2_SendingAnInterimResponse);
+
+            if (IsBitSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnInterimResponse_1, null, null);
+            }
+            
+            var req = transportConnection.RequestList[smb2Request.Header.MessageId];
+            transportConnection.AsyncCommandList[smb2Request.Header.MessageId] = smb2Request;
+            
+            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsServerToRedir))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnInterimResponse_2, null, null);
+            }
+
+            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnInterimResponse_3, null, null);
+            }
+            if (smb2Response.Header.AsyncId is asyncId:ulong && asyncId != 0)
+            {
+                req.AsyncId = asyncId;
+            }
+            else
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnInterimResponse_4, null, null);
+            }
+            if (smb2Response is err:SMB2.Messages.ErrorResponse && err.Response.ByteCount != 0)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnInterimResponse_5, null, null);
+            }
+        }
+        return true;
+    }
+}
+
+// 3.3.4.3 Sending a Success Response
+ScenarioValidation sendingASuccessResponse = new SendingASuccessResponse(new EmptyScenarioValidation());
+type SendingASuccessResponse: ScenarioValidationDecorator
+{
+    SendingASuccessResponse(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert request != null && smb2Response != null && transportConnection != null && config != null;
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            LogLine(SMB2_SendingASuccessResponse);
+            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsServerToRedir))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingASuccessResponse_1, null, null);
+            }
+            var req = transportConnection.RequestList[smb2Request.Header.MessageId];
+            if (req.AsyncId != 0)
+            {
+                if (!(smb2Response.Header.AsyncId is asyncId:ulong && asyncId == req.AsyncId && IsBitSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) && smb2Response.Header.Credit == 0))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingASuccessResponse_2, null, null);
+                }
+            }
+            transportConnection.RequestList = transportConnection.RequestList.Remove(smb2Request.Header.MessageId);
+        }
+        return true;
+    }
+}
+
+// 3.3.4.4 Sending an Error Response
+ScenarioValidation sendingAnErrorResponse = new SendingAnErrorResponse(new EmptyScenarioValidation());
+type SendingAnErrorResponse: ScenarioValidationDecorator
+{
+    SendingAnErrorResponse(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert request != null && smb2Response != null && transportConnection != null && config != null;
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            LogLine(SMB2_SendingAnErrorResponse);
+            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsServerToRedir))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnErrorResponse_1, null, null);
+            }
+            var req = transportConnection.RequestList[smb2Request.Header.MessageId];
+            if (req.AsyncId != 0)
+            {
+                if (!(smb2Response.Header.AsyncId is asyncId:ulong && asyncId == req.AsyncId && IsBitSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsAsyncCommand) && smb2Response.Header.Credit == 0))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_SendingAnErrorResponse_2, null, null);
+                }
+            }
+            transportConnection.RequestList = transportConnection.RequestList.Remove(smb2Request.Header.MessageId);
+        }
+        return true;
+    }
+}
+
+// 3.3.5.2 Receiving Any Message
+type ReceivingAnyMessage: ScenarioValidationDecorator
+{
+    const uint MaxLength = 69632; // 68*1024
+    const set<ushort> commandSet = {SMB2.SMB2PacketHeaderCommand.SMB2Read, SMB2.SMB2PacketHeaderCommand.SMB2Write, SMB2.SMB2PacketHeaderCommand.SMB2Ioctl, SMB2.SMB2PacketHeaderCommand.SMB2QueryDirectory, SMB2.SMB2PacketHeaderCommand.SMB2QueryInfo, SMB2.SMB2PacketHeaderCommand.SMB2SetInfo};
+
+    ReceivingAnyMessage(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && smb2Response != null && transportConnection != null;
+        LogLine(SMB2_ReceivingAnyMessage);
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            if (smb2Request is SMB2.Messages.CancelRequest)
+            {
+                return true;
+            }
+
+            transportConnection.RequestList[smb2Request.Header.MessageId] = new Request(smb2Request.Header.MessageId, 0);
+
+            var messageLength = GetSMB2MessageLength(smb2Request);
+            if (messageLength > transportConnection.MaxTransactSize + 256)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnyMessage_1, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+
+            // for compound request, the above process is done automatically, because we seperate them in SMB2
+            
+            if (!transportConnection.SupportsMultiCredit && messageLength > MaxLength)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnyMessage_2, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+
+            if (transportConnection.SupportsMultiCredit && !(smb2Request.Header.Command in commandSet) && messageLength > MaxLength)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnyMessage_3, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+// 3.3.5.2.2 Verifying the Connection State
+type VerifyTheConnectionState: ScenarioValidationDecorator
+{
+    VerifyTheConnectionState(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && response != null && transportConnection != null;
+        LogLine(SMB2_VerifyTheConnectionState);
+
+        if ((transportConnection.NegotiateDialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB2WildcardRevisionNumber || transportConnection.NegotiateDialect == SMB2InitialDialect)
+            && !(request is (SMB.Messages.ComNegotiateRequest | SMB2.Messages.NegotiateRequest)))
+        {
+            // check in Negotiate state, no other type request will be sent
+            SequenceValidationCheckFail(response, DiagnosisLevel.Error, SMB2_VerifyTheConnectionState_1, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        return true;
+    }
+}
+
+// 3.3.5.2.3 Verifying the Sequence Number
+type VerifyTheSequenceNumber: ScenarioValidationDecorator
+{
+    VerifyTheSequenceNumber(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && response != null && transportConnection != null;
+        LogLine(SMB2_VerifyTheSequenceNumber);
+
+        if (request is SMB2.Messages.CancelRequest)
+        {
+            return true;
+        }
+
+        // [startIndex, endIndex)
+        ulong startIndex = 0; // If the received request is an SMB_COM_NEGOTIATE, as described in section 1.7, the server MUST assume that MessageId is zero for this request.
+        ushort count = 1;
+        if (request is req:SMB2.SMB2Request)
+        {
+            startIndex = req.Header.MessageId;
+            if (transportConnection.SupportsMultiCredit && (req.Header.CreditCharge > 0))
+            {
+                count = req.Header.CreditCharge;
+            }
+            else
+            {
+                count = 1;
+            }
+        }
+        
+        // If the received request is an SMB_COM_NEGOTIATE, the server must assume that MessageId is zero for this request
+        if (!ValidateSequenceNumbers(ref transportConnection.CommandSequenceWindow, startIndex, count))
+        {
+            SequenceValidationCheckFail(response, DiagnosisLevel.Error, SMB2_VerifyTheSequenceNumber_1, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        else if (!IsAnInterimResponse(response))
+        {
+            // 3.3.1.1   Algorithm for Handling Available Message Sequence Numbers by the Server
+            RemoveSequenceNumbers(ref transportConnection, startIndex, count);
+        }
+        AddSequenceNumbers(ref transportConnection, response);
+        return true;
+    }
+
+    // Check if a set of sequence numbers are in the allowed sequence window (commandSequenceWindow), start from 'startIdx', size is 'count'.
+    bool ValidateSequenceNumbers(ref set<ulong> commandSequenceWindow, ulong startIdx, ushort count)
+    {
+        for (ulong i = 0; i < count; i++)
+        {
+            if (!((startIdx + i) in commandSequenceWindow))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Remove a set of sequence numbers from allowed sequence window (commandSequenceWindow), start from 'startIdx', size is 'count'.
+    void RemoveSequenceNumbers(ref TransportConnection transportConnection, ulong startIdx, ushort count)
+    {
+        for (ulong i = 0; i < count; i++)
+        {
+            transportConnection.CommandSequenceWindow[startIdx + i] = false;
+        }
+    }
+
+    // Extend the allowed sequence window (commandSequenceWindow) according to a response
+    void AddSequenceNumbers(ref TransportConnection transportConnection, SMB2.SMB2Response response)
+    {
+        for (uint i = 0; i < response.Header.Credit; i++)
+        {
+            transportConnection.currentMaxSequenceNumber = transportConnection.currentMaxSequenceNumber + 1;
+            transportConnection.CommandSequenceWindow[transportConnection.currentMaxSequenceNumber] = true;
+        }
+    }
+}
+
+// 3.3.5.2.4 Verifying the Signature
+type VerifyTheSignature: ScenarioValidationDecorator
+{
+    VerifyTheSignature(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && smb2Response != null && transportConnection != null;
+        LogLine(SMB2_VerifyTheSignature);
+
+        if (request is SMB2.Messages.CancelRequest)
+        {
+            return true;
+        }
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            ulong requestSessionId = GetSMB2RequestSessionID(smb2Request);
+            if (smb2Request is negReq:SMB2.Messages.NegotiateRequest)
+            {
+                if (IsBitSetInFlag(negReq.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER)) 
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSignature_1, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+            }
+            else if (IsBitSetInFlag(smb2Request.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+            {
+                Session session = null;
+                if (smb2Request is sessReq:SMB2.Messages.SessionSetupRequest && IsBitSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding))
+                {
+                    if (!(requestSessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys))
+                    {
+                        if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED)) 
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSignature_2, DiableValidationForTransportConnection, transportConnection);
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        session = globalMap[transportConnection.ServerGuid].GlobalSessionTable[requestSessionId];
+                    }
+                }
+                else
+                {
+                    if (!(requestSessionId in transportConnection.SessionTable.Keys))
+                    {
+                        if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED)) 
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSignature_3, DiableValidationForTransportConnection, transportConnection);
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        session = transportConnection.SessionTable[requestSessionId];
+                    }
+                }
+            }
+            else
+            {
+                if (requestSessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys && globalMap[transportConnection.ServerGuid].GlobalSessionTable[requestSessionId].SigningRequired == true)
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_ACCESS_DENIED)) 
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSignature_4, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForVerifyTheSignature = {
+        STATUS_NOT_SUPPORTED, // 3.3.5.2.4 Verifying the Signature
+        STATUS_ACCESS_DENIED, // 3.3.5.2.4 Verifying the Signature
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForVerifyTheSignature);
+    };
+}
+
+// 3.3.5.2.5 Verifying the Credit Charge and the Payload Size
+type VerifyTheCreditChargeAndThePayloadSize: ScenarioValidationDecorator
+{
+    const uint Kilobytes64 = 65536; // 64*1024
+
+    VerifyTheCreditChargeAndThePayloadSize(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && smb2Response != null && transportConnection != null;
+        LogLine(SMB2_VerifyTheCreditChargeAndThePayloadSize);
+
+        if (request is smb2Request:SMB2.SMB2Request && transportConnection.SupportsMultiCredit)
+        {
+            ulong payloadSize = GetSendPayloadSize(smb2Request);
+            if (smb2Request.Header.CreditCharge == 0)
+            {
+                if (((payloadSize > Kilobytes64) || (smb2Request is ioReq:SMB2.Messages.IoctlRequest && ioReq.Request.MaxOutputResponse > Kilobytes64)))
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheCreditChargeAndThePayloadSize_1, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+            }
+            else
+            {
+                ulong expectedCreditCharge = 0;
+                if (smb2Request is ioReq:SMB2.Messages.IoctlRequest && payloadSize < ioReq.Request.MaxOutputResponse)
+                {
+                    expectedCreditCharge = (ioReq.Request.MaxOutputResponse - 1) / Kilobytes64 + 1;
+                }
+                else
+                {
+                    expectedCreditCharge = (payloadSize > 0) ? ((payloadSize - 1) / Kilobytes64 + 1) : 0;
+                }
+                if (expectedCreditCharge > smb2Request.Header.CreditCharge)
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheCreditChargeAndThePayloadSize_2, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+}
+
+ulong GetSendPayloadSize(SMB2.SMB2Request smb2Request)
+{
+    ulong sendPayloadSize = 0;
+
+    switch (smb2Request.Header.Command)
+    {
+        case SMB2.SMB2PacketHeaderCommand.SMB2Negotiate =>
+            sendPayloadSize = (GetSMB2MessageLength(smb2Request) - smb2Request.Header.StructureSize - (smb2Request as SMB2.Messages.NegotiateRequest).Request.StructureSize) as ulong;
+        case SMB2.SMB2PacketHeaderCommand.SMB2SessionSetup =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.SessionSetupRequest).Request.SecurityBufferLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2TreeConnect =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.TreeConnectRequest).Request.PathLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Create =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.CreateRequest).Request.CreateContextsLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Read =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.ReadRequest).Request.ReadChannelInfoLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Write =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.WriteRequest).Request.Length;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Lock =>
+            sendPayloadSize = ((smb2Request as SMB2.Messages.LockRequest).Request.LockCount * 24) as ulong;
+        case SMB2.SMB2PacketHeaderCommand.SMB2Ioctl =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.IoctlRequest).Request.InputCount;
+        case SMB2.SMB2PacketHeaderCommand.SMB2QueryDirectory =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.QueryDirectoryRequest).Request.FileNameLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2QueryInfo =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.QueryInfoRequest).Request.InputBufferLength;
+        case SMB2.SMB2PacketHeaderCommand.SMB2SetInfo =>
+            sendPayloadSize = (smb2Request as SMB2.Messages.SetInfoRequest).Request.BufferLength;
+        default =>;
+    }
+    return sendPayloadSize;
+}
+
+// 3.3.5.2.7 Handling Compounded Requests
+type HandlingCompoundedRequests: ScenarioValidationDecorator
+{
+    HandlingCompoundedRequests(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        assert request != null && smb2Response != null && transportConnection != null;
+        LogLine(SMB2_HandlingCompoundedRequests);
+
+        if (request is smb2Request:SMB2.SMB2Request && !IsAnInterimResponse(smb2Response))
+        {
+            if (smb2Request#IsCompounded is cmp:bool && cmp)
+            {
+                uint messageNumber = smb2Request.CompoundedMessageNumber() as uint;
+
+                // possible case for SMB2.SMB2PacketHeaderFlags.SMB2FlagsRelatedOperations, only the last frame's HeaderNextCommand == 0
+                // Invalid case 1:   11111
+                // Related case 2:   01111
+                // Unrelated case 3: 00000
+                // Invalid case 4:   01101
+                // Mixed case 5:     00011
+
+                // Windows-based SMB2 servers allow a mix of related and unrelated compound requests in the same transport send. Upon encountering a request with SMB2_FLAGS_RELATED_OPERATIONS not set, a Windows-based SMB2 server treats it as the start of a chain.
+                if (IsBitNotSetInFlag(smb2Request.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsRelatedOperations))
+                {
+                    // Invalid case 4:   011(0)1
+                    if (messageNumber in transportConnection.CompoundedRelatedMessageNumber)
+                    {
+                        if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingCompoundedRequests_1, DiableValidationForTransportConnection, transportConnection);
+                        }
+                        else
+                        {
+                            DiableValidationForTransportConnection(transportConnection);
+                        }
+                        return false;
+                    }
+
+                    if (messageNumber in transportConnection.PreviousCompoundedMessageResponse.Keys)
+                    {
+                        // Unrelated case 3: 0(0000)
+                        // Mixed case 5:     (000)11
+                        transportConnection.PreviousCompoundedMessageResponse = transportConnection.PreviousCompoundedMessageResponse.Remove(messageNumber);
+                        transportConnection.PreviousCompoundedMessageRequest = transportConnection.PreviousCompoundedMessageRequest.Remove(messageNumber);
+                    }
+                }
+
+                // the first compounded request of Compounded Related Requests or all reqeust of Compounded Unrelated Requests
+                if (!(messageNumber in transportConnection.PreviousCompoundedMessageResponse.Keys)) 
+                {
+                    if (IsBitSetInFlag(smb2Request.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsRelatedOperations)) 
+                    {
+                        // Invalid case 1:   11111
+                        if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingCompoundedRequests_2, DiableValidationForTransportConnection, transportConnection);
+                        }
+                        else
+                        {
+                            DiableValidationForTransportConnection(transportConnection);
+                        }
+                        return false;
+                    }
+                    // Related case 2:   (0)1111
+                    // Unrelated case 3: 00000
+                    // Mixed case 5:     (000)11
+                    transportConnection.PreviousCompoundedMessageResponse[messageNumber] = smb2Response;
+                    transportConnection.PreviousCompoundedMessageRequest[messageNumber] = smb2Request;
+                }
+                else // the following compounded request of Compounded Related Requests
+                {
+                    // Related case 2:   0(1111)
+                    // Mixed case 5:     000(11)
+                    transportConnection.CompoundedRelatedMessageNumber[messageNumber] = true;
+                    SMB2.SMB2Response preSMB2Response = transportConnection.PreviousCompoundedMessageResponse[messageNumber];
+                    if (preSMB2Response is errRes:SMB2.Messages.ErrorResponse && errRes.Header.Status is errStatus:ERREF.NTSTATUS)
+                    {
+                        if (!(IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER) || IsErrorResponseWithSpecailStatusCode(smb2Response, errStatus.Value)))
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingCompoundedRequests_3, DiableValidationForTransportConnection, transportConnection);
+                        }
+                        else
+                        {
+                            SetIDsForCompoundedRequest(ref smb2Request, transportConnection.PreviousCompoundedMessageRequest[messageNumber], preSMB2Response);
+                            transportConnection.PreviousCompoundedMessageResponse[messageNumber] = smb2Response;
+                            transportConnection.PreviousCompoundedMessageRequest[messageNumber] = smb2Request;
+                        }
+                        return false;
+                    }
+                    else
+                    {
+                        SetIDsForCompoundedRequest(ref smb2Request, transportConnection.PreviousCompoundedMessageRequest[messageNumber], preSMB2Response);
+                        transportConnection.PreviousCompoundedMessageResponse[messageNumber] = smb2Response;
+                        transportConnection.PreviousCompoundedMessageRequest[messageNumber] = smb2Request;
+                    }
+
+                    if (smb2Request.Header.NextCommand == 0) // the last compounded request of Compounded Related Requests
+                    {
+                        // Related case 2:   0111(1)
+                        transportConnection.PreviousCompoundedMessageResponse = transportConnection.PreviousCompoundedMessageResponse.Remove(messageNumber);
+                        transportConnection.PreviousCompoundedMessageRequest = transportConnection.PreviousCompoundedMessageRequest.Remove(messageNumber);
+                        transportConnection.CompoundedRelatedMessageNumber[messageNumber] = false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+}
+
+// 3.3.5.2.9 Verifying the Session
+type VerifyTheSession: ScenarioValidationDecorator
+{
+    VerifyTheSession(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var request = msgs[0] as any message;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert request != null && smb2Response != null && transportConnection != null && config != null;
+        LogLine(SMB2_VerifyTheSession);
+
+        if (request is smb2Request:SMB2.SMB2Request)
+        {
+            if (transportConnection.ConstrainedConnection)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSession_1, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+
+            ulong requestSessionId = GetSMB2RequestSessionID(smb2Request);
+            if (!(requestSessionId in transportConnection.SessionTable.Keys))
+            {
+                if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED)) 
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheSession_2, DiableValidationForTransportConnection, transportConnection);
+                }
+                return false;
+            }
+            else
+            {
+                // NotFullCoveredStatusForVerifyTheSession.STATUS_NETWORK_SESSION_EXPIRED
+                // NotFullCoveredStatusForVerifyTheSession.implementation-specific error code
+                // NotFullCoveredStatusForVerifyTheSession.STATUS_ACCESS_DENIED
+                if (IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED)) 
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((smb2Response.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForVerifyTheSession = {
+        STATUS_NETWORK_SESSION_EXPIRED,
+        0x80090302, // implementation-specific error code
+        STATUS_ACCESS_DENIED,
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForVerifyTheSession);
+    };
+}
+
+// 3.3.5.2.11 Verifying the Tree Connect
+type VerifyTheTreeConnect: ScenarioValidationDecorator
+{
+    VerifyTheTreeConnect(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        var smb2Request = msgs[0] as SMB2.SMB2Request;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert smb2Request != null && smb2Response != null && transportConnection != null && config != null;
+        LogLine(SMB2_VerifyTheTreeConnect);
+
+        if (GetSMB2RequestTreeID(smb2Request) is requestTreeid:uint)
+        {
+            ulong requestSessionId = GetSMB2RequestSessionID(smb2Request);
+            var session = transportConnection.SessionTable[requestSessionId];
+            int rejectUnencryptedAccess = config.RejectUnencryptedAccess;
+            int encryptData = config.EncryptData;
+            if (!(requestTreeid in session.TreeConnectTable.Keys))
+            {
+                if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_NETWORK_NAME_DELETED)) 
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheTreeConnect_1, DiableValidationForTransportConnection, transportConnection);
+                }
+                return false;
+            }
+            else if (IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_NETWORK_NAME_DELETED)) 
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_VerifyTheTreeConnect_2, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+            else
+            {
+                // NotFullCoveredStatusForVerifyTheTreeConnect.STATUS_ACCESS_DENIED
+            }
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForVerifyTheTreeConnect = {
+        STATUS_ACCESS_DENIED,
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForVerifyTheTreeConnect);
+    };
+}
+
+// 3.3.5.3 Receiving an SMB_COM_NEGOTIATE 
+type ReceivingAnSMBComNegotiate : ScenarioValidationDecorator
+{
+    ReceivingAnSMBComNegotiate(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert configs.Count > 0;
+        assert msgs.Count >= 2;
+
+        var comNegReq = msgs[0] as SMB.Messages.ComNegotiateRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert comNegReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2Negotiate && transportConnection != null && config != null;
+        LogLine(SMB2_ReceivingAnSMBComNegotiate);
+    
+        if (transportConnection.NegotiateDialect != SMB2InitialDialect)
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_1, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+
+        if (smb2Response is SMB2.Messages.ErrorResponse)
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_2, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+
+        var res = smb2Response as SMB2.Messages.NegotiateResponse;
+        int requireMessageSigning = config.RequireMessageSigning;
+        int isDfsCapable = config.IsDfsCapable;
+        // If DialectRevision is 0x02FF, we assume the server support SMB 2.1 or SMB 3.0.
+        // 3.3.5.3.1   SMB 2.1 or SMB 3.0 Support
+        if (res.Response.DialectRevision == SMB2.SMB2NegotiateResponseDialectRevision.SMB2WildcardRevisionNumber && CheckSMBDialect(comNegReq, "SMB 2.???"))
+        {
+            if (transportConnection.ServerPort == IANA.Port.SMB)
+            {
+                transportConnection.SupportsMultiCredit = true;
+            }
+
+            if (IsBitNotSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningEnabled))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_3, null, null);
+            }
+            
+            if (requireMessageSigning == 1 && IsBitNotSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_4, null, null);
+            }
+            
+            if (requireMessageSigning == -1 && IsBitSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+            {
+                globalMap[transportConnection.ServerGuid].RequireMessageSigning = true;
+            }
+            globalMap[transportConnection.ServerGuid].ServerGuid = res.Response.ServerGuid;
+
+            if (isDfsCapable == 1 && IsBitNotSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_40, null, null);
+            }
+
+            if (isDfsCapable == -1 && IsBitSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+            {
+                globalMap[transportConnection.ServerGuid].IsDfsCapable = true;
+            }
+
+            if (IsBitSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapLeasing))
+            {
+                globalMap[transportConnection.ServerGuid].IsLeaseCapable = true;
+            }
+
+            if (transportConnection.SupportsMultiCredit && IsBitNotSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapLargeMtu))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_41, null, null);
+            }
+
+            transportConnection.MaxTransactSize = res.Response.MaxTransactSize;
+            transportConnection.MaxReadSize = res.Response.MaxReadSize;
+            transportConnection.MaxWriteSize = res.Response.MaxWriteSize;
+            globalMap[transportConnection.ServerGuid].ServerStartTime = res.Response.ServerStartTime;
+            transportConnection.NegotiateDialect = res.Response.DialectRevision;
+        }
+        // 3.3.5.3.2   SMB 2.002 Support
+        else
+        {
+            if (!CheckSMBDialect(comNegReq, "SMB 2.002"))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_5, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+            else
+            {
+                if (IsBitNotSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningEnabled))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_6, null, null);
+                }
+                if (requireMessageSigning == 1 && IsBitNotSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_7, null, null);
+                }
+
+                if (requireMessageSigning == -1 && IsBitSetInFlag(res.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+                {
+                    globalMap[transportConnection.ServerGuid].RequireMessageSigning = true;
+                }
+
+                if (res.Response.DialectRevision != SMB2.SMB2NegotiateResponseDialectRevision.SMB2002DialectRevisionNumber)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_8, DiableValidationForTransportConnection, transportConnection);
+                    return false;
+                }
+                globalMap[transportConnection.ServerGuid].ServerGuid = res.Response.ServerGuid;
+
+                if (isDfsCapable == 1 && IsBitNotSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_9, null, null);
+                }
+                if (isDfsCapable == -1 && IsBitSetInFlag(res.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+                {
+                    globalMap[transportConnection.ServerGuid].IsDfsCapable = true;
+                }
+
+                transportConnection.MaxTransactSize = res.Response.MaxTransactSize;
+                transportConnection.MaxReadSize = res.Response.MaxReadSize;
+                transportConnection.MaxWriteSize = res.Response.MaxWriteSize;
+                globalMap[transportConnection.ServerGuid].ServerStartTime = res.Response.ServerStartTime;
+
+                transportConnection.Dialect = SMB2.SMB2NegotiateResponseDialectRevision.SMB2002DialectRevisionNumber;
+                transportConnection.NegotiateDialect = SMB2.SMB2NegotiateResponseDialectRevision.SMB2002DialectRevisionNumber;
+                transportConnection.SupportsMultiCredit = false;
+            }
+        }
+        return true;
+    }
+
+    // Check if a SMB.Messages.ComNegotiateRequest message contains a Dialect string
+    bool CheckSMBDialect(SMB.Messages.ComNegotiateRequest req, string dialectStr)
+    {
+        if (some (var dialect in req.Request.Dialects) dialect.DialectString == dialectStr)
+        {
+            return true;
+        }
+        return false;
+    }
+}
+
+// 3.3.5.4 Receiving an SMB2 NEGOTIATE Request
+const set<ushort> SMB2SupportDialects = {0x0202, 0x0210, 0x0300, 0x0302, 0x0311};
+type ReceivingAnSMB2NegotiateRequest : ScenarioValidationDecorator
+{
+    ReceivingAnSMB2NegotiateRequest(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var negReq = msgs[0] as SMB2.Messages.NegotiateRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert negReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2Negotiate && transportConnection != null && config != null;
+        SMB2.Messages.ErrorResponse errRes = null;
+        SMB2.Messages.NegotiateResponse negRes = null;
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+        if (smb2Response is res:SMB2.Messages.NegotiateResponse)
+        {
+            negRes = res;
+        }
+
+        LogLine(SMB2_ReceivingAnSMB2NegotiateRequest);
+
+        int requireMessageSigning = config.RequireMessageSigning;
+        int isMultiChannelCapable = config.IsMultiChannelCapable;
+        int isDirectoryLeasingCapable = config.IsDirectoryLeasingCapable;
+        int isPersistentHandleCapable = config.IsPersistentHandleCapable;
+        int isEncryptionCapable = config.IsEncryptionCapable;
+        int isDfsCapable = config.IsDfsCapable;
+        ushort serverMaxDialect = DialectStringToUShort(config.ServerMaxDialect);
+
+        // 3.3.5.4   Receiving an SMB2 NEGOTIATE Request
+        if (transportConnection.NegotiateDialect in SMB2SupportDialects)
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_1, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        transportConnection.ClientCapabilities = negReq.Request.Capabilities;
+
+        // If DialectRevision >= 0x0300, we assume the server support SMB 3.x dialect family
+        if (InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect) || (negRes != null && InRange<SMB2.SMB3xDialectFamily>(negRes.Response.DialectRevision)))
+        {
+            transportConnection.ClientSecurityMode = negReq.Request.SecurityMode;
+        }
+        if ((serverMaxDialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB21DialectRevisionNumber || InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect)) || 
+            (negRes != null && (negRes.Response.DialectRevision == SMB2.SMB2NegotiateResponseDialectRevision.SMB21DialectRevisionNumber || InRange<SMB2.SMB3xDialectFamily>(negRes.Response.DialectRevision))))
+        {
+            transportConnection.ClientGuid = negReq.Request.ClientGuid;
+        }
+
+        if (IsBitSetInFlag(negReq.Request.SecurityMode, SMB2.SMB2NegotiateRequestSecurityMode.SMB2NegotiateSigningRequired))
+        {
+            transportConnection.ShouldSign = true;
+        }
+
+        if (negReq.Request.DialectCount == 0)
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_2, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+
+        // NotFullCoveredStatusForNegotiate.STATUS_NOT_SUPPORTED
+        if (negRes != null)
+        {
+            // Because we can't know if the server implements a dialect, so loosen restrictions of the following rule: 
+            // The server must select the greatest common dialect between the dialects it implements and the Dialects array of the SMB2 NEGOTIATE request.
+            if (!(negRes.Response.DialectRevision in negReq.Request.Dialects))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_3, DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+
+             if ((serverMaxDialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber) || 
+                (negRes != null && (negRes.Response.DialectRevision == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber)))
+            {
+                transportConnection.ClientDialects = negReq.Request.Dialects;
+            }
+            transportConnection.Dialect = negRes.Response.DialectRevision;
+            transportConnection.NegotiateDialect = negRes.Response.DialectRevision;
+
+            int encryptionCapabilitiesNumber = 0;
+            if (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber && negReq.Request.NegotiateContextList is contextList:array<SMB2NegotiateContext>)
+            {
+                int preauthIntegrityCapabilitiesContextNumber = 0;
+                foreach (var context in contextList)
+                {
+                    if (context.ContextType == SMB2NegotiateContextContextType.SMB2_PREAUTH_INTEGRITY_CAPABILITIES && context.Data is SMB2PreauthIntegrityCapabilities)
+                    {
+                        preauthIntegrityCapabilitiesContextNumber++;
+                    }
+                    if (context.ContextType == SMB2NegotiateContextContextType.SMB2_ENCRYPTION_CAPABILITIES && context.Data is SMB2EncryptionCapabilities)
+                    {
+                        encryptionCapabilitiesNumber++;
+                    }
+                }
+
+                if (preauthIntegrityCapabilitiesContextNumber != 1)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_4, DiableValidationForTransportConnection, transportConnection);
+                    return false;
+                }
+                // NotFullCoveredStatusForNegotiate.STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP 
+                if (encryptionCapabilitiesNumber > 1)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_5, DiableValidationForTransportConnection, transportConnection);
+                    return false;
+                }
+            }
+
+            if ((InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) || transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB21DialectRevisionNumber) && transportConnection.ServerPort == IANA.Port.SMB)
+            {
+                transportConnection.SupportsMultiCredit = true;
+            }
+
+            if (IsBitNotSetInFlag(negRes.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningEnabled))
+            {
+                SequenceValidationCheckFail(negRes, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_6, null, null);
+            }
+
+            if (requireMessageSigning == 1 && IsBitNotSetInFlag(negRes.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+            {
+                SequenceValidationCheckFail(negRes, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_7, null, null);
+            }
+
+            if (requireMessageSigning == -1 && IsBitSetInFlag(negRes.Response.SecurityMode, SMB2.SMB2NegotiateResponseSecurityMode.SMB2NegotiateSigningRequired))
+            {
+                globalMap[transportConnection.ServerGuid].RequireMessageSigning = true;
+            }
+
+            globalMap[transportConnection.ServerGuid].ServerGuid = negRes.Response.ServerGuid;
+
+            if (isDfsCapable == 1 && IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMBComNegotiate_9, null, null);
+            }
+            if (isDfsCapable == -1 && IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDfs))
+            {
+                globalMap[transportConnection.ServerGuid].IsDfsCapable = true;
+            }
+            if (IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapLeasing))
+            {
+                globalMap[transportConnection.ServerGuid].IsLeaseCapable = true;
+            }
+
+            if (transportConnection.SupportsMultiCredit &&
+                IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapLargeMtu))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_8, null, null);
+            }
+
+            if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && (isMultiChannelCapable == 1) &&
+                IsBitSetInFlag(negReq.Request.Capabilities, SMB2.SMB2NegotiateRequestCapabilities.SMB2GlobalCapMultiChannel) &&
+                IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapMultiChannel))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_9, null, null);
+            }
+            if (isMultiChannelCapable == -1 &&
+                IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapMultiChannel))
+            {
+                globalMap[transportConnection.ServerGuid].IsMultiChannelCapable = true;
+            }
+
+            if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && (isDirectoryLeasingCapable == 1) &&
+                IsBitSetInFlag(negReq.Request.Capabilities, SMB2.SMB2NegotiateRequestCapabilities.SMB2GlobalCapDirectoryLeasing) &&
+                IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDirectoryLeasing))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_10, null, null);
+            }
+            if (isDirectoryLeasingCapable == -1 &&
+                IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapDirectoryLeasing))
+            {
+                globalMap[transportConnection.ServerGuid].IsDirectoryLeasingCapable = true;
+            }
+
+            if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && (isPersistentHandleCapable == 1) &&
+                IsBitSetInFlag(negReq.Request.Capabilities, SMB2.SMB2NegotiateRequestCapabilities.SMB2GlobalCapPersistentHandles) &&
+                IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapPersistentHandles))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_11, null, null);
+            }
+            if (isPersistentHandleCapable == -1 &&
+                IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapPersistentHandles))
+            {
+                globalMap[transportConnection.ServerGuid].IsPersistentHandleCapable = true;
+            }
+
+            if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && (isEncryptionCapable == 1) &&
+                IsBitSetInFlag(negReq.Request.Capabilities, SMB2.SMB2NegotiateRequestCapabilities.SMB2GlobalCapEncryption) &&
+                IsBitNotSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapEncryption))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_11, null, null);
+            }
+            if (isEncryptionCapable == -1 &&
+                IsBitSetInFlag(negRes.Response.Capabilities, SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapEncryption))
+            {
+                globalMap[transportConnection.ServerGuid].IsEncryptionCapable = true;
+            }
+
+            transportConnection.MaxTransactSize = negRes.Response.MaxTransactSize;
+            transportConnection.MaxReadSize = negRes.Response.MaxReadSize;
+            transportConnection.MaxWriteSize = negRes.Response.MaxWriteSize;
+            globalMap[transportConnection.ServerGuid].ServerStartTime = negRes.Response.ServerStartTime;
+
+            if (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber)
+            {
+                if (negRes.Response.NegotiateContextCount is count:USHORT && count == 0)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_12, null, null);
+                }
+                else if (negRes.Response.NegotiateContextList is list:array<SMB2NegotiateContext>)
+                {
+                    array<SMB2NegotiateContext> preauthResponseList = list.Filter<SMB2NegotiateContext>((SMB2NegotiateContext x) => (x.ContextType == SMB2NegotiateContextContextType.SMB2_PREAUTH_INTEGRITY_CAPABILITIES));
+
+                    if (preauthResponseList.Count == 0 || !(preauthResponseList[0].Data is preauth:SMB2PreauthIntegrityCapabilities) || preauth.HashAlgorithmCount != 1)
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_14, null, null);
+                    }
+                    else
+                    {
+                        transportConnection.PreauthIntegrityHashId = preauth.HashAlgorithms[0];
+                    }
+
+                    if (encryptionCapabilitiesNumber > 0)
+                    {
+                        array<SMB2NegotiateContext> encryptionResponseList = list.Filter<SMB2NegotiateContext>((SMB2NegotiateContext x) => (x.ContextType == SMB2NegotiateContextContextType.SMB2_ENCRYPTION_CAPABILITIES));
+                        if (encryptionResponseList.Count == 0 || !(encryptionResponseList[0].Data is ency:SMB2EncryptionCapabilities) || ency.CipherCount != 1)
+                        {
+                            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2NegotiateRequest_15, null, null);
+                        }
+                        else
+                        {
+                            transportConnection.CipherId = ency.Ciphers[0];
+                        }
+                    }
+                }
+            }
+
+            if (InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect) || InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+            {
+                // for dialect upper than SMB3.0
+                transportConnection.ServerSecurityMode = negRes.Response.SecurityMode;
+                transportConnection.ServerCapabilities = negRes.Response.Capabilities;
+            }
+
+            if (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber)
+            {
+                if (transportConnection.CipherId != 0)
+                {
+                    transportConnection.ServerSecurityMode = transportConnection.ServerSecurityMode | SMB2.SMB2NegotiateResponseCapabilities.SMB2GlobalCapEncryption;
+                }
+            }
+        }
+        else
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((errRes.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForNegotiate = {
+        STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP,
+        STATUS_NOT_SUPPORTED,
+        // <2> Section 2.2.1.1: If SessionId is not equal to zero, Windows 8, Windows Server 2012, Windows 8.1, Windows Server 2012 R2, Windows 10, and Windows Server 2016 Technical Preview fail the SMB2 NEGOTIATE request with STATUS_USER_SESSION_DELETED.
+        STATUS_USER_SESSION_DELETED, 
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForNegotiate);
+    };
+}
+
+// 3.3.5.5 Receiving an SMB2 SESION_SETUP Request
+ScenarioValidation handlingGSSAPIAuthentication = new HandlingGSSAPIAuthentication(new EmptyScenarioValidation());
+ScenarioValidation authenticatingANewSession = new AuthenticatingANewSession(new EmptyScenarioValidation());
+ScenarioValidation verifyTheSignature = new VerifyTheSignature(new EmptyScenarioValidation());
+
+type ReceivingAnSMB2SessionSetupRequest: ScenarioValidationDecorator
+{
+    ReceivingAnSMB2SessionSetupRequest(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var sessReq = msgs[0] as SMB2.Messages.SessionSetupRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert sessReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2SessionSetup && transportConnection != null && config != null;
+        SMB2.Messages.ErrorResponse errRes = null;
+        SMB2.Messages.SessionSetupResponse sessRes = null;
+
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+        if (smb2Response is res:SMB2.Messages.SessionSetupResponse)
+        {
+            sessRes = res;
+        }
+
+        LogLine(SMB2_ReceivingAnSMB2SessionSetupRequest);
+
+        ushort serverMaxDialect = DialectStringToUShort(config.ServerMaxDialect);
+        int encryptData = config.EncryptData;
+        int rejectUnencryptedAccess = config.RejectUnencryptedAccess;
+        int isMultiChannelCapable = config.IsMultiChannelCapable;
+
+        if (InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect) && !InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect)
+            && encryptData == 1 && rejectUnencryptedAccess == 1)
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_ACCESS_DENIED))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_1, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+        
+        if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect)
+            && encryptData == 1 && rejectUnencryptedAccess == 1 && IsBitSetInFlag(transportConnection.ClientCapabilities, SMB2NegotiateRequestCapabilities.SMB2GlobalCapEncryption))
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_ACCESS_DENIED))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_2, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+        ulong requestSessionId = GetSMB2RequestSessionID(sessReq);
+        if (requestSessionId == 0)
+        {
+            return authenticatingANewSession.CheckAndUpdate(abstractDataModel, configs, msgs);
+        }
+        else if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && (isMultiChannelCapable == 1 || globalMap[transportConnection.ServerGuid].IsMultiChannelCapable == true) && 
+            IsBitSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding))
+        {
+            if (!(requestSessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys))
+            {
+                if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED))
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_3, DiableValidationForTransportConnection, transportConnection);
+                }
+                return false;
+            }
+            else
+            {
+                Session session = globalMap[transportConnection.ServerGuid].GlobalSessionTable[requestSessionId];
+                assert session.Connection != null;
+                if (transportConnection.Dialect != session.Connection.Dialect)
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_4, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+                if (IsBitNotSetInFlag(sessReq.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned))
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_INVALID_PARAMETER))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_5, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+                // NotFullCoveredStatusForSessionSetup.STATUS_REQUEST_NOT_ACCEPTED
+                // NotFullCoveredStatusForSessionSetup.STATUS_NETWORK_SESSION_EXPIRED
+                if (session.IsAnonymous || session.IsGuest)
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_NOT_SUPPORTED))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_6, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+
+                if (requestSessionId in transportConnection.SessionTable.Keys)
+                {
+                    if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_REQUEST_NOT_ACCEPTED))
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_7, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    return false;
+                }
+
+                if (verifyTheSignature.CheckAndUpdate(abstractDataModel, configs, msgs) is false)
+                {
+                    return false;
+                }
+                
+                // NotFullCoveredStatusForSessionSetup.STATUS_NOT_SUPPORTED
+
+                if (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber)
+                {
+                    if (!(requestSessionId in transportConnection.PreauthSessionTable.Keys))
+                    {
+                        transportConnection.PreauthSessionTable[requestSessionId] = new PreauthSession{SessionId = requestSessionId};
+                    }
+                }
+
+                // No Session.State, can't check for Step 5, 6
+                // Step 7
+                return handlingGSSAPIAuthentication.CheckAndUpdate(abstractDataModel + [session], configs, msgs);
+            }
+        }
+        // NotFullCoveredStatusForSessionSetup.STATUS_REQUEST_NOT_ACCEPTED
+        else if (InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect) && 
+            (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB2002DialectRevisionNumber || transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB21DialectRevisionNumber || isMultiChannelCapable == 0) && IsBitSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding))
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_REQUEST_NOT_ACCEPTED))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_8, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+        else if (!(requestSessionId in transportConnection.SessionTable.Keys))
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2SessionSetupRequest_9, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+        else
+        {
+            Session session = transportConnection.SessionTable[requestSessionId];
+            // No Session.State, can't check for Step 5, 6
+            // Step 7
+            return handlingGSSAPIAuthentication.CheckAndUpdate(abstractDataModel + [session], configs, msgs);
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForSessionSetup = {
+        STATUS_REQUEST_NOT_ACCEPTED,
+        STATUS_NETWORK_SESSION_EXPIRED,
+        STATUS_NOT_SUPPORTED, 
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForSessionSetup);
+    };
+}
+
+// 3.3.5.5.1 Authenticating a New Session
+type AuthenticatingANewSession: ScenarioValidationDecorator
+{
+    AuthenticatingANewSession(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+        var sessReq = msgs[0] as SMB2.Messages.SessionSetupRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert sessReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2SessionSetup && transportConnection != null && config != null;
+
+        LogLine(SMB2_AuthenticatingANewSession);
+        int encryptData = config.EncryptData;
+        if (smb2Response.Header.SessionId != 0)
+        {
+            Session session = new Session();
+            session.SessionId = smb2Response.Header.SessionId;
+            session.Connection = transportConnection;
+            if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+            {
+                if (encryptData == 1)
+                {
+                    session.EncryptData = true;
+                }
+                else if (encryptData == 0)
+                {
+                    session.EncryptData = false;
+                }
+            }
+
+            globalMap[transportConnection.ServerGuid].GlobalSessionTable[session.SessionId] = session;
+            transportConnection.SessionTable[session.SessionId] = session;
+
+            return handlingGSSAPIAuthentication.CheckAndUpdate(abstractDataModel + [session], configs, msgs);
+        }
+        else
+        {
+            return false;
+        }
+        return true;
+    }
+}
+
+// 3.3.5.5.2 Reauthenticating an Existing Session
+// No Session.State, can't check for this section
+type ReauthenticatingAnExistingSession: ScenarioValidationDecorator
+{
+    ReauthenticatingAnExistingSession(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        return true;
+    }
+}
+
+// 3.3.5.5.3 Handling GSS-API Authentication
+type HandlingGSSAPIAuthentication: ScenarioValidationDecorator
+{
+    HandlingGSSAPIAuthentication(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count >= 2;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+        var sessReq = msgs[0] as SMB2.Messages.SessionSetupRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var session = (abstractDataModel[1] as Session);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+
+        assert sessReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2SessionSetup && transportConnection != null && session != null && config != null;
+        LogLine(SMB2_HandlingGSSAPIAuthentication);
+
+        SMB2.Messages.ErrorResponse errRes = null;
+        SMB2.Messages.SessionSetupResponse sessRes = null;
+
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+        if (smb2Response is res:SMB2.Messages.SessionSetupResponse)
+        {
+            sessRes = res;
+        }
+        var encryptData = config.EncryptData;
+        var requireMessageSigning = config.RequireMessageSigning;
+        // If the authentication protocol indicates an error, 
+        // the server MUST fail the session setup request with the error received by placing the 32-bit NTSTATUS code received into the Status field of the SMB2 header. 
+        if (errRes != null && errRes.Header.Status is errStatus1:ERREF.NTSTATUS && errStatus1.Value in GSSAPIError)
+        {
+            ServerApplicationRequestsClosingASession(abstractDataModel, configs, msgs);
+            return false;
+        }
+        else
+        {
+            if (IsBitNotSetInFlag(smb2Response.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsServerToRedir))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_1, null, null);
+            }
+
+            if (sessRes != null && sessRes.Header.Status is errStatus2:ERREF.NTSTATUS && errStatus2.Value == STATUS_MORE_PROCESSING_REQUIRED) // more processing required
+            {
+                if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && IsBitSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding))
+                {
+                    if (IsBitNotSetInFlag(sessRes.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || sessRes.Header.Signature == $[00000000000000000000000000000000])
+                    {
+                        SequenceValidationCheckFail(sessRes, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_6, null, null);
+                    }
+                }
+            }
+            else if (IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_USER_SESSION_DELETED) is deleteError:bool || (sessRes != null && sessRes.Header.Status is errStatus3:ERREF.NTSTATUS && errStatus3.Value == STATUS_SUCCESS)) // the final message 
+            {
+                array<TransportConnection> connects = globalMap[transportConnection.ServerGuid].ConnectionList.Values.Filter<TransportConnection>((TransportConnection x) => (x.ClientGuid == session.Connection.ClientGuid && x.Dialect != session.Connection.Dialect));
+                if (connects.Count > 0)
+                {
+                    if (!deleteError)
+                    {
+                        SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_2, DiableValidationForTransportConnection, transportConnection);
+                    }
+                    ServerApplicationRequestsClosingASession(abstractDataModel, configs, msgs);
+                    return false;
+                }
+                else if (deleteError)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_21, DiableValidationForTransportConnection, transportConnection);
+                    return false;
+                }
+                // success
+                else
+                {
+                    if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+                    {
+                        transportConnection.SessionTable[session.SessionId] = session; // for session binding
+                    }
+
+                    if (session.ChannelList.Filter<Channel>((Channel x) => (x.Connection.ConnectionEndpointAddress == transportConnection.ConnectionEndpointAddress)).Count == 0)
+                    {
+                        session.ChannelList = session.ChannelList + [new Channel{Connection = transportConnection}];
+                    }
+
+                    if (transportConnection.ClientCapabilities == 0)
+                    {
+                        transportConnection.ClientCapabilities = sessReq.Request.Capabilities;
+                    }
+
+                    if (IsBitSetInFlag(sessRes.Response.SessionFlags, SMB2.SMB2SessionSetupResponseSessionFlags.SMB2SessionFlagIsNull))
+                    {
+                        session.IsAnonymous = true;
+                    }
+                    if (IsBitSetInFlag(sessRes.Response.SessionFlags, SMB2.SMB2SessionSetupResponseSessionFlags.SMB2SessionFlagIsGuest))
+                    {
+                        session.IsGuest = true;
+                    }
+                    if (session.IsAnonymous == false)
+                    {
+                        transportConnection.ConstrainedConnection = false;
+                    }
+                    
+                    if (IsBitSetInFlag(sessReq.Request.SecurityMode, SMB2.SMB2SessionSetupRequestSecurityMode.SMB2NegotiateSigningRequired) ||
+                        (IsBitNotSetInFlag(sessRes.Response.SessionFlags, SMB2.SMB2SessionSetupResponseSessionFlags.SMB2SessionFlagIsGuest) && session.IsAnonymous == false && (transportConnection.ShouldSign == true || requireMessageSigning == 1 || globalMap[transportConnection.ServerGuid].RequireMessageSigning == true)))
+                    {
+                        session.SigningRequired = true;
+                    }
+
+                    if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && IsBitNotSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding))
+                    {
+                        if (session.SessionId in transportConnection.PreauthSessionTable.Keys)
+                        {
+                            transportConnection.PreauthSessionTable = transportConnection.PreauthSessionTable.Remove(session.SessionId);
+                        }
+                    }
+
+                    if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+                    {
+                        if (encryptData == 1)
+                        {
+                            if (IsBitNotSetInFlag(sessRes.Response.SessionFlags, SMB2.SMB2SessionSetupResponseSessionFlags.SMB2SessionFlagEncryptData))
+                            {
+                                SequenceValidationCheckFail(sessRes, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_3, null, null);
+                            }
+                            session.SigningRequired = false;
+                        }
+                        if (encryptData == -1 && IsBitSetInFlag(sessRes.Response.SessionFlags, SMB2.SMB2SessionSetupResponseSessionFlags.SMB2SessionFlagEncryptData))
+                        {
+                            globalMap[transportConnection.ServerGuid].EncryptData = true;
+                            session.SigningRequired = false;
+                        }
+                    }
+                    // If Connection.Dialect is "3.1.1" or Session.SigningRequired is TRUE, the server MUST sign the final session setup response using Session.SigningKey before sending it to the client
+                    if ((transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber || session.SigningRequired) && sessRes.Header.Status is err1:ERREF.NTSTATUS && err1.Value == STATUS_SUCCESS) 
+                    {
+                        if (IsBitNotSetInFlag(sessRes.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || sessRes.Header.Signature == $[00000000000000000000000000000000])
+                        {
+                            SequenceValidationCheckFail(sessRes, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_4, null, null);
+                        }
+                    }
+                    else if ((transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB30DialectRevisionNumber || transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB302DialectRevisionNumber) && IsBitSetInFlag(sessReq.Request.Flags, SMB2.SMB2SessionSetupRequestFlags.SMB2SessionFlagBinding) && sessRes.Header.Status is err2:ERREF.NTSTATUS && err2.Value == STATUS_SUCCESS) 
+                    {
+                        if (IsBitNotSetInFlag(sessRes.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || sessRes.Header.Signature == $[00000000000000000000000000000000])
+                        {
+                            SequenceValidationCheckFail(sessRes, DiagnosisLevel.Error, SMB2_HandlingGSSAPIAuthentication_5, null, null);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((errRes.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+                return false;
+            }
+        }
+        
+        return true;
+    }
+}
+
+const set<uint> GSSAPIError = 
+{
+    0xC0000388, // -> "STATUS_DOWNGRADE_DETECTED",
+    0xC000005F, // -> "STATUS_NO_SUCH_LOGON_SESSION",
+    0x80090322, // -> "SEC_E_WRONG_PRINCIPAL",
+    0xC0000064, // -> "STATUS_NO_SUCH_USER",
+    0xC0000072, // -> "STATUS_ACCOUNT_DISABLED",
+    0xC000006E, // -> "STATUS_ACCOUNT_RESTRICTION",
+    0xC0000234, // -> "STATUS_ACCOUNT_LOCKED_OUT",
+    0xC000006A, // -> "STATUS_WRONG_PASSWORD",
+    0xC0000380, // -> "STATUS_SMARTCARD_WRONG_PIN",
+    0xC0000193, // -> "STATUS_ACCOUNT_EXPIRED",
+    0xC0000071, // -> "STATUS_PASSWORD_EXPIRED",
+    0xC000006F, // -> "STATUS_INVALID_LOGON_HOURS",
+    0xC0000070, // -> "STATUS_INVALID_WORKSTATION",
+    0xC0000224, // -> "STATUS_PASSWORD_MUST_CHANGE",
+    0xC000015B, // -> "STATUS_LOGON_TYPE_NOT_GRANTED",
+    0xC000006C, // -> "STATUS_PASSWORD_RESTRICTION",
+    0xC000038F, // -> "STATUS_SMARTCARD_SILENT_CONTEXT",
+    0xC0000383, // -> "STATUS_SMARTCARD_NO_CARD",
+    0xC0000381, // -> "STATUS_SMARTCARD_CARD_BLOCKED",
+    0xC0000320, // -> "STATUS_PKINIT_FAILURE",
+    0xC000038C, // -> "STATUS_PKINIT_CLIENT_FAILURE",
+    0xC00002F9, // -> "STATUS_PKINIT_NAME_MISMATCH",
+    0xC0000192, // -> "STATUS_NETLOGON_NOT_STARTED",
+    0xC0000233, // -> "STATUS_DOMAIN_CONTROLLER_NOT_FOUND",
+    0xC00000DF, // -> "STATUS_NO_SUCH_DOMAIN",
+    0xC00000BE, // -> "STATUS_BAD_NETWORK_PATH",
+    0xC0000190, // -> "STATUS_TRUST_FAILURE",
+    0xC000018D, // -> "STATUS_TRUSTED_RELATIONSHIP_FAILURE",
+    0xC000023C, // -> "STATUS_NETWORK_UNREACHABLE",
+    0x80090308, // -> "SEC_E_INVALID_TOKEN",
+    0x80090311, // -> "SEC_E_NO_AUTHENTICATING_AUTHORITY",
+    0x8009030E, // -> "SEC_E_NO_CREDENTIALS",
+    0xC00000E5, // -> "STATUS_INTERNAL_ERROR",
+    0xC0000017, // -> "STATUS_NO_MEMORY",
+    0x80090306, // -> "SEC_E_NOT_OWNER",
+    0x80090349, // -> "SEC_E_CERT_WRONG_USAGE",
+    0x8009033E, // -> "SEC_E_SMARTCARD_LOGON_REQUIRED",
+    0x8009033F, // -> "SEC_E_SHUTDOWN_IN_PROGRESS",
+    0xC000006D, // -> "STATUS_LOGON_FAILURE",
+};
+
+// 3.3.4.12 Server Application Requests Closing a Session
+void ServerApplicationRequestsClosingASession(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+{
+    var transportConnection = (abstractDataModel[0] as TransportConnection);
+    var session = (abstractDataModel[1] as Session);
+
+    globalMap[transportConnection.ServerGuid].GlobalSessionTable = globalMap[transportConnection.ServerGuid].GlobalSessionTable.Remove(session.SessionId);
+    transportConnection.SessionTable = transportConnection.SessionTable.Remove(session.SessionId);
+    if (session.SessionId in transportConnection.PreauthSessionTable.Keys)
+    {
+        transportConnection.PreauthSessionTable = transportConnection.PreauthSessionTable.Remove(session.SessionId);
+    }
+    session.OpenTable = {}; // TODO: open and treeconnect
+    session.TreeConnectTable = {};
+}
+
+// 3.3.5.6 Receiving an SMB2 LOGOFF Request
+type ReceivingAnSMB2LogoffRequest : ScenarioValidationDecorator
+{
+    ReceivingAnSMB2LogoffRequest(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var smb2Request = msgs[0] as SMB2.SMB2Request;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert smb2Request != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2Logoff && transportConnection != null && config != null;
+        LogLine(SMB2_ReceivingAnSMB2LogoffRequest);
+        SMB2.Messages.ErrorResponse errRes = null;
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+
+        ulong requestSessionId = GetSMB2RequestSessionID(smb2Request);
+        var session = transportConnection.SessionTable[requestSessionId];
+        if (requestSessionId in globalMap[transportConnection.ServerGuid].GlobalSessionTable.Keys)
+        {
+            globalMap[transportConnection.ServerGuid].GlobalSessionTable = globalMap[transportConnection.ServerGuid].GlobalSessionTable.Remove(requestSessionId);
+        }
+        if (requestSessionId in transportConnection.SessionTable.Keys)
+        {
+            transportConnection.SessionTable = transportConnection.SessionTable.Remove(requestSessionId);
+        }
+
+        // TODO: open and treeConnect
+        session.TreeConnectTable = {};
+        if (InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+        {
+            foreach (var channel in session.ChannelList)
+            {
+                if (requestSessionId in channel.Connection.SessionTable.Keys)
+                {
+                    channel.Connection.SessionTable = channel.Connection.SessionTable.Remove(requestSessionId);
+                }
+            }
+            session.ChannelList = [];
+        }
+        
+        if (!(smb2Response.Header.Status is errStatus:ERREF.NTSTATUS && errStatus.Value == STATUS_SUCCESS))
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((errRes.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        return true;
+    }
+}
+
+// 3.3.5.7 Receiving an SMB2 TREE_CONNECT Request
+type ReceivingAnSMB2TreeConnectRequest : ScenarioValidationDecorator
+{
+    ReceivingAnSMB2TreeConnectRequest(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var treeConnectReq = msgs[0] as SMB2.Messages.TreeConnectRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert treeConnectReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2TreeConnect && transportConnection != null && config != null;
+        LogLine(SMB2_ReceivingAnSMB2TreeConnectRequest);
+        SMB2.Messages.ErrorResponse errRes = null;
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+
+        Share share = null;
+        string index = null;
+        UNC unc = null;
+        if (UNCSyntax(treeConnectReq.Request.GetPathName()) is temp:UNC)
+        {
+            unc = temp;
+            index = unc.HostName + unc.ShareName;
+            if (index in globalMap[transportConnection.ServerGuid].ShareList.Keys)
+            {
+                share = globalMap[transportConnection.ServerGuid].ShareList[index];
+            }
+        }
+        if (unc == null)
+        {
+            ThrowDecodingException("SMB2", "hostname and sharename");
+        }
+        ulong requestSessionId = GetSMB2RequestSessionID(treeConnectReq);
+        var session = transportConnection.SessionTable[requestSessionId];
+        if (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber && !session.IsAnonymous && !session.IsGuest && (IsBitNotSetInFlag(treeConnectReq.Header.Flags, SMB2.SMB2PacketHeaderFlags.SMB2FlagsSigned) || treeConnectReq.Header.Signature == $[00000000000000000000000000000000]))
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_1, DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        // NotFullCoveredStatusForTreeConnect.STATUS_INVALID_PARAMETER
+        // NotFullCoveredStatusForTreeConnect.STATUS_BAD_NETWORK_NAME
+        // NotFullCoveredStatusForTreeConnect.STATUS_SMB_BAD_CLUSTER_DIALECT
+        ushort serverMaxDialect = DialectStringToUShort(config.ServerMaxDialect);
+        int encryptData = config.EncryptData;
+        int rejectUnencryptedAccess = config.RejectUnencryptedAccess;
+        string serverHashLevel = config.ServerHashLevel;
+
+        if ((InRange<SMB2.SMB3xDialectFamily>(serverMaxDialect) || InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect)) &&
+            (encryptData == 1 || (share != null && share.EncryptData == true)) &&
+            rejectUnencryptedAccess == 1 && IsBitNotSetInFlag(transportConnection.ServerCapabilities, SMB2NegotiateRequestCapabilities.SMB2GlobalCapEncryption))
+        {
+            if (!IsErrorResponseWithSpecailStatusCode(smb2Response, STATUS_ACCESS_DENIED))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_2, DiableValidationForTransportConnection, transportConnection);
+            }
+            return false;
+        }
+        // NotFullCoveredStatusForTreeConnect.STATUS_ACCESS_DENIED
+        // NotFullCoveredStatusForTreeConnect.STATUS_REQUEST_NOT_ACCEPTED
+
+        if (smb2Response is treeConnectRes:SMB2.Messages.TreeConnectResponse)
+        {
+            var treeConnect = new TreeConnect{TreeId = treeConnectRes.Header.TreeId as uint, Session = session};
+            bool isAShareInShareList = true;
+            if (share == null)
+            {
+                isAShareInShareList = false;
+                if (unc != null && index != null)
+                {
+                    share = new Share{ServerName = unc.HostName, Name = unc.ShareName, Index = index};
+                }
+                else
+                {
+                    share = new Share();
+                }
+            }
+
+            if (isAShareInShareList && share.CscFlags != null && treeConnectRes.Response.ShareFlags.SMB2ShareflagCaching != share.CscFlags)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_3, null, null);
+            }
+            if (share.CscFlags == null)
+            {
+                share.CscFlags = treeConnectRes.Response.ShareFlags.SMB2ShareflagCaching;
+            }
+
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagDfs && share.IsDfs == null)
+            {
+                share.IsDfs = true;
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagDfsRoot && share.IsDfs == null)
+            {
+                share.IsDfs = true;
+            }
+                
+            if (isAShareInShareList && share.DoAccessBasedDirectoryEnumeration == true && (serverHashLevel == "HashEnableAll" || serverHashLevel == "HashEnableShare") && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagAccessBasedDirectoryEnum)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_4, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagAccessBasedDirectoryEnum && share.DoAccessBasedDirectoryEnumeration == null)
+            {
+                share.DoAccessBasedDirectoryEnumeration = true;
+            }
+
+            if (isAShareInShareList && share.AllowNamespaceCaching == true && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagAllowNamespaceCaching)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_5, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagAllowNamespaceCaching && share.AllowNamespaceCaching == null)
+            {
+                share.AllowNamespaceCaching = true;
+            }
+
+            if (isAShareInShareList && share.ForceSharedDelete == true && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagForceSharedDelete)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_6, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagForceSharedDelete && share.ForceSharedDelete == null)
+            {
+                share.ForceSharedDelete = true;
+            }
+
+            if (isAShareInShareList && share.RestrictExclusiveOpens == true && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagRestrictExclusiveOpens)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_7, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagRestrictExclusiveOpens && share.RestrictExclusiveOpens == null)
+            {
+                share.RestrictExclusiveOpens = true;
+            }
+
+            if (isAShareInShareList && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.EncryptData == true && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagEncryptData)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_8, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagEncryptData && share.EncryptData == null && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+            {
+                share.EncryptData = true;
+            }
+
+            if (isAShareInShareList && !InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.HashEnabled == true && 
+                (serverHashLevel == "HashEnableAll" || serverHashLevel == "HashEnableShare") && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagEnableHashV1)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_9, null, null);
+            }
+            if (!InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.HashEnabled == null && 
+            treeConnectRes.Response.ShareFlags.SMB2ShareflagEnableHashV1)
+            {
+                share.HashEnabled = true;
+            }
+
+            if (isAShareInShareList && share.ForceLevel2Oplock == true && 
+                !treeConnectRes.Response.ShareFlags.SMB2ShareflagForceLeveliiOplock)
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_10, null, null);
+            }
+            if (treeConnectRes.Response.ShareFlags.SMB2ShareflagForceLeveliiOplock && share.ForceLevel2Oplock == null)
+            {
+                share.ForceLevel2Oplock = true;
+            }
+
+            if (isAShareInShareList && share.Type != null)
+            {
+                if ((share.Type & 0x000000FF) == SRVS.ShareTypes.STYPE_IPC && 
+                    treeConnectRes.Response.ShareType != SMB2.SMB2TreeConnectResponseShareType.SMB2ShareTypePipe)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_11, null, null);
+                }
+                if ((share.Type & 0x000000FF) == SRVS.ShareTypes.STYPE_PRINTQ && 
+                    treeConnectRes.Response.ShareType != SMB2.SMB2TreeConnectResponseShareType.SMB2ShareTypeprint)
+                {
+                    SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_12, null, null);
+                }
+            }
+            if (share.Type == null)
+            {
+                if (treeConnectRes.Response.ShareType == SMB2.SMB2TreeConnectResponseShareType.SMB2ShareTypePipe)
+                    share.Type = SRVS.ShareTypes.STYPE_IPC;
+                if (treeConnectRes.Response.ShareType == SMB2.SMB2TreeConnectResponseShareType.SMB2ShareTypeprint)
+                    share.Type = SRVS.ShareTypes.STYPE_PRINTQ;
+            }
+
+            if (isAShareInShareList && share.IsDfs == true && 
+                IsBitNotSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_DFS))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_13, null, null);
+            }
+            if (IsBitSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_DFS) && share.IsDfs == null)
+            {
+                share.IsDfs = true;
+            }
+
+            if (isAShareInShareList && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.IsCA == true &&
+                IsBitNotSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_14, null, null);
+            }
+            if (IsBitSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_CONTINUOUS_AVAILABILITY) && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.IsCA == null)
+            {
+                share.IsCA = true;
+            }
+
+            if (isAShareInShareList && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.Type != null &&
+                IsBitSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_SOFS) &&
+                IsBitNotSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_SCALEOUT))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_15, null, null);
+            }
+            if (IsBitSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_SCALEOUT) && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect))
+            {
+                if (share.Type == null)
+                    share.Type = SRVS.ShareTypes.STYPE_CLUSTER_SOFS;
+                else if (IsBitNotSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_SOFS))
+                    share.Type = share.Type | SRVS.ShareTypes.STYPE_CLUSTER_SOFS;
+            }
+
+            if (isAShareInShareList && InRange<SMB2.SMB3xDialectFamily>(transportConnection.Dialect) && share.Type != null &&
+                (IsBitSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_FS) || IsBitSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_SOFS) || IsBitSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_DFS)) &&
+                IsBitNotSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_CLUSTER))
+            {
+                SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, SMB2_ReceivingAnSMB2TreeConnectRequest_16, null, null);
+            }
+
+            if (IsBitSetInFlag(treeConnectRes.Response.Capabilities, SMB2.SMB2TreeConnectResponseCapabilities.SMB2_SHARE_CAP_ASYMMETRIC) && (transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB311DialectRevisionNumber || transportConnection.Dialect == SMB2.SMB2NegotiateResponseDialectRevision.SMB302DialectRevisionNumber))
+            {
+                if (share.Type == null)
+                    share.Type = SRVS.ShareTypes.STYPE_CLUSTER_SOFS;
+                else if (IsBitNotSetInFlag(share.Type as uint, SRVS.ShareTypes.STYPE_CLUSTER_SOFS))
+                    share.Type = share.Type | SRVS.ShareTypes.STYPE_CLUSTER_SOFS;
+            }
+
+            treeConnect.MaximalAccess = treeConnectRes.Response.MaximalAccess;
+            // NOTCOVERED: cann't guess for SRVS.ShareTypes.STYPE_DISKTREE, SRVS.ShareTypes.STYPE_DEVICE, SRVS.ShareTypes.STYPE_CLUSTER_FS, SRVS.ShareTypes.STYPE_CLUSTER_DFS
+
+            if (index != null && !(index in globalMap[transportConnection.ServerGuid].ShareList.Keys))
+            {
+                globalMap[transportConnection.ServerGuid].ShareList[index] = share;
+            }
+            treeConnect.Share = share;
+            session.TreeConnectTable[treeConnectRes.Header.TreeId as uint] = treeConnect;
+        }
+        else
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((errRes.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        return true;
+    }
+
+    static const set<uint> NotFullCoveredStatusForTreeConnect = {
+        STATUS_INVALID_PARAMETER,
+        STATUS_BAD_NETWORK_NAME,
+        STATUS_SMB_BAD_CLUSTER_DIALECT,
+        STATUS_ACCESS_DENIED,
+        STATUS_REQUEST_NOT_ACCEPTED,
+    };
+
+    override bool IsUnattainableCase(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert msgs.Count >= 2;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        return IsErrorResponseWithSpecailStatusCode(smb2Response, NotFullCoveredStatusForTreeConnect);
+    };
+}
+
+// 3.3.5.8 Receiving an SMB2 TREE_DISCONNECT Request
+type ReceivingAnSMB2TreeDisconnectRequest : ScenarioValidationDecorator
+{
+    ReceivingAnSMB2TreeDisconnectRequest(ScenarioValidation validation)
+    {
+        base.ScenarioValidationDecorator(validation);
+    }
+
+    override bool MyCheckAndUpdate(array<any> abstractDataModel, array<any> configs, array<any message> msgs)
+    {
+        assert abstractDataModel.Count > 0;
+        assert msgs.Count >= 2;
+        assert configs.Count > 0;
+
+        var treeDisconnectReq = msgs[0] as SMB2.Messages.TreeDisconnectRequest;
+        var smb2Response = msgs[1] as SMB2.SMB2Response;
+        var transportConnection = (abstractDataModel[0] as TransportConnection);
+        var config = (configs[0] as SMBScenarioValidationConfiguration);
+        assert treeDisconnectReq != null && smb2Response != null && smb2Response.Header.Command == SMB2.SMB2PacketHeaderCommand.SMB2TreeDisconnect && transportConnection != null && config != null;
+        LogLine(SMB2_ReceivingAnSMB2TreeDisconnectRequest);
+        SMB2.Messages.ErrorResponse errRes = null;
+        if (smb2Response is err:SMB2.Messages.ErrorResponse)
+        {
+            errRes = err;
+        }
+
+        ulong requestSessionId = GetSMB2RequestSessionID(treeDisconnectReq);
+        var session = transportConnection.SessionTable[requestSessionId];
+        if (GetSMB2RequestTreeID(treeDisconnectReq) is requestTreeid:uint)
+        {
+            if (requestTreeid in session.TreeConnectTable.Keys)
+            {
+                session.TreeConnectTable = session.TreeConnectTable.Remove(requestTreeid);
+            }
+        }
+
+        if (smb2Response is treeDisconnectRes:SMB2.Messages.TreeDisconnectResponse)
+        {
+        }
+        else
+        {
+            SequenceValidationCheckFail(smb2Response, DiagnosisLevel.Error, Format(SMB2_WrongStatusCode, [SMB2.SmbCmdMapToMessageName[smb2Response.Header.Command], NtStatusValuesToText((errRes.Header.Status as ERREF.NTSTATUS).Value)]), DiableValidationForTransportConnection, transportConnection);
+            return false;
+        }
+        return true;
+    }
+}

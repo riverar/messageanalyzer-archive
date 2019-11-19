@@ -1,0 +1,349 @@
+protocol DDP with BinaryEncodingDefaults {Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Direct Data Placement over Reliable Transports",
+    ShortName = "DDP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 5041"},
+            new Reference{Name = "RFC 5043"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "366681", Date = "07/24/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using SCTP;
+using MPA;
+
+endpoint Server issues mutable Segment  accepts mutable Segment;
+endpoint ReassemblyNode issues Segment accepts Segment
+{
+    array<Segment> tagedSgments = [];
+    map<uint,array<Segment>> unTaggedSgments= {};
+    
+    process this accepts s:Segment
+    {
+        ReassembleSegment(s, ref tagedSgments, ref unTaggedSgments);
+    }
+    
+    process this issues s:Segment
+    {
+        ReassembleSegment(s, ref tagedSgments, ref unTaggedSgments);
+    }
+}
+endpoint MediaDDP accepts DDPSegmentChunkMsg issues DDPSegmentChunkMsg
+                  accepts DDPStreamSessionControlMsg issues DDPStreamSessionControlMsg;
+
+autostart actor DDPOverMPA(MPA.Node node)
+{    
+    process node accepts fpdu:MPA.Fpdu where (fpdu.Ulpdu[0] & 0x3D) == 1
+    {
+        switch (fpdu.Ulpdu)
+        {
+            case d:DDP.Segment from BinaryDecoder<DDP.Segment> =>
+                dispatch (endpoint DDP.ReassemblyNode over node) accepts d;
+            default => ThrowDecodingException("DDP Segment from MPA ULPDU");
+        }
+    }
+    
+    process node issues fpdu:MPA.Fpdu where (fpdu.Ulpdu[0] & 0x3D) == 1
+    {
+        switch (fpdu.Ulpdu)
+        {
+            case d:DDP.Segment from BinaryDecoder<DDP.Segment> =>
+                dispatch (endpoint DDP.ReassemblyNode over node) issues d;
+            default => ThrowDecodingException("DDP Segment from MPA ULPDU");
+        }
+    }
+}
+
+autostart actor DDPOverMedia(DDP.MediaDDP node)
+{
+    process node accepts m:DDP.DDPSegmentChunkMsg where (m.DDPSegmentData[0]& 0x3D) == 1
+    {
+        switch (m.DDPSegmentData)
+        {
+            case d:DDP.Segment from BinaryDecoder<DDP.Segment> =>
+                dispatch (endpoint DDP.ReassemblyNode over node) accepts d;
+             default => ThrowDecodingException("DDP Segment");
+        }
+    }
+    
+    process node issues m:DDP.DDPSegmentChunkMsg where (m.DDPSegmentData[0]& 0x3D) == 1
+    {
+        switch (m.DDPSegmentData)
+        {
+            case d:DDP.Segment from BinaryDecoder<DDP.Segment> =>
+                dispatch (endpoint DDP.ReassemblyNode over node) issues d;
+             default => ThrowDecodingException("DDP Segment");
+        }
+    }
+}
+
+const set<uint> ProtocolIdentifier = {16, 17};
+
+/**********************************************RFC 5043 5.2 Payload Data Chunks  Message & Types **********************************************/
+autostart actor DDPMediaOverSCTP(SCTP.Server node)
+{   
+    process node accepts p:SCTP.Packet where !(p#SctpPayloadProtocolIdentifier is nothing) && (p#SctpPayloadProtocolIdentifier as uint) in ProtocolIdentifier
+    {
+        DecodeAndParseFromSctp(p, node, true);
+    } 
+    
+    process node issues p:SCTP.Packet where !(p#SctpPayloadProtocolIdentifier is nothing) && (p#SctpPayloadProtocolIdentifier as uint) in ProtocolIdentifier
+    {
+        DecodeAndParseFromSctp(p, node, false);
+    }     
+}
+
+void DecodeAndParseFromSctp(SCTP.Packet p, SCTP.Server node, bool isAccepts)
+{
+    for (int i = 0; i < p.Chunks.Count; i++)
+    {
+        if (p.Chunks[i] is PayloadData)
+        {
+            PayloadData plData = p.Chunks[i] as PayloadData;
+            if (plData.PayloadProtocolIdentifier == 16)
+            {
+                switch (plData.UserData)
+                {
+                    case ddpOne:DDP.DDPSegmentChunkMsg from BinaryDecoder<DDP.DDPSegmentChunkMsg> =>
+                    if (isAccepts)
+                    {
+                        dispatch (endpoint DDP.MediaDDP over node) accepts ddpOne;
+                    }
+                    else
+                    {
+                        dispatch (endpoint DDP.MediaDDP over node) issues ddpOne;
+                    }
+                    default => ThrowDecodingException("DDP Segment Chunk");
+                }
+            }
+            else if (plData.PayloadProtocolIdentifier == 17)
+            {
+                switch (plData.UserData)
+                {
+                    case ddpTwo:DDP.DDPStreamSessionControlMsg from BinaryDecoder<DDP.DDPStreamSessionControlMsg> =>
+                    if (isAccepts)
+                    {
+                        dispatch (endpoint DDP.MediaDDP over node) accepts ddpTwo;
+                    }
+                    else
+                    {
+                        dispatch (endpoint DDP.MediaDDP over node) issues ddpTwo;
+                    }
+                    default => ThrowDecodingException("DDP Stream Session Control");
+                }
+            }
+        }
+    }
+}
+
+autostart actor ReassemblyNodeActor(ReassemblyNode reassemblyNode)
+{
+    // destructor
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        // array<Segment> tagedSgments
+        if (reassemblyNode.tagedSgments.Count > 0)
+        {
+            foreach (var segment in reassemblyNode.tagedSgments) // segment type is Segment
+            {
+                ReportInsufficientData(segment, DiagnosisLevel.Error, "DDP: Insufficient fragments for full reassembly.");
+                DisplayTopLevelMessage(segment);
+            }
+            reassemblyNode.tagedSgments = [];
+        }
+        
+        // map<uint,array<Segment>> unTaggedSgments
+        if ((reassemblyNode.unTaggedSgments.Values).Count > 0)
+        {
+            foreach (var segments in reassemblyNode.unTaggedSgments.Values) // segments type is array<Segment>
+            {
+                foreach (var s in segments)
+                {
+                    ReportInsufficientData(s, DiagnosisLevel.Error, "DDP: Insufficient fragments for full reassembly.");
+                    DisplayTopLevelMessage(s);
+                }
+            }
+            reassemblyNode.unTaggedSgments = {};
+        }
+    }
+}
+
+message DDPSegmentChunkMsg
+{
+    ushort DDPSSN;
+    binary DDPSegmentData;   
+    
+    override string ToString()
+    {
+        return "DDP Segment Chunk";
+    }
+}
+
+message DDPStreamSessionControlMsg
+{
+    ushort DDPSSN;
+    ushort FunctionCode;
+    binary PrivateData;
+    
+    override string ToString()
+    {
+        switch (FunctionCode)
+        {
+            case 1 => return "DDP Stream Session Initiate.";
+            case 2 => return "DDP Stream Session Accept.";
+            case 3 => return "DDP Stream Session Reject.";
+            case 4 => return "DDP Stream Session Terminate.";
+            default => return "Not Defined Message.";
+        }       
+    }
+}
+/**********************************************RFC 5043 5.2 Payload Data Chunks  Message & Types **********************************************/
+
+message Segment
+{
+    ((UntaggedBufferModel where !value.T) | (TaggedBufferModel where value.T)) BufferModel;
+        
+    binary Payload;
+    
+    override string ToString()
+    {
+        return (BufferModel is UntaggedBufferModel) ? "DDP Untagged Buffer Model" : "DDP Tagged Buffer Model";
+    }
+}
+
+type TaggedBufferModel
+{
+    bool T with BinaryEncoding{Width = 1}; 
+    bool L with BinaryEncoding{Width = 1};
+    byte Rsvd with BinaryEncoding{Width = 4}; 
+    byte DV with BinaryEncoding{Width = 2};    
+    RsvdULPType RsvdULP with BinaryEncoding{WidthForComposedType = 8};
+    uint STag;
+    ulong TO;
+        
+    invariant T == true;
+    invariant Rsvd ==  0;
+    invariant DV == 1; 
+}
+
+type UntaggedBufferModel
+{
+    bool T with BinaryEncoding{Width = 1}; 
+    bool L with BinaryEncoding{Width = 1};
+    byte Rsvd with BinaryEncoding{Width = 4}; 
+    byte DV with BinaryEncoding{Width = 2};    
+    RsvdULPType RsvdULP with BinaryEncoding{WidthForComposedType = 40};
+    uint QN;
+    uint MSN;
+    uint MO;   
+     
+    invariant T == false;
+    invariant Rsvd ==  0;
+    invariant DV == 1;
+}
+
+type RsvdULPType
+{
+    binary Value;
+}
+
+void ReassembleSegment(Segment d, ref array<Segment> tagedSgments, ref map<uint,array<Segment>> unTaggedSgments)
+{ 
+    if (d.BufferModel is UntaggedBufferModel)
+    {
+        UntaggedBufferModel unTag = d.BufferModel as UntaggedBufferModel;
+        if (!unTag.L)
+        {
+            if (unTag.QN in unTaggedSgments)
+            {
+                unTaggedSgments[unTag.QN] += [d];
+            }
+            else
+            {
+                unTaggedSgments[unTag.QN] = [d];
+            }
+        }
+        else 
+        {
+            if (unTaggedSgments.Count == 0)
+            {
+                dispatch (endpoint DDP.Server) accepts d;
+            }
+            else
+            {
+                Segment seg = new Segment{};
+                UntaggedBufferModel unTagbf = new UntaggedBufferModel{};
+                seg.Payload = $[];
+                
+                if (unTag.QN in unTaggedSgments)
+                {
+                    UntaggedBufferModel unTagSg = unTaggedSgments[unTag.QN][0].BufferModel as UntaggedBufferModel;
+                    unTagbf.T = unTagSg.T;
+                    unTagbf.L = unTagSg.L;
+                    unTagbf.Rsvd = unTagSg.Rsvd;
+                    unTagbf.DV = unTagSg.DV;
+                    unTagbf.RsvdULP = unTagSg.RsvdULP;
+                    unTagbf.QN = unTagSg.QN;
+                    unTagbf.MSN = unTagSg.MSN;
+                    unTagbf.MO = unTagSg.MO;
+                    seg.BufferModel = unTagbf;
+                    for (int i = 0; i < unTaggedSgments.Count; i++)
+                    {
+                        seg.Payload += unTaggedSgments[unTag.QN][0].Payload;
+                        seg.Origins += [unTaggedSgments[unTag.QN][0]];
+                    }
+                    dispatch (endpoint DDP.Server) accepts seg;
+                }
+            }
+        }
+    }
+    else
+    {
+        TaggedBufferModel tag = d.BufferModel as TaggedBufferModel;
+        if (!tag.L)
+        {
+            tagedSgments +=[d];
+        }
+        else 
+        {
+            if (tagedSgments.Count == 0)
+            {
+                dispatch (endpoint DDP.Server) accepts d;
+            }
+            else
+            {
+                Segment seg = new Segment{};
+                TaggedBufferModel tagbf = new TaggedBufferModel{};
+                seg.Payload = $[];
+                TaggedBufferModel tagBfModel = tagedSgments[0].BufferModel as TaggedBufferModel;
+                tagbf.T = tagBfModel.T;
+                tagbf.L = tagBfModel.L;
+                tagbf.Rsvd = tagBfModel.Rsvd;
+                tagbf.DV = tagBfModel.DV;
+                tagbf.RsvdULP = tagBfModel.RsvdULP;
+                tagbf.STag = tagBfModel.STag;
+                tagbf.TO = tagBfModel.TO;
+                seg.BufferModel = tagbf;
+                for (int i = 0; i < tagedSgments.Count; i++)
+                {
+                    seg.Payload += tagedSgments[i].Payload;
+                    seg.Origins += [tagedSgments[i]];
+                }                
+                dispatch (endpoint DDP.Server) accepts seg;
+            }
+        }
+    }
+}
+

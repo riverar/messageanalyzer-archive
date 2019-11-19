@@ -1,0 +1,1633 @@
+protocol ADTS with
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.BER},
+// Future Reference: Enable it when the feature is ready
+//Asn1ModuleEncoding {ExtensionDefault = Asn1Extensibility.Implied, TagDefault = Asn1Tagging.Implicit},
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Active Directory Technical Specification",
+    ShortName = "ADTS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+    new Reference{Name = "MS-ADTS", Version = "48.0", Date = "03/16/2018", ProgramName = ProgramName.WSPP},
+    new Reference{Name = "RFC 2251"},
+    new Reference{Name = "RFC 2696"},
+    new Reference{Name = "RFC 2891"},
+    new Reference{Name = "RFC 2830"},
+    new Reference{Name = "RFC 2589"},
+    new Reference{Name = "RFC 4532"},
+    new Reference{Name = "RFC 4513"},
+    new Reference{Name = "RFC 1035"},
+    ],
+    RevisionSummary =
+    [
+    new Revision{Class = RevisionClass.Major, Version = "382126", Date = "10/12/2015"},
+    ]
+};
+
+using Standard;
+using Technologies.ASN1;
+using LDAP;
+using CLDAP;
+using DTYP;
+using MAIL;
+using IANA;
+using Utility;
+using TCP;
+using Technologies.IDL;
+using InfrastructureResources;
+
+string ADTS_MODULE = "ADTS";
+
+endpoint DcDiscoveryServer over CLDAP.Server | over MAIL.Server | over LDAP.Server 
+issues NetlogonSamLogonResponseEx 
+issues NetlogonSamLogonResponse 
+issues NetlogonPrimaryResponse 
+issues NetlogonSamLogonResponseNt40 
+accepts NetlogonLogonQuery 
+accepts NetlogonSamLogonRequest;
+
+client endpoint DcDiscoveryClient connected to DcDiscoveryServer;
+
+void DecodeAndDispatchNetlogon(binary bin, string mailslot, DcDiscoveryServer server)
+{
+    optional NetlogonOperationCode op = BinaryDecoder<NetlogonOperationCode>(bin.Segment(0, 2));
+    switch (op as NetlogonOperationCode)
+    {
+        case NetlogonOperationCode.LOGON_SAM_LOGON_RESPONSE_EX =>
+            DecodeNetlogonSamLogonResponseEx(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_USER_UNKNOWN_EX =>
+            DecodeNetlogonSamLogonResponseEx(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_PAUSE_RESPONSE_EX =>
+            DecodeNetlogonSamLogonResponseEx(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_PAUSE_RESPONSE =>
+            DecodeMultiplePossibleResponse(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_USER_UNKNOWN =>
+            DecodeMultiplePossibleResponse(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_LOGON_RESPONSE =>
+            DecodeMultiplePossibleResponse(bin, server);
+        case NetlogonOperationCode.LOGON_SAM_LOGON_REQUEST =>
+            optional NetlogonSamLogonRequest m = BinaryDecoder<NetlogonSamLogonRequest>(bin);
+            if (m != nothing)
+            {
+                dispatch server accepts m as NetlogonSamLogonRequest;
+            }
+            else
+            {
+                ThrowDecodingException(ADTS_MODULE, "NetlogonSamLogonRequest");
+            }
+        case NetlogonOperationCode.LOGON_PRIMARY_QUERY =>
+            optional NetlogonLogonQuery m = BinaryDecoder<NetlogonLogonQuery>(bin);
+            if (m != nothing)
+            {
+                dispatch server accepts m as NetlogonLogonQuery;
+            }
+            else
+            {
+                ThrowDecodingException(ADTS_MODULE, "NetlogonLogonQuery");
+            }
+        case NetlogonOperationCode.LOGON_PRIMARY_RESPONSE =>
+            optional NetlogonPrimaryResponse primary = BinaryDecoder<NetlogonPrimaryResponse>(bin);
+            if (primary != nothing)
+            {
+                dispatch server issues primary as NetlogonPrimaryResponse;
+            }
+            else
+            {
+                ThrowDecodingException(ADTS_MODULE, "NetlogonPrimaryResponse");
+            }
+        default =>
+            ThrowDecodingException(ADTS_MODULE, "ADTS message", UTILITY_UNKNOWN_DATA, ["operation code"]);
+    }
+}
+
+void DecodeMultiplePossibleResponse(binary bin, DcDiscoveryServer server)
+{
+    optional NetlogonSamLogonResponse sam = BinaryDecoder<NetlogonSamLogonResponse>(bin);
+    if (sam != nothing)
+    {
+        dispatch server issues sam as NetlogonSamLogonResponse;
+    }
+    else
+    {
+        optional NetlogonPrimaryResponse primary = BinaryDecoder<NetlogonPrimaryResponse>(bin);
+        if (primary != nothing)
+        {
+            dispatch server issues primary as NetlogonPrimaryResponse;
+        }
+        else
+        {
+            optional NetlogonSamLogonResponseNt40 nt40 = BinaryDecoder<NetlogonSamLogonResponseNt40>(bin);
+            if (nt40 != nothing)
+            {
+                dispatch server issues nt40 as NetlogonSamLogonResponseNt40;
+            }
+            else
+            {
+                ThrowDecodingException(ADTS_MODULE, "NetlogonSamLogonResponse or NetlogonPrimaryResponse or NetlogonSamLogonResponseNt40");
+            }
+        }
+    }
+}
+
+string NetlogonMailslotName = "\\MAILSLOT\\NET\\";
+
+// process MAIL message to get netlogon
+autostart actor AdtsOverMail(MAIL.Server server)
+{
+    process server accepts m:MAIL.MailslotWriteMessage where (m.MailslotName.Count > 14 && m.MailslotName.Segment(0, 14) == NetlogonMailslotName)
+    {
+        var ep = endpoint DcDiscoveryServer over server;
+        DecodeAndDispatchNetlogon(m.Databytes, m.MailslotName, ep);
+    }
+}
+
+void DecodeAndDispatchNetlogonOverLdap(LdapMessage m, DcDiscoveryServer server)
+{
+    array<AttributeValue> v = (m.ProtocolOp as SearchResultEntry).Attributes[0].Vals;
+    DecodeAndDispatchNetlogon(v[0] as binary, "", server);
+}
+
+void DecodeExtMatchingRule(LDAP.Filter f)
+{
+    switch (f.Content)
+    {
+        case a:LDAP.And =>
+            foreach (LDAP.Filter fi in a.Content)
+            {
+                DecodeExtMatchingRule(fi);
+            }
+        case a:LDAP.Or =>
+            foreach (LDAP.Filter fi in a.Content)
+            {
+                DecodeExtMatchingRule(fi);
+            }
+        case a:LDAP.ExtensibleMatch =>
+            if(a.MatchingRule != nothing)
+            {
+                switch (a.MatchingRule as string)
+                {
+                    case ADTSExtendedMatchingRuleIds.LDAP_MATCHING_RULE_BIT_AND =>
+                    a.MatchingRule = (a.MatchingRule as string) + " (LDAP_MATCHING_RULE_BIT_AND)";
+                    case ADTSExtendedMatchingRuleIds.LDAP_MATCHING_RULE_BIT_OR =>
+                    a.MatchingRule = (a.MatchingRule as string) + " (LDAP_MATCHING_RULE_BIT_OR)";
+                    case ADTSExtendedMatchingRuleIds.LDAP_MATCHING_RULE_TRANSITIVE_EVAL =>
+                    a.MatchingRule = (a.MatchingRule as string) + " (LDAP_MATCHING_RULE_TRANSITIVE_EVAL)";
+                }
+            }
+    }
+}
+
+pattern ADTSExtendedMatchingRuleIds = enum string
+{
+    LDAP_MATCHING_RULE_BIT_AND = "1.2.840.113556.1.4.803",
+    LDAP_MATCHING_RULE_BIT_OR = "1.2.840.113556.1.4.804",
+    LDAP_MATCHING_RULE_TRANSITIVE_EVAL = "1.2.840.113556.1.4.1941",
+};
+
+bool IsLdapControlsExtension(LdapMessage ldapMessage)
+{
+    return ldapMessage.Controls is ctrls:LDAP.Controls
+        where some (var ctrl in ctrls) ctrl.ControlType is ADTSExtendedLDAPControlOids;
+}
+
+// process LDAP from 389 port
+autostart actor AdtsOverLdap(LDAP.Server ldapServer)
+{
+    observe ldapServer accepts ldapMessage:LdapMessage
+    {
+        if (IsLdapControlsExtension(ldapMessage))
+        {
+            DecodeExtendedControl(ldapMessage.Controls as LDAP.Controls, true);
+        }
+        switch (ldapMessage.ProtocolOp)
+        {
+            case extendedReq:LDAP.ExtendedRequest =>
+                if (extendedReq.RequestName is ADTSExtendedLDAPOperationOids)
+                {
+                    DecodeExtendedRequestOperation(extendedReq);
+                }
+            case search:LDAP.SearchRequest =>
+                DecodeExtMatchingRule(search.Filter);
+            case modifyRequest:ModifyRequest =>
+                ExtendAttributeInModifyRequest(modifyRequest);
+        }
+    }
+
+    observe ldapServer issues ldapMessage:LdapMessage
+    {
+        if (IsLdapControlsExtension(ldapMessage))
+        {
+            DecodeExtendedControl(ldapMessage.Controls as LDAP.Controls, false);
+        }
+        switch (ldapMessage.ProtocolOp)
+        {
+            case extendedResp:LDAP.ExtendedResponse =>
+                if (extendedResp.ResponseName is ADTSExtendedLDAPOperationOids)
+                {
+                    DecodeExtendedResponseOperation(extendedResp);
+                }
+            case searchResultEntry:SearchResultEntry =>
+                ExtendAttributeInSearchResultEntry(searchResultEntry);
+        }
+    }
+
+    process ldapServer issues m:LdapMessage where (m.ProtocolOp is SearchResultEntry && ((m.ProtocolOp as SearchResultEntry).Attributes.Count == 1) && ((m.ProtocolOp as SearchResultEntry).Attributes[0].Type == "netlogon"))
+    {
+        var ep = endpoint DcDiscoveryServer over ldapServer;
+        array<AttributeValue> v = (m.ProtocolOp as SearchResultEntry).Attributes[0].Vals;
+        DecodeAndDispatchNetlogon(v[0] as binary, "", ep);
+    }
+}
+
+// process CLDAP message from 389 port
+autostart actor AdtsOverCldap(CLDAP.Server ldapServer)
+{
+    observe ldapServer accepts CldapMessage{ProtocolOp is search:LDAP.SearchRequest}
+    {
+        DecodeExtMatchingRule(search.Filter);
+    }  
+    process ldapServer issues m:CldapMessage where (m.ProtocolOp is SearchResultEntry && ((m.ProtocolOp as SearchResultEntry).Attributes.Count == 1) && ((m.ProtocolOp as SearchResultEntry).Attributes[0].Type == "netlogon"))
+    {
+        var ep = endpoint DcDiscoveryServer over ldapServer;
+        array<AttributeValue> v = (m.ProtocolOp as SearchResultEntry).Attributes[0].Vals;
+        DecodeAndDispatchNetlogon(v[0] as binary, "", ep);
+    }
+}
+
+// process LDS message, only deal with messages if first fragment received is unencrypted LDAP message
+// and process LDAP message from GC port
+autostart actor AdtsLdsOverTcp(TCP.Server server)
+{
+    LdapDecodingHelper ldapDecodingHelper;
+    
+    process server accepts seg:TCP.Segment where IsLdsMessage(seg) 
+    {
+        ldapDecodingHelper.TryDecode(seg, MessageDirection.Accepts);
+    }
+
+    process server issues seg:TCP.Segment where IsLdsMessage(seg)
+    {
+        ldapDecodingHelper.TryDecode(seg, MessageDirection.Issues);
+    }
+    
+    // destructor
+    ~endpoint(TCP.Server server)
+    {
+        if (ldapDecodingHelper != null)
+        {
+            ldapDecodingHelper.ClearInDestructor();
+        }
+    }
+    
+    bool IsLdsMessage(TCP.Segment seg)
+    {
+        // check IsLdap at last from the consideration of performance
+        if (ldapDecodingHelper == null &&
+            // for MSFT GC port
+            (seg.SourcePort == Port.MsftGC || seg.DestinationPort == Port.MsftGC ||
+                (seg.SourcePort != Port.LDAP &&
+                seg.SourcePort != Port.LDAPS &&
+                seg.DestinationPort != Port.LDAP &&
+                seg.DestinationPort != Port.LDAPS &&
+                IsLdap(seg.Payload) == true)))
+        {
+            ldapDecodingHelper = new LdapDecodingHelper();
+            ldapDecodingHelper.InitializeLdapDecodingHelper(new LdapDecodingCache(), new LdapDecodingCache(), endpoint LDAP.Server over server);
+        }
+        
+        return ldapDecodingHelper != null;
+    }
+}
+
+void DecodeNetlogonSamLogonResponseEx(binary data, DcDiscoveryServer server)
+{
+    NetlogonSamLogonResponseEx m = null;
+    if (data.Count < 8)
+    {
+        ThrowDecodingException(ADTS_MODULE, "NetlogonSamLogonResponseEx");
+    }
+    // Get NetlogonNtVersionOptions
+    uint ver = BinaryDecoder<uint>(data.Segment(data.Count - 8, 4)) as uint;
+    optional NetlogonSamLogonResponseEx ex = BinaryDecoder<NetlogonSamLogonResponseEx[(ver & NetlogonNtVersionOptions.V5EP) > 0 ? true : false, (ver & NetlogonNtVersionOptions.VCS) > 0 ? true : false]>(data);
+    if (ex == nothing)
+    {
+        ThrowDecodingException(ADTS_MODULE, "NetlogonSamLogonResponseEx");
+    }    
+    m = (ex as NetlogonSamLogonResponseEx);
+    dispatch server issues m as NetlogonSamLogonResponseEx;
+}
+
+pattern ADTSExtendedLDAPControlOids = enum string
+{
+    LDAP_PAGED_RESULT_OID_STRING = "1.2.840.113556.1.4.319",
+    LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID = "1.2.840.113556.1.4.521",
+    LDAP_SERVER_DIRSYNC_OID = "1.2.840.113556.1.4.841",
+    LDAP_SERVER_DOMAIN_SCOPE_OID = "1.2.840.113556.1.4.1339",
+    LDAP_SERVER_EXTENDED_DN_OID = "1.2.840.113556.1.4.529",
+    LDAP_SERVER_GET_STATS_OID = "1.2.840.113556.1.4.970",
+    LDAP_SERVER_LAZY_COMMIT_OID = "1.2.840.113556.1.4.619",
+    LDAP_SERVER_PERMISSIVE_MODIFY_OID = "1.2.840.113556.1.4.1413",
+    LDAP_SERVER_NOTIFICATION_OID = "1.2.840.113556.1.4.528",
+    LDAP_SERVER_RESP_SORT_OID = "1.2.840.113556.1.4.474",
+    LDAP_SERVER_SD_FLAGS_OID = "1.2.840.113556.1.4.801",
+    LDAP_SERVER_SEARCH_OPTIONS_OID = "1.2.840.113556.1.4.1340",
+    LDAP_SERVER_SORT_OID = "1.2.840.113556.1.4.473",
+    LDAP_SERVER_SHOW_DELETED_OID = "1.2.840.113556.1.4.417",
+    LDAP_SERVER_TREE_DELETE_OID = "1.2.840.113556.1.4.805",
+    LDAP_SERVER_VERIFY_NAME_OID = "1.2.840.113556.1.4.1338",
+    LDAP_CONTROL_VLVREQUEST = "2.16.840.1.113730.3.4.9",
+    LDAP_CONTROL_VLVRESPONSE = "2.16.840.1.113730.3.4.10",
+    LDAP_SERVER_ASQ_OID = "1.2.840.113556.1.4.1504",
+    LDAP_SERVER_QUOTA_CONTROL_OID = "1.2.840.113556.1.4.1852",
+    LDAP_SERVER_RANGE_OPTION_OID = "1.2.840.113556.1.4.802",
+    LDAP_SERVER_SHUTDOWN_NOTIFY_OID = "1.2.840.113556.1.4.1907",
+    LDAP_SERVER_FORCE_UPDATE_OID  = "1.2.840.113556.1.4.1974",
+    LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID = "1.2.840.113556.1.4.1948",
+    LDAP_SERVER_RODC_DCPROMO_OID = "1.2.840.113556.1.4.1341",
+    LDAP_SERVER_DN_INPUT_OID = "1.2.840.113556.1.4.2026",
+    LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID = "1.2.840.113556.1.4.2065",
+    LDAP_SERVER_SHOW_RECYCLED_OID = "1.2.840.113556.1.4.2064",
+    LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID = "1.2.840.113556.1.4.2066",
+    LDAP_SERVER_DIRSYNC_EX_OID = "1.2.840.113556.1.4.2090",
+    LDAP_SERVER_UPDATE_STATS_OID = "1.2.840.113556.1.4.2205",
+    LDAP_SERVER_TREE_DELETE_EX_OID = "1.2.840.113556.1.4.2204",
+    LDAP_SERVER_SEARCH_HINTS_OID = "1.2.840.113556.1.4.2206",
+    LDAP_SERVER_EXPECTED_ENTRY_COUNT_OID = "1.2.840.113556.1.4.2211",
+    LDAP_SERVER_POLICY_HINTS_OID = "1.2.840.113556.1.4.2239",
+    LDAP_SERVER_SET_OWNER_OID = "1.2.840.113556.1.4.2255",
+    LDAP_SERVER_BYPASS_QUOTA_OID = "1.2.840.113556.1.4.2256",
+    LDAP_SERVER_LINK_TTL_OID= "1.2.840.113556.1.4.2309",
+    LDAP_SERVER_SET_CORRELATION_ID_OID= "1.2.840.113556.1.4.2330",
+    LDAP_SERVER_THREAD_TRACE_OVERRIDE_OID= "1.2.840.113556.1.4.2354",
+};
+
+pattern ADTSExtendedLDAPOperationOids = enum string
+{
+    LDAP_SERVER_FAST_BIND_OID = "1.2.840.113556.1.4.1781",
+    LDAP_SERVER_START_TLS_OID = "1.3.6.1.4.1.1466.20037",
+    LDAP_TTL_REFRESH_OID = "1.3.6.1.4.1.1466.101.119.1",
+    LDAP_SERVER_WHO_AM_I_OID = "1.3.6.1.4.1.4203.1.11.3",
+    LDAP_SERVER_BATCH_REQUEST_OID = "1.2.840.113556.1.4.2212",
+};
+
+void DecodeExtendedControl(LDAP.Controls ctrls, bool isRequest)
+{
+    foreach (Control ctrl in ctrls)
+    {
+        switch (ctrl.ControlType)
+        {
+            case ADTSExtendedLDAPControlOids.LDAP_PAGED_RESULT_OID_STRING =>
+                DecodeControl<LDAP_PAGED_RESULT_OID_STRING>(ctrl, "LDAP_PAGED_RESULT_OID_STRING");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID =>
+                DecodeControlByBinaryDecoder<LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID>(ctrl, "LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_DIRSYNC_OID =>
+                if (isRequest)
+                {
+                    DecodeControl<DirSyncRequestValue>(ctrl, "LDAP_SERVER_DIRSYNC_OID");
+                }
+                else
+                {
+                    DecodeControl<DirSyncResponseValue>(ctrl, "LDAP_SERVER_DIRSYNC_OID");
+                }
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_DOMAIN_SCOPE_OID =>
+                DecodeControl<LDAP_SERVER_DOMAIN_SCOPE_OID>(ctrl, "LDAP_SERVER_DOMAIN_SCOPE_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_EXTENDED_DN_OID =>
+                DecodeControl<ExtendedDNRequestValue>(ctrl, "LDAP_SERVER_EXTENDED_DN_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_GET_STATS_OID =>
+                if (isRequest)
+                {
+                    DecodeControlByBinaryDecoder<LDAP_SERVER_GET_STATS_OID_REQUEST>(ctrl, "LDAP_SERVER_GET_STATS_OID");
+                }
+                else
+                {
+                    DecodeLDAP_SERVER_GET_STATS_OIDResponse(ctrl); // DecodeControl<LDAP_SERVER_GET_STATS_OID_RESPONSE>(ctrl, "LDAP_SERVER_GET_STATS_OID");
+                }
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_LAZY_COMMIT_OID =>
+                DecodeControl<LDAP_SERVER_LAZY_COMMIT_OID>(ctrl, "LDAP_SERVER_LAZY_COMMIT_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_PERMISSIVE_MODIFY_OID =>
+                DecodeControl<LDAP_SERVER_PERMISSIVE_MODIFY_OID>(ctrl, "LDAP_SERVER_PERMISSIVE_MODIFY_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_NOTIFICATION_OID =>
+                DecodeControl<LDAP_SERVER_NOTIFICATION_OID>(ctrl, "LDAP_SERVER_NOTIFICATION_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SD_FLAGS_OID =>
+                DecodeControl<SDFlagsRequestValue>(ctrl, "LDAP_SERVER_SD_FLAGS_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SEARCH_OPTIONS_OID =>
+                DecodeControl<SearchOptionsRequestValue>(ctrl, "LDAP_SERVER_SEARCH_OPTIONS_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SORT_OID =>
+                DecodeControl<SortKeyList>(ctrl, "LDAP_SERVER_SORT_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_RESP_SORT_OID =>
+                DecodeControl<SortResult>(ctrl, "LDAP_SERVER_RESP_SORT_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SHOW_DELETED_OID =>
+                DecodeControl<LDAP_SERVER_SHOW_DELETED_OID>(ctrl, "LDAP_SERVER_SHOW_DELETED_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_TREE_DELETE_OID =>
+                DecodeControl<LDAP_SERVER_TREE_DELETE_OID>(ctrl, "LDAP_SERVER_TREE_DELETE_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_VERIFY_NAME_OID =>
+                DecodeControl<VerifyNameRequestValue>(ctrl, "LDAP_SERVER_VERIFY_NAME_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_CONTROL_VLVREQUEST =>
+                DecodeControl<VLVRequestValue>(ctrl, "LDAP_CONTROL_VLVREQUEST");
+            case ADTSExtendedLDAPControlOids.LDAP_CONTROL_VLVRESPONSE =>
+                DecodeControl<VLVResponseValue>(ctrl, "LDAP_CONTROL_VLVRESPONSE");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_ASQ_OID =>
+                if (isRequest)
+                {
+                    DecodeControl<ASQRequestValue>(ctrl, "LDAP_SERVER_ASQ_OID");
+                }
+                else
+                {
+                    DecodeControl<ASQResponseValue>(ctrl, "LDAP_SERVER_ASQ_OID");
+                }
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_QUOTA_CONTROL_OID =>
+                DecodeControl<QuotaRequestValue>(ctrl, "LDAP_SERVER_QUOTA_CONTROL_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SHUTDOWN_NOTIFY_OID =>
+                DecodeControl<LDAP_SERVER_SHUTDOWN_NOTIFY_OID>(ctrl, "LDAP_SERVER_SHUTDOWN_NOTIFY_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_FORCE_UPDATE_OID =>
+                DecodeControl<LDAP_SERVER_FORCE_UPDATE_OID>(ctrl, "LDAP_SERVER_FORCE_UPDATE_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID =>
+                DecodeControl<LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID>(ctrl, "LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_RODC_DCPROMO_OID =>
+                DecodeControl<LDAP_SERVER_RODC_DCPROMO_OID>(ctrl, "LDAP_SERVER_RODC_DCPROMO_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_DN_INPUT_OID =>
+                DecodeControl<DNInputRequestValue>(ctrl, "LDAP_SERVER_DN_INPUT_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID =>
+                DecodeControl<LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID>(ctrl, "LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SHOW_RECYCLED_OID =>
+                DecodeControl<LDAP_SERVER_SHOW_RECYCLED_OID>(ctrl, "LDAP_SERVER_SHOW_RECYCLED_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_POLICY_HINTS_OID =>
+                DecodeControl<PolicyHintsRequestValue>(ctrl, "LDAP_SERVER_POLICY_HINTS_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID =>
+                DecodeControl<LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID>(ctrl, "LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_DIRSYNC_EX_OID =>
+                if (isRequest)
+                {
+                    DecodeControl<LDAP_SERVER_DIRSYNC_EX_OID_REQUEST>(ctrl, "LDAP_SERVER_DIRSYNC_EX_OID");
+                }
+                else
+                {
+                    DecodeControl<LDAP_SERVER_DIRSYNC_EX_OID_RESPONSE>(ctrl, "LDAP_SERVER_DIRSYNC_EX_OID");
+                }
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_UPDATE_STATS_OID =>
+                DecodeControl<UpdateStatsResponseValue>(ctrl, "LDAP_SERVER_UPDATE_STATS_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_TREE_DELETE_EX_OID =>
+                DecodeControl<TreeDeleteExRequestValue>(ctrl, "LDAP_SERVER_TREE_DELETE_EX_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SEARCH_HINTS_OID =>
+                DecodeControl<LDAP_SERVER_SEARCH_HINTS_OID>(ctrl, "LDAP_SERVER_SEARCH_HINTS_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_EXPECTED_ENTRY_COUNT_OID =>
+                DecodeControl<ExpectedEntryCountRequestValue>(ctrl, "LDAP_SERVER_EXPECTED_ENTRY_COUNT_OID");
+            case ADTSExtendedLDAPControlOids.LDAP_SERVER_SET_OWNER_OID =>
+                DecodeControl<LDAP_SERVER_SET_OWNER_OID>(ctrl, "LDAP_SERVER_SET_OWNER_OID");
+        }
+    }
+}
+
+void DecodeLDAP_SERVER_GET_STATS_OIDResponse(LDAP.Control ctrl)
+{
+    if (ctrl.ControlValue is binary)
+    {
+        // BUG#51833 [AsnCodec] Provide consistent behavior for AsnCodec as BinaryCodec processing zero-length binary with empty types
+        binary bin = ctrl.ControlValue as binary;
+        ctrl.ControlType = (ctrl.ControlType as string) + " (LDAP_SERVER_GET_STATS_OID)";
+        if (bin.Count > 0)
+        {
+            optional StatsResponseValueV4 win2008FMT = Asn1BerDecoder<StatsResponseValueV4>(bin);
+            if (win2008FMT != nothing)
+            {
+                ctrl.ControlValue = win2008FMT;
+                return;
+            }
+            optional StatsResponseValueV3 win2008NoFMT = Asn1BerDecoder<StatsResponseValueV3>(bin);
+            if (win2008NoFMT != nothing)
+            {
+                ctrl.ControlValue = win2008NoFMT;
+                return;
+            }
+            optional StatsResponseValueV2 win2003 = Asn1BerDecoder<StatsResponseValueV2>(bin);
+            if (win2003 != nothing)
+            {
+                ctrl.ControlValue = win2003;
+                return;
+            }
+            ////Win2000 implementation
+            //optional LDAP_SERVER_GET_STATS_RESPONSE_WINDOWS2000 win2000 = Asn1BerDecoder<LDAP_SERVER_GET_STATS_RESPONSE_WINDOWS2000>(bin);
+            //if (win2000!= nothing)
+            //{
+            //ctrl.ControlValue = win2000;
+            //return;
+            //}
+            ThrowDecodingException(ADTS_MODULE, "LDAP_SERVER_GET_STATS_OID");
+        }
+    }
+}
+
+type UpdateStatsResponseValue
+{
+    array<LDAP_SERVER_UPDATE_STATS_OID_Inner> inner;
+} with Asn1Encoding{TagClass = Asn1TagClass.Universal, TagNumber = 0, Flags = Asn1EncodingFlags.TagLengthSkipped, Tagging = Asn1Tagging.Implicit};
+
+type LDAP_SERVER_UPDATE_STATS_OID_Inner
+{
+    array<LDAP_SERVER_UPDATE_STATS_OID_Inner2> inner2;
+} with Asn1Encoding{TagClass = Asn1TagClass.Universal, TagNumber = 0, Flags = Asn1EncodingFlags.TagLengthSkipped, Tagging = Asn1Tagging.Implicit};
+
+// because we need to make statID decoded as string, while keep statData as binary, so have to define this type
+type LDAP_SERVER_UPDATE_STATS_OID_Inner2
+{
+    LDAPOID statID where ValidationCheck((value as string).Segment(0, (value as string).Count - 1) is LDAP_SERVER_UPDATE_STATS_statID, null, "ADTS: statID not in range of LDAP_SERVER_UPDATE_STATS_statID defined in [MS-ADTS]");
+    OctetString statData;
+} with Asn1Encoding{TagClass = Asn1TagClass.Universal, TagNumber = 0, Flags = Asn1EncodingFlags.TagLengthSkipped, Tagging = Asn1Tagging.Implicit};
+
+void DecodeExtendedRequestOperation(LDAP.ExtendedRequest extendedReq)
+{
+    switch (extendedReq.RequestName)
+    {
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_FAST_BIND_OID =>
+        extendedReq.RequestName = (extendedReq.RequestName as string) + " (LDAP_SERVER_FAST_BIND_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_START_TLS_OID =>
+        extendedReq.RequestName = (extendedReq.RequestName as string) + " (LDAP_SERVER_START_TLS_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_TTL_REFRESH_OID =>
+        extendedReq.RequestName = (extendedReq.RequestName as string) + " (LDAP_TTL_REFRESH_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_WHO_AM_I_OID =>
+        // RFC 4532 2.1.  The whoami Request: The whoami request is an ExtendedRequest with a requestName field containing the whoamiOID OID and an absent requestValue field.
+        extendedReq.RequestName = (extendedReq.RequestName as string) + " (LDAP_SERVER_WHO_AM_I_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_BATCH_REQUEST_OID =>
+        extendedReq.RequestValue = DecodeBatchRequestOid(extendedReq.RequestValue as binary);
+        extendedReq.RequestName = (extendedReq.RequestName as string) + " (LDAP_SERVER_BATCH_REQUEST_OID)";
+    }
+}
+
+void DecodeExtendedResponseOperation(LDAP.ExtendedResponse extendedResp)
+{
+    switch (extendedResp.ResponseName)
+    {
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_FAST_BIND_OID =>
+            extendedResp.ResponseName = (extendedResp.ResponseName as string) + " (LDAP_SERVER_FAST_BIND_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_START_TLS_OID =>
+            extendedResp.ResponseName = (extendedResp.ResponseName as string) + " (LDAP_SERVER_START_TLS_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_TTL_REFRESH_OID =>
+            extendedResp.ResponseName = (extendedResp.ResponseName as string) + " (LDAP_TTL_REFRESH_OID)";
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_WHO_AM_I_OID =>
+            // RFC 4532 2.2.  The whoami Response: The whoami response is an ExtendedResponse where the responseName field is absent and the response field, if present, is empty or an authzId [RFC4513].
+            extendedResp.ResponseName = (extendedResp.ResponseName as string) + " (LDAP_SERVER_WHO_AM_I_OID)";
+            if(extendedResp.ResponseValue != nothing)
+            {
+                extendedResp.ResponseValue = BinaryDecoder<LDAP.UTF8StringWrapper>(extendedResp.ResponseValue as binary);
+            }
+        case ADTSExtendedLDAPOperationOids.LDAP_SERVER_BATCH_REQUEST_OID =>
+            extendedResp.ResponseValue = DecodeBatchRequestOid(extendedResp.ResponseValue as binary);
+            extendedResp.ResponseName = (extendedResp.ResponseName as string) + " (LDAP_SERVER_BATCH_REQUEST_OID)";
+    }
+}
+
+type SearchHintsRequestValue
+{
+    LDAPOID hintId;
+    OctetString hintValue;
+}
+
+// by design, ASN1 Codec for OR pattern only supports (OctetString | any) -> "binary" convertion, so here we cannot get value after value of extendedOp is already decoded
+BatchRequestRequestValue DecodeBatchRequestOid(binary bin)
+{
+    BatchRequestRequestValue ret = new BatchRequestRequestValue();
+    if (bin.Count > 0)
+    {
+        stream data = bin as stream;
+        BinaryDecoder<Blob[1]>(data);
+        byte lengthOfLength = BinaryDecoder<byte>(data) as byte;
+        if (lengthOfLength >= 0x80)
+        {
+            BinaryDecoder<Blob[GetLengthOfLength(lengthOfLength)]>(data);
+        }
+        while (data.BytePosition < data.ByteLength)
+        {
+            // for search result entry and search result done, they are in single OctetString so does not need check OctetString tag header
+            if (bin[data.BytePosition] == 4)
+            {
+                BinaryDecoder<Blob[1]>(data);
+                lengthOfLength = BinaryDecoder<byte>(data) as byte;
+                if (lengthOfLength >= 0x80)
+                {
+                    BinaryDecoder<Blob[GetLengthOfLength(lengthOfLength)]>(data);
+                }
+            }
+            LdapMessage ldap = Asn1BerDecoder<LdapMessage[null]>(data) as LdapMessage;
+            ret.LdapMessages += [ldap];
+        }   
+    }
+    return ret;
+}
+
+/* 3.1.1.3.4.2.5   LDAP_SERVER_BATCH_REQUEST_OID
+ */
+type BatchRequestRequestValue
+{
+    array<LdapMessage> LdapMessages = [];
+};
+
+uint GetLengthOfLength(byte b)
+{
+    uint v = 0;
+    switch (b)
+    {
+        case 0x81 =>
+            v = 1;
+        case 0x82 =>
+            v = 2;
+        case 0x84 =>
+            v = 4;
+    }
+    return v;
+}
+
+any DecodeOperation<T>(binary bin, string typeName)
+{
+    if (bin.Count > 0)
+    {
+        var t = Asn1BerDecoder<T>(bin);
+        if (t != nothing)
+        {
+            return t;
+        }
+        else
+        {
+            ThrowDecodingException(ADTS_MODULE, typeName);
+        }
+    }
+    return nothing;
+}
+
+void DecodeControl<T>(LDAP.Control ctrl, string controlName)
+{
+    if (ctrl.ControlValue is binary)
+    {
+        // BUG#51833 [AsnCodec] Provide consistent behavior for AsnCodec as BinaryCodec processing zero-length binary with empty types
+        binary bin = ctrl.ControlValue as binary;
+        ctrl.ControlType = (ctrl.ControlType as string) + " (" + controlName + ")";
+        if (bin.Count > 0)
+        {
+            var val = Asn1BerDecoder<T>(bin);
+            if (!(val is nothing))
+            {
+                ctrl.ControlValue = val;
+            }
+            else
+            {
+                ThrowDecodingException(ADTS_MODULE, controlName);
+            }
+        }
+    }
+}
+
+void DecodeControlByBinaryDecoder<T>(LDAP.Control ctrl, string controlName)
+{
+    if (ctrl.ControlValue is binary)
+    {
+        ctrl.ControlType = (ctrl.ControlType as string) + " (" + controlName + ")";
+        var val = BinaryDecoder<T>(ctrl.ControlValue as binary);
+        if (!(val is nothing))
+        {
+            ctrl.ControlValue = val as T;
+        }
+        else
+        {
+            ThrowDecodingException(ADTS_MODULE, controlName);
+        }
+    }
+}
+
+void ExtendAttributeInSearchResultEntry(SearchResultEntry searchResultEntry)
+{
+    for (int i = 0; i < searchResultEntry.Attributes.Count; i++)
+    {
+        var newAttribute = ExtendLdapAttribute(searchResultEntry.Attributes[i]);
+        if (newAttribute != null)
+        {
+            searchResultEntry.Attributes[i] = newAttribute;
+        }
+    }
+}
+
+void ExtendAttributeInModifyRequest(ModifyRequest modifyRequest)
+{
+    for (int i = 0; i < modifyRequest.Modifications.Count; i++)
+    {
+        var newAttribute = ExtendLdapAttribute(modifyRequest.Modifications[i].Modification);
+        if (newAttribute != null)
+        {
+            modifyRequest.Modifications[i].Modification = newAttribute;
+        }
+    }
+}
+
+PartialAttribute ExtendLdapAttribute(PartialAttribute orgAttribute)
+{
+    if (orgAttribute.Type.ToString() == "nTSecurityDescriptor" &&
+        orgAttribute.Vals.Count == 1 && orgAttribute.Vals[0] is bin:binary &&
+        BinaryDecoder<SECURITY_DESCRIPTOR_NonRpc>(bin) is securityDescriptor:SECURITY_DESCRIPTOR_NonRpc)
+    {
+        return new SecurityDescriptorPartialAttribute
+        {
+            Type = orgAttribute.Type,
+            Vals = securityDescriptor
+        };
+    }
+
+    return null;
+}
+
+type SecurityDescriptorPartialAttribute : PartialAttribute
+{
+    new SECURITY_DESCRIPTOR_NonRpc Vals;
+
+    override string ToString()
+    {
+        return "nTSecurityDescriptor";
+    }
+}
+
+/* controlType     1.2.840.113556.1.4.319
+ * 3.1.1.3.4.1.1   LDAP_PAGED_RESULT_OID_STRING 
+ * rfc 2696 2. This control is included in the searchRequest and searchResultDone messages as part of the controls field of the LDAPMessage.
+ * The searchControlValue is an OCTET STRING wrapping the BER-encoded version of the following SEQUENCE:
+ */
+type LDAP_PAGED_RESULT_OID_STRING
+{
+    Integer size with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    OctetString cookie;
+}
+
+/* controlType     1.2.840.113556.1.4.521
+ * 3.1.1.3.4.1.2   LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID
+ * When sending this control to the DC, the controlValue field is set to a UTF-8 string 
+ * containing the fully qualified domain name of a DC in the domain to which the object is to be moved. 
+ * The string is not BER-encoded. Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_CROSSDOM_MOVE_TARGET_OID
+{
+    string DNSHostname with BinaryEncoding{TextEncoding = TextEncoding.UTF8};
+}
+
+/* controlType     1.2.840.113556.1.4.841
+ * 3.1.1.3.4.1.3   LDAP_SERVER_DIRSYNC_OID 
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ */
+type DirSyncRequestValue
+{
+    LDAP_SERVER_DIRSYNC_FLAGS Flags where ValidationCheckCombinationValue(InRange<LDAP_SERVER_DIRSYNC_FLAGS>(value), null, true, ReferenceType.Type,
+        "ADTS", "Flags", "DirSyncRequestValue", "0x00000001, 0x00000800, 0x00002000, 0x80000000", value);
+    Integer MaxBytes;
+    OctetString Cookie;
+}
+
+/* controlType     1.2.840.113556.1.4.841
+ * 3.1.1.3.4.1.3   LDAP_SERVER_DIRSYNC_OID 
+ * The structure of the controlValue in the response control is the same as the structure of the controlValue in the request control, 
+ * but the fields are interpreted differently. 
+ */
+type DirSyncResponseValue
+{
+    Integer MoreResults;
+    Integer unused;
+    OctetString CookieServer;
+}
+
+pattern LDAP_SERVER_DIRSYNC_FLAGS = flags Integer
+{
+    LDAP_DIRSYNC_OBJECT_SECURITY = 0x00000001, // Windows Server® 2003 operating system, Windows Server® 2008 operating system, Windows Server® 2008 R2 operating system, and Windows Server® 2012 operating system: If this flag is present, the client can only view objects and attributes that are otherwise accessible to the client. If this flag is not present, the server checks if the client has access rights to read the changes in the NC.\r\nMicrosoft Windows® 2000 operating system: Not supported.
+    LDAP_DIRSYNC_ANCESTORS_FIRST_ORDER = 0x00000800, // The server returns parent objects before child objects.
+    LDAP_DIRSYNC_PUBLIC_DATA_ONLY = 0x00002000, // Windows Server 2003, Windows Server 2008, Windows Server 2008 R2, and Windows Server 2012: This flag can optionally be passed to the DC, but it has no effect.\r\nWindows 2000: Not supported.
+    LDAP_DIRSYNC_INCREMENTAL_VALUES = 0x80000000, // Windows Server 2003, Windows Server 2008, Windows Server 2008 R2, and Windows Server 2012: If this flag is not present, all of the values, up to a server-specified limit, in a multivalued attribute are returned when any value changes. If this flag is present, only the changed values are returned, provided the attribute is a forward link value.\r\nWindows 2000: Not supported.
+    ...
+} with Asn1Encoding{Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+
+/* controlType     1.2.840.113556.1.4.1339
+ * 3.1.1.3.4.1.4   LDAP_SERVER_DOMAIN_SCOPE_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_DOMAIN_SCOPE_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.529
+ * 3.1.1.3.4.1.5   LDAP_SERVER_EXTENDED_DN_OID 
+ * When sending this control to a Microsoft Windows® 2000 operating system DC, the controlValue field is omitted. 
+ * When sending this control to a Windows Server® 2003 operating system, Windows Server® 2008 operating system, 
+ * Windows Server® 2008 R2 operating system, or Windows Server® 2012 operating system DC, 
+ * the controlValue field is either omitted or is set to the BER encoding of the following ASN.1 structure:
+ */
+type ExtendedDNRequestValue
+{
+    Integer Flag;
+}
+
+/* controlType     1.2.840.113556.1.4.970
+ * 3.1.1.3.4.1.6   LDAP_SERVER_GET_STATS_OID
+ * When sending this control to a DC running Microsoft Windows® 2000 operating system, the client omits the controlValue field. 
+ * When sending this control to a DC running Windows Server® 2003 operating system, Windows Server® 2008 operating system, 
+ * Windows Server® 2008 R2 operating system, or Windows Server® 2012 operating system, the client either omits the controlValue field 
+ * or sets the controlValue field to one of the 32-bit unsigned integer values in the following table. The values are not BER-encoded.
+ */
+type LDAP_SERVER_GET_STATS_OID_REQUEST
+{
+    LDAP_SERVER_GET_STATS_ENUM Value where ValidationCheckEnumValue(InRange<LDAP_SERVER_GET_STATS_ENUM>(value), null, true, ReferenceType.Type,
+        "ADTS", "Value", "LDAP_SERVER_GET_STATS_OID_REQUEST", "0, 1, 2, 4", value);
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+pattern LDAP_SERVER_GET_STATS_ENUM = enum uint
+{
+    SO_NORMAL = 0, // Perform the search as if no LDAP_SERVER_GET_STATS_OID control was included in the search request.
+    SO_STATS = 1, // Perform the search and return data related to the resources consumed performing the search, as well as the actual search results.
+    SO_ONLY_OPTIMIZE = 2, // Return data related to how the search would be performed, but do not actually return the search results.
+    SO_EXTENDED_FMT = 4, // Windows Server 2008, Windows Server 2008 R2, and Windows Server 2012: Returns the data in an alternative format documented later in this section.\r\nWindows 2000, Windows Server 2003, and Active Directory® Application Mode (ADAM): Not supported.
+    ...
+};
+
+// For Windows 2000 DCs, the returned controlValue is the BER encoding of the following ASN.1 structure:
+//type LDAP_SERVER_GET_STATS_RESPONSE_WINDOWS2000
+//{
+//Integer threadCountTag where value == 1;
+//Integer threadCount;
+//Integer coreTimeTag where value == 2;
+//Integer coreTime;
+//Integer callTimeTag where value == 3;
+//Integer callTime;
+//Integer searchSubOperationsTag where value == 4;
+//Integer searchSubOperations;
+//}
+
+// For Windows Server 2003 and ADAM DCs, the controlValue of the response control is the BER encoding of the following ASN.1 structure.
+type StatsResponseValueV2
+{
+    Integer threadCountTag where value == 1;
+    Integer threadCount;
+    Integer callTimeTag where value == 3;
+    Integer callTime;
+    Integer entriesReturnedTag where value == 5;
+    Integer entriesReturned;
+    Integer entriesVisitedTag where value == 6;
+    Integer entriesVisited;
+    Integer filterTag where value == 7;
+    OctetString filter with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+    Integer indexTag where value == 8;
+    OctetString index with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+}
+
+/* For Windows Server 2008, Windows Server 2008 R2, and Windows Server 2012 DCs, 
+ * the controlValue of the response control is the BER encoding of the following ASN.1 structure 
+ * if the SO_EXTENDED_FMT flag is not specified.
+ */
+type StatsResponseValueV3 : StatsResponseValueV2
+{
+    Integer pagesReferencedTag where value == 9;
+    Integer pagesReferenced;
+    Integer pagesReadTag where value == 10;
+    Integer pagesRead;
+    Integer pagesPrereadTag where value == 11;
+    Integer pagesPreread;
+    Integer pagesDirtiedTag where value == 12;
+    Integer pagesDirtied;
+    Integer pagesRedirtiedTag where value == 13;
+    Integer pagesRedirtied;
+    Integer logRecordCountTag where value == 14;
+    Integer logRecordCount;
+    Integer logRecordBytesTag where value == 15;
+    Integer logRecordBytes;
+}
+
+/* For Windows Server 2008, Windows Server 2008 R2, and Windows Server 2012 DCs, if the SO_EXTENDED_FMT flag is specified, an alternative format is used.
+ * When using the alternative format, the controlValue of the response control is the BER encoding of the following ASN.1 structure.
+ */
+type StatsResponseValueV4
+{
+    StatsResponseValueV4Element threadCount;
+    StatsResponseValueV4Element reserved1;
+    StatsResponseValueV4Element callTime;
+    StatsResponseValueV4Element reserved2;
+    StatsResponseValueV4Element entriesReturned;
+    StatsResponseValueV4Element entriesVisited;
+    StatsResponseValueV4Element filter;
+    StatsResponseValueV4Element index;
+    StatsResponseValueV4Element pagesReferenced;
+    StatsResponseValueV4Element pagesRead;
+    StatsResponseValueV4Element pagesPreread;
+    StatsResponseValueV4Element pagesDirtied;
+    StatsResponseValueV4Element pagesRedirtied;
+    StatsResponseValueV4Element logRecordCount;
+    StatsResponseValueV4Element logRecordBytes;
+}
+
+type StatsResponseValueV4Element
+{
+    OctetString statisticName with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+    (intStatisticPattern | stringStatisticPattern) Statistic;
+}
+
+pattern intStatisticPattern = Integer with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+
+pattern stringStatisticPattern = OctetString with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+
+pattern StatisticNameEnum = enum string
+{
+    threadCount           = "Thread count",
+    callTime              = "Call time (in ms)",
+    entriesReturned       = "Entries Returned",
+    entriesVisited        = "Entries Visited",
+    filter                = "Used Filter",
+    index                 = "Used Indexes",
+    pagesReferenced       = "Pages Referenced",
+    pagesRead             = "Pages Read From Disk",
+    pagesPreread          = "Pages Pre-read From Disk",
+    pagesDirtied          = "Clean Pages Modified",
+    pagesRedirtied        = "Dirty Pages Modified",
+    logRecordCount        = "Log Records Generated",
+    logRecordBytes        = "Log Record Bytes Generated",
+};
+
+/* controlType     1.2.840.113556.1.4.619
+ * 3.1.1.3.4.1.7   LDAP_SERVER_LAZY_COMMIT_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted.
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_LAZY_COMMIT_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.1413
+ * 3.1.1.3.4.1.8   LDAP_SERVER_PERMISSIVE_MODIFY_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_PERMISSIVE_MODIFY_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.528
+ * 3.1.1.3.4.1.9   LDAP_SERVER_NOTIFICATION_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its eventual responses.
+ */
+type LDAP_SERVER_NOTIFICATION_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.802
+ * 3.1.1.3.4.1.10   LDAP_SERVER_RANGE_OPTION_OID
+ * LDAP_SERVER_RANGE_OPTION_OID, unlike the other controls discussed in this section, does not actually designate an LDAP extended control. 
+ */
+//type LDAP_SERVER_RANGE_OPTION
+//{
+//}
+
+/* controlType     1.2.840.113556.1.4.801
+ * 3.1.1.3.4.1.11   LDAP_SERVER_SD_FLAGS_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type SDFlagsRequestValue
+{
+    LDAP_SERVER_SD_FLAGS_FLAG Flags where ValidationCheckEnumValue(InRange<LDAP_SERVER_SD_FLAGS_FLAG>(value), null, true, ReferenceType.Type,
+        "ADTS", "Flags", "SDFlagsRequestValue", "0x1, 0x2, 0x4, 0x8", value);
+}
+
+pattern LDAP_SERVER_SD_FLAGS_FLAG = flags Integer
+{
+    OWNER_SECURITY_INFORMATION = 0x1, // Owner identifier of the object.
+    GROUP_SECURITY_INFORMATION = 0x2, // Primary group identifier.
+    DACL_SECURITY_INFORMATION = 0x4, // Discretionary access control list (DACL) of the object.
+    SACL_SECURITY_INFORMATION = 0x8, // System access control list (SACL) of the object.
+    ...
+} with Asn1Encoding{Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+
+/* controlType     1.2.840.113556.1.4.1340
+ * 3.1.1.3.4.1.12   LDAP_SERVER_SEARCH_OPTIONS_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type SearchOptionsRequestValue
+{
+    LDAP_SERVER_SEARCH_OPTIONS_FLAG Flags where ValidationCheckEnumValue(InRange<LDAP_SERVER_SEARCH_OPTIONS_FLAG>(value), null, true, ReferenceType.Type,
+        "ADTS", "Flags", "SearchOptionsRequestValue", "1, 2", value);
+}
+
+pattern LDAP_SERVER_SEARCH_OPTIONS_FLAG = flags Integer
+{
+    SERVER_SEARCH_FLAG_DOMAIN_SCOPE = 1, // Prevents continuation references from being generated when the search results are returned. This performs the same function as the LDAP_SERVER_DOMAIN_SCOPE_OID control.
+    SERVER_SEARCH_FLAG_PHANTOM_ROOT = 2 // For AD DS, instructs the server to search all NC replicas except application NC replicas that are subordinate to the search base, even if the search base is not instantiated on the server.  For AD LDS, the behavior is the same except that it also includes application NC replicas in the search.  For AD DS and AD LDS, this will cause the search to be executed over all NC replicas (except for application NCs on AD DS DCs) held on the DC that are subordinate to the search base. This enables search bases such as the empty string, which would cause the server to search all of the NC replicas (except for application NCs on AD DS DCs) that it holds.
+    ...
+} with Asn1Encoding{Flags = Asn1EncodingFlags.FlagsEncodedAsInteger};
+
+/* controlType     1.2.840.113556.1.4.473
+ * 3.1.1.3.4.1.13   LDAP_SERVER_SORT_OID
+ * rfc 2891 1.1 Request Control
+ * The controlType is set to "1.2.840.113556.1.4.473". The controlValue is an OCTET STRING,
+ * whose value is the BER encoding of a value of the following SEQUENCE:
+ */
+type SortKeyList
+{
+    array<AttributeDescription> attributeTypes;
+    optional MatchingRuleId orderingRule with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+    Boolean reverseOrder = false with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Implicit, Flags = Asn1EncodingFlags.HasDefaultValue};
+};
+
+/* controlType     1.2.840.113556.1.4.474
+ * 3.1.1.3.4.1.13   LDAP_SERVER_RESP_SORT_OID
+ * rfc 2891 1.2 Response Control
+ * The controlType is set to "1.2.840.113556.1.4.474". The controlValue is an OCTET STRING,
+ * whose value is the BER encoding of a value of the following SEQUENCE:
+ */
+type SortResult
+{
+    (enum Integer
+    {
+        $"success"                = 0, // results are sorted
+        operationsError           = 1, // server internal failure
+        timeLimitExceeded         = 3, // timelimit reached before sorting was completed
+        strongAuthRequired        = 8, // refused to return sorted results via insecure protocol
+        adminLimitExceeded        = 11, // too many matching entries for the server to sort
+        noSuchAttribute           = 16, // unrecognized attribute type in sort key
+        inappropriateMatching     = 18, // unrecognized or inappropriate matching rule in sort key
+        insufficientAccessRights  = 50, // refused to return sorted results to this client
+        busy                      = 51, // too busy to process
+        unwillingToPerform        = 53, // unable to sort
+        other                     = 80,
+    }) sortResult;
+    optional AttributeDescription attributeType;
+}
+
+/* controlType     1.2.840.113556.1.4.417
+ * 3.1.1.3.4.1.14   LDAP_SERVER_SHOW_DELETED_OID 
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_SHOW_DELETED_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.805
+ * 3.1.1.3.4.1.15   LDAP_SERVER_TREE_DELETE_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_TREE_DELETE_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.1338
+ * 3.1.1.3.4.1.16   LDAP_SERVER_VERIFY_NAME_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure:
+ * where Flags is ignored and ServerName is a UTF-16 encoded Unicode string containing the FQDN of the GC server to contact for verification. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type VerifyNameRequestValue
+{
+    Integer Flags;
+    OctetString ServerName with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+}
+
+/* controlType     2.16.840.1.113730.3.4.9
+ * 3.1.1.3.4.1.17   LDAP_CONTROL_VLVREQUEST
+ * This control can only be used if the LDAP_SERVER_SORT_OID (section 3.1.1.3.4.1.13) control is also specified.
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure 
+ * (maxInt is defined in [RFC2251] section 4.1.1):
+ */
+type VLVRequestValue
+{
+    Integer beforeCount with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    Integer afterCount with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    (LDAP_CONTROL_VLVREQUEST_byoffset_pattern | LDAP_CONTROL_VLVREQUEST_greaterThanOrEqual_pattern) TargetObject;
+    optional OctetString contextID;
+}
+
+type LDAP_CONTROL_VLVREQUEST_byoffset
+{
+    Integer offset with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    Integer contentCount with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+}
+
+pattern LDAP_CONTROL_VLVREQUEST_byoffset_pattern = LDAP_CONTROL_VLVREQUEST_byoffset with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+
+pattern LDAP_CONTROL_VLVREQUEST_greaterThanOrEqual_pattern = AssertionValue with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+
+/* controlType     2.16.840.1.113730.3.4.10
+ * 3.1.1.3.4.1.17   LDAP_CONTROL_VLVRESPONSE
+ * When the server receives a search request with the LDAP_CONTROL_VLVREQUEST control attached to it, 
+ * it includes a response control in the search response. 
+ * The controlType field of the returned Control structure is set to the OID of the LDAP_CONTROL_VLVRESPONSE control, 
+ * and the controlValue is the BER encoding of the following ASN.1 structure.
+ */
+type VLVResponseValue
+{
+    Integer targetPosition with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    Integer contentCount with Asn1Encoding{LowerEndValue = 0, UpperEndValue = maxInt};
+    (enum Integer
+    {
+        $"success"                = 0, // success is a keywords of OPN, and here "$" is a workaround. 
+        operationsError           = 1,
+        unwillingToPerform        = 53,
+        insufficientAccessRights  = 50,
+        busy                      = 51,
+        timeLimitExceeded         = 3,
+        adminLimitExceeded        = 11,
+        sortControlMissing        = 60,
+        offsetRangeError          = 61,
+        UnwillingToPerform        = 53,
+        Other                     = 80,
+    }) virtualListViewResult;
+    optional OctetString contextIDServer;
+}
+
+/* controlType     1.2.840.113556.1.4.1504
+ * 3.1.1.3.4.1.18   LDAP_SERVER_ASQ_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure:
+ * sourceAttribute is a UTF-8 string that specifies the LDAP display name of the attribute to use to scope the search
+ */
+type ASQRequestValue
+{
+    OctetString sourceAttribute with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+}
+
+/* controlType     1.2.840.113556.1.4.1504
+ * 3.1.1.3.4.1.18   LDAP_SERVER_ASQ_OID
+ * When the server receives a search request with the LDAP_SERVER_ASQ_OID control attached to it, 
+ * it includes a response control in the search response. The controlType field of the returned Control structure 
+ * is set to the OID of the LDAP_SERVER_ASQ_OID control, and the controlValue is the BER encoding of the following ASN.1 structure:
+ */
+type ASQResponseValue
+{
+    (enum Integer
+    {
+        $"success"                = 0,  // Search results are returned for all objects referenced by sourceAttribute.
+        invalidAttributeSyntax    = 21, // sourceAttribute is not of Object(DS-DN) syntax.
+        unwillingToPerform        = 53, // The search scope was not set to base object scope.
+        affectsMultipleDSAs       = 71, // Partial results were returned, but not all the objects were available on the DC.
+    }) searchResults;
+}
+
+/* controlType     1.2.840.113556.1.4.1852
+ * 3.1.1.3.4.1.19   LDAP_SERVER_QUOTA_CONTROL_OID
+ * querySID is the SID, in binary form, of the user whose quota is to be retrieved (the binary form of SIDs is documented in [MS-DTYP] section 2.4.2).
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type QuotaRequestValue
+{
+    OctetString querySID;
+    
+    override string ToString()
+    {
+        return (querySID == nothing) ? "" : (BinaryDecoder<SID>(querySID as binary) as SID).ToString();
+    }
+}
+
+/* controlType     1.2.840.113556.1.4.1907
+ * 3.1.1.3.4.1.20   LDAP_SERVER_SHUTDOWN_NOTIFY_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_SHUTDOWN_NOTIFY_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.1974
+ * 3.1.1.3.4.1.21   LDAP_SERVER_FORCE_UPDATE_OID
+ * When sending this control to a DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to a DC does not cause the DC to include any controls in its response.
+ */
+type LDAP_SERVER_FORCE_UPDATE_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.1948
+ * 3.1.1.3.4.1.22   LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID
+ * When sending this control to a DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to a DC does not cause the DC to include any controls in its response.
+ */
+type LDAP_SERVER_RANGE_RETRIEVAL_NOERR_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.1341
+ * 3.1.1.3.4.1.23   LDAP_SERVER_RODC_DCPROMO_OID
+ * When sending this control to a DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to a DC does not cause the DC to include any controls in its response.
+ */
+type LDAP_SERVER_RODC_DCPROMO_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.2026
+ * 3.1.1.3.4.1.24   LDAP_SERVER_DN_INPUT_OID
+ * InputDN is a UTF-8 encoding of the DN of a security principal. 
+ * The DN may be either an RFC 2253–style DN or one of the alternative DN formats described in section 3.1.1.3.1.2.4.
+ */
+type DNInputRequestValue
+{
+    OctetString InputDN with Asn1Encoding{Flags = Asn1EncodingFlags.OctetStringIsString};
+}
+
+/* controlType     1.2.840.113556.1.4.2065
+ * 3.1.1.3.4.1.25   LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response. 
+ */
+type LDAP_SERVER_SHOW_DEACTIVATED_LINK_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.2064
+ * 3.1.1.3.4.1.26   LDAP_SERVER_SHOW_RECYCLED_OID
+ * When sending this control to the DC, the controlValue field of the Control structure is omitted. 
+ * Sending this control to the DC does not cause the server to include any controls in its response.
+ */
+type LDAP_SERVER_SHOW_RECYCLED_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* controlType     1.2.840.113556.1.4.2239
+ * 3.1.1.3.4.1.27   LDAP_SERVER_POLICY_HINTS_OID
+ * Flags tells the server whether to apply the password history length constraint on password-set operations. 
+ * If it is 0x1, then that constraint will be enforced. Otherwise, the constraint is not enforced. 
+ */
+type PolicyHintsRequestValue
+{
+    Integer Flags;
+}
+
+/* controlType     1.2.840.113556.1.4.2066
+ * 3.1.1.3.4.1.28   LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID 
+ * The LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID control has the exact semantics and behaviors as LDAP_SERVER_POLICY_HINTS_OID (section 3.1.1.3.4.1.27); 
+ * this control MAY be used by clients when the server does not support LDAP_SERVER_POLICY_HINTS_OID. 
+ * Clients SHOULD use LDAP_SERVER_POLICY_HINTS_OID when it is supported by the server.
+ */
+type LDAP_SERVER_POLICY_HINTS_DEPRECATED_OID
+{
+    Integer Flags;
+}
+
+/* controlType     1.2.840.113556.1.4.2090
+ * 3.1.1.3.4.1.29   LDAP_SERVER_DIRSYNC_EX_OID
+ * The LDAP_SERVER_DIRSYNC_EX_OID control is used with an LDAP search operation in exactly the same way as the LDAP_SERVER_DIRSYNC_OID control,
+ * except for differences specified in this section. All ASN.1 structures and the meaning of the fields of those structures are the same.
+ * However, where the LDAP_SERVER_DIRSYNC_OID control returns only those attributes that have changed, 
+ * the LDAP_SERVER_DIRSYNC_EX_OID control returns all the attributes specified in the LDAP search operation.
+ */
+type LDAP_SERVER_DIRSYNC_EX_OID_REQUEST
+{
+    LDAP_SERVER_DIRSYNC_FLAGS Flags where ValidationCheckCombinationValue(InRange<LDAP_SERVER_DIRSYNC_FLAGS>(value), null, true, ReferenceType.Type,
+        "ADTS", "Flags", "LDAP_SERVER_DIRSYNC_EX_OID_REQUEST", "0x00000001, 0x00000800, 0x00002000, 0x80000000", value);
+    Integer MaxBytes;
+    OctetString Cookie;
+}
+
+/* controlType     1.2.840.113556.1.4.2090
+ * 3.1.1.3.4.1.29   LDAP_SERVER_DIRSYNC_EX_OID
+ * The LDAP_SERVER_DIRSYNC_EX_OID control is used with an LDAP search operation in exactly the same way as the LDAP_SERVER_DIRSYNC_OID control,
+ * except for differences specified in this section. All ASN.1 structures and the meaning of the fields of those structures are the same.
+ * However, where the LDAP_SERVER_DIRSYNC_OID control returns only those attributes that have changed, 
+ * the LDAP_SERVER_DIRSYNC_EX_OID control returns all the attributes specified in the LDAP search operation.
+ */
+type LDAP_SERVER_DIRSYNC_EX_OID_RESPONSE
+{
+    Integer MoreResults;
+    Integer unused;
+    OctetString CookieServer;
+}
+
+/* The following table specifies the statistics that a DC MUST return. 
+ * A DC MAY return other implementation-defined statistics. 
+ * No other statistics are returned by DCs in any Microsoft Windows® Server operating system.
+ */
+pattern LDAP_SERVER_UPDATE_STATS_statID = enum string
+{
+    HighestUSNAllocated    = "1.2.840.113556.1.4.2208" with Documentation{NameInDocumentation = "Highest USN Allocated"},
+    InvocationIDOfServer   = "1.2.840.113556.1.4.2209" with Documentation{NameInDocumentation = "Invocation ID Of Server"},
+};
+
+/* controlType     1.2.840.113556.1.4.2204
+ * 3.1.1.3.4.1.31   LDAP_SERVER_TREE_DELETE_EX_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ * countOfObjectsToDelete is a limit on the number of objects that will be deleted while processing this control.
+ */
+type TreeDeleteExRequestValue
+{
+    Integer countOfObjectsToDelete;
+}
+
+/* controlType     1.2.840.113556.1.4.2206
+ * 3.1.1.3.4.1.32   LDAP_SERVER_SEARCH_HINTS_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ */
+type LDAP_SERVER_SEARCH_HINTS_OID
+{
+    LDAP_SERVER_SEARCH_HINTS_OID_inner hints with Asn1Encoding{TagClass = Asn1TagClass.Universal, Flags = Asn1EncodingFlags.TagLengthSkipped, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+} with Asn1Encoding{TagClass = Asn1TagClass.Universal, TagNumber = 0, Flags = Asn1EncodingFlags.TagLengthSkipped, Tagging = Asn1Tagging.Implicit};
+
+pattern LDAP_SERVER_SEARCH_HINTS_OID_inner = array<SearchHintsRequestValue> with Asn1Encoding{TagClass = Asn1TagClass.Universal, Flags = Asn1EncodingFlags.TagLengthSkipped, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+
+/* The following table specifies the hints that a DC MUST honor. 
+ * A DC MAY honor other implementation-defined search hints. 
+ * No other search hints are honored by DCs in any Microsoft Windows® Server operating system.
+ */
+pattern LDAP_SERVER_SEARCH_HINTS_hintId = enum string
+{
+    RequireSortIndex = "1.2.840.113556.1.4.2207" with Documentation{NameInDocumentation = "Require Sort Index"},
+    SoftSizeLimit    = "1.2.840.113556.1.4.2210" with Documentation{NameInDocumentation = "Soft Size Limit"},
+};
+
+/* controlType     1.2.840.113556.1.4.2211
+ * 3.1.1.3.4.1.33   LDAP_SERVER_EXPECTED_ENTRY_COUNT_OID
+ * When the search operation would normally return success / <unrestricted> 
+ * and the number of searchEntries returned by the search is less than searchEntriesMin or greater than searchEntriesMax, 
+ * the return code of the search operation is modified to be constraintViolation / <unrestricted>.
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+ * this control affects only the return value of the search operation. It does not affect any other part of the returned data from the search operation.
+ */
+type ExpectedEntryCountRequestValue
+{
+    Integer searchEntriesMin;
+    Integer searchEntriesMax;
+}
+
+/* controlType     1.2.840.113556.1.4.2211
+ * 3.1.1.3.4.1.34   LDAP_SERVER_SET_OWNER_OID
+ * When sending this control to the DC, the controlValue field is set to the BER encoding of the following ASN.1 structure.
+*/
+type LDAP_SERVER_SET_OWNER_OID{
+    SID SID;
+}
+
+// ---------------------------------------------------------extended operations---------------------------------------------------------
+
+/* 3.1.1.3.4.2.1   LDAP_SERVER_FAST_BIND_OID
+ * To send this extended operation to the DC, the client sends an LDAP ExtendedRequest with the requestName field containing the operation's OID. 
+ * The requestValue field is omitted. The server will return an ExtendedResponse with the responseName field containing the operation's OID and the response field omitted.
+ */
+type LDAP_SERVER_FAST_BIND_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* 3.1.1.3.4.2.2   LDAP_SERVER_START_TLS_OID
+ * RFC 2830, 2.1 A Start TLS extended request is formed by setting the requestName
+   field to the OID string given above.  The requestValue field is
+   absent.A Start TLS extended response MUST contain a responseName field which
+   MUST be set to the same string as that in the responseName field
+   present in the Start TLS extended request. The response field is
+   absent.
+ */
+type LDAP_SERVER_START_TLS_OID {} with Asn1Encoding{Flags = Asn1EncodingFlags.TagLengthSkipped};
+
+/* 3.1.1.3.4.2.3   LDAP_TTL_REFRESH_OID
+ * rfc 2589 4.1 Refresh Request
+ */
+type LDAP_TTL_REFRESH_OID_Request
+{
+    LdapDN entryName with Asn1Encoding {TagClass = Asn1TagClass.ContextSpecific, TagNumber = 0, Tagging = Asn1Tagging.Implicit};
+    Integer requestTtl with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+}
+
+/* 3.1.1.3.4.2.3   LDAP_TTL_REFRESH_OID
+ * rfc 2589 4.2 Refresh Response
+ */
+type LDAP_TTL_REFRESH_OID_Response
+{
+    Integer requestTtl with Asn1Encoding{TagClass = Asn1TagClass.ContextSpecific, TagNumber = 1, Tagging = Asn1Tagging.Implicit};
+}
+
+// 6.3.1.3   Operation Code
+pattern NetlogonOperationCode = enum ushort
+{
+    LOGON_PRIMARY_QUERY = 7,
+    LOGON_PRIMARY_RESPONSE = 12,
+    LOGON_SAM_LOGON_REQUEST = 18,
+    LOGON_SAM_LOGON_RESPONSE = 19,
+    LOGON_SAM_PAUSE_RESPONSE = 20,
+    LOGON_SAM_USER_UNKNOWN = 21,
+    LOGON_SAM_LOGON_RESPONSE_EX = 23,
+    LOGON_SAM_PAUSE_RESPONSE_EX = 24,
+    LOGON_SAM_USER_UNKNOWN_EX = 25,
+    ...
+};
+
+// 6.3.1.2   DS_FLAG Options Bits
+pattern DsFlag = flags uint
+{
+    FP = 0x1,
+    FG = 0x4,
+    FL = 0x8,
+    FD = 0x10,
+    FK = 0x20,
+    FT = 0x40,
+    FC = 0x80,
+    FW = 0x100,
+    FGT = 0x200,
+    FN = 0x400,
+    FSS = 0x800,
+    FFS = 0x1000,
+    FWS = 0x2000,
+    FW8 = 0x4000,
+    FW9 = 0x8000,
+    FDNS = 0x20000000,
+    FDM = 0x40000000,
+    FF = 0x80000000,
+    ...
+};
+
+// 6.3.1.1   NETLOGON_NT_VERSION Options Bits
+pattern NetlogonNtVersionOptions = flags uint
+{
+    V1 = 0x1,
+    V5 = 0x2,
+    V5EX = 0x4,
+    V5EP = 0x8,
+    VCS = 0x10,
+    VNT4 = 0x1000000,
+    VPDC = 0x10000000,
+    VIP = 0x20000000,
+    VL = 0x40000000,
+    VGC = 0x80000000,
+    ...
+};
+
+// 2.2.16 userAccountControl Bits
+pattern UserAccountControl = flags uint
+{
+    D  = 0x00000002,
+    HR = 0x00000008,
+    L  = 0x00000010,
+    NR = 0x00000020,
+    CC = 0x00000040,
+    ET = 0x00000080,
+    N  = 0x00000200,
+    ID = 0x00000800,
+    WT = 0x00001000,
+    ST = 0x00002000,
+    DP = 0x00010000,
+    SR = 0x00040000,
+    TD = 0x00080000,
+    ND = 0x00100000,
+    DK = 0x00200000,
+    DR = 0x00400000,
+    PE = 0x00800000,
+    TA = 0x01000000,
+    NA = 0x02000000,
+    PS = 0x04000000,
+    ...
+};
+
+// 6.3.1.9 DcSockAddr (16 bytes)
+type DcSockAddrType
+{
+    ushort sin_family where ValidationCheckValue(value == 2, null, true, ReferenceType.Type, ADTS_MODULE, "sin_family", "DcSockAddr", 2, value);
+    ushort sin_port;
+    IPv4Address sin_addr with BinaryEncoding{Endian = Endian.Big};
+    ulong sin_zero where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, ADTS_MODULE, "sin_zero", "DcSockAddr", value);
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.9   NETLOGON_SAM_LOGON_RESPONSE_EX
+message NetlogonSamLogonResponseEx[bool hasIp, bool closestSite]
+{
+    NetlogonOperationCode Opcode;
+    ushort Sbz;
+    DsFlag Flags;
+    guid DomainGuid;
+    DNSString DnsForestName;
+    DNSString DnsDomainName;
+    DNSString DnsHostName;
+    DNSString NetbiosDomainName;
+    DNSString NetbiosComputerName;
+    DNSString UserName;
+    DNSString DcSiteName;
+    DNSString ClientSiteName;
+    optional [|hasIp|] char DcSockAddrSize with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional [|hasIp|] DcSockAddrType DcSockAddr;
+    optional [|closestSite|] DNSString NextClosestSiteName;
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValue((value & NetlogonNtVersionOptions.V1) > 0 && (value & NetlogonNtVersionOptions.V5EX) > 0 , this, true, ReferenceType.Message, ADTS_MODULE, "NtVersion", "NetlogonSamLogonResponseEx", NetlogonNtVersionOptions.V5EX | NetlogonNtVersionOptions.V1, value);
+    ushort LmNtToken where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "LmNtToken", "NetlogonSamLogonResponseEx", 0xffff, value);
+    ushort Lm20Token where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "Lm20Token", "NetlogonSamLogonResponseEx", 0xffff, value);
+
+    override string ToString()
+    {
+        return "NetlogonSamLogonResponseEx, Opcode: " + EnumToString(Opcode, "ADTS.NetlogonOperationCode") + ", NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.4   NETLOGON_LOGON_QUERY
+message NetlogonLogonQuery
+{
+    NetlogonOperationCode Opcode;
+    string ComputerName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    string MailslotName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional [|(ComputerName.Count + MailslotName.Count) % 2 == 1|] byte Padding; // aligned to an even byte
+    string UnicodeComputerName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValueTooManyItems(InRange<NetlogonNtVersionOptions>(value), this, true, ReferenceType.Message,
+        "ADTS", "NtVersion", "NetlogonLogonQuery", "NETLOGON_NT_VERSION Options", "[MS-ADTS]");
+    ushort LmNtToken where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "LmNtToken", "NetlogonLogonQuery", 0xffff, value);
+    ushort Lm20Token where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "Lm20Token", "NetlogonLogonQuery", 0xffff, value);
+
+    override string ToString()
+    {
+        return "NetlogonLogonQuery, NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.5   NETLOGON_PRIMARY_RESPONSE
+message NetlogonPrimaryResponse
+{
+    NetlogonOperationCode Opcode;
+    string PrimaryDCName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    // aligned to an even byte, (PrimaryDCName.Count + 1) % 2 == 1 => (PrimaryDCName.Count ) % 2 == 0
+    optional [|(PrimaryDCName.Count) % 2 == 0|] byte Padding;
+    string UnicodePrimaryDCName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    string UnicodeDomainName with BinaryEncoding{TextEncoding = TextEncoding.Unicode};
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValueTooManyItems(InRange<NetlogonNtVersionOptions>(value), this, true, ReferenceType.Message,
+        "ADTS", "NtVersion", "NetlogonLogonQuery", "NETLOGON_NT_VERSION Options", "[MS-ADTS]");
+    // Use below to value to check whether binary should be decoded as this type
+    ushort LmNtToken where value == 0xffff;
+    ushort Lm20Token where value == 0xffff;
+
+    override string ToString()
+    {
+        return "NetlogonPrimaryResponse, Opcode: " + EnumToString(Opcode, "ADTS.NetlogonOperationCode") + ", NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.6   NETLOGON_SAM_LOGON_REQUEST
+message NetlogonSamLogonRequest
+{
+    NetlogonOperationCode Opcode;
+    ushort RequestCount;
+    string UnicodeComputerName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string UnicodeUserName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string MailslotName with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    UserAccountControl AllowableAccountControlBits where ValidationCheck(InRange<UserAccountControl>(value), this, DiagnosisLevel.Warning, "ADTS: The AllowableAccountControlBits field in message NetlogonSamLogonRequest has one or more undefined bits. Please refer to userAccountControl Bits in Technical Document [MS-ADTS].");
+    uint DomainSidSize;
+    optional [|DomainSidSize > 0|] binary align with BinaryEncoding{Length = ((4 + (UnicodeComputerName.Count + 1) * 2 + (UnicodeUserName.Count + 1) * 2 + (MailslotName.Count + 1) + 8) % 4 == 0 ? 0 : (4 - (4 + (UnicodeComputerName.Count + 1) * 2 + (UnicodeUserName.Count + 1) * 2 + (MailslotName.Count + 1) + 8) % 4))};
+    optional [|DomainSidSize > 0|] SID DomainSid;
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValueTooManyItems(InRange<NetlogonNtVersionOptions>(value), this, true, ReferenceType.Message,
+        "ADTS", "NtVersion", "NetlogonLogonQuery", "NETLOGON_NT_VERSION Options", "[MS-ADTS]");
+    ushort LmNtToken where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "LmNtToken", "NetlogonSamLogonRequest", 0xffff, value);
+    ushort Lm20Token where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "Lm20Token", "NetlogonSamLogonRequest", 0xffff, value);
+
+    override string ToString()
+    {
+        return "NetlogonSamLogonRequest, NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.7   NETLOGON_SAM_LOGON_RESPONSE_NT40
+message NetlogonSamLogonResponseNt40
+{
+    NetlogonOperationCode Opcode;
+    string UnicodeLogonServer with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string UnicodeUserName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string UnicodeDomainName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValue((value & NetlogonNtVersionOptions.V1) > 0 , this, true, ReferenceType.Message, ADTS_MODULE, "NtVersion", "NetlogonSamLogonResponseNt40", NetlogonNtVersionOptions.V1, value);
+    // Use below to value to check whether binary should be decoded as this type
+    ushort LmNtToken where value == 0xffff;
+    ushort Lm20Token where value == 0xffff;
+
+    override string ToString()
+    {
+        return "NetlogonSamLogonResponseNt40, Opcode: " + EnumToString(Opcode, "ADTS.NetlogonOperationCode") + ", NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 6.3.1.8   NETLOGON_SAM_LOGON_RESPONSE
+message NetlogonSamLogonResponse
+{
+    NetlogonOperationCode Opcode;
+    string UnicodeLogonServer with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string UnicodeUserName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    string UnicodeDomainName with BinaryEncoding{TextEncoding = TextEncoding.UTF16};
+    guid DomainGuid;
+    guid NullGuid;
+    DNSString DnsForestName;
+    DNSString DnsDomainName;
+    DNSString DnsHostName;
+    IPv4Address DcIpAddress with BinaryEncoding{Endian = Endian.Little}, DisplayInfo{ToText = IPv4AddressLittleEndianToText};
+    DsFlag Flags;
+    NetlogonNtVersionOptions NtVersion where ValidationCheckCombinationValue((value & NetlogonNtVersionOptions.V1) > 0 && (value & NetlogonNtVersionOptions.V5) > 0 , this, true, ReferenceType.Message, ADTS_MODULE, "NtVersion", "NetlogonSamLogonResponse", NetlogonNtVersionOptions.V5 | NetlogonNtVersionOptions.V1, value);
+    ushort LmNtToken where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "LmNtToken", "NetlogonSamLogonResponse", 0xffff, value);
+    ushort Lm20Token where ValidationCheckValue(value == 0xffff, this, true, ReferenceType.Message, ADTS_MODULE, "Lm20Token", "NetlogonSamLogonResponse", 0xffff, value);
+
+    override string ToString()
+    {
+        return "NetlogonSamLogonResponse, Opcode: " + EnumToString(Opcode, "ADTS.NetlogonOperationCode") + ", NtVersion: " + Utility.DecToHexFormat(NtVersion);
+    }
+    
+    static string IPv4AddressLittleEndianToText(any address)
+    {
+        binary octets = (address as IPv4Address).Octets;
+        // Memo: Using array index may fail if encounter trucated messages.
+        string ip = "";
+        for (int i = octets.Count - 1; i >= 0; i--)
+        {
+            ip = ip + (octets[i] as string);
+            if (i > 0)
+            {
+                ip = ip + ".";
+            }
+        }
+        return ip;
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// 2.2.18.4 CLAIMS_COMPRESSION_FORMAT
+pattern CLAIMS_COMPRESSION_FORMAT = enum 
+{
+    COMPRESSION_FORMAT_NONE = 0,
+    COMPRESSION_FORMAT_LZNT1 = 2,
+    COMPRESSION_FORMAT_XPRESS = 3,
+    COMPRESSION_FORMAT_XPRESS_HUFF = 4,
+    ...
+};
+
+// 2.2.18.8 CLAIMS_SET_METADATA
+type CLAIMS_SET_METADATA
+{
+    ULONG ulClaimsSetSize;
+    array<BYTE> ClaimsSet with IDL{Size_is = [ulClaimsSetSize], IndirectionLevel = 1};
+    CLAIMS_COMPRESSION_FORMAT usCompressionFormat where ValidationCheckEnumValue(InRange<CLAIMS_COMPRESSION_FORMAT>(value),
+        null, true, ReferenceType.Type, "ADTS", "usCompressionFormat", "CLAIMS_SET_METADATA", "0, 2, 3, 4", value);
+    ULONG ulUncompressedClaimsSetSize;
+    USHORT usReservedType;
+    ULONG ulReservedFieldSize;
+    array<BYTE> ReservedField with IDL{Size_is = [ulReservedFieldSize], IndirectionLevel = 1};
+};

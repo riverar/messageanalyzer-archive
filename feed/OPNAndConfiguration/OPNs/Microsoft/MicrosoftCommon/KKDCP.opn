@@ -1,0 +1,120 @@
+protocol KKDCP with
+Asn1EncodingDefaults{EncodingRule = Asn1EncodingRule.BER},
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Kerberos Key Distribution Center (KDC) Proxy Protocol",
+    ShortName = "KKDCP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "MS-KKDCP", Version = "1.1", Date = "10/25/2012", ProgramName = ProgramName.WSPP},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "363167", Date = "04/30/2014"},
+        ]
+};
+
+using Standard;
+using Technologies.ASN1;
+using HTTP;
+using KerberosV5;
+using Utility;
+
+const string KdcProxyString = "/KdcProxy";
+
+endpoint Server over HTTP.Server accepts mutable KdcProxyMessage issues mutable KdcProxyMessage
+{
+    observe this accepts kdcMsg:KdcProxyMessage
+    {
+        DecodeActualKerbMessage(kdcMsg);
+    }
+    observe this issues kdcMsg:KdcProxyMessage
+    {
+        DecodeActualKerbMessage(kdcMsg);
+    }
+}
+
+void DecodeActualKerbMessage(KdcProxyMessage kdcMsg)
+{
+    if (kdcMsg.KerbMessage is msgPayload:binary &&
+        msgPayload.Count > 4 &&
+        BinaryDecoder<MaxLength>(msgPayload.Segment(0, 4)) is length:MaxLength &&
+        BinaryDecoder<KrbMessage[length.Length == (msgPayload.Count - 4)]>(msgPayload) is krbMsg:KrbMessage)
+    {
+        kdcMsg.KerbMessage = krbMsg;
+    }
+}
+
+message KdcProxyMessage
+{
+    /* Kerberos might be transmitted both on TCP and UDP, 
+     * so can't identify whether total length (4 octets) are present or not,
+     * which need manual decode in server observe rules.
+     */
+    (OctetString | KrbMessage) KerbMessage with Asn1Encoding{TagNumber = 0, Tagging = Asn1Tagging.Explicit}, Documentation{NameInDocumentation = "kerb-message"};
+    optional Realm TargetDomain with Asn1Encoding{TagNumber = 1, Tagging = Asn1Tagging.Explicit}, Documentation{NameInDocumentation = "target-domain"};
+    optional Integer DclocatorHint with Asn1Encoding{TagNumber = 2, Tagging = Asn1Tagging.Explicit}, Documentation{NameInDocumentation = "dclocator-hint"};
+    override string ToString()
+    {
+        string summary = (TargetDomain is nothing) ? "" : "TargetDomain: " + TargetDomain.ToString();
+        summary += (DclocatorHint is nothing) ? "" : ", DclocatorHint: " + DclocatorHint.ToString();
+        return summary;
+    }
+} with Documentation{NameInDocumentation = "KDC-PROXY-MESSAGE"};
+
+autostart actor KkdcpOverHttps(HTTP.Server httpServer)
+{
+    process httpServer accepts req:HttpContract.Request where IsKkdcpPayload(req.Uri.AbsPath)
+    {
+        DecodeKdcProxyMessage(httpServer, req.Payload, true);
+    }
+    process httpServer issues resp:HttpContract.Response where resp#Uri != nothing && IsKkdcpPayload((resp#Uri as UriType).AbsPath)
+    {
+        DecodeKdcProxyMessage(httpServer, resp.Payload, false);
+    }
+}
+
+bool IsKkdcpPayload(optional string str)
+{
+    if (str is nothing)
+    {
+        return false;
+    }
+    else
+    {
+        var uriStr = str as string;
+        if (uriStr == null)
+        {
+            return false;
+        }
+        else
+        {
+            return uriStr == KdcProxyString || uriStr.IndexOf(KdcProxyString) != -1;
+        }
+    }
+}
+
+void DecodeKdcProxyMessage(HTTP.Server httpServer, binary payload, bool isAccepts)
+{
+    switch (payload)
+    {
+        case kdcMsg:KdcProxyMessage from Asn1BerDecoder<KdcProxyMessage> =>
+            var kkdcpServer = endpoint Server over httpServer;
+            if (isAccepts)
+            {
+                dispatch kkdcpServer accepts kdcMsg;
+            }
+            else
+            {
+                dispatch kkdcpServer issues kdcMsg;
+            }
+        default =>
+            ThrowDecodingException("KKDCP", "KdcProxyMessage");
+    }
+}

@@ -1,0 +1,264 @@
+protocol IP1394 with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "IPv4 Over IEEE 1394",
+    ShortName = "IP1394",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2734"},
+            new Reference{Name = "MS-V4OF", Version = "4.0", Date = "03/14/2008", ProgramName = ProgramName.MCPP},
+            new Reference{Name = "IEEE Std 802.1D", Version = "2004 Edition", Link = "http://standards.ieee.org/getieee802/download/802.1D-2004.pdf"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "366790", Date = "07/23/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using IANA;
+
+annotation byte IP1394.Frame#If;
+annotation ushort IP1394.Frame#Dgl;
+annotation ushort IP1394.Frame#FragmentOffset;
+annotation ushort IP1394.Frame#EthernetType;
+
+endpoint Node
+    over ReassemblyNode
+    accepts Frame;
+
+endpoint ReassemblyNode[binary Address]
+    accepts Frame
+{
+    map<ushort, array<Frame>> fragments = {};
+    process this accepts f:Frame
+    {
+        ReassembleIP1394Fragment(f, ref fragments, this);
+    }
+};
+
+autostart actor ReassemblyNodeActor(ReassemblyNode reassemblyNode)
+{
+    // destructor
+    ~endpoint(ReassemblyNode reassemblyNode)
+    {
+        // map<ushort, array<Frame>> fragments
+        if ((reassemblyNode.fragments.Values).Count > 0)
+        {
+            foreach (var frames in reassemblyNode.fragments.Values)
+            {
+                foreach (var msg in frames)
+                {
+                    ReportInsufficientData(msg, DiagnosisLevel.Error, "IP1394: Insufficient fragments for full reassembly.");
+                    DisplayTopLevelMessage(msg);
+                }
+            }
+            reassemblyNode.fragments = {};
+        }
+    }
+}
+
+void ReassembleIP1394Fragment(Frame f, ref map<ushort, array<Frame>> fragments, ReassemblyNode e)
+{
+    if (f.EncapsulationHeader is UnFragment)
+    {
+        var h          = f.EncapsulationHeader as UnFragment;
+        f#If           = h.If as byte;
+        f#EthernetType = h.EthernetType;
+    }
+    else if (f.EncapsulationHeader is FirstFragment)
+    {
+        var h            = f.EncapsulationHeader as FirstFragment;
+        f#If             = h.If as byte;
+        f#EthernetType   = h.EthernetType as ushort;
+        f#Dgl            = h.Dgl as ushort;
+        f#FragmentOffset = 0;
+    }
+    else if (f.EncapsulationHeader is LastOrInteriorFragment)
+    {
+        var h            = f.EncapsulationHeader as LastOrInteriorFragment;
+        f#If             = h.If as byte;
+        f#Dgl            = h.Dgl as ushort;
+        f#FragmentOffset = h.FragmentOffset as ushort;
+    }
+    
+    
+    var node = endpoint IP1394.Node over e;
+    if (f.EncapsulationHeader is UnFragment)
+    {
+        dispatch node accepts f;
+    }
+    else
+    {
+        var id = f#Dgl as ushort;
+        
+        // Catch the fragment
+        if (!(id in fragments))
+        {
+            // This is the first arrived fragment
+            fragments[id] = [f];
+        }
+        else
+        {
+            // This is a follow up fragment
+            // Notice that InsertSorted function deals with fragments out of order
+            if (!IsDuplicatedFragment(fragments[id], f))
+            {
+                fragments[id] = fragments[id].InsertSorted<IP1394.Frame>((IP1394.Frame f1, IP1394.Frame f2) => (f1#FragmentOffset as ushort) - (f2#FragmentOffset as ushort), f);
+            }
+        }
+                    
+        // Reassemble
+        if (IsFragmentsSequentialCompleted<IP1394.Frame>(
+                fragments[id],
+                (Frame m) => m#If == 1,                           // Function to identify the first fragment
+                (Frame m) => m#If == 2,                           // Function to identify the last fragment 
+                (Frame m) => (m#FragmentOffset as ushort),                    // Function to get the sequence token of current fragment
+                (Frame m) => (m#FragmentOffset as ushort) + (m.Payload).Count)) // Function to get the expected next sequence token
+        {
+            Frame msg = new Frame{};
+                
+            // Reassemble
+            foreach (var frag in fragments[id])
+            {
+                if (frag.EncapsulationHeader is FirstFragment)
+                {
+                    msg.DestinationAddress  = frag.DestinationAddress;
+                    msg.SourceAddress       = frag.SourceAddress;
+                    msg.EncapsulationHeader = frag.EncapsulationHeader;
+                    msg.Payload             = frag.Payload;
+                    msg#If                  = frag#If as byte;
+                    msg#EthernetType        = frag#EthernetType as ushort;
+                    msg#Dgl                 = frag#Dgl as ushort;
+                    msg#FragmentOffset      = 0;
+                }
+                else
+                {
+                    msg.Payload += frag.Payload;
+                }
+            }
+                
+            foreach (Frame dg in fragments[id])
+            {
+                msg.Origins += [dg];
+            }
+                
+            // Clear buffered fragments
+            fragments = fragments.Remove(id);
+
+            // Dispatch the reassembled message
+            dispatch node accepts msg;
+        }
+    }
+}
+
+
+// -------------------------------------------
+// Helper functions
+bool IsDuplicatedFragment(array<Frame> frames, Frame m)
+{
+    foreach (Frame t in frames)
+    {
+        if (m#FragmentOffset == t#FragmentOffset)
+        {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+
+// -------------------------------------------
+// Interface
+message Frame
+{
+    MacAddress DestinationAddress with Visualization{AliasName = "Address"};
+    MacAddress SourceAddress      with Visualization{AliasName = "Address"};
+    ulong VCI;
+    
+    (UnFragment | FirstFragment | LastOrInteriorFragment) EncapsulationHeader;
+    binary Payload;
+    
+    override string ToString()
+    {
+        string summary = "EthernetType: " + GetEtherTypeName((this#EthernetType as ushort)) + ", If: ";
+        switch(this#If)
+        {
+            case 0 =>
+                summary += "Unfragmented";
+            case 1 =>
+                summary += "First";
+            case 2 => 
+                summary += "Last";
+            case 3 =>
+                summary += "Interior";
+            default =>
+                summary += "Unknown (" + (this#If as string) + ")";   
+        }
+        return summary;
+    }
+}
+
+MacAddress get Source(this IP1394.Frame frame)
+{
+    return frame.SourceAddress;
+}
+
+MacAddress get Destination(this IP1394.Frame frame)
+{
+    return frame.DestinationAddress;
+}
+
+MacAddress get SourceMACAddress(this IP1394.Frame frame)
+{
+    return frame.SourceAddress;
+}
+
+MacAddress get DestinationMACAddress(this IP1394.Frame frame)
+{
+    return frame.DestinationAddress;
+}
+
+string get Network(this IP1394.Frame f)
+{
+    string src = GetAlias("Utility.MacAddress", f.SourceAddress, this) ?? f.SourceAddress.ToString();
+    string dst = GetAlias("Utility.MacAddress", f.DestinationAddress, this) ?? f.DestinationAddress.ToString();
+    return (f.SourceAddress.Octets > f.DestinationAddress.Octets ? (dst + " - " + src) : (src + " - " + dst));
+}
+
+// -------------------------------------------
+// Data types
+type UnFragment
+{
+    (byte where value == 0) If                                                       with BinaryEncoding{Width = 2}; // Don't Fragment 
+    ushort Reserved where ValidationCheck(value == 0, null, () => "IP1394: The Reserved field in type UnFragment must be set to zero, not " + DecToHexFormat(value) + ".") with BinaryEncoding{Width = 14};
+    ushort EthernetType where ValidationCheck(value is EtherType, null, "IP1394: UnFragment cannot be decoded successfully due to unknown EthernetType.");
+};
+
+type FirstFragment
+{
+    (byte where value == 1) If with BinaryEncoding{Width = 2}; // First Fragment
+    ushort DatagramSize        with BinaryEncoding{Width = 14};
+    EtherType EthernetType;
+    ushort Dgl;
+    ushort Reserved;
+};
+
+type LastOrInteriorFragment
+{
+    (byte where (value == 2 | value == 3)) If with BinaryEncoding{Width = 2}; // Last or Interior Fragment
+    byte rsv                                  with BinaryEncoding{Width = 2};
+    ushort DatagramSize                       with BinaryEncoding{Width = 12};
+    byte Rsv                                  with BinaryEncoding{Width = 2};
+    ushort FragmentOffset                     with BinaryEncoding{Width = 14};
+    ushort Dgl;
+    ushort Reserved;
+}

@@ -1,0 +1,2477 @@
+protocol DHCP with 
+BinaryEncodingDefaults{Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "Dynamic Host Configuration Protocol",
+    ShortName = "DHCP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1542"},
+            new Reference{Name = "RFC 2131"},
+            new Reference{Name = "RFC 2132"},
+            new Reference{Name = "RFC 2563"},
+            new Reference{Name = "RFC 2242"},
+            new Reference{Name = "RFC 3046"},
+            new Reference{Name = "RFC 3004"},
+            new Reference{Name = "RFC 2610"},
+            new Reference{Name = "RFC 4039"},
+            new Reference{Name = "RFC 4702"},
+            new Reference{Name = "RFC 4174"},
+            new Reference{Name = "RFC 2241"},
+            new Reference{Name = "RFC 4280"},
+            new Reference{Name = "RFC 3118"},
+            new Reference{Name = "RFC 4388"},
+            new Reference{Name = "RFC 4578"},
+            new Reference{Name = "RFC 2485"},
+            new Reference{Name = "RFC 4776"},
+            new Reference{Name = "RFC 4833"},
+            new Reference{Name = "RFC 3397"},
+            new Reference{Name = "RFC 3361"},
+            new Reference{Name = "RFC 3442"},
+            new Reference{Name = "RFC 3495"},
+            new Reference{Name = "RFC 6225"},
+            new Reference{Name = "RFC 3925"},
+            new Reference{Name = "RFC 5192"},
+            new Reference{Name = "RFC 5223"},
+            new Reference{Name = "RFC 5417"},
+            new Reference{Name = "RFC 5678"},
+            new Reference{Name = "RFC 6001"},
+            new Reference{Name = "RFC 6153"},
+            new Reference{Name = "RFC 5859"},
+            new Reference{Name = "RFC 5071"},
+            new Reference{Name = "RFC 5969"},
+            new Reference{Name = "RFC 5986"},
+            new Reference{Name = "Preboot Execution Environment (PXE) Specification", Version = "2.1", Link = "http://download.intel.com/design/archives/wfm/downloads/pxespec.pdf"}
+        ],
+    RevisionSummary =
+        [
+             new Revision{Class = RevisionClass.Major, Version = "372181", Date = "12/09/2014"}
+        ]
+};
+
+using Standard;
+using UDP;
+using Utility;
+using IANA;
+using CoreNetworkingResources;
+using Diagnostics;
+
+const binary OptionsTypeMessageCookie = $[63825363]; // 99,130,83,99
+const binary MagicM = $[F100747E];
+
+endpoint Server
+    over UDP.Host
+    accepts mutable DhcpMessage issues mutable DhcpMessage;
+
+client endpoint Client connected to Server;
+
+autostart actor DHCPOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram // request
+        where d.SourcePort == Port.DHCPClient && (d.DestinationPort == Port.DHCPServer || d.DestinationPort == 4011) /* PXE */ 
+    {
+        assert d.Payload.Count >= 243;
+        switch (d.Payload)
+        {
+            case dhcpMessage:DhcpMessage from BinaryDecoder<DhcpMessage> =>
+                dispatch (endpoint DHCP.Server over host) accepts dhcpMessage;
+            default =>
+                ThrowDecodingException("DHCP");
+        }
+    }
+
+    process host accepts d:UDP.Datagram // response
+        where ((d.SourcePort == Port.DHCPServer || d.SourcePort == 4011 /* PXE port */) && d.DestinationPort == Port.DHCPClient)
+            || (d.SourcePort == Port.DHCPServer && d.DestinationPort == Port.DHCPServer) /* DHCP relays */
+    {
+        assert d.Payload.Count >= 243;
+        switch (d.Payload)
+        {
+            case dhcpMessage:DhcpMessage from BinaryDecoder<DhcpMessage> =>
+                dispatch (endpoint DHCP.Server over host) issues dhcpMessage;
+            default =>
+                ThrowDecodingException("DHCP");
+        }
+    }
+}
+
+// RFC 2131, page 9
+message DhcpMessage
+{
+    OpCode OpCode where ValidationCheckEnumValue(InRange<OpCode>(value), this, true, ReferenceType.Message,
+        "DHCP", "OpCode", "DhcpMessage", "1, 2", value);
+    IANA.HardwareTypeByte Hardwaretype where ValidationCheckEnumValueTooManyItems(
+        InRange<IANA.HardwareTypeByte>(value), this, true, ReferenceType.Message,
+        "DHCP", "Hardwaretype", "DhcpMessage", "Hardware Types", "RFC 2131");
+    byte HardwareAddressLength;
+    byte HopCount;
+    uint TransactionID;
+    ushort Seconds;
+    Flag Flags where ValidationCheckCombinationValue(InRange<Flag>(value), this, true, ReferenceType.Message,
+        "DHCP", "Flags", "DhcpMessage", "0x8000. 0x7FFF", value);
+    IPv4Address ClientIP;
+    IPv4Address YourIP;
+    IPv4Address ServerIP;
+    IPv4Address RelayAgentIP;
+    ([|HardwareAddressLength == 6 && Hardwaretype == 1|] EthernetHAddress | ClientHardwareAddress) ClientHardwareAddress;
+    string ServerHostName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 64};
+    string BootFileName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 128};
+    OptionsType Options;
+    
+    override string ToString()
+    {
+        string summary;
+        if (Options.Option.Count > 0)
+        {
+            if (Options.GetMessageType() is messageType:MessageTypeEnum)
+            {
+                summary += EnumToStringInSummary<DHCP.MessageTypeEnum>(messageType) + ", ";
+            }
+            else
+            {
+                summary += "";
+            }
+        }
+        else
+        {
+            summary += "Unknown Message Type, ";
+        }
+                
+        summary += "OpCode: " + EnumToStringInSummary<DHCP.OpCode>(OpCode);
+        summary += ", TransID: " + DecToHexFormat(TransactionID);
+
+        return summary;
+    }
+}
+
+static string GetEthernetAddr((EthernetHAddress | ClientHardwareAddress) hardwareAddr)
+{
+    if (hardwareAddr is EthernetHAddress)
+    {
+        return ((hardwareAddr as EthernetHAddress).HAddress as MacAddress).ToString();
+    }  
+    return "";
+}
+
+pattern OpCode = enum byte
+{
+    BootRequest = 1,
+    BootReply = 2,
+    ...
+};
+
+// RFC 2131, page 11
+pattern Flag = flags ushort
+{
+    BroadcastFlag = 0x8000,
+    Reserved = 0x7FFF,
+    ...
+};
+
+type EthernetHAddress
+{
+    MacAddress HAddress;
+    array<byte> Pad with BinaryEncoding{Length = 10};
+    
+    override string ToString()
+    {
+        return HAddress.ToString();
+    }
+}
+
+string MacAddress(this EthernetHAddress ethernetAddr)
+{
+    return (ethernetAddr.HAddress as MacAddress).ToString();
+}
+
+pattern ClientHardwareAddress = binary with BinaryEncoding{Length = 16};
+   
+type OptionsType
+{
+    // RFC 2131, page 13.
+    // The first four octets of the 'options' field of the DHCP message contain the (decimal) values 99, 130, 83 and 99
+    binary MessageCookie where ValidationCheck(value == OptionsTypeMessageCookie, null, MESSAGE_COOKIE)
+        with BinaryEncoding{Length = 4}, DisplayInfo{ToText = MessageCookieToText};
+    array<OptionsChoice> Option;
+    optional [|stream.RemainingByteLength() > 0 && stream.CurrentByte() == 255|] EndOption End;
+    optional binary Pad;
+    
+    optional MessageTypeEnum GetMessageType()
+    {
+        if (Option.Count > 0 && Option[0] is messageType:MessageType)
+        {
+            return messageType.Type;
+        }
+        return nothing;
+    }
+    
+    static string MessageCookieToText(any m)
+    {
+        binary messageCookieArr = m as binary;
+        string s = "[";
+        for (int i = 0; i < 4; i++)
+        {
+            s += messageCookieArr[i].ToString();
+            if (i == 3)
+            {
+                break;
+            }
+            s += ",";
+        }
+        s += "]";
+        return s;
+    }
+}
+
+// Base type of Option and all options should be inherited from this type
+type BaseOption
+{
+    byte Code;
+}
+
+pattern OptionsChoice = [|stream.RemainingByteLength() > 0 && CurrentByte(stream) == 0|] PadOption | //  consume pad data between options.
+    [|RemainingByteLength(stream) >= 2|] (SubOptionsChoice | [|CurrentByte(stream) != 255|] UnknownOption);
+
+pattern SubOptionsChoice =
+    // MS-DHCPE defines Microsoft Encoding Long Option with option code 250.
+    // The option supports the options with data length larger than 255.
+    // If current code or next code is 250, decode as UnknownOption. In DHCPE.opn, these options will be reassembled and decoded as correct option.
+    [|CurrentByte(stream) == 250 ||
+        (RemainingByteLength(stream) > PeekByte(stream, stream.BitPosition + 8) + 3 &&
+        PeekByte(stream, (stream.BytePosition + PeekByte(stream, stream.BitPosition + 8) + 2) << 3) == 250)|] UnknownOption |
+    // Move some of frequent used option to the top to improve performance
+    [|CurrentByte(stream) == 53 && PeekByte(stream, stream.BitPosition + 8) == 1|] MessageType |
+    [|CurrentByte(stream) == 121 && PeekByte(stream, stream.BitPosition + 8) >= 5|] ClasslessStaticRoute |
+    [|CurrentByte(stream) == 12|] HostName |
+    [|CurrentByte(stream) == 60 && PeekByte(stream, stream.BitPosition + 8) >= 1|] VendorClassIdentifier |
+    [|CurrentByte(stream) == 61 && PeekByte(stream, stream.BitPosition + 8) >= 2|] ClientIdentifier |
+    [|CurrentByte(stream) == 81 && PeekByte(stream, stream.BitPosition + 8) >= 3|] ClientFQDN |
+    [|CurrentByte(stream) == 15|] DomainName |
+    [|CurrentByte(stream) == 43|] VendorSpecificInformation |
+    [|CurrentByte(stream) == 55 && PeekByte(stream, stream.BitPosition + 8) >= 1|] ParameterRequestList |
+    [|CurrentByte(stream) == 50 && PeekByte(stream, stream.BitPosition + 8) == 4|] RequestedIPAddress |
+    // RFC 2132
+    [|CurrentByte(stream) == 1 && PeekByte(stream, stream.BitPosition + 8) == 4|] SubnetMask |
+    [|CurrentByte(stream) == 2 && PeekByte(stream, stream.BitPosition + 8) == 4|] TimeOffset |
+    [|CurrentByte(stream) == 3 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] Router |
+    [|CurrentByte(stream) == 4 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] TimeServer |
+    [|CurrentByte(stream) == 5 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] DHCP.NameServer |
+    [|CurrentByte(stream) == 6 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] DomainNameServer |
+    [|CurrentByte(stream) == 7 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] LogServer |
+    [|CurrentByte(stream) == 8 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] CookieServer |
+    [|CurrentByte(stream) == 9 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] LPRServer |
+    [|CurrentByte(stream) == 10 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] ImpressServer |
+    [|CurrentByte(stream) == 11 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] ResourceLocationServer |
+    [|CurrentByte(stream) == 13 && PeekByte(stream, stream.BitPosition + 8) == 2|] BootFileSize |
+    [|CurrentByte(stream) == 14|] MeritDumpFile |
+    [|CurrentByte(stream) == 16 && PeekByte(stream, stream.BitPosition + 8) == 4|] SwapServer |
+    [|CurrentByte(stream) == 17|] RootPath |
+    [|CurrentByte(stream) == 18|] ExtensionsPath |
+    [|CurrentByte(stream) == 19 && PeekByte(stream, stream.BitPosition + 8) == 1|] IPForwardingEnableDisable |
+    [|CurrentByte(stream) == 20 && PeekByte(stream, stream.BitPosition + 8) == 1|] NonLocalSourceRoutingEnalbeDiable |
+    [|CurrentByte(stream) == 21 && PeekByte(stream, stream.BitPosition + 8) % 8 == 0|] PolicyFilter |
+    [|CurrentByte(stream) == 22 && PeekByte(stream, stream.BitPosition + 8) == 2|] MaximumDatagramReassemblySize |
+    [|CurrentByte(stream) == 23 && PeekByte(stream, stream.BitPosition + 8) == 1|] DefaultIPTimetolive |
+    [|CurrentByte(stream) == 24 && PeekByte(stream, stream.BitPosition + 8) == 4|] PathMTUAgingTimeout |
+    [|CurrentByte(stream) == 25 && PeekByte(stream, stream.BitPosition + 8) >= 2 && PeekByte(stream, stream.BitPosition + 8) % 2 == 0|] PathMTUPlateauTable |
+    [|CurrentByte(stream) == 26 && PeekByte(stream, stream.BitPosition + 8) == 2|] InterfaceMTU |
+    [|CurrentByte(stream) == 27 && PeekByte(stream, stream.BitPosition + 8) == 1|] AllSubnetsAreLocal |
+    [|CurrentByte(stream) == 28 && PeekByte(stream, stream.BitPosition + 8) == 4|] BroadcastAddress |
+    [|CurrentByte(stream) == 29 && PeekByte(stream, stream.BitPosition + 8) == 1|] PerformMaskDiscovery |
+    [|CurrentByte(stream) == 30 && PeekByte(stream, stream.BitPosition + 8) == 1|] MaskSupplier |
+    [|CurrentByte(stream) == 31 && PeekByte(stream, stream.BitPosition + 8) == 1|] PerformRouterDiscovery |
+    [|CurrentByte(stream) == 32 && PeekByte(stream, stream.BitPosition + 8) == 4|] RouterSolicitationAddress |
+    [|CurrentByte(stream) == 33 && PeekByte(stream, stream.BitPosition + 8) >= 8 && PeekByte(stream, stream.BitPosition + 8) % 8 == 0|] StaticRoute |
+    [|CurrentByte(stream) == 34 && PeekByte(stream, stream.BitPosition + 8) == 1|] TrailerEncapsulation |
+    [|CurrentByte(stream) == 35 && PeekByte(stream, stream.BitPosition + 8) == 4|] ARPCacheTimeout |
+    [|CurrentByte(stream) == 36 && PeekByte(stream, stream.BitPosition + 8) == 1|] EthernetEncapsulation |
+    [|CurrentByte(stream) == 37 && PeekByte(stream, stream.BitPosition + 8) == 1|] TCPDefaultTTL |
+    [|CurrentByte(stream) == 38 && PeekByte(stream, stream.BitPosition + 8) == 4|] TCPKeepaliveInterval |
+    [|CurrentByte(stream) == 39 && PeekByte(stream, stream.BitPosition + 8) == 1|] TCPKeepaliveGarbage |
+    [|CurrentByte(stream) == 40|] NetworkInformationServiceDomain |
+    [|CurrentByte(stream) == 41 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetworkInformationServer |
+    [|CurrentByte(stream) == 42 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetworkTimeProtocolServers |
+    [|CurrentByte(stream) == 44 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetBIOSOverTCPIPNameServer |
+    [|CurrentByte(stream) == 45 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetBIOSOverTCPIPDatagramDistributionServer |
+    [|CurrentByte(stream) == 46 && PeekByte(stream, stream.BitPosition + 8) == 1|] NetBIOSOverTCPIPNodeType |
+    [|CurrentByte(stream) == 47 && PeekByte(stream, stream.BitPosition + 8) >= 1|] NetBIOSOverTCPIPScope |
+    [|CurrentByte(stream) == 48 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] XWindowSystemFontServer |
+    [|CurrentByte(stream) == 49 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] XWindowSystemDisplayManager |
+    [|CurrentByte(stream) == 51 && PeekByte(stream, stream.BitPosition + 8) == 4|] IPAddressLeaseTime |
+    [|CurrentByte(stream) == 52 && PeekByte(stream, stream.BitPosition + 8) == 1|] OptionOverload |
+    [|CurrentByte(stream) == 54 && PeekByte(stream, stream.BitPosition + 8) == 4|] ServerIdentifier |
+    [|CurrentByte(stream) == 56 && PeekByte(stream, stream.BitPosition + 8) >= 1|] MessageOption |
+    [|CurrentByte(stream) == 57 && PeekByte(stream, stream.BitPosition + 8) == 2|] MaximumDHCPMessageSize |
+    [|CurrentByte(stream) == 58 && PeekByte(stream, stream.BitPosition + 8) == 4|] RenewalT1TimeValue |
+    [|CurrentByte(stream) == 59 && PeekByte(stream, stream.BitPosition + 8) == 4|] RebindingT2TimeValue |
+    //  RFC 2242
+    [|CurrentByte(stream) == 62|] NetWareIPDomainName |
+    //  RFC 2132
+    [|CurrentByte(stream) == 64 && PeekByte(stream, stream.BitPosition + 8) >= 1|] NetworkInformationServicePlusDomain |
+    [|CurrentByte(stream) == 65 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetworkInformationServicePlusServers |
+    [|CurrentByte(stream) == 66 && PeekByte(stream, stream.BitPosition + 8) >= 1|] TFTPServerName |
+    [|CurrentByte(stream) == 67 && PeekByte(stream, stream.BitPosition + 8) >= 1|] BootfileName |
+    [|CurrentByte(stream) == 68 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] MobileIPHomeAgent |
+    [|CurrentByte(stream) == 69 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] SimpleMailTransportProtocolServer |
+    [|CurrentByte(stream) == 70 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] PostOfficeProtocolServer |
+    [|CurrentByte(stream) == 71 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NetworkNewsTransportProtocolServer |
+    [|CurrentByte(stream) == 72 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] DefaultWorldWideWebServer |
+    [|CurrentByte(stream) == 73 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] DefaultFingerServer |
+    [|CurrentByte(stream) == 74 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] DefaultInternetRelayChatServer |
+    [|CurrentByte(stream) == 75 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] StreetTalkServer |
+    [|CurrentByte(stream) == 76 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] StreetTalkDirectoryAssistanceServer |
+    //  RFC 3004
+    [|CurrentByte(stream) == 77|] (UserClassOption | UnknownOption /* There is definition conflict between RFC and MS-DHCPE. Decode UnknownOption to solve such conflict. */) |
+    //  RFC 2610
+    [|CurrentByte(stream) == 78 && PeekByte(stream, stream.BitPosition + 8) >= 5 && PeekByte(stream, stream.BitPosition + 8) % 4 == 1|] SLPDirectoryAgent |
+    [|CurrentByte(stream) == 79 && PeekByte(stream, stream.BitPosition + 8) > 1|] SLPServiceScope |
+    //  RFC 4039
+    [|CurrentByte(stream) == 80 && PeekByte(stream, stream.BitPosition + 8) == 0|] RapidCommit |
+    // RFC 3046
+    [|CurrentByte(stream) == 82 && PeekByte(stream, stream.BitPosition + 8) >= 2|] RelayAgentInformation |
+    //  RFC 4174
+    [|CurrentByte(stream) == 83 && PeekByte(stream, stream.BitPosition + 8) >= 14|] ISNS |
+    //  RFC 2241
+    [|CurrentByte(stream) == 85 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] NDSServer |
+    [|CurrentByte(stream) == 86|] NDSTreeName |
+    [|CurrentByte(stream) == 87|] NDSContext |
+    //  RFC 4280
+    [|CurrentByte(stream) == 88|] BCMCSControllerDomainNameList |
+    [|CurrentByte(stream) == 89 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] BCMCSControllerIPv4Address |
+    //  RFC 3118
+    [|CurrentByte(stream) == 90 && PeekByte(stream, stream.BitPosition + 8) >= 7|] Authentication |
+    //  RFC 4388
+    [|CurrentByte(stream) == 91 && PeekByte(stream, stream.BitPosition + 8) == 4|] ClientLastTransactionTime |
+    [|CurrentByte(stream) == 92 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] AssociatedIp |
+    //  RFC 4578
+    [|CurrentByte(stream) == 93|] ClientSystemArchitecture |
+    [|CurrentByte(stream) == 94 && PeekByte(stream, stream.BitPosition + 8) == 3|] ClientNetworkInterfaceIdentifier |
+    [|CurrentByte(stream) == 97 && PeekByte(stream, stream.BitPosition + 8) >= 1|] ClientMachineIdentifier |
+    //  RFC 2485
+    [|CurrentByte(stream) == 98|] UserAuthenticationProtocol |
+    //  RFC 4776
+    [|CurrentByte(stream) == 99 && PeekByte(stream, stream.BitPosition + 8) >= 3|] CivicLocation |
+    //  RFC 4833
+    [|CurrentByte(stream) == 100|] NewTimezonePCode |
+    [|CurrentByte(stream) == 101|] NewTimezoneTCode |
+    [|CurrentByte(stream) == 117|] NameServiceSearch |
+    //  RFC 2563
+    [|CurrentByte(stream) == 116 && PeekByte(stream, stream.BitPosition + 8) == 1|] AutoConfigure |
+    //  2937
+    [|CurrentByte(stream) == 118 && PeekByte(stream, stream.BitPosition + 8) == 4|] SubnetSelection |
+    //  RFC 3397
+    [|CurrentByte(stream) == 119|] DomainSearch |
+    //  RFC 3361
+    [|CurrentByte(stream) == 120 && PeekByte(stream, stream.BitPosition + 8) >= 1|] SIPServers |
+    //  RFC 3495
+    [|CurrentByte(stream) == 122|] CableLabsClientConfiguration |
+    //  RFC 6225
+    [|CurrentByte(stream) == 123 && PeekByte(stream, stream.BitPosition + 8) == 16|] GeoConf |
+    //  RFC 3925
+    [|CurrentByte(stream) == 124|] VIVendorClass |
+    [|CurrentByte(stream) == 125 && PeekByte(stream, stream.BitPosition + 8) > 3|] VIVendorSpecificInformation |
+    //  RFC 5192
+    [|CurrentByte(stream) == 136 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] PANAAuthenticationAgent |
+    //  RFC 5223
+    [|CurrentByte(stream) == 137|] LoSTServer |
+    //  RFC 5417
+    [|CurrentByte(stream) == 138 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] CAPWAPAccessController |
+    //  RFC 5678
+    [|CurrentByte(stream) == 139|] MoSIPv4Address |
+    //  RFC 6011
+    [|CurrentByte(stream) == 141|] SIPUAConfigurationServiceDomains |
+    [|CurrentByte(stream) == 142 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] IPv4AddressANDSF |
+    [|CurrentByte(stream) == 144 && PeekByte(stream, stream.BitPosition + 8) == 16|] GeoLoc |
+    //  RFC 5859
+    [|CurrentByte(stream) == 150 && PeekByte(stream, stream.BitPosition + 8) >= 4 && PeekByte(stream, stream.BitPosition + 8) % 4 == 0|] TFTPServerAddress |
+    //  RFC 5071
+    [|CurrentByte(stream) == 208 && PeekByte(stream, stream.BitPosition + 8) == 4|] Magic |
+    [|CurrentByte(stream) == 209|] ConfigurationFile |
+    [|CurrentByte(stream) == 210|] PathPrefix |
+    [|CurrentByte(stream) == 211 && PeekByte(stream, stream.BitPosition + 8) == 4|] RebootTime |
+    [|CurrentByte(stream) == 212 && PeekByte(stream, stream.BitPosition + 8) >= 18 && (PeekByte(stream, stream.BitPosition + 8) - 18) % 4 == 0|] SixRd |
+    //  RFC 5986
+    [|CurrentByte(stream) == 213|] AccessNetworkDomainName |
+    // RFC 2563
+    [|CurrentByte(stream) == 252|] WPAD;
+    
+pattern OptionCodeEnum = enum byte
+{
+    PadOption = 0,
+    MessageType = 53,
+    ClasslessStaticRoute = 121,
+    HostName = 12,
+    VendorClassIdentifier = 60,
+    ClientIdentifier = 61,
+    ClientFQDN = 81,
+    DomainName = 15,
+    VendorSpecificInformation = 43,
+    ParameterRequestList = 55,
+    RequestedIPAddress = 50,
+    // RFC 2132
+    SubnetMask = 1,
+    TimeOffset = 2,
+    Router = 3,
+    TimeServer = 4,
+    NameServer = 5,
+    DomainNameServer = 6,
+    LogServer = 7,
+    CookieServer = 8,
+    LPRServer = 9,
+    ImpressServer = 10,
+    ResourceLocationServer = 11,
+    BootFileSize = 13,
+    MeritDumpFile = 14,
+    SwapServer = 16,
+    RootPath = 17,
+    ExtensionsPath = 18,
+    IPForwardingEnableDisable = 19,
+    NonLocalSourceRoutingEnalbeDiable = 20,
+    PolicyFilter = 21,
+    MaximumDatagramReassemblySize = 22,
+    DefaultIPTimetolive = 23,
+    PathMTUAgingTimeout = 24,
+    PathMTUPlateauTable = 25,
+    InterfaceMTU = 26,
+    AllSubnetsAreLocal = 27,
+    BroadcastAddress = 28,
+    PerformMaskDiscovery = 29,
+    MaskSupplier = 30,
+    PerformRouterDiscovery = 31,
+    RouterSolicitationAddress = 32,
+    StaticRoute = 33,
+    TrailerEncapsulation = 34,
+    ARPCacheTimeout = 35,
+    EthernetEncapsulation = 36,
+    TCPDefaultTTL = 37,
+    TCPKeepaliveInterval = 38,
+    TCPKeepaliveGarbage = 39,
+    NetworkInformationServiceDomain = 40,
+    NetworkInformationServer = 41,
+    NetworkTimeProtocolServers = 42,
+    NetBIOSOverTCPIPNameServer = 44,
+    NetBIOSOverTCPIPDatagramDistributionServer = 45,
+    NetBIOSOverTCPIPNodeType = 46,
+    NetBIOSOverTCPIPScope = 47,
+    XWindowSystemFontServer = 48,
+    XWindowSystemDisplayManager = 49,
+    IPAddressLeaseTime = 51,
+    OptionOverload = 52,
+    ServerIdentifier = 54,
+    MessageOption = 56,
+    MaximumDHCPMessageSize = 57,
+    RenewalT1TimeValue = 58,
+    RebindingT2TimeValue = 59,
+    //  RFC 2242
+    NetWareIPDomainName = 62,
+    //  RFC 2132
+    NetworkInformationServicePlusDomain = 64,
+    NetworkInformationServicePlusServers = 65,
+    TFTPServerName = 66,
+    BootfileName = 67,
+    MobileIPHomeAgent = 68,
+    SimpleMailTransportProtocolServer = 69,
+    PostOfficeProtocolServer = 70,
+    NetworkNewsTransportProtocolServer = 71,
+    DefaultWorldWideWebServer = 72,
+    DefaultFingerServer = 73,
+    DefaultInternetRelayChatServer = 74,
+    StreetTalkServer = 75,
+    StreetTalkDirectoryAssistanceServer = 76,
+    //  RFC 3004
+    UserClassOption = 77,
+    //  RFC 2610
+    SLPDirectoryAgent = 78,
+    SLPServiceScope = 79,
+    //  RFC 4039
+    RapidCommit = 80,
+    // RFC 3046
+    RelayAgentInformation = 82,
+    //  RFC 4174
+    ISNS = 83,
+    //  RFC 2241
+    NDSServer = 84,
+    NDSTreeName = 86,
+    NDSContext = 87,
+    //  RFC 4280
+    BCMCSControllerDomainNameList = 88,
+    BCMCSControllerIPv4Address = 89,
+    //  RFC 3118
+    Authentication = 90,
+    //  RFC 4388
+    ClientLastTransactionTime = 91,
+    AssociatedIp = 92,
+    //  RFC 4578
+    ClientSystemArchitecture = 93,
+    ClientNetworkInterfaceIdentifier = 94,
+    ClientMachineIdentifier = 97,
+    //  RFC 2485
+    UserAuthenticationProtocol = 98,
+    //  RFC 4776
+    CivicLocation = 99,
+    //  RFC 4833
+    NewTimezonePCode = 100,
+    NewTimezoneTCode = 101,
+    NameServiceSearch = 117,
+    //  RFC 2563
+    AutoConfigure = 116,
+    //  2937
+    SubnetSelection = 118,
+    //  RFC 3397
+    DomainSearch = 119,
+    //  RFC 3361
+    SIPServers = 120,
+    //  RFC 3495
+    CableLabsClientConfiguration = 122,
+    //  RFC 6225
+    GeoConf = 123,
+    //  RFC 3925
+    VIVendorClass = 124,
+    VIVendorSpecificInformation = 125,
+    //  RFC 5192
+    PANAAuthenticationAgent = 136,
+    //  RFC 5223
+    LoSTServer = 137,
+    //  RFC 5417
+    CAPWAPAccessController = 138,
+    //  RFC 5678
+    MoSIPv4Address =  139,
+    //  RFC 6011
+    SIPUAConfigurationServiceDomains = 141,
+    IPv4AddressANDSF = 142,
+    GeoLoc = 144,
+    //  RFC 5859
+    TFTPServerAddress = 150,
+    //  RFC 5071
+    Magic = 208,
+    ConfigurationFile = 209,
+    PathPrefix = 210,
+    RebootTime = 211,
+    SixRd = 212,
+    //  RFC 5986
+    AccessNetworkDomainName = 213,
+    // RFC 2563
+    WPAD = 252,
+    // DHCPE
+    DHCPEMicrosoftClasslessStaticRouteOption = 249,
+    ...
+};
+
+// RFC 2132
+// Option with Code 0
+type PadOption : BaseOption
+{
+    override string ToString()
+    {
+        return "Pad";
+    }
+}
+
+// Option with Code 255
+type EndOption : BaseOption
+{
+    override string ToString()
+    {
+        return "End";
+    }
+}
+
+// Option with Code 1
+type SubnetMask : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "SubnetMask: " + Address.ToString();
+    }
+}
+
+// Option with Code 2
+type TimeOffset : BaseOption
+{
+    byte Len;
+    int TimeOffset;
+    
+    override string ToString()
+    {
+        return "TimeOffset: " + TimeOffset.ToString() + "s";
+    }
+}
+
+// Option with Code 3
+type Router : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "Router: " + Address.ToString();
+    }
+}
+
+// Option with Code 4
+type TimeServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "TimeServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 5
+type NameServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NameServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 6
+type DomainNameServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "DomainNameServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 7
+type LogServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "LogServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 8
+type CookieServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "CookieServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 9
+type LPRServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "LPRServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 10
+type ImpressServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "ImpressServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 11
+type ResourceLocationServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "ResourceLocationServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 12
+type HostName : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "HostName: " + Name;
+    }
+}
+
+// Option with Code 13
+type BootFileSize : BaseOption
+{
+    byte Len;
+    ushort  FileSize;
+    
+    override string ToString()
+    {
+        return "BootFileSize: " + FileSize.ToString();
+    }
+}
+
+// Option with Code 14
+type MeritDumpFile : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "MeritDumpFile: " + Name;
+    }
+}
+
+// Option with Code 15
+type DomainName : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "DomainName: " + Name;
+    }
+}
+
+// Option with Code 16
+type SwapServer : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "SwapServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 17
+type RootPath : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "RootPath: " + Name;
+    }
+}
+
+// Option with Code 18
+type ExtensionsPath : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "ExtensionsPath: " + Name;
+    }
+}
+
+// Option with Code 19
+type IPForwardingEnableDisable : BaseOption
+{
+    byte Len;
+    EnableDisableEnum Value where ValidationCheckEnumValue(InRange<EnableDisableEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Value", "IPForwardingEnableDisable", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "IPForwardingEnableDisable: " + EnumToStringInSummary<DHCP.EnableDisableEnum>(Value);
+    }
+}
+
+pattern EnableDisableEnum = enum byte
+{
+    Disable = 0,
+    Enable = 1,
+    ...
+};
+
+// Option with Code 20
+type NonLocalSourceRoutingEnalbeDiable : BaseOption
+{
+    byte Len;
+    EnableDisableEnum Value where ValidationCheckEnumValue(InRange<EnableDisableEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Value", "NonLocalSourceRoutingEnalbeDiable", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "NonLocalSourceRoutingEnalbeDiable: " + EnumToStringInSummary<DHCP.EnableDisableEnum>(Value);
+    }
+}
+
+// Option with Code 21
+type PolicyFilter : BaseOption
+{
+    byte Len;
+    array<DestinationMaskPair> DestinationMaskList with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "PolicyFilter";
+    }
+}
+
+type DestinationMaskPair
+{
+    IPv4Address IPAddress;
+    IPv4Address Mask;
+}
+
+// Option with Code 22
+type MaximumDatagramReassemblySize : BaseOption
+{
+    byte Len;
+    ushort Size where ValidationCheckGreaterThan(value >= 576, null, true, ReferenceType.Type,
+        "DHCP", "Size", "MaximumDatagramReassemblySize", 576, value);
+    
+    override string ToString()
+    {
+        return "MaximumDatagramReassemblySize: " + Size.ToString();
+    }
+}
+
+// Option with Code 23
+type DefaultIPTimetolive : BaseOption
+{
+    byte Len;
+    byte TTL;
+    
+    override string ToString()
+    {
+        return "DefaultIPTimetolive: " + TTL.ToString();
+    }
+}
+
+// Option with Code 24
+type PathMTUAgingTimeout : BaseOption
+{
+    byte Len;
+    uint TimeOut;
+    
+    override string ToString()
+    {
+        return "PathMTUAgingTimeout: " + TimeOut.ToString();
+    }
+}
+
+// Option with Code 25
+type PathMTUPlateauTable : BaseOption
+{
+    byte Len;
+    array<ushort> Size with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "PathMTUPlateauTable: " + Size.ToString();
+    }
+}
+
+// Option with Code 26
+type InterfaceMTU : BaseOption
+{
+    byte Len;
+    ushort MTU where ValidationCheckGreaterThan(value >= 68, null, true, ReferenceType.Type,
+        "DHCP", "MTU", "InterfaceMTU", 68, value);
+    
+    override string ToString()
+    {
+        return "InterfaceMTU: " + MTU.ToString();
+    }
+}
+
+pattern ShareSameMTUEnum = enum byte
+{
+    AllSubnetShareSameMTU = 1,
+    SomeSubnetsUseSmallerMTU = 0,
+    ...
+};
+
+// Option with Code 27
+type AllSubnetsAreLocal : BaseOption
+{
+    byte Len;
+    ShareSameMTUEnum Value where ValidationCheckEnumValue(InRange<ShareSameMTUEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Value", "AllSubnetsAreLocal", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "AllSubnetsAreLocal: " + EnumToStringInSummary<DHCP.ShareSameMTUEnum>(Value);
+    }
+}
+
+// Option with Code 28
+type BroadcastAddress : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "BroadcastAddress: " + Address.ToString();
+    }
+}   
+     
+pattern PerformEnum = enum byte{ShouldNotPerform = 0, ShouldPerform = 1, ...};
+
+// Option with Code 29
+type PerformMaskDiscovery : BaseOption
+{
+    byte Len;
+    PerformEnum PerformMaskDiscoveryValue where ValidationCheckEnumValue(InRange<PerformEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "PerformMaskDiscoveryValue", "PerformMaskDiscovery", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "PerformMaskDiscovery: " + EnumToStringInSummary<DHCP.PerformEnum>(PerformMaskDiscoveryValue);
+    }
+}
+
+pattern RespondToSubnetMaskEnum = enum byte
+{
+    ClientShouldNotRespond = 0,
+    ClientShouldRespond = 1,
+    ...
+};
+
+// Option with Code 30
+type MaskSupplier : BaseOption
+{
+    byte Len;
+    RespondToSubnetMaskEnum Value where ValidationCheckEnumValue(InRange<RespondToSubnetMaskEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Value", "MaskSupplier", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "MaskSupplier: " + EnumToStringInSummary<DHCP.RespondToSubnetMaskEnum>(Value);
+    }
+}
+
+// Option with Code 31
+type PerformRouterDiscovery : BaseOption
+{
+    byte Len;
+    PerformEnum PerformRouterDiscoveryValue where ValidationCheckEnumValue(InRange<PerformEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "PerformRouterDiscoveryValue", "PerformRouterDiscovery", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "PerformRouterDiscovery: " + EnumToStringInSummary<DHCP.PerformEnum>(PerformRouterDiscoveryValue);
+    }
+}
+
+// Option with Code 32
+type RouterSolicitationAddress : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "RouterSolicitationAddress: " + Address.ToString();
+    }
+}
+
+type DestinationRouterPair
+{
+    IPv4Address Destination;
+    IPv4Address Router;
+}
+
+// Option with Code 33
+type StaticRoute : BaseOption
+{
+    byte Len;
+    array<DestinationRouterPair> DestinationRouterList with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "StaticRoute";
+    }
+}
+
+// Option with Code 34
+type TrailerEncapsulation : BaseOption
+{
+    byte Len;
+    PerformEnum AttemptToUseTrailerValue where ValidationCheckEnumValue(InRange<PerformEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "AttemptToUseTrailerValue", "TrailerEncapsulation", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "TrailerEncapsulation: " + EnumToStringInSummary<DHCP.PerformEnum>(AttemptToUseTrailerValue);
+    }
+}
+
+// Option with Code 35
+type ARPCacheTimeout : BaseOption
+{
+    byte Len;
+    uint Time;
+    
+    override string ToString()
+    {
+        return "ARPCacheTimeout: " + Time.ToString();
+    }
+}
+  
+pattern EthernetEncapsulationEnum = enum byte
+{
+    UseRFC894Encapsulation = 0,
+    UseRFC1042Encapsulation = 1,
+    ...
+};
+
+// Option with Code 36
+type EthernetEncapsulation : BaseOption
+{
+    byte Len;
+    EthernetEncapsulationEnum EncapsulationValue where ValidationCheckEnumValue(InRange<EthernetEncapsulationEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "EncapsulationValue", "EthernetEncapsulation", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "EthernetEncapsulation: " + EnumToStringInSummary<DHCP.EthernetEncapsulationEnum>(EncapsulationValue);
+    }
+}
+
+// Option with Code 37
+type TCPDefaultTTL : BaseOption
+{
+    byte Len;
+    byte TTL;
+    
+    override string ToString()
+    {
+        return "TCPDefaultTTL: " + TTL.ToString();
+    }
+}
+
+// Option with Code 38
+type TCPKeepaliveInterval : BaseOption
+{
+    byte Len;
+    uint Time;
+    
+    override string ToString()
+    {
+        return "TCPKeepaliveInterval: " + Time.ToString();
+    }
+}
+
+// Option with Code 39
+type TCPKeepaliveGarbage : BaseOption
+{
+    byte Len;
+    PerformEnum SendGarbageOctetValue where ValidationCheckEnumValue(InRange<PerformEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "SendGarbageOctetValue", "TCPKeepaliveGarbage", "0, 1", value);
+        
+    override string ToString()
+    {
+        return "TCPKeepaliveGarbage: " + EnumToStringInSummary<DHCP.PerformEnum>(SendGarbageOctetValue);
+    }
+}
+
+// Option with Code 40
+type NetworkInformationServiceDomain : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkInformationServiceDomain: " + Name;
+    }
+}
+
+// Option with Code 41
+type NetworkInformationServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkInformationServer: " + Address.ToString();
+    }
+}   
+
+// Option with Code 42
+type NetworkTimeProtocolServers : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkTimeProtocolServers: " + Address.ToString();
+    }
+} 
+
+// Option with Code 43
+type VendorSpecificInformation : BaseOption
+{
+    byte Len;
+    array<VendorInfoData> Value with BinaryEncoding{WidthForComposedType = Len << 3};
+
+    override string ToString()
+    {
+        return "VendorSpecificInformation";
+    }
+};
+
+type VendorInfoData
+{
+    byte Code;
+    byte Len;
+    binary Data with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "VendorInfoData: " + Data.ToString();
+    }
+}
+
+// Option with Code 44
+type NetBIOSOverTCPIPNameServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetBIOSOverTCPIPNameServer: " + Address.ToString();
+    }
+} 
+
+// Option with Code 45
+type NetBIOSOverTCPIPDatagramDistributionServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetBIOSOverTCPIPDatagramDistributionServer: " + Address.ToString();
+    }
+}
+    
+pattern NodeTypeEnum = enum byte
+{
+    BNode = 1,
+    PNode = 2,
+    MNode = 4,
+    HNode = 8,
+    ...
+};
+
+// Option with Code 46
+type NetBIOSOverTCPIPNodeType : BaseOption
+{
+    byte Len;
+    NodeTypeEnum NodeType where ValidationCheckEnumValue(InRange<NodeTypeEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "NodeType", "NetBIOSOverTCPIPNodeType", "1, 2, 4, 8", value);
+        
+    override string ToString()
+    {
+        return "NetBIOSOverTCPIPNodeType: " + EnumToStringInSummary<DHCP.NodeTypeEnum>(NodeType);
+    }
+}
+
+// Option with Code 47
+type NetBIOSOverTCPIPScope : BaseOption
+{
+    byte Len;
+    string NetBIOSScope with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetBIOSOverTCPIPScope: " + NetBIOSScope;
+    }
+}
+
+// Option with Code 48
+type XWindowSystemFontServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "XWindowSystemFontServer: " + Address.ToString();
+    }
+} 
+
+// Option with Code 49
+type XWindowSystemDisplayManager : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "XWindowSystemDisplayManager: " + Address.ToString();
+    }
+}
+
+// Option with Code 64
+type NetworkInformationServicePlusDomain : BaseOption
+{
+    byte Len;
+    string Name with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkInformationServicePlusDomain: " + Name;
+    }
+}
+
+// Option with Code 65
+type NetworkInformationServicePlusServers : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkInformationServicePlusServers: " + Address.ToString();
+    }
+}  
+
+// Option with Code 68
+type MobileIPHomeAgent : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "MobileIPHomeAgent: " + Address.ToString();
+    }
+}  
+
+// Option with Code 69
+type SimpleMailTransportProtocolServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "SimpleMailTransportProtocolServer: " + Address.ToString();
+    }
+}  
+
+// Option with Code 70
+type PostOfficeProtocolServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "PostOfficeProtocolServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 71
+type NetworkNewsTransportProtocolServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetworkNewsTransportProtocolServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 72
+type DefaultWorldWideWebServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "DefaultWorldWideWebServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 73
+type DefaultFingerServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "DefaultFingerServer: " + Address.ToString();
+    }
+}  
+
+// Option with Code 74
+type DefaultInternetRelayChatServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "DefaultInternetRelayChatServer: " + Address.ToString();
+    }
+}  
+
+// Option with Code 75
+type StreetTalkServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "StreetTalkServer: " + Address.ToString();
+    }
+}  
+
+// Option with Code 76
+type StreetTalkDirectoryAssistanceServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "StreetTalkDirectoryAssistanceServer: " + Address.ToString();
+    }
+}  
+
+// Option with Code 50
+type RequestedIPAddress : BaseOption
+{
+    byte Len;
+    IPv4Address IpAddress;
+    
+    override string ToString()
+    {
+        return "RequestedIPAddress: " + IpAddress.ToString();
+    }
+}
+
+// Option with Code 51
+type IPAddressLeaseTime : BaseOption
+{
+    byte Len;
+    uint LeaseTime;
+    
+    override string ToString()
+    {
+        return "IPAddressLeaseTime: " + LeaseTime.ToString();
+    }
+}
+
+pattern OptionOverloadEnum = enum byte
+{
+    FileFieldUsedToHoldOptions = 1,
+    SnameFieldUsedToHoldOptions = 2,
+    BothFieldsUsedToHoldOptions = 3,
+    ...
+};
+
+// Option with Code 52
+type OptionOverload : BaseOption
+{
+    byte Len;
+    OptionOverloadEnum OverLoadFieldsValue where ValidationCheckEnumValue(InRange<OptionOverloadEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "OverLoadFieldsValue", "OptionOverload", "1, 2, 3", value);
+        
+    override string ToString()
+    {
+        return "OptionOverload: " + EnumToStringInSummary<DHCP.OptionOverloadEnum>(OverLoadFieldsValue);
+    }
+}
+
+// Option with Code 66
+type TFTPServerName : BaseOption
+{
+    byte Len;
+    string TFTPServer with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "TFTPServerName: " + TFTPServer.ToString();
+    }
+}
+
+// Option with Code 67
+type BootfileName : BaseOption
+{
+    byte Len;
+    string BootFileName with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "BootfileName: " + BootFileName.ToString();
+    }
+}
+
+pattern MessageTypeEnum = enum byte 
+{ 
+    DHCPDiscover = 1, 
+    DHCPOffer = 2, 
+    DHCPRequest = 3, 
+    DHCPDecline = 4,
+    DHCPACK = 5, 
+    DHCPNAK = 6,
+    DHCPRelease = 7,
+    DHCPInform = 8,
+    ...
+};
+
+// Option with Code 53
+type MessageType : BaseOption
+{
+    byte Len;
+    MessageTypeEnum Type where ValidationCheckEnumValue(InRange<MessageTypeEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Type", "MessageType", "1, 2, 3, 4, 5, 6, 7, 8", value);
+    
+    override string ToString()
+    {
+        return "MessageType: " + EnumToStringInSummary<DHCP.MessageTypeEnum>(Type);
+    }
+}
+
+// Option with Code 54
+type ServerIdentifier : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "ServerIdentifier: " + Address.ToString();
+    }
+}
+
+// Option with Code 55
+type ParameterRequestList : BaseOption
+{
+    byte Len;
+    array<OptionCodeEnum> OptionCodes with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "ParameterRequestList: " + OptionCodes.ToString();
+    }
+}
+
+// Option with Code 56
+type MessageOption : BaseOption
+{
+    byte Len;
+    string Text with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "MessageOption: " + Text.ToString();
+    }
+}
+
+// Option with Code 57
+type MaximumDHCPMessageSize : BaseOption
+{
+    byte Len;
+    ushort Length where ValidationCheckGreaterThan(value >= 576, null, true, ReferenceType.Type,
+        "DHCP", "Length", "MaximumDHCPMessageSize", 576, value);
+    
+    override string ToString()
+    {
+        return "MaximumDHCPMessageSize: " + Length.ToString();
+    }
+}
+
+// Option with Code 58
+type RenewalT1TimeValue : BaseOption
+{
+    byte Len;
+    uint T1Interval;
+    
+    override string ToString()
+    {
+        return "RenewalT1TimeValue: " + T1Interval.ToString();
+    }
+}
+
+// Option with Code 59
+type RebindingT2TimeValue : BaseOption
+{
+    byte Len;
+    uint T2Interval;
+    
+    override string ToString()
+    {
+        return "RebindingT2TimeValue: " + T2Interval.ToString();
+    }
+}
+
+// Option with Code 60
+type VendorClassIdentifier : BaseOption
+{
+    byte Len;
+    string VendorClassIdentifier with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "VendorClassIdentifier: " + VendorClassIdentifier;
+    }
+}
+
+// Option with Code 61
+type ClientIdentifier : BaseOption
+{
+    byte Len;
+    byte Type;
+    array<byte> ClientID with BinaryEncoding{Length = (Len - 1)};
+    
+    override string ToString()
+    {
+        return "ClientIdentifier: " + EnumToStringInSummary<IANA.HardwareTypeByte>(Type);
+    }
+} 
+
+// RFC2242
+// Option with Code 62
+type NetWareIPDomainName : BaseOption
+{
+    byte Len;
+    string DomainName with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NetWareIPDomainName: " + DomainName;
+    }
+}
+
+// RFC3046
+// Option with Code 82
+type RelayAgentInformation : BaseOption
+{
+    byte Len;
+    array<RelayAgentSubOptionChoice> AgentInformation with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "RelayAgentInformation";
+    }
+}
+
+pattern RelayAgentSubOptionChoice = [|RemainingByteLength(stream) >= 1|]
+([|CurrentByte(stream) == 1|] AgentCircuitIDSub | [|CurrentByte(stream) == 2|] AgentRemoteIDSub);
+
+type AgentCircuitIDSub 
+{
+    byte SubCode;
+    byte Len;
+    binary SubOptionValue with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "AgentCircuitIDSub";
+    }
+}
+
+type AgentRemoteIDSub 
+{
+    byte SubCode;
+    byte Len;
+    binary SubOptionValue with BinaryEncoding{Length = Len};
+}
+
+// RFC2563
+// Option with Code 116
+type AutoConfigure : BaseOption
+{
+    byte Len;
+    AutoConfigureValueEnum Value where ValidationCheckEnumValue(InRange<AutoConfigureValueEnum>(value), null, true, ReferenceType.Type,
+        "DHCP", "Value", "AutoConfigure", "0, 1", value);
+    
+    override string ToString()
+    {
+        return "AutoConfigure: " + EnumToStringInSummary<DHCP.AutoConfigureValueEnum>(Value);
+    }
+}
+
+pattern AutoConfigureValueEnum = enum byte
+{
+    DoNotAutoConfigue = 0,
+    AutoConfigue = 1,
+    ...
+};
+
+// http://tools.ietf.org/id/draft-ietf-wrec-wpad-01.txt
+// Option with Code 252
+type WPAD : BaseOption
+{
+    byte Len;
+    string URL with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "WPAD: " + URL;
+    }
+}
+
+// RFC 3004
+// Option with Code 77
+type UserClassOption : BaseOption
+{
+    byte Len;
+    // compatible with DHCP extension.
+    // If the LEN is larger than 0, there must be element in User Class Data.
+    // If it cannot be decoded successful, it must be the DHCP extension.
+    // Keep this as Unknown Option and wait extension OPN to decode.
+    array<UserClassData> UserClassData
+        where ValidateUserClassData(value)
+        with BinaryEncoding{WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "UserClassOption";
+    }
+
+    bool ValidateUserClassData(array<UserClassData> dataArray)
+    {
+        int len = 0;
+        foreach (UserClassData data in dataArray)
+        {
+            if (data.UCLen == 0)
+            {
+                // when there is User Class Data in this Option is 0, it must be the option extended by DHCPE
+                // make the decoding failure.
+                return false;
+            }
+            len += 1 + data.UCLen;
+        }
+        return this.Len == len;
+    }
+}
+
+type UserClassData
+{
+    byte UCLen;
+    binary Data with BinaryEncoding{Length = UCLen};
+}
+
+// RFC 2610
+// Option with Code 78
+type SLPDirectoryAgent : BaseOption
+{
+    byte Length;
+    byte Mandatory where ValidationCheck((value & 0x80) == 0 || value == 0x80, null, () => Format(SLPDirectoryAgentMandatory, DecToHexFormat(value)));
+    array<IPv4Address> A with BinaryEncoding{WidthForComposedType = (Length - 1) * 8};
+    
+    override string ToString()
+    {
+        return "SLPDirectoryAgent" + A.ToString();
+    }
+}
+
+// Option with Code 79
+type SLPServiceScope : BaseOption
+{
+    byte Length;
+    SLPServiceScopeMandatory Mandatory;
+    string ScopeList with BinaryEncoding{WidthForComposedType = (Length - 1) * 8, TextEncoding = TextEncoding.UTF8};
+    
+    override string ToString()
+    {
+        return "SLPServiceScope";
+    }
+}
+
+pattern SLPServiceScopeMandatory = enum byte
+{
+    StaticConfiguration = 0,
+    ScopeList = 1,
+    ...
+};
+
+// RFC 4039
+// Option with Code 80
+type RapidCommit : BaseOption
+{
+    byte Len;
+    
+    override string ToString()
+    {
+        return "RapidCommit";
+    }
+}
+
+// RFC 4702
+// Option with Code 81
+type ClientFQDN : BaseOption
+{
+    byte Len;
+    Flags Flag where ValidationCheckCombinationValue(InRange<Flags>(value), null, true, ReferenceType.Type,
+        "DHCP", "Flag", "ClientFQDN", "0xF0, 0x8, 0x4, 0x2, 0x1", value);
+    byte Rcode1;
+    byte Rcode2;
+    optional [|Len > 3|] ([|((Flags.E as ushort) & (Flag as ushort)) == (Flags.E as ushort)|]
+         // even Flag.E on, try DNSString decoding first and try ASCII string decoding. Refer to UT DHCPInvalidOption
+        (DNSString | string) | string)
+        DomainName with BinaryEncoding{WidthForComposedType = (Len - 3) << 3, TextEncoding = TextEncoding.ASCII};
+
+    override string ToString()
+    {
+        if (DomainName is str:string)
+        {
+            return "ClientFQDN: " + str;
+        }
+        return "ClientFQDN";
+    }
+}
+
+pattern Flags = flags byte
+{
+    MBZ = 0xF0,
+    N = 0x8,
+    E = 0x4,
+    O = 0x2,
+    S = 0x1,
+    ...
+};
+
+// RFC 4174
+// Option with Code 83
+type ISNS : BaseOption
+{
+    byte Length;
+    ISNSFunctions IsnsFunction where ValidationCheckCombinationValue(InRange<ISNSFunctions>(value), null, true, ReferenceType.Type,
+        "DHCP", "IsnsFunction", "ISNS", "0x4, 0x2, 0x1", value);
+    DDAccess DDAccess where ValidationCheckCombinationValue(InRange<DDAccess>(value), null, true, ReferenceType.Type,
+        "DHCP", "DDAccess", "ISNS", "0x20, 0x10, 0x8, 0x4, 0x2, 0x1", value);
+    AdministrativeFlags AdministrativeFlag where ValidationCheckCombinationValue(InRange<AdministrativeFlags>(value), null, true, ReferenceType.Type,
+        "DHCP", "AdministrativeFlag", "ISNS", "0x8, 0x4, 0x2, 0x1", value);
+    ISNSServerSecurityBitmap ISNSServerSecurityBitmap where ValidationCheckCombinationValue(InRange<ISNSServerSecurityBitmap>(value), null, true, ReferenceType.Type,
+        "DHCP", "ISNSServerSecurityBitmap", "ISNS", "0x40, 0x20, 0x10, 0x8, 0x4, 0x2, 0x1", value);
+    IPv4Address A;
+    optional [|(AdministrativeFlags.H & AdministrativeFlag) == AdministrativeFlags.H && Length >= 18|] IPv4Address B;
+    optional [|Length > 18|] array<IPv4Address> AdditionalSecondaryiSNSServers with BinaryEncoding{WidthForComposedType = (Length - 18) * 8};
+    
+    override string ToString()
+    {
+        return "ISNS";
+    }
+}
+
+pattern ISNSFunctions = flags ushort 
+{
+    S = 0x4,
+    A = 0x2,
+    E = 0x1,
+    ...
+};
+
+pattern DDAccess = flags ushort
+{
+    IF = 0x20,
+    TF = 0x10,
+    IS = 0x8,
+    TS = 0x4,
+    C = 0x2,
+    E = 0x1,
+    ...
+};
+
+pattern AdministrativeFlags = flags ushort
+{
+    D = 0x8,
+    M = 0x4,
+    H = 0x2,
+    E = 0x1,
+    ...
+};
+
+pattern ISNSServerSecurityBitmap = flags uint
+{
+    T = 0x40,
+    X = 0x20,
+    P = 0x10,
+    A = 0x8,
+    M = 0x4,
+    S = 0x2,
+    E = 0x1,
+    ...
+};
+
+// RFC 2241
+// Option with Code 85
+type NDSServer : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NDSServer: " + Address.ToString();
+    }
+}
+
+// Option with Code 86
+type NDSTreeName : BaseOption
+{
+    byte Len;
+    string NDSTreeName with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NDSTreeName: " + NDSTreeName;
+    }
+}
+
+// Option with Code 87
+type NDSContext : BaseOption
+{
+    byte Len;
+    string InitialNDSContext with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "NDSContext: " + InitialNDSContext;
+    }
+}
+
+// RFC 4280
+// Option with Code 88
+type BCMCSControllerDomainNameList : BaseOption
+{
+    byte Len;
+    DNSString BCMCSController with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "BCMCSControllerDomainNameList: " + BCMCSController.ToString();
+    }
+}
+
+// Option with Code 89
+type BCMCSControllerIPv4Address : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "BCMCSControllerIPv4Address: " + Address.ToString();
+    }
+}
+
+// RFC 3118
+// Option with Code 90
+type Authentication : BaseOption
+{
+    byte Length;
+    ProtocolField ProtocolField where ValidationCheckEnumValue(InRange<ProtocolField>(value), null, true, ReferenceType.Type,
+        "DHCP", "ProtocolField", "Authentication", "0, 1", value);
+    byte Algorithm;
+    byte RDM;
+    long ReplayDetection;
+    (DelayedAuthenticationInfo | binary) AuthenticationInfo with BinaryEncoding{Length = Length - 11},
+        Encoding{Decoder = AuthenticationInfoDecoder, SourcePattern = TypeOf<binary>()};
+    
+    override string ToString()
+    {
+        return "Authentication";
+    }
+    
+    optional (DelayedAuthenticationInfo | binary) AuthenticationInfoDecoder(binary bin)
+    {
+        if (ProtocolField == 1 && bin.Count > 4)
+        {
+            return BinaryDecoder<DelayedAuthenticationInfo>(bin); // always decoding successfully
+        }
+        
+        return bin;
+    }
+}
+
+type DelayedAuthenticationInfo
+{
+    uint SecretID;
+    binary HMAC_MD5;
+}
+
+pattern ProtocolField = enum byte
+{
+    ConfigurationToken = 0,
+    DelayedAuthentication = 1,
+    ...
+};
+
+// RFC 4388
+// Option with Code 91
+type ClientLastTransactionTime : BaseOption
+{
+    byte Len;
+    uint Seconds;
+    
+    override string ToString()
+    {
+        return "ClientLastTransactionTime: " + Seconds.ToString();
+    }
+}
+
+// Option with Code 92
+type AssociatedIp : BaseOption
+{
+    byte Len;
+    array<IPv4Address> Addresses with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "AssociatedIp: " + Addresses.ToString();
+    }
+}
+
+// RFC 4578
+// Option with Code 93
+type ClientSystemArchitecture : BaseOption
+{
+    byte Len;
+    ArchitectureType Type where ValidationCheckEnumValue(InRange<ArchitectureType>(value), null, true, ReferenceType.Type,
+        "DHCP", "Type", "ClientSystemArchitecture", "0, 1, 2, 3, 4, 5, 6, 7, 8, 9", value);
+    
+    override string ToString()
+    {
+        return "ClientSystemArchitecture: " + EnumToStringInSummary<DHCP.ArchitectureType>(Type);
+    }
+}
+
+pattern ArchitectureType = enum ushort
+{
+    IntelX86PC = 0,
+    NECPC98 = 1,
+    EFIItanium = 2,
+    DECAlpha = 3,
+    Arcx86 = 4,
+    IntelLeanClient = 5,
+    EFIIA32 = 6,
+    EFIXBC = 7,
+    EFIXscale = 8,
+    EFIXsx8664 = 9,
+    ...
+};
+
+// Option with Code 94
+type ClientNetworkInterfaceIdentifier : BaseOption
+{
+    byte Len;
+    byte Type where ValidationCheckValue(value == 1, null, true, ReferenceType.Type,
+        "DHCP", "Type", "ClientNetworkInterfaceIdentifier", 1, value);
+    byte Major;
+    byte Minor;
+    
+    override string ToString()
+    {
+        return "ClientNetworkInterfaceIdentifier: " + Major.ToString() + "." + Minor.ToString();
+    }
+}
+
+// Option with Code 97
+type ClientMachineIdentifier : BaseOption
+{
+    byte Len;
+    byte T;
+    ([|Len == 17|] guid | binary) MachineIdentifier with BinaryEncoding{Length = Len - 1};
+    
+    override string ToString()
+    {
+        return "ClientMachineIdentifier: " + MachineIdentifier.ToString();
+    }
+}
+
+// RFC 2485
+// Option with Code 98
+type UserAuthenticationProtocol : BaseOption
+{
+    byte Length;
+    string URLList with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Length * 8};
+    
+    override string ToString()
+    {
+        return "UserAuthenticationProtocol: " + URLList;
+    }
+}
+
+// RFC 4776
+// Option with Code 99
+type CivicLocation : BaseOption
+{
+    byte Len;
+    byte What;
+    string CountryCode with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = 16};
+    array<CivicAddress> Address with BinaryEncoding{WidthForComposedType = (Len - 3) << 3};
+    
+    override string ToString()
+    {
+        return "Civic Location: " + CountryCode;
+    }
+}
+
+type CivicAddress
+{
+    byte CAtype;
+    byte CALength;
+    string CAValue with BinaryEncoding{TextEncoding = TextEncoding.UTF8, WidthForComposedType = CALength << 3};
+}
+
+// RFC 4833
+// Option with Code 100
+type NewTimezonePCode : BaseOption
+{
+    byte Len;
+    string TZPOSIXString with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "NewTimezonePCode: " + TZPOSIXString;
+    }
+}
+
+// Option with Code 101
+type NewTimezoneTCode : BaseOption
+{
+    byte Len;
+    string TimezonePCode with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "NewTimezoneTCode: " + TimezonePCode;
+    }
+}
+
+// RFC 2937
+// Option with Code 117
+type NameServiceSearch : BaseOption
+{
+    byte Len;
+    array<NameServiceSearchOrder> Ns with BinaryEncoding{WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "NameServiceSearch";
+    }
+}
+
+pattern NameServiceSearchOrder = enum ushort
+{
+    DomainNameServerOption = 6,
+    NetworkInformationServersOption = 41,
+    NetBIOSTCPIPNameServerOption = 44,
+    NetworkInformatioice = 65,
+    ...
+};
+
+// RFC 3011
+// Option with Code 118
+type SubnetSelection : BaseOption
+{
+    byte Len;
+    IPv4Address Address;
+    
+    override string ToString()
+    {
+        return "SubnetSelection: " + Address.ToString();
+    }
+}
+
+// RFC 3397
+// Option with Code 119
+type DomainSearch : BaseOption
+{
+    byte Len;
+    DNSString SeachString with BinaryEncoding{WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "DomainSearch: " + SeachString.ToString();
+    }
+}
+
+// RFC 3361
+// Option with Code 120
+type SIPServers : BaseOption
+{
+    byte Len;
+    byte Enc;
+    ([|Enc == 0|] DNSString
+    | [|Enc == 1|] array<IPv4Address>) Address with BinaryEncoding{WidthForComposedType = (Len - 1) << 3};
+    
+    override string ToString()
+    {
+        return "SIPServers: " + Address.ToString();
+    }
+}
+
+// RFC 3442
+// Option with Code 121
+type ClasslessStaticRoute : BaseOption
+{
+    byte Len;
+    array<DestinationRouter> DestinationRouter with BinaryEncoding{WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "ClasslessStaticRoute";
+    }
+}
+
+type DestinationRouter
+{
+    byte Width where ValidationCheckLessThanOrEqualTo(value <= 32, null, true, ReferenceType.Type,
+        "DHCP", "Width", "DestinationRouter", 32, value);
+    array<byte> SubnetMask with BinaryEncoding{Length = (Width + 7) / 8};
+    IPv4Address Router;
+}
+
+// RFC 3495
+// Option with Code 122
+type CableLabsClientConfiguration : BaseOption
+{
+    byte Length;
+    array<SubOptions> SubOptions with BinaryEncoding{WidthForComposedType = Length << 3};
+    
+    override string ToString()
+    {
+        return "CableLabsClientConfiguration";
+    }
+}
+
+type SubOptions
+{
+    SubCode SubCode where ValidationCheckEnumValue(InRange<SubCode>(value), null, true, ReferenceType.Type,
+        "DHCP", "SubCode", "SubOptions", "1, 2, 3, 4, 5, 6, 7, 8", value);
+    byte Length;
+    binary SubInformation with BinaryEncoding{Length = Length};
+}
+
+pattern SubCode = enum byte
+{
+    TSPsPrimaryDHCPServerAddress = 1,
+    TSPsSecondaryDHCPServerAddress = 2,
+    TSPsProvisioningServerAddress = 3,
+    TSPsASREQASREPBackoffandRetry = 4,
+    TSPsAPREQAPREPBackoffandRetry = 5,
+    TSPsKerberosRealmName = 6,
+    TSPsTicketGrantingServerUtilization = 7,
+    TSPsProvisioningTimerValue = 8,
+    ...
+};
+
+// RFC 6225
+// Option with Code 123
+type GeoConf : BaseOption
+{
+    byte Length;
+    byte LaRes with BinaryEncoding{Width = 6};
+    long Latitude with BinaryEncoding{Width = 34};
+    byte LoRes with BinaryEncoding{Width = 6};
+    long Longitude with BinaryEncoding{Width = 34};
+    byte AType with BinaryEncoding{Width = 4};
+    byte AltRes with BinaryEncoding{Width = 6};
+    uint Altitude with BinaryEncoding{Width = 30};
+    byte Res with BinaryEncoding{Width = 5};
+    byte Datum with BinaryEncoding{Width = 3};
+    
+    override string ToString()
+    {
+        return "GeoConf";
+    }
+}
+
+// Option with Code 144
+type GeoLoc : BaseOption
+{
+    byte Length;
+    byte LatUnc with BinaryEncoding{Width = 6};
+    long Latitude with BinaryEncoding{Width = 34};
+    byte LongUnc with BinaryEncoding{Width = 6};
+    long Longitude with BinaryEncoding{Width = 34};
+    byte AType with BinaryEncoding{Width = 4};
+    byte AltUnc with BinaryEncoding{Width = 6};
+    uint Altitude with BinaryEncoding{Width = 30};
+    byte Ver with BinaryEncoding{Width = 2};
+    byte Res with BinaryEncoding{Width = 3};
+    byte Datum with BinaryEncoding{Width = 3};
+    
+    override string ToString()
+    {
+        return "GeoLoc";
+    }
+}
+
+// RFC 3925
+// Option with Code 124
+type VIVendorClass : BaseOption
+{
+    byte OptionLength;
+    array<OptionData> OptionData with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+    
+    override string ToString()
+    {
+        return "VIVendorClass";
+    }
+}
+
+type OptionData
+{
+    ushort Enterprise;
+    byte DataLen;
+    VendorClassData ClassData;
+}
+
+type VendorClassData
+{
+    byte VendorClassLen;
+    binary OpaqueData with BinaryEncoding{Length = VendorClassLen};
+}
+
+// Option with Code 125
+type VIVendorSpecificInformation : BaseOption
+{
+    byte OptionLength;
+    array<OptionData> OptionData with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+    
+    override string ToString()
+    {
+        return "VIVendorSpecificInformation";
+    }
+}
+
+// RFC 5192
+// Option with Code 136
+type PANAAuthenticationAgent : BaseOption
+{
+    byte OptionLength;
+    array<IPv4Address> IPv4Address with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+    
+    override string ToString()
+    {
+        return "PANAAuthenticationAgent: " + IPv4Address.ToString();
+    }
+}
+
+// RFC 5223
+// Option with Code 137
+type LoSTServer : BaseOption
+{
+    byte OptionLength;
+    DNSString DomainName with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+    
+    override string ToString()
+    {
+        return "LoSTServer: " + DomainName.ToString();
+    }
+}
+
+// RFC 5417
+// Option with Code 138
+type CAPWAPAccessController : BaseOption
+{
+    byte OptionLength;
+    array<IPv4Address> ACIPv4Address with BinaryEncoding{WidthForComposedType = OptionLength << 3};
+    
+    override string ToString()
+    {
+        return "CAPWAPAccessController: " + ACIPv4Address.ToString();
+    }
+}
+
+// RFC 5678
+// Option with Code 139
+type MoSIPv4Address : BaseOption
+{
+    byte Length;
+    array<SubOption> SubOption with BinaryEncoding{WidthForComposedType = Length << 3};
+    
+    override string ToString()
+    {
+        return "MoSIPv4Address";
+    }
+}
+
+type SubOption
+{
+    SubOptCode SubOptCode where ValidationCheckEnumValue(InRange<SubOptCode>(value), null, true, ReferenceType.Type,
+        "DHCP", "SubOptCode", "SubOption", "1, 2, 3", value);
+    byte Length;
+    array<IPv4Address> IPAddress with BinaryEncoding{WidthForComposedType = Length << 3};
+}
+
+pattern SubOptCode = enum byte
+{
+    IS = 1,
+    CS = 2,
+    ES = 3,
+    ...
+};
+
+// RFC 6011
+// Option with Code 141
+type SIPUAConfigurationServiceDomains : BaseOption
+{
+    byte Len;
+    DNSString Searchstring with BinaryEncoding{WidthForComposedType = Len * 8};
+    
+    override string ToString()
+    {
+        return "SIPUAConfigurationServiceDomains: " + Searchstring.ToString();
+    }
+}
+
+// RFC 6153
+// Option with Code 142
+type IPv4AddressANDSF : BaseOption
+{
+    byte Length;
+    array<IPv4Address> IPAddress with BinaryEncoding{WidthForComposedType = Length << 3};
+    
+    override string ToString()
+    {
+        return "IPv4AddressANDSF: " + IPAddress.ToString();
+    }
+}
+
+// RFC 5859
+// Option with Code 150
+type TFTPServerAddress : BaseOption
+{
+    byte Len;
+    array<IPv4Address> IPv4Address with BinaryEncoding{WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "TFTPServerAddress: " + IPv4Address.ToString();
+    }
+}
+
+// RFC 5071
+// Option with Code 208
+type Magic : BaseOption
+{
+    byte Length;
+    IPv4Address M where ValidationCheck(value.Octets == MagicM, null, MAGIC_OPTION);
+
+    override string ToString()
+    {
+        return "Magic: " + M.ToString();
+    }
+}
+
+// Option with Code 209
+type ConfigurationFile : BaseOption
+{
+    byte Len;
+    string ConfigFile with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "ConfigurationFile: " + ConfigFile;
+    }
+}
+
+// Option with Code 210
+type PathPrefix : BaseOption
+{
+    byte Len;
+    string PathPrefix with BinaryEncoding{TextEncoding = TextEncoding.ASCII, WidthForComposedType = Len << 3};
+    
+    override string ToString()
+    {
+        return "PathPrefix: " + PathPrefix;
+    }
+}
+
+// Option with Code 211
+type RebootTime : BaseOption
+{
+    byte Len;
+    int RebootTime;
+    
+    override string ToString()
+    {
+        return "RebootTime: " + RebootTime.ToString();
+    }
+}
+
+// RFC 5969
+// Option with Code 212
+type SixRd : BaseOption
+{
+    byte OptionLength;
+    byte IPv4MaskLen where ValidationCheckLessThanOrEqualTo(value <= 32, null, false, ReferenceType.Type,
+        "DHCP", "IPv4MaskLen", "SixRd", 32, value);
+    byte RdPrefixLen;
+    binary RdPrefix with BinaryEncoding{Length = 16};
+    array<IPv4Address> Address with BinaryEncoding{WidthForComposedType = (OptionLength - 18) << 3};
+    
+    override string ToString()
+    {
+        return "SixRd";
+    }
+}
+
+// RFC 5986
+// Option with Code 213
+type AccessNetworkDomainName : BaseOption
+{
+    byte Length;
+    DNSString DomainName with BinaryEncoding{WidthForComposedType = Length * 8};
+    
+    override string ToString()
+    {
+        return "AccessNetworkDomainName: " + DomainName.ToString();
+    }
+}
+
+type UnknownOption : BaseOption
+{
+    byte Len;
+    binary Value with BinaryEncoding{Length = Len};
+    
+    override string ToString()
+    {
+        return "UnknownOption";
+    }
+}

@@ -1,0 +1,1972 @@
+protocol ICMPv6 with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Internet Control Message Protocol version 6",
+    ShortName = "ICMPv6",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2491"},
+            new Reference{Name = "RFC 2710"},
+            new Reference{Name = "RFC 2894"},
+            new Reference{Name = "RFC 3122"},
+            new Reference{Name = "RFC 3971"},
+            new Reference{Name = "RFC 4065"},
+            new Reference{Name = "RFC 4140"},
+            new Reference{Name = "RFC 4191"},
+            new Reference{Name = "RFC 4286"},
+            new Reference{Name = "RFC 4443"},
+            new Reference{Name = "RFC 4620"},
+            new Reference{Name = "RFC 4727"},
+            new Reference{Name = "RFC 4861"},
+            new Reference{Name = "RFC 4810"},
+            new Reference{Name = "RFC 5006"},
+            new Reference{Name = "RFC 5175"},
+            new Reference{Name = "RFC 5268"},
+            new Reference{Name = "RFC 5269"},
+            new Reference{Name = "RFC 5271"},
+            new Reference{Name = "RFC 5568"},
+            new Reference{Name = "RFC 6106"},
+            new Reference{Name = "RFC 6275"},
+            new Reference{Name = "RFC 6496"},
+            new Reference{Name = "RFC 6775"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "370924", Date = "11/18/2014"}
+        ]
+};
+
+using IPv6;
+using IANA;
+using Standard;
+using Utility;
+using Technologies.ASN1;
+using X509;
+using Diagnostics;
+using CoreNetworkingResources;
+    
+endpoint Node[binary Address] 
+    provides ICMPv6Contract
+    consumes ICMPv6Contract;
+    
+autostart actor ICMPv6OverIPv6(IPv6.Node node)
+{
+    process node accepts d:IPv6.Datagram where d.NextProtocol == ProtocolType.IPv6ICMP
+    {
+        ICMPv6DecodeAndDispatch(d.SourceAddress.FlatAddress, d.DestinationAddress.FlatAddress, d.Payload);
+    }
+}
+
+void ICMPv6DecodeAndDispatch(binary sourceAddress, binary destinationAddress, stream s)
+{
+    if (BinaryDecoder<ICMPv6.DatagramWrapper>(s) is d:ICMPv6.DatagramWrapper)
+    {
+        ICMPv6Contract.MessageType m = d.Value as ICMPv6Contract.MessageType;
+        if (IsAcceptMessage(m.Type))
+        {
+            if (m is neighbor:ICMPv6Contract.NeighborSolicitation)
+                dispatch (endpoint Node[neighbor.TargetAddress.Octets]) accepts m;
+            else
+                dispatch (endpoint Node[destinationAddress]) accepts m;
+        }
+        else
+        {
+            if (m is neighbor:ICMPv6Contract.NeighborAdvertisement)
+                dispatch (endpoint Node[neighbor.TargetAddress.Octets]) issues m;
+            else
+                dispatch (endpoint Node[sourceAddress]) issues m;
+        }
+    }
+    else
+    {
+        s = s.PeekBytes(0);
+        if (RemainingBitLength(s) >= 8)
+        {
+            byte currentByte = CurrentByte(s);
+            if (currentByte in ICMPv6MessageNameMap)
+                ThrowDecodingException("ICMPv6", ICMPv6MessageNameMap[CurrentByte(s)]);
+            else if (RemainingBitLength(s) >= 16 && PeekBytes(s, s.BitPosition, 2) == $[8A00])
+                ThrowDecodingException("ICMPv6", "RouterRenumberingCommand");
+            else if (RemainingBitLength(s) >= 16 && PeekBytes(s, s.BitPosition, 2) == $[8A01])
+                ThrowDecodingException("ICMPv6", "RouterRenumberingResult");
+            else if (currentByte == 154 && RemainingBitLength(s) >= 40 && PeekBytes(s, s.BitPosition + 32, 1) == $[02])
+                ThrowDecodingException("ICMPv6", "RouterSolicitationForProxyAdvertisement");
+            else if (currentByte == 154 && RemainingBitLength(s) >= 40 && PeekBytes(s, s.BitPosition + 32, 1) == $[03])
+                ThrowDecodingException("ICMPv6", "ProxyRouterAdvertisement");
+            else
+                ThrowDecodingException("ICMPv6");
+        }
+        else
+            ThrowDecodingException("ICMPv6");
+    }
+}
+
+const map<byte, string> ICMPv6MessageNameMap = 
+{
+    1 -> "DestinationUnreachable",
+    2 -> "PacketTooBig",
+    3 -> "TimeExceeded",
+    4 -> "ParameterProblem",
+    128 -> "EchoRequest",
+    129 -> "EchoReply",
+    130 -> "MulticastListenerQuery",
+    131 -> "MulticastListenerReport",
+    132 -> "MulticastListenerDone",
+    133 -> "RouterSolicitation",
+    134 -> "RouterAdvertisement",
+    135 -> "NeighborSolicitation",
+    136 -> "NeighborAdvertisement",
+    137 -> "Redirect",
+    139 -> "NodeInformationQuery",
+    140 -> "NodeInformationReply",
+    141 -> "InverseNeighborDiscoverySolicitation",
+    142 -> "InverseNeighborDiscoveryAdvertisement",
+    143 -> "Version2MulticastListenerReport",
+    144 -> "HomeAgentAddressDiscoveryRequest",
+    145 -> "HomeAgentAddressDiscoveryReply",
+    146 -> "MobilePrefixSolicitation",
+    147 -> "MobilePrefixAdvertisement",
+    148 -> "CertificationPathSolicitation",
+    149 -> "CertificationPathAdvertisement",
+    150 -> "ExperimentalMobilityType",
+    151 -> "MulticastRouterAdvertisement",
+    152 -> "MulticastRouterSolicitation",
+    153 -> "MulticastRouterTermination",
+    155 -> "RPLControlMessage",
+};
+
+const array<byte> RouterRenumberingCommand_BYTEARRAY = [0x8A, 0x00];
+const array<byte> RouterRenumberingResult_BYTEARRAY = [0x8A, 0x01];
+
+pattern Datagram = [|RemainingBitLength(stream) >= 8|]
+    (
+        [|CurrentByte(stream) == 1|] ICMPv6Contract.DestinationUnreachable |
+        [|CurrentByte(stream) == 2|] ICMPv6Contract.PacketTooBig |
+        [|CurrentByte(stream) == 3|] ICMPv6Contract.TimeExceeded |
+        [|CurrentByte(stream) == 4|] ICMPv6Contract.ParameterProblem |
+        [|CurrentByte(stream) == 128|] ICMPv6Contract.EchoRequest |
+        [|CurrentByte(stream) == 129|] ICMPv6Contract.EchoReply |
+        [|CurrentByte(stream) == 130|] ICMPv6Contract.MulticastListenerQuery |
+        [|CurrentByte(stream) == 131|] ICMPv6Contract.MulticastListenerReport |
+        [|CurrentByte(stream) == 132|] ICMPv6Contract.MulticastListenerDone |
+        [|CurrentByte(stream) == 133|] ICMPv6Contract.RouterSolicitation |
+        [|CurrentByte(stream) == 134|] ICMPv6Contract.RouterAdvertisement |
+        [|CurrentByte(stream) == 135|] ICMPv6Contract.NeighborSolicitation |
+        [|CurrentByte(stream) == 136|] ICMPv6Contract.NeighborAdvertisement |
+        [|CurrentByte(stream) == 137|] ICMPv6Contract.Redirect |
+        // 138
+        [|RemainingBitLength(stream) >= 16 && PeekByteCompare(stream, stream.BitPosition, RouterRenumberingCommand_BYTEARRAY)|] ICMPv6Contract.RouterRenumberingCommand |
+        [|RemainingBitLength(stream) >= 16 && PeekByteCompare(stream, stream.BitPosition, RouterRenumberingResult_BYTEARRAY)|] ICMPv6Contract.RouterRenumberingResult |
+        [|CurrentByte(stream) == 139|] ICMPv6Contract.NodeInformationQuery |
+        [|CurrentByte(stream) == 140|] ICMPv6Contract.NodeInformationReply |
+        [|CurrentByte(stream) == 141|] ICMPv6Contract.InverseNeighborDiscoverySolicitation |
+        [|CurrentByte(stream) == 142|] ICMPv6Contract.InverseNeighborDiscoveryAdvertisement |
+        [|CurrentByte(stream) == 143|] ICMPv6Contract.Version2MulticastListenerReport |
+        [|CurrentByte(stream) == 144|] ICMPv6Contract.HomeAgentAddressDiscoveryRequest |
+        [|CurrentByte(stream) == 145|] ICMPv6Contract.HomeAgentAddressDiscoveryReply |
+        [|CurrentByte(stream) == 146|] ICMPv6Contract.MobilePrefixSolicitation |
+        [|CurrentByte(stream) == 147|] ICMPv6Contract.MobilePrefixAdvertisement |
+        [|CurrentByte(stream) == 148|] ICMPv6Contract.CertificationPathSolicitation |
+        [|CurrentByte(stream) == 149|] ICMPv6Contract.CertificationPathAdvertisement |
+        [|CurrentByte(stream) == 150|] ICMPv6Contract.ExperimentalMobilityType |
+        [|CurrentByte(stream) == 151|] ICMPv6Contract.MulticastRouterAdvertisement |
+        [|CurrentByte(stream) == 152|] ICMPv6Contract.MulticastRouterSolicitation |
+        [|CurrentByte(stream) == 153|] ICMPv6Contract.MulticastRouterTermination |
+        // 154
+        [|CurrentByte(stream) == 154 && RemainingBitLength(stream) >= 40 && PeekByte(stream, stream.BitPosition + 32) == 0x02|] ICMPv6Contract.RouterSolicitationForProxyAdvertisement |
+        [|CurrentByte(stream) == 154 && RemainingBitLength(stream) >= 40 && PeekByte(stream, stream.BitPosition + 32) == 0x03|] ICMPv6Contract.ProxyRouterAdvertisement |
+        [|CurrentByte(stream) == 155|] ICMPv6Contract.RPLControlMessage
+    );
+
+type DatagramWrapper
+{
+    Datagram Value;
+}
+
+bool IsAcceptMessage(byte messageType)
+{
+    return (messageType in AcceptedMessageTypeSet);
+}
+
+const set<byte> AcceptedMessageTypeSet = {128, 131, 132, 134, 135, 140, 137, 142, 143, 144, 146, 148, 153};
+
+string MessageNaming(byte messageType, byte messageCode)
+{
+    string summary;
+    switch (messageType)
+    {
+        case 1 =>
+            summary = "Destination Unreachable, ";
+            switch (messageCode)
+            {
+                case 0  =>
+                    summary += "No route to destination.";
+                case 1  =>
+                    summary += "Communication with destination administratively prohibited.";
+                case 2  =>
+                    summary += "Beyond scope of source address.";
+                case 3  =>
+                    summary += "Address unreachable.";
+                case 4  =>
+                    summary += "Port unreachable.";
+                case 5  =>
+                    summary += "Source address failed ingress/egress policy.";
+                case 6  =>
+                    summary += "Reject route to destination.";
+                default =>
+                    summary += "Code: Unknown (" + (messageCode as string) + ")";
+            }
+        case 2 =>
+            summary = "Packet Too Big";
+        case 3 =>
+            summary = "Time Exceeded, ";
+            switch (messageCode)
+            {
+                case 0  => summary += "Hop limit exceeded in transit.";
+                case 1  => summary += "Fragment reassembly time exceeded.";
+                default => summary += "Code: Unknown (" + (messageCode as string) + ")";
+            }
+        case 4 =>
+            summary = "Parameter Problem, ";
+            switch (messageCode)
+            {
+                case 0  => summary += "Erroneous header field encountered.";
+                case 1  => summary += "Unrecognized Next Header type encountered.";
+                case 2  => summary += "Unrecognized IPv6 option encountered.";
+                default => summary += "Code: Unknown (" + (messageCode as string) + ")";
+            }
+        default =>
+            summary = "";
+    }
+    
+    return summary;
+}
+
+contract ICMPv6Contract
+{
+    message MessageType
+    {
+        byte Type;
+    }
+    
+    // ICMPv6 Error Messages
+    // type: 1, RFC 4443, page 8
+    message DestinationUnreachable : MessageType
+    {
+        byte Code where ErrorCodeIf(value is DestinationUnreachableMessageCode, this, MessageNaming(Type, value)) &&
+            ValidationCheck(value <= 7, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        int Unused where ValidationCheck(value == 0, this, "ICMPv6: The Unused in message DestinationUnreachable must be set to zero.");
+        binary Data;
+        
+        override string ToString()
+        {
+            return MessageNaming(Type, Code);
+        }
+    }
+    
+    // type: 2, RFC 4443
+    message PacketTooBig : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint MTU where ErrorCodeIf(true, this, MessageNaming(Type, Code) + ", MTU: " + value.ToString());
+        binary Data;
+        
+        override string ToString()
+        {
+            return MessageNaming(Type, Code) + ", MTU: " + MTU.ToString();
+        }
+    }
+    
+    // type: 3, RFC 4443
+    message TimeExceeded : MessageType
+    {
+        byte Code where ErrorCodeIf(value is TimeExceededMessageCode, this, MessageNaming(Type, value)) &&
+            ValidationCheck(value <= 1, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        int Unsed where ValidationCheck(value == 0, this, "ICMPv6: The Unused in message TimeExceeded must be set to zero.");
+        binary Data;
+        
+        override string ToString()
+        {
+            return MessageNaming(Type, Code);
+        }
+    }
+
+    // type: 4, RFC 4443
+    message ParameterProblem : MessageType
+    {
+        byte Code where ErrorCodeIf(value is ParameterProblemMessageCode, this, MessageNaming(Type, value)) &&
+            ValidationCheck(value <= 2, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Pointer;
+        binary Data;
+        
+        override string ToString()
+        {
+            string summary = MessageNaming(Type, Code);
+            summary += ", Pointer: " + DecToHexFormat(Pointer);
+            return summary;
+        }
+    }
+       
+    // ICMPv6 Informational Messages
+    // type:128, RFC 4443
+    message EchoRequest : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort SequenceNumber;
+        binary Data;
+        
+        override string ToString()
+        {
+            return "Echo Request, ID: " + DecToHexFormat(Identifier) + ", Seq: " + DecToHexFormat(SequenceNumber);
+        }
+    }
+    
+    // type:129, RFC 4443
+    message EchoReply : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort SequenceNumber;
+        binary Data;
+        
+        override string ToString()
+        {
+            return "Echo Reply, ID: " + DecToHexFormat(Identifier) + ", Seq: " + DecToHexFormat(SequenceNumber);
+        }
+    }
+
+    issues virtual operation EchoOp
+    {
+        in ushort Identifier = identifier;
+        in ushort SequenceNumber = sequenceNumber;
+        
+        override string ToString()
+        {
+            return "Echo Operation";
+        }
+    } =
+    accepts ICMPv6Contract.EchoRequest{Identifier is var identifier, SequenceNumber is var sequenceNumber}
+    issues ICMPv6Contract.EchoReply{Identifier == identifier , SequenceNumber == sequenceNumber};
+    
+    // type: 130, RFC2710, page 3
+    message MulticastListenerQuery : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort MaximumResponseDelay;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MulticastListenerQuery must be set to zero.");
+        (MulticastAddress | ZeroMulticastAddress) MulticastAddress; // Add ZeroMulticastAddress to deal with zero Multicast Address field in RFC2710 3.6
+        
+        override string ToString()
+        {
+            return "Multicast Listener Query, Maximum Response Delay: " + DecToHexFormat(MaximumResponseDelay);
+        }
+    }
+    
+    // type:131, RFC2710
+    message MulticastListenerReport : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort MaximumResponseDelay;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MulticastListenerReport must be set to zero.");
+        MulticastAddress MulticastAddress;
+        
+        override string ToString()
+        {
+            return "Multicast Listener Report";
+        }
+    }
+    
+    // type:132, RFC2710
+    message MulticastListenerDone : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort MaximumResponseDelay;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MulticastListenerDone must be set to zero.");
+        MulticastAddress MulticastAddress;
+        
+        override string ToString()
+        {
+            return "Multicast Listener Done";
+        }
+    }
+    
+    // type: 133, RFC 4861
+    message RouterSolicitation : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message RouterSolicitation must be set to zero.");
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Router Solicitation";
+        }
+    }
+    
+    // type: 134, RFC 6275, page 64 changed the message format
+    message RouterAdvertisement : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        byte CurHopLimit;
+        bool M with BinaryEncoding{Width = 1};
+        bool O with BinaryEncoding{Width = 1};
+        bool H with BinaryEncoding{Width = 1};
+        RouterAdvertisement_Prf Prf with BinaryEncoding{Width = 2};
+        bool P with BinaryEncoding{Width = 1};
+        byte Reserved with BinaryEncoding{Width = 2};
+        ushort RouterLifetime;
+        uint ReachableTime;
+        uint RetransTimer;
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Router Advertisement";
+        }
+    }
+    
+    // type: 135, RFC 4861
+    message NeighborSolicitation : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message NeighborSolicitation must be set to zero.");
+        IPv6Address TargetAddress; // Future Reference: add Validation check, must not mulicast address.
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Neighbor Solicitation, Target: " + TargetAddress.ToString();
+        }
+    }
+
+    // type: 136, RFC 4861
+    message NeighborAdvertisement : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        bool R with BinaryEncoding{Width = 1};
+        bool S with BinaryEncoding{Width = 1};
+        bool O with BinaryEncoding{Width = 1};
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message NeighborAdvertisement must be set to zero.") with BinaryEncoding{Width = 29};
+        IPv6Address TargetAddress; // Future Reference: add Validation check, must not mulicast address.
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Neighbor Advertisement, Target: " + TargetAddress.ToString();
+        }
+    }
+    
+    issues virtual operation NeighborOp
+    {
+        in IPv6Address TargetAddress = reqAddr;
+        
+        override string ToString()
+        {
+            return "Neighbor Operation";
+        }
+    } =
+    backtrack(ICMPv6Contract.NeighborSolicitation{})
+    accepts ICMPv6Contract.NeighborSolicitation{TargetAddress is var reqAddr}
+    issues ICMPv6Contract.NeighborAdvertisement{TargetAddress is (IPv6Address{Octets == reqAddr.Octets})};
+    
+    // type: 137
+    message Redirect : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message Redirect must be set to zero.");
+        IPv6Address TargetAddress; // Future Reference: Validation check, must not mulicast address.
+        IPv6Address DestinationAddress; // Future Reference: Validation check, must not mulicast address.
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Redirect, Target: " + TargetAddress.ToString();
+        }
+    }
+
+    // type: 138    RFC 2894, page 7 
+    message RouterRenumberingHeader : MessageType
+    {
+        byte Code;
+        ushort Checksum;
+        uint SequenceNumber;
+        byte SegmentNumber;
+        ICMPv6.Flags Flags;
+        ushort  MaxDelay;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message RouterRenumberingHeader must be set to zero.");
+        
+        override string ToString()
+        {
+            string summary = "Router Renumbering";
+            switch (Code)
+            {
+                case 0   => summary += ", Router Renumbering Command";
+                case 1   => summary += ", Router Renumbering Result";
+                case 255 => summary += ", Sequence Number Reset";
+                default  => summary += ", Code: Unknown (" + (Code as string) + ")";
+            }
+            return summary;
+        }
+    }
+    
+    // RFC 2894 3.2.  Message Body -- Command Message
+    message RouterRenumberingCommand : RouterRenumberingHeader
+    {
+        invariant Code == 0;
+        optional array<PrefixControlOperation> PrefixControlOperations;
+    } 
+    
+    // RFC 2894 3.3.  Message Body -- Result Message
+    message RouterRenumberingResult : RouterRenumberingHeader
+    {
+        invariant Code == 1;
+        ushort Reserved1 where ValidationCheck(value == 0, this, "ICMPv6: The Reserved1 in message RouterRenumberingResult must be set to zero.") with BinaryEncoding{Width = 14};
+        bool B with BinaryEncoding{Width = 1};
+        bool F with BinaryEncoding{Width = 1};
+        byte Ordinal;
+        byte MatchedLen;
+        binary MatchedPrefix with BinaryEncoding{MaxLength = 16};
+    }
+    
+    // type: 139 RFC 4620
+    message NodeInformationQuery : MessageType
+    {
+        byte Code where ValidationCheck(value <= 2, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort QType where ValidationCheck(value <= 4, this, "ICMPv6: The QType in message NodeInformationQuery must be less than or equal to 4.");
+        ([|QType == 3|] NIFlag3 | [|QType == 4|] NIFlag4 | ushort) Flags;
+        long Nonce;
+        optional ([|Code == 0|] IPv6Address    | 
+        [|Code == 1|] DNSString          |
+        [|Code == 2|] IPv4Address) Data;
+        
+        override string ToString()
+        {
+            string summary = "ICMP Node Information Query";
+            switch (Code)
+            {
+                case 0  => summary += ", Data field contains an IPv6 address that is the Subject of this Query.";
+                case 1  => summary += ", Data field contains a name that is the Subject of this Query, or is empty.";
+                case 2  => summary += ", Data field contains an IPv4 address that is the Subject of this Query.";
+                default => summary += ", Code: Unknown (" + (Code as string) + ")";
+            }
+            return summary;
+        }
+    }
+
+    // type: 140 RFC 4620
+    message NodeInformationReply : MessageType
+    {
+        byte Code where ValidationCheck(value <= 2, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort QType where ValidationCheck(value <= 4, this, "ICMPv6: The QType in message NodeInformationReply must be less than or equal to 4.");
+        ([|QType == 3|] NIFlag3 | [|QType == 4|] NIFlag4 | ushort) Flags;
+        long Nonce;
+        ([|Code == 0 && QType == 2|] NodeNames              |
+        [|Code == 0 && QType == 3|] IPv6UnicastAddresses    |
+        [|Code == 0 && QType == 4|] IPv4UnicastAddresses    |
+        binary) Data;
+        
+        override string ToString()
+        {
+            string summary = "ICMP Node Information Response";
+            switch (Code)
+            {
+                case 0  => summary += ", A successful reply.";
+                case 1  => summary += ", The Responder refuses to supply the answer.";
+                case 2  => summary += ", The Qtype of the Query is unknown to the Responder.";
+                default => summary += ", Code: Unknown (" + (Code as string) + ")";
+            }
+            return summary;
+        }
+    }
+
+    // type: 141
+    message InverseNeighborDiscoverySolicitation : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message InverseNeighborDiscoverySolicitation must be set to zero.");
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Inverse Neighbor Discovery Solicitation Message";
+        }
+    }
+
+    // type: 142
+    message InverseNeighborDiscoveryAdvertisement : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        uint Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message InverseNeighborDiscoveryAdvertisement must be set to zero.");
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Inverse Neighbor Discovery Advertisement Message";
+        }
+    }
+
+    // type: 143 RFC 3810
+    message Version2MulticastListenerReport : MessageType
+    {
+        byte Reserved1 where ValidationCheck(value == 0, this, "ICMPv6: The Reserved1 in message Version2MulticastListenerReport must be set to zero.");
+        ushort Checksum;
+        ushort Reserved2 where ValidationCheck(value == 0, this, "ICMPv6: The Reserved2 in message Version2MulticastListenerReport must be set to zero.");
+        ushort McastAddressRecordsCount;
+        array<MulticastAddressRecord> MulticastAddressRecords with BinaryEncoding{MaxLength = McastAddressRecordsCount};
+        
+        override string ToString()
+        {
+            return "MLDv2 Multicast Listener Report";
+        }
+    }
+    
+    // type: 144, RFC 6275
+    message HomeAgentAddressDiscoveryRequest : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message HomeAgentAddressDiscoveryRequest must be set to zero.");
+        
+        override string ToString()
+        {
+            return "Home Agent Address Discovery Request Message";
+        }
+    }
+    
+    // type: 145, RFC 6275
+    message HomeAgentAddressDiscoveryReply : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message HomeAgentAddressDiscoveryReply must be set to zero.");
+        
+        override string ToString()
+        {
+            return "Home Agent Address Discovery Reply Message";
+        }
+    }
+    
+    issues virtual operation HomeAgentAddressDiscoveryOp
+    {
+        in ushort Identifier = identifier;
+        
+        override string ToString()
+        {
+            return "HomeAgentAddressDiscovery Operation";
+        }
+    } =
+    accepts ICMPv6Contract.HomeAgentAddressDiscoveryRequest{Identifier is var identifier}
+    issues ICMPv6Contract.HomeAgentAddressDiscoveryReply{Identifier == identifier};
+    
+    // type: 146
+    message MobilePrefixSolicitation : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MobilePrefixSolicitation must be set to zero.");
+        
+        override string ToString()
+        {
+            return "Mobile Prefix Solicitation";
+        }
+    }
+    
+    // type: 147
+    message MobilePrefixAdvertisement : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MobilePrefixAdvertisement must be set to zero.");
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Mobile Prefix Advertisement";
+        }
+    }
+    
+    issues virtual operation MobilePrefixSolicitationOp
+    {
+        in ushort Identifier = identifier;
+        
+        override string ToString()
+        {
+            return "Mobile Prefix Solicitation Operation";
+        }
+    } =
+    accepts ICMPv6Contract.MobilePrefixSolicitation{Identifier is var identifier}
+    issues ICMPv6Contract.MobilePrefixAdvertisement{Identifier == identifier};
+
+    // type: 148, RFC 3971
+    message CertificationPathSolicitation : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier where ValidationCheck(value != 0, this, "ICMPv6: The Identifier in message CertificationPathSolicitation must not be zero.");
+        ushort Component;
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Certification Path Solicitation (SEND)";
+        }
+    }
+    
+    // type: 149, RFC 3971
+    message CertificationPathAdvertisement : MessageType
+    {
+        byte Code where ValidationCheck(value == 0, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        ushort Identifier where ValidationCheck(value != 0, this, "ICMPv6: The Identifier in message CertificationPathAdvertisement must not be zero.");
+        ushort AllComponents;
+        ushort Component;
+        ushort Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message CertificationPathAdvertisement must be set to zero.");
+        optional array<OptionChoicePattern> Option;
+        
+        override string ToString()
+        {
+            return "Certification Path Advertisement (SEND)";
+        }
+    }
+    
+    issues virtual operation CertificationPathOp
+    {
+        in ushort Identifier = identifier;
+        in ushort ReqComponent = reqComponent;
+        out ushort AllComponents = allComponents;
+        out ushort ResComponent = resComponent;
+        
+        override string ToString()
+        {
+            return "CertificationPath Operation";
+        }
+    } =
+    accepts ICMPv6Contract.CertificationPathSolicitation{Identifier is var identifier, Component is var reqComponent}
+    issues ICMPv6Contract.CertificationPathAdvertisement{Identifier == identifier, AllComponents is var allComponents, Component is var resComponent};
+    
+    // type 150, RFC 4065
+    message ExperimentalMobilityType : MessageType
+    {
+        byte Code;
+        ushort Checksum;
+        ExperimentalMobilityProtocolSubtype SubType;
+        int Reserved where ValidationCheck(value == 0, this, "ICMPv6: The field Reserved in message ExperimentalMobilitySubtype must be set to zero.")
+            with BinaryEncoding{Width = 24};
+        binary Options; // Future Reference: Should be decoded following Experimental Mobility protocol, RFC 4066, 4067.
+        
+        override string ToString()
+        {
+            return "Experimental Mobility Type, Subtype: " + EnumToString(SubType, "ICMPv6.ExperimentalMobilityProtocolSubtype");
+        }
+    }
+    
+    // type 151, RFC 4286
+    message MulticastRouterAdvertisement : MessageType
+    {
+        byte AdvertisementInterval;
+        ushort Checksum;
+        ushort QueryInterval;
+        ushort RobustnessVariable;
+        
+        override string ToString()
+        {
+            return "Multicast Router Advertisement (MRD)";
+        }
+    }
+
+    // type 152
+    message MulticastRouterSolicitation : MessageType
+    {
+        byte Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MulticastRouterSolicitation must be set to zero.");
+        ushort Checksum;
+        
+        override string ToString()
+        {
+            return "Multicast Router Solicitation (MRD)";
+        }
+    }
+    
+    // type 153
+    message MulticastRouterTermination : MessageType
+    {
+        byte Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message MulticastRouterTermination must be set to zero.");
+        ushort Checksum;
+        
+        override string ToString()
+        {
+            return "Multicast Router Termination (MRD)";
+        }
+    }
+    
+    // type 154, RFC 5568 page 20
+    message RouterSolicitationForProxyAdvertisement : MessageType
+    {
+        byte Code;
+        ushort Checksum;
+        (byte where value == 2) SubType;
+        byte Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message RouterSolicitationForProxyAdvertisement must be set to zero.");
+        ushort Identifier;
+        optional array<LinkLayerAddressOption> Options;
+        
+        override string ToString()
+        {
+            return "Router Solicitation for Proxy Advertisement (RtSolPr)";
+        }
+    }
+    
+    message ProxyRouterAdvertisement : MessageType
+    {
+        byte Code;
+        ushort Checksum;
+        (byte where value == 3) SubType;
+        byte Reserved where ValidationCheck(value == 0, this, "ICMPv6: The Reserved in message ProxyRouterAdvertisement must be set to zero.");
+        ushort Identifier;
+        ProxyRouterAdvertisementOptions[Code] Options;
+        
+        override string ToString()
+        {
+            return "Proxy Router Advertisement";
+        }
+    }
+    
+    // type 155  http://tools.ietf.org/html/draft-ietf-roll-rpl-19
+    message RPLControlMessage : MessageType
+    {
+        byte Code where ValidationCheck(value in ValidRPLControlMessageCode, this, () => "ICMPv6: Code: " + (value as string) + " is not valid for Type: " + (Type as string) + ".");
+        ushort Checksum;
+        optional [|Code >= 0x80|] Security Security;
+        ([|Code in {0x00, 0x80}|]DISBaseObject
+            | [|Code in {0x01, 0x81}|] DIOBaseObject
+            | [|Code in {0x02, 0x82}|] DAOBaseObject
+            | [|Code in {0x03, 0x83}|] DAOACKBaseObject
+            | [|Code == 0x8A|] ConsistencyCheckBaseObject) Base;
+        optional array<OptionChoice1Pattern> Options;
+        
+        override string ToString()
+        {
+            string summary = "RPL Control Message";
+            switch (Code)
+            {
+                case 0x00 => summary += ", DODAG Information Solicitation";
+                case 0x01 => summary += ", DODAG Information Object";
+                case 0x02 => summary += ", Destination Advertisement Object";
+                case 0x03 => summary += ", Destination Advertisement Object Acknowledgment";
+                case 0x80 => summary += ", Secure DODAG Information Solicitation";
+                case 0x81 => summary += ", Secure DODAG Information Object";
+                case 0x82 => summary += ", Secure Destination Advertisement Object";
+                case 0x83 => summary += ", Secure Destination Advertisement Object Acknowledgment";
+                case 0x8A => summary += ", Consistency Check";
+                default   => summary += ", Code: Unknown (" + (Code as string) + ")";
+            }
+            return summary;
+        }
+    }
+}
+    
+// RFC2710 page 3 ,Add ZeroMulticastAddress to deal with zero Multicast Address field in RFC2710 3.6
+const binary OctetsZero16Bytes = $[00000000000000000000000000000000];
+type ZeroMulticastAddress
+{
+    binary Octets where value == OctetsZero16Bytes with BinaryEncoding {Length = 16};
+
+    override string ToString()
+    {
+        string ip = "";
+        array<byte> byteArr = Octets as array<byte>;
+        for (int index = 0; index < byteArr.Count; index += 2)
+        {
+            int b = (byteArr[index] << 8) + byteArr[index + 1];
+            ip += (b == 0) ? "0:" : (Utility.DecToHexFormat(b as uint).Segment(2) + ":");
+        }    
+        return ip.Segment(0, ip.Count - 1);
+    }
+}
+
+// RFC 2894 3.2.1.  Prefix Control Operation
+type PrefixControlOperation
+{
+    MatchPrefixPart MatchPrefixPart;
+    optional [|((MatchPrefixPart.OpLength * 8 - 24) / 32) > 0|] array<UsePrefixPart> UsePrefixParts with BinaryEncoding{Length = ((MatchPrefixPart.OpLength * 8 - 24) / 32)};
+}
+
+// RFC 2894 3.2.1.1.  Match-Prefix Part
+type MatchPrefixPart
+{
+    (enum byte
+        {
+            AddOperation        = 1,
+            ChangeOperation     = 2,
+            SetGlobalOperation  = 3,
+        }
+    ) OpCode;
+    byte OpLength;
+    byte Ordinal;
+    byte MatchLen;
+    byte MinLen;
+    byte MaxLen;
+    ushort Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type MatchPrefixPart must be set to zero.");
+    binary MatchPrefix with BinaryEncoding{Length = 16};
+}
+
+// RFC 2894 3.2.1.2.  Use-Prefix Part
+type UsePrefixPart
+{
+    byte UseLen;
+    byte KeepLen;
+    byte FlagMask;
+    byte RAFlags;
+    uint ValidLifetime;
+    uint PreferredLifetime;
+    bool V with BinaryEncoding{Width = 1};
+    bool P with BinaryEncoding{Width = 1};
+    uint Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type UsePrefixPart must be set to zero.") with BinaryEncoding{Width = 30};
+    binary UsePrefix with BinaryEncoding{Length = 16};
+}
+
+type Flags
+{
+    bool T with BinaryEncoding{Width = 1};
+    bool R with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool S with BinaryEncoding{Width = 1};
+    bool P with BinaryEncoding{Width = 1};
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type Flags must be set to zero.") with BinaryEncoding{Width = 3};
+}
+
+type Security
+{
+    bool T with BinaryEncoding{Width = 1};
+    byte Reserved1 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved1 in type Security must be set to zero.") with BinaryEncoding{Width = 7};
+    byte KIM with BinaryEncoding{Width = 2};
+    byte Reserved2 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved2 in type Security must be set to zero.") with BinaryEncoding{Width = 3};
+    byte LVL with BinaryEncoding{Width = 3};
+    byte Flags;
+    uint Counter;
+    KeyIdentifier KeyIdentifier;
+}
+
+type KeyIdentifier
+{
+    array<byte> KeySource with BinaryEncoding{Length = 8};
+    byte KeyIndex;
+}
+
+type NIFlag3
+{
+    ushort Unused where ValidationCheck(value == 0, null, "ICMPv6: The Unused in type NIFlag3 must be set to zero.") with BinaryEncoding{Width = 10};
+    bool G with BinaryEncoding{Width = 1};
+    bool S with BinaryEncoding{Width = 1};
+    bool L with BinaryEncoding{Width = 1};
+    bool C with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool T with BinaryEncoding{Width = 1};
+}
+
+type NIFlag4
+{
+    ushort Unused where ValidationCheck(value == 0, null, "ICMPv6: The Unused in type NIFlag4 must be set to zero.") with BinaryEncoding{Width = 14};
+    bool A with BinaryEncoding{Width = 1};
+    bool T with BinaryEncoding{Width = 1};
+}
+
+type NodeNames
+{
+    uint TTL where ValidationCheck(value == 0, null, "ICMPv6: The TTL in type NodeNames must be set to zero.");
+    DNSString NodeName;
+}
+
+type IPv6UnicastAddresses
+{
+    uint TTL where ValidationCheck(value == 0, null, "ICMPv6: The TTL in type IPv6UnicastAddresses must be set to zero.");
+    IPv6Address Address;
+}
+
+type IPv4UnicastAddresses
+{
+    uint TTL where ValidationCheck(value == 0, null, "ICMPv6: The TTL in type IPv4UnicastAddresses must be set to zero.");
+    IPv4Address Address;
+}
+
+type MulticastAddressRecord
+{
+    byte RecordType where ValidationCheck(value <= 6, null, "ICMPv6: Type must be less than or equal to 6.");
+    byte  AuxDataLen;
+    ushort SourcesNumber;
+    IPv6.MulticastAddress MulticastAddress;
+    optional [|SourcesNumber > 0|] array<IPv6Address> SourceAddresses with BinaryEncoding{Length = SourcesNumber};
+    optional [|AuxDataLen > 0|] binary AuxiliaryData with BinaryEncoding{Length = AuxDataLen};
+}
+
+// 0x00, 0x80
+type DISBaseObject
+{
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type DISBaseObject must be set to zero.");
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type DISBaseObject must be set to zero.");
+}
+
+// 0x01, 0x81
+type  DIOBaseObject
+{
+    byte RPLInstanceID;
+    byte VersionNumber;
+    ushort Rank;
+    bool G with BinaryEncoding{Width = 1};
+    bool O with BinaryEncoding{Width = 1};
+    byte MOP  where ValidationCheck(value <= 3, null, "ICMPv6: The MOP in type DIOBaseObject must be less than or equal to 3.") with BinaryEncoding{Width = 3};
+    byte Prf with BinaryEncoding{Width = 3};
+    byte DTSN;
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type DIOBaseObject must be set to zero.");
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type DIOBaseObject must be set to zero.");
+    IPv6Address DODAGID;
+}
+
+// 0x02, 0x82
+type DAOBaseObject
+{
+    byte RPLInstanceID;
+    bool K with BinaryEncoding{Width = 1};
+    bool D with BinaryEncoding{Width = 1};
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type DAOBaseObject must be set to zero.");
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type DAOBaseObject must be set to zero.");
+    byte DAOSequence;
+    optional [|D == true|] IPv6Address DODAGID;
+}
+
+// 0x03, 0x83
+type DAOACKBaseObject
+{
+    byte RPLInstanceID;
+    bool D with BinaryEncoding{Width = 1};
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type DAOACKBaseObject must be set to zero.");
+    byte DAOSequence;
+    byte Status;
+    optional [|D == true|] IPv6Address DODAGID;
+}
+
+// 0x8A
+type ConsistencyCheckBaseObject
+{
+    byte RPLInstanceID;
+    bool R with BinaryEncoding{Width = 1};
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type ConsistencyCheckBaseObject must be set to zero.");
+    ushort CCNonce;
+    IPv6Address DODAGID;
+    uint  DestinationCounter;
+}
+
+// IPv6 Neighbor Discovery Option Formats, http://www.iana.org/assignments/icmpv6-parameters/icmpv6-parameters.xhtml#icmpv6-parameters-5
+pattern OptionChoicePattern = [|RemainingBitLength(stream) >= 8|]
+    ([|CurrentByte(stream) == 1 || CurrentByte(stream) == 2|] LinkLayerAddress                   |   // 1,2
+    [|CurrentByte(stream) == 3|] PrefixInformation                                               |   // 3
+    [|CurrentByte(stream) == 4|] RedirectedHeader                                                |   // 4
+    [|CurrentByte(stream) == 5|] MTU                                                             |   // 5
+    [|CurrentByte(stream) == 6|] NBMAShortcutLimitOption                                         |   // 6
+    [|CurrentByte(stream) == 7|] AdvertisementIntervalOption                                     |   // 7
+    [|CurrentByte(stream) == 8|] HomeAgentInformationOption                                      |   // 8
+    [|CurrentByte(stream) == 9|| CurrentByte(stream) == 10|] AddressList                         |   // 9, 10
+    [|CurrentByte(stream) == 11|] CGAOption                                                      |   // 11
+    [|CurrentByte(stream) == 12|] RSASignatureOption                                             |   // 12
+    [|CurrentByte(stream) == 13|] TimestampOption                                                |   // 13
+    [|CurrentByte(stream) == 14|] NonceOption                                                    |   // 14
+    [|CurrentByte(stream) == 15|] TrustAnchorOption                                              |   // 15
+    [|CurrentByte(stream) == 16|] CertificateOption                                              |   // 16
+    [|CurrentByte(stream) == 17|] IPAddressPrefixOption                                          |   // 17
+    [|CurrentByte(stream) == 18|] RouterPrefixInformationOption                                  |   // 18
+    [|CurrentByte(stream) == 19|] LinkLayerAddressOption                                         |   // 19
+    [|CurrentByte(stream) == 20|] NeighborAdvertisementAcknowledgmentOption                      |   // 20
+                                                                                                     // 21-22 Unassigned
+    [|CurrentByte(stream) == 23|] MAPOption                                                      |   // 23
+    [|CurrentByte(stream) == 24|] RouteInformationOption                                         |   // 24
+    [|CurrentByte(stream) == 25|] RecursiveDNSServerOption                                       |   // 25
+    [|CurrentByte(stream) == 26|] RAFlagsExtensionOption                                         |   // 26
+    [|CurrentByte(stream) == 27|] HandoverKeyRequestOption                                       |   // 27
+    [|CurrentByte(stream) == 28|] HandoverKeyReplyOption                                         |   // 28
+    [|CurrentByte(stream) == 29|] HandoverAssistInformationOption                                |   // 29
+    [|CurrentByte(stream) == 30|] MobileNodeIdentifierOption                                     |   // 30
+    [|CurrentByte(stream) == 31|] DNSSearchListOption                                            |   // 31
+    [|CurrentByte(stream) == 32|] ProxySignatureOption                                           |   // 32
+    [|CurrentByte(stream) == 33|] AddressRegistrationOption                                      |   // 33
+    [|CurrentByte(stream) == 34|] _6LoWPANContextOption                                          |   // 34
+    [|CurrentByte(stream) == 35|] AuthoritativeBorderRouterOption                                |   // 35
+    [|CurrentByte(stream) == 36|] _6LoWPANCapabilityIndicationOption                                 |   // 36
+                                                                                                     // 37-137 Unassigned
+    [|CurrentByte(stream) == 138|] CARDRequestOption                                             |   // 138
+    [|CurrentByte(stream) == 139|] CARDReplyOption                                               |   // 139
+    // 140-252 Unassigned;
+    // 253,254 are used to explicitly configured experiments
+    NDOptionGeneral);
+
+// RFC 4861, section 4.6.  Option Formats
+type NDOptionGeneral
+{
+    byte Type;
+    byte Length;
+    binary Data with BinaryEncoding{Length = Length * 8 - 2};
+}
+
+// RFC 4861, section 4.6.1.  Source/Target Link-layer Address
+type LinkLayerAddress
+{
+    byte Type; // 1, 2
+    byte Length;
+    binary LinkLayerAddress with BinaryEncoding{Length = Length * 8 - 2};
+}
+
+// RFC 4861, section 4.6.2.  Prefix Information
+// RFC 6275, section 7.2.  Modified Prefix Information Option Format
+type PrefixInformation
+{
+    byte Type; // 3
+    byte Length where ValidationCheckValue(value == 4, null, true, ReferenceType.Type, "ICMPv6", "Length", "PrefixInformation", "4", value);
+    byte PrefixLength;
+    PrefixOption PrefixOption where ValidationCheckEnumValue(InRange<PrefixOption>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "PrefixOption", "PrefixInformation", "0x20, 0x40, 0x80", value);
+    uint ValidLifetime;
+    uint PreferredLifetime;
+    uint Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved2", "PrefixInformation", value);
+    IPv6Address Prefix;
+}
+
+pattern PrefixOption = flags byte
+{
+    L = 0x80,
+    A = 0x40,
+    R = 0x20,
+    ...
+};
+
+// RFC 4861, section 4.6.3.  Redirected Header
+type RedirectedHeader
+{
+    byte Type; // 4
+    byte Length;
+    ushort Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved1", "RedirectedHeader", value);
+    uint Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved2", "RedirectedHeader", value);
+    IPHeaderAndData IPHeaderAndData with BinaryEncoding{WidthForComposedType = (Length - 1) * 64};
+}
+
+// The original packet truncated to ensure that the size of the redirect message does not exceed the minimum MTU required to support IPv6 as specified in [IPv6].
+// Future Reference: Move this type into IPv6.opn
+type IPHeaderAndData
+{
+    byte Version where ValidationCheckValue(value == 6, null, true, ReferenceType.Type, "ICMPv6", "Version", "IPHeaderAndData", "6", value) with BinaryEncoding {Width = 4};
+    byte TrafficClass;
+    uint FlowLabel with BinaryEncoding{Width = 20};
+    ushort PayloadLength;
+    ProtocolType NextHeader;
+    byte HopLimit;
+    IPv6Address SourceAddress;
+    IPv6Address DestinationAddress;
+    binary OriginalIPPayload;
+}
+
+// RFC 4861, section 4.6.4.  MTU
+type MTU
+{
+    byte Type; // 5
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "MTU", "1", value);
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "MTU", value);
+    uint MTU;
+}
+
+// RFC 2491, Appendix D
+type  NBMAShortcutLimitOption
+{
+    byte Type; // 6
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "NBMAShortcutLimitOption", "1", value);
+    byte ShortcutLimit;
+    byte Reserved1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved1", "NBMAShortcutLimitOption", value);
+    uint Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved2", "NBMAShortcutLimitOption", value);
+}
+
+// RFC 6275, section 7.3.  New Advertisement Interval Option Format
+type AdvertisementIntervalOption
+{
+    byte Type; // 7
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "AdvertisementIntervalOption", "1", value);
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "AdvertisementIntervalOption", value);
+    uint AdvertisementInterval;
+}
+
+// RFC 6275, section 7.4.  New Home Agent Information Option Format
+type HomeAgentInformationOption 
+{
+    byte Type; // 8
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "HomeAgentInformationOption", "1", value);
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "HomeAgentInformationOption", value);
+    ushort HomeAgentPreference;
+    ushort HomeAgentLifetime;
+}
+
+// RFC 3122, section 3.1  Source/Target Address List
+type AddressList
+{
+    byte Type; // 9, 10
+    byte Length where ValidationCheckGreaterThanOrEqualTo(value >= 3, null, true, ReferenceType.Type, "ICMPv6", "Length", "AddressList", "3", value);
+    binary Reserved where ValidationCheckReservedZero(value == ReservedZero6Bytes, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "AddressList", value) with BinaryEncoding{Length = 6};
+    array<IPv6Address> IPv6Addresses with BinaryEncoding{Length = (Length - 1) / 2};
+}
+
+// RFC 3971, section 5.1.  CGA Option
+type CGAOption
+{
+    byte Type; // 11
+    byte Length;
+    byte PadLength;
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "CGAOption", value);
+    CGAParametersAndHashValues CGAParameters with BinaryEncoding{WidthForComposedType = (Length * 8 - 4 - PadLength) * 8}; 
+    binary Padding with BinaryEncoding{Length = PadLength};
+}
+
+// RFC 3972, section 3.  CGA Parameters and Hash Values
+type CGAParametersAndHashValues
+{
+    binary Modifier with BinaryEncoding{Length = 16};
+    binary SubnetPrefix with BinaryEncoding{Length = 8};
+    byte CollisionCount where ValidationCheckValue(value >= 0 && value <= 2, null, true, ReferenceType.Type, "ICMPv6", "CollisionCount", "CGAParametersAndHashValues", "0, 1, or 2", value);
+    X509.SubjectPublicKeyInfo PublicKey with Encoding{Decoder = Asn1BerDecoder<X509.SubjectPublicKeyInfo>};
+    optional binary ExtensionFields;
+}
+
+// RFC 3971, section 5.2.  RSA Signature Option
+type RSASignatureOption
+{
+    byte Type; // 12
+    byte Length;
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "RSASignatureOption", value);
+    binary KeyHash with BinaryEncoding{Length = 16};
+    DigitalSignatureAndPadding DigitalSignatureAndPadding with BinaryEncoding{Length = Length * 8 - 20};
+}
+
+// RFC 3971, section 5.3.1.  Timestamp Option
+const binary ReservedZero6Bytes = $[000000000000];
+type TimestampOption
+{
+    byte Type; // 13
+    byte Length;
+    binary Reserved where ValidationCheckReservedZero(value == ReservedZero6Bytes, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "TimestampOption", value) with BinaryEncoding{Length = 6};
+    Timestamp Timestamp;
+}
+
+type Timestamp
+{
+    ulong Seconds with BinaryEncoding{Width = 48};
+    ushort FractionsOfSecond with BinaryEncoding{Width = 16};
+}
+
+// RFC 3971, section 5.3.2.  Nonce Option
+type NonceOption
+{
+    byte Type; // 14
+    byte Length;
+    binary Nonce with BinaryEncoding{Length = Length * 8 - 2};
+}
+
+// RFC 3971, section 6.4.3.  Trust Anchor Option
+type TrustAnchorOption
+{
+    byte Type; // 15
+    byte Length;
+    NameType NameType where ValidationCheckEnumValue(InRange<NameType>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "NameType", "TrustAnchorOption", "1, 2", value);
+    byte PadLength;
+    (X509.Name | DNSString | binary) Name with BinaryEncoding{Length = Length * 8 - 4 - PadLength}, Encoding{Decoder = NameDecoder, SourcePattern = TypeOf<binary>()};
+    binary Padding with BinaryEncoding{Length = PadLength};
+
+    optional (X509.Name | DNSString) NameDecoder(binary bin)
+    {
+        switch (NameType)
+        {
+            case NameType.X501Name  => return Asn1BerDecoder<X509.Name>(bin);
+            case NameType.FQDN      => return BinaryDecoder<DNSString>(bin);
+            default => return bin;
+        }
+    }
+}
+
+pattern NameType = enum byte
+{
+    X501Name    = 1,
+    FQDN        = 2,
+    ...
+};
+
+// RFC 3971, section 6.4.4.  Certificate Option
+type CertificateOption
+{
+    byte Type; // 16
+    byte Length;
+    byte CertType where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "CertType", "CertificateOption", "1", value);
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "CertificateOption", value);
+    X509.Certificate Certification with Encoding{Decoder = Asn1BerDecoder<X509.Certificate>};
+    optional binary Padding with BinaryEncoding{MaxLength = Length * 8 - 4};
+}
+
+// rfc 5568, page 23
+type ProxyRouterAdvertisementOptions[byte Code]
+{
+    optional (LinkLayerAddressOption where value.OptionCode == 4) SourceLinkLayerAddress; // rfc 5568, page 36
+    (LinkLayerAddressOption where value.OptionCode == 1) NewAccessPointLinkLayerAddress; // rfc 5568, page 36
+    optional [|Code == 0 || Code == 1|] (LinkLayerAddressOption where value.OptionCode == 3) NewRouterLinkLayerAddress; // rfc 5568, page 36
+    optional [|Code == 0 || Code == 1|] (IPAddressPrefixOption where value.OptionCode == 3) NewRouterIPAddress; // rfc 5568, page 34
+    optional (IPAddressPrefixOption where value.OptionCode == 4) NewRouterPrefixInformation; // rfc 5568, page 34
+    optional (IPAddressPrefixOption where value.OptionCode == 2) NewCoA;  // rfc 5568, page 34
+}
+
+// RFC 5568, section 6.4.1.  IP Address/Prefix Option
+type IPAddressPrefixOption
+{
+    byte Type; // 17
+    byte Length;
+    IPAddressPrefixOptionCode OptionCode where ValidationCheckEnumValue(InRange<IPAddressPrefixOptionCode>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "OptionCode", "IPAddressPrefixOption", "1, 2, 3, 4", value);
+    byte PrefixLength where ValidationCheckLessThanOrEqualTo(value <= 128, null, true, ReferenceType.Type, "ICMPv6", "PrefixLength", "IPAddressPrefixOption", 128, value);
+    uint Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "IPAddressPrefixOption", value);
+    IPv6Address Address;
+}
+
+pattern IPAddressPrefixOptionCode = enum byte
+{
+    $"Old Care-of Address"  = 1,
+    $"New Care-of Address"  = 2,
+    $"NAR's IP address"     = 3,
+    $"NAR's Prefix"         = 4,
+    ...
+};
+
+// RFC 4068, section 6.4.2.  New Router Prefix Information Option
+type RouterPrefixInformationOption
+{
+    byte Type; // 18
+    byte Length;
+    byte OptionCode where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "OptionCode", "RouterPrefixInformationOption", value);
+    byte PrefixLength where ValidationCheckLessThanOrEqualTo(value <= 128, null, true, ReferenceType.Type, "ICMPv6", "PrefixLength", "RouterPrefixInformationOption", 128, value);
+    binary Prefix with BinaryEncoding{Width = PrefixLength, TrailPadding = (Length * 8 - 4) * 8 - PrefixLength};
+}
+
+// RFC 4068, section 6.4.3.  Link-Layer Address (LLA) Option
+type LinkLayerAddressOption
+{
+    byte Type; // 19
+    byte Length;
+    LinkLayerAddressOptionCode OptionCode where ValidationCheckEnumValue(InRange<LinkLayerAddressOptionCode>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "OptionCode", "LinkLayerAddressOption", "0, 1, 2, 3, 4, 5, 6, 7", value);
+    binary LLA with BinaryEncoding{Length = Length * 8 - 3};
+}
+
+pattern LinkLayerAddressOptionCode = enum byte
+{
+    Wildcard                    = 0,
+    NewAccessPoint              = 1,
+    MN                          = 2,
+    NAR                         = 3,
+    SourceOfRtSolPrOrPrRtAdv    = 4,
+    CurrentRouterInterface      = 5,
+    NoPrefix                    = 6,
+    NoFastHandover              = 7,
+    ...
+};
+
+// RFC 4068, section 6.4.6.  Neighbor Advertisement Acknowledgment (NAACK)
+type NeighborAdvertisementAcknowledgmentOption
+{
+    byte Type; // 20
+    byte Length;
+    byte OptionCode where ValidationCheckZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "OptionCode", "NeighborAdvertisementAcknowledgmentOption", value);
+    NAAStatusPattern Status where ValidationCheckEnumValue(InRange<NAAStatusPattern>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "Status", "NeighborAdvertisementAcknowledgmentOption", "1, 2, 3, 4, 128", value);
+    uint Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "NeighborAdvertisementAcknowledgmentOption", value);
+    optional [|Length == 3|] IPAddressPrefixOption CoA;
+}
+
+pattern NAAStatusPattern = enum byte
+{
+    $"NCoA is invalid, perform address configuration" = 1,
+    $"NCoA is invalid, use the supplied NCoA" = 2,
+    $"NCoA is invalid, use NAR's IP address as NCoA in FBU" = 3,
+    $"PCoA supplied, do not send FBU" = 4,
+    $"Link-Layer Address unrecognized" = 128,
+    ...
+};
+
+// RFC 4140, section 5.  Neighbour Discovery Extension: The MAP Option Message Format
+type MAPOption
+{
+    byte Type; // 23
+    byte Length where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "ICMPv6", "Length", "MAPOption", "3", value);
+    byte Dist where ValidationCheckValue(value == 1, null, false, ReferenceType.Type, "ICMPv6", "Dist", "MAPOption", "1", value) with BinaryEncoding{Width = 4};
+    byte Perf with BinaryEncoding{Width = 4};
+    byte R with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 7};
+    uint ValidLifeTime;
+    IPv6Address GlobalAddress;
+}
+
+// RFC 4191, section 2.3.  Route Information Option
+type  RouteInformationOption
+{
+    byte Type; // 24
+    byte Length where ValidationCheck(value >= 1 && value <= 3, null, () => Format(CoreNetworkingResources.ICMPv6_CHECK_MULTI_VALUE, ["Length", "RouteInformationOption", "1, 2", "3"]));
+    byte PrefixLength where ValidationCheckLessThanOrEqualTo(value <= 128, null, true, ReferenceType.Type, "ICMPv6", "PrefixLength", "RouteInformationOption", 128, value);
+    byte Resvd1 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Resvd1", "RouteInformationOption", value) with BinaryEncoding{Width = 3};
+    binary RoutePreference with BinaryEncoding{Width = 2};
+    byte Resvd2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Resvd2", "RouteInformationOption", value) with BinaryEncoding{Width = 3};
+    uint RouteLifetime;
+    binary Prefix with BinaryEncoding{Width = PrefixLength, TrailPadding = (Length * 8 - 8) * 8 - PrefixLength};
+}
+
+// RFC 5006, section 5.1.  Recursive DNS Server Option
+// RFC 6106, section 5.1.  Recursive DNS Server Option
+type RecursiveDNSServerOption
+{
+    byte Type; // 25
+    byte Length where ValidationCheckGreaterThanOrEqualTo(value >= 3, null, true, ReferenceType.Type, "ICMPv6", "Length", "RecursiveDNSServerOption", "3", value);
+    ushort Reserved;
+    uint Lifetime;
+    array<IPv6Address> DNSServersAddresses with BinaryEncoding{Length = (Length - 1) / 2};
+}
+
+// RFC 5175, section 4.  Flags Expansion Option
+type RAFlagsExtensionOption
+{
+    byte Type; // 26
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "RAFlagsExtensionOption", "1", value);
+    RAOptionBit BitFields;
+}
+
+pattern RAOptionBit = flags uint
+{
+    M       = 0x80000000,
+    O       = 0x40000000,
+    H       = 0x20000000,
+    Prf1    = 0x10000000,
+    Prf2    = 0x08000000,
+    P       = 0x04000000,
+    ...
+} with BinaryEncoding{Width = 24};
+
+// RFC 5269, section 4.1.  Handover Key Request Option
+type HandoverKeyRequestOption
+{
+    byte Type; // 27
+    byte Length where ValidationCheckGreaterThanOrEqualTo(value >= 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "HandoverKeyRequestOption", "1", value);
+    byte PadLength;
+    byte AT with BinaryEncoding{Width = 4}; // TODO: Page 7, RFC 5268 ?
+    byte Resrvd where ValidationCheck(value == 0, null, "ICMPv6: The Resrve in type HandoverKeyRequestOption must be zero.") with BinaryEncoding{Width = 4};
+    binary HandoverKey with BinaryEncoding{Length = Length * 8 - 4 - PadLength};
+    array<byte> Padding with BinaryEncoding{Length = PadLength};
+}
+
+// RFC 5269, section 4.2.  Handover Key Reply Option
+type HandoverKeyReplyOption
+{
+    byte Type; // 28
+    byte Length where ValidationCheckGreaterThanOrEqualTo(value >= 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "HandoverKeyReplyOption", "1", value);
+    byte PadLength;
+    byte AT with BinaryEncoding{Width = 4};
+    byte Resrvd where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Resrvd", "HandoverKeyReplyOption", value) with BinaryEncoding{Width = 4};
+    ushort KeyLifetime;
+    binary EncryptedHandoverKey with BinaryEncoding{Length = Length * 8 - 6 - PadLength};
+    binary Padding with BinaryEncoding{Length = PadLength};
+}
+
+// RFC 5271, section 6.1.  Handover Assist Information Option
+type HandoverAssistInformationOption
+{
+    byte Type; // 29
+    byte Length;
+    HAIOptionCode OptionCode where ValidationCheckEnumValue(InRange<HAIOptionCode>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "OptionCode", "HandoverAssistInformationOption", "1, 2", value);
+    byte HAILength;
+    binary HAIValue with BinaryEncoding{Length = HAILength};
+}
+
+pattern HAIOptionCode = enum byte
+{
+    $"AN ID" = 1,
+    $"Sector ID" = 2,
+    ...
+};
+
+// RFC 5271, section 6.2.  Mobile Node Identifier Option
+type MobileNodeIdentifierOption
+{
+    byte Type; // 30
+    byte Length;
+    MNIOptionCode OptionCode where ValidationCheckEnumValue(InRange<MNIOptionCode>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "OptionCode", "MobileNodeIdentifierOption", "1, 2", value);
+    byte MNIDLength;
+    binary MNIDValue with BinaryEncoding{Length = MNIDLength};
+}
+
+pattern MNIOptionCode = enum byte
+{
+    NAI = 1,
+    IMSI = 2,
+    ...
+};
+
+// RFC 6106, section 6.2.  Mobile Node Identifier Option
+type DNSSearchListOption
+{
+    byte Type; // 31
+    byte Length where ValidationCheckGreaterThanOrEqualTo(value >= 2, null, true, ReferenceType.Type, "ICMPv6", "Length", "DNSSearchListOption", "2", value);
+    ushort Reserved;
+    uint Lifetime;
+    array<DNSString> DNSSearchList with BinaryEncoding{WidthForComposedType = (Length - 1) * 64};
+}
+
+// RFC 6496, section 5.1.  Proxy Signature Option
+type  ProxySignatureOption
+{
+    byte Type; // 32
+    byte Length;
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "ProxySignatureOption", value);
+    binary KeyHash with BinaryEncoding{Length = 16};
+    DigitalSignatureAndPadding DigitalSignatureAndPadding with BinaryEncoding{Length = Length * 8 - 20};
+}
+
+// Future Reference: Signature is defined in PKCS protocol, but we cannot reference it here since PKCS.opn is in Common Package.
+pattern Signature = BitString;
+
+type DigitalSignatureAndPadding
+{
+    Signature DigitalSignature with Encoding{Decoder = Asn1BerDecoder<Signature>};
+    optional binary Padding;
+}
+
+// RFC 6775, section 4.1.  Address Registration Option
+type AddressRegistrationOption
+{
+    byte Type; // 33
+    byte Length where ValidationCheckValue(value == 2, null, true, ReferenceType.Type, "ICMPv6", "Length", "AddressRegistrationOption", "2", value);
+    ARStatusPattern Status where ValidationCheckEnumValue(InRange<ARStatusPattern>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "Status", "AddressRegistrationOption", "0, 1, 2", value);
+    binary Reserved where ValidationCheckReservedZero(value == $[000000], null, true, ReferenceType.Type, "ICMPv6", "Reserved", "AddressRegistrationOption", value) with BinaryEncoding{Length = 3};
+    ushort RegistrationLifetime;
+    binary EUI64 with BinaryEncoding{Length = 8};
+}
+
+pattern ARStatusPattern = enum byte
+{
+    $"Success" = 0,
+    $"Duplicate Address" = 1,
+    $"Neighbor Cache Full" = 2,
+    ...
+};
+
+// RFC 6775, section 4.2.  6LoWPAN Context Option
+type _6LoWPANContextOption 
+{
+    byte Type; // 34
+    byte Length;
+    byte ContextLength where ValidationCheckLessThanOrEqualTo(value <= 128, null, true, ReferenceType.Type, "ICMPv6", "PrefixLength", "RouteInformationOption", 128, value);
+    byte Res where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Res", "_6LoWPANContextOption", value) with BinaryEncoding{Width = 3};
+    byte C with BinaryEncoding{Width = 1};
+    byte CID with BinaryEncoding{Width = 4};
+    ushort Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "_6LoWPANContextOption", value);
+    ushort ValidLifetime;
+    binary ContextPrefix with BinaryEncoding{Width = ContextLength, TrailPadding = (Length - 1) * 64 - ContextLength};
+}
+
+// RFC 6775, section 4.3.  Authoritative Border Router Option
+type AuthoritativeBorderRouterOption
+{
+    byte Type; // 35
+    byte Length where ValidationCheckValue(value == 3, null, true, ReferenceType.Type, "ICMPv6", "Length", "AuthoritativeBorderRouterOption", "3", value);
+    ushort VersionLow;
+    ushort VersionHigh;
+    ushort ValidLifetime;
+    IPv6Address _6LBRAddress;
+}
+
+// RFC-ietf-6lo-ghc-05, 3.3.  Indicating GHC capability. http://tools.ietf.org/html/draft-ietf-6lo-ghc-05
+type _6LoWPANCapabilityIndicationOption 
+{
+    byte Type; // 36
+    byte Length where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "ICMPv6", "Length", "_6LoWPANCapabilityIndicationOption", "2", value);
+    NDOption NDOptions where ValidationCheckEnumValue(InRange<NDOption>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "NDOptions", "_6LoWPANCapabilityIndicationOption", "1", value);
+    uint Reserved2 where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved2", "_6LoWPANCapabilityIndicationOption", value);
+}
+
+pattern NDOption = flags ushort
+{
+    G = 1,
+    ...
+};
+
+// RFC 4065, section 4.  IPv6 Allocations
+// RFC 4066, section 4.  5.1.2.1.  CARD Request Option
+type CARDRequestOption
+{
+    byte Type; // 138
+    byte Length;
+    byte Vers with BinaryEncoding{Width = 3};
+    bool P with BinaryEncoding{Width = 1};
+    bool C with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool T with BinaryEncoding{Width = 1};
+    short Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "CARDRequestOption", value) with BinaryEncoding{Width = 9};
+    uint SequenceNumber;
+    SubOptionsPattern SubOption;
+}
+
+// RFC 4065, section 4.  IPv6 Allocations
+// RFC 4066, section 5.1.2.2.  CARD Reply Option
+type CARDReplyOption
+{
+    byte Type; // 139
+    byte Length;
+    byte Vers with BinaryEncoding{Width = 3};
+    bool P with BinaryEncoding{Width = 1};
+    bool U with BinaryEncoding{Width = 1};
+    bool L with BinaryEncoding{Width = 1};
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "CARDReplyOption", value) with BinaryEncoding{Width = 10};
+    uint SequenceNumber;
+    SubOptionsPattern SubOption;
+}
+
+// RFC 4066, section 5.1.3.  Sub-Options Format
+pattern SubOptionsPattern = [|RemainingBitLength(stream) >= 8|]
+    ([|CurrentByte(stream) == 0x01|] Pad1                       |   // 0x01
+    [|CurrentByte(stream) == 0x02|] PadN                        |   // 0x02
+    [|CurrentByte(stream) == 0x03|] MetricContainer             |   // 0x03
+    [|CurrentByte(stream) == 0x04|] RouteInformation            |   // 0x04
+    [|CurrentByte(stream) == 0x05|] DODAGConfiguration          |   // 0x05
+    [|CurrentByte(stream) == 0x06|] RPLTarget                   |   // 0x06
+    [|CurrentByte(stream) == 0x07|] TransitInformation          |   // 0x07
+    GeneralSubOption);                                              // others
+
+type GeneralSubOption
+{
+    byte SubOptionType;
+    byte SubOptionLen;
+    binary SubOptionData with BinaryEncoding{Length = SubOptionLen * 8 - 2};
+}
+
+// RFC 4066, section 5.1.3.1.  L2 ID Sub-Option
+type L2IDSubOption
+{
+    byte SubOptionType; // 0x01
+    byte SubOptionLen;
+    byte ContextID;
+    L2IDStatusCode StatusCode where ValidationCheckEnumValue(InRange<L2IDStatusCode>(value), null, true, 
+            ReferenceType.Type, "ICMPv6", "StatusCode", "L2IDSubOption", "0x00, 0x01, 0x02, 0x03", value);
+    Layer2AccessTechnologyTypePattern L2Type;
+    binary L2ID with BinaryEncoding{Length = SubOptionLen * 8 - 6};
+}
+
+pattern L2IDStatusCode = enum byte
+{
+    NONE = 0x00,
+    CANDIDATE = 0x01,
+    MATCH = 0x02,
+    RESOLVER_ERROR = 0x03,
+    ...
+};
+
+// RFC 4065, section 5.2.  Layer 2 Access Technology Identifier Registry
+pattern Layer2AccessTechnologyTypePattern = enum ushort
+{
+    $"RESERVED" = 0x00,
+    $"IEEE 802.3 (Ethernet)" = 0x01,
+    $"IEEE 802.11a" = 0x02,
+    $"IEEE 802.11b" = 0x03,
+    $"IEEE 802.11g" = 0x04,
+    $"IEEE 802.15.1(Bluetooth)" = 0x05,
+    $"IEEE 802.15.3" = 0x06,
+    $"IEEE 802.15.4" = 0x07,
+    $"IEEE 802.16" = 0x08,
+    ...
+};
+
+// RFC 4066, section 5.1.3.2.  Preferences Sub-Option
+type PreferencesSubOption
+{
+    byte SubOptionType; // 0x04
+    byte SubOptionLen;
+    array<AVP> Perferences with BinaryEncoding{WidthForComposedType = (SubOptionLen * 8 - 2) * 8};
+}
+
+// RFC 4066, section 5.1.4.  Capability AVP Encoding Rule
+type AVP
+{
+    ushort AVPCode;
+    byte AVPLength;
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "AVP", value);
+    ushort Lifttime;
+    binary Data with BinaryEncoding{Length = AVPLength - 6};
+}
+
+// RFC 4066, section 5.1.3.3.  Requirements Sub-Option
+type RequirementSubOption
+{
+    byte SubOptionType; // 0x05
+    byte SubOptionLen;
+    array<AVP> Requirements with BinaryEncoding{WidthForComposedType = (SubOptionLen * 8 - 2) * 8};
+}
+
+// RFC 4066, section 5.1.3.4.  Capability Container Sub-Option
+type CapabilityContainerSubOption
+{
+    byte SubOptionType; // 0x03
+    byte SubOptionLen;
+    byte ContextID;
+    bool P with BinaryEncoding{Width = 1};
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "TrustedAnchorSubOption", value) with BinaryEncoding{Width = 7};
+    array<AVP> AVPs with BinaryEncoding{WidthForComposedType = (SubOptionLen * 8 - 4) * 8};
+}
+
+// RFC 4066, section 5.1.3.5.  Address Sub-Option
+type AddressSubOption
+{
+    byte SubOptionType; // 0x02
+    byte SubOptionLen;
+    byte ContextID;
+    byte AddressType;
+    ([|AddressType == 0x01|] IPv4Address | [|AddressType == 0x02|] IPv6Address) Address with BinaryEncoding{WidthForComposedType = (SubOptionLen * 8 - 4) * 8};
+}
+
+// RFC 4066, section 5.1.3.6.  Trusted Anchor Sub-Option
+type TrustedAnchorSubOption
+{
+    byte SubOptionType; // 0x06
+    byte SubOptionLen;
+    ushort Component;
+    X509.Name TrustedAnchorName with BinaryEncoding{WidthForComposedType = (SubOptionLen * 8 - 4) * 8}, Encoding{Decoder = Asn1BerDecoder<X509.Name>, SourcePattern = TypeOf<binary>()};
+}
+
+// RFC 4066, section 5.1.3.7.  Router Certificate Sub-Option
+type RouterCertificationSubOption
+{
+    byte SubOptionType; // 0x07
+    byte SubOptionLen;
+    byte ContextID;
+    byte Reserved where ValidationCheckReservedZero(value == 0, null, true, ReferenceType.Type, "ICMPv6", "Reserved", "RouterCertificationSubOption", value);
+    ushort AllComponents;
+    ushort Component;
+    CertificateAndPadding CertificateAndPadding with BinaryEncoding{WidthForComposedType = (SubOptionLen - 1) * 8 * 8};
+}
+
+type CertificateAndPadding
+{
+    X509.Certificate Certificate with Encoding{Decoder = Asn1BerDecoder<X509.Certificate>};
+    optional binary Padding;
+}
+
+// This type is only for type 155
+pattern OptionChoice1Pattern = [|RemainingBitLength(stream) >= 8|]
+    ([|CurrentByte(stream) == 0|] Pad1                       |   // 0
+    [|CurrentByte(stream) == 1|] PadN                        |   // 1
+    [|CurrentByte(stream) == 2|] MetricContainer             |   // 2
+    [|CurrentByte(stream) == 3|] RouteInformation            |   // 3
+    [|CurrentByte(stream) == 4|] DODAGConfiguration          |   // 4
+    [|CurrentByte(stream) == 5|] RPLTarget                   |   // 5
+    [|CurrentByte(stream) == 6|] TransitInformation          |   // 6
+    [|CurrentByte(stream) == 7|] SolicitedInformation        |   // 7
+    [|CurrentByte(stream) == 8|] PrefixInformation155        |   // 8
+    [|CurrentByte(stream) == 9|] RPLTargetDescriptor);           // 9
+
+// type 0
+// MAY be present in DIS, DIO, DAO, DAO-ACK, and CC message
+type Pad1
+{
+    byte Type; // 0
+}
+
+// type 1
+// MAY be present in DIS, DIO, DAO, DAO-ACK, and CC message
+type PadN
+{
+    byte Type; // 1
+    byte Length where ValidationCheck(value >= 2 && value <= 7, null, "ICMPv6: The Length in type PadN must be between 2 and 7, inclusive.");
+    array<byte> Padding with BinaryEncoding{Length = Length - 2};
+}
+
+// type 2
+// MAY be present in DIO or DAO messages
+type MetricContainer
+{
+    byte Type; // 2
+    byte Length;
+    array<byte> MetricData with BinaryEncoding{Length = Length};
+}
+
+// type 3
+// MAY be present in DIO messages
+type RouteInformation
+{
+    byte Type; // 3
+    byte Length;
+    byte PrefixLength where ValidationCheck(value <= 128, null, "ICMPv6: The PrefixLength in type RouteInformation must be less than or equal to 128.");
+    byte Reserved1 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved1 in type RouteInformation must be set to zero.") with BinaryEncoding{Width = 3};
+    byte Prf with BinaryEncoding{Width = 2};
+    byte Reserved2 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved2 in type RouteInformation must be set to zero.") with BinaryEncoding{Width = 3};
+    uint RouteLifetime;
+    binary Prefix with BinaryEncoding{LeadPadding = PrefixLength, Length = Length - 6};
+}
+
+// type 4
+// MAY be present in DIO messages
+type DODAGConfiguration
+{
+    byte Type; // 4
+    byte Length where ValidationCheck(value == 14, null, "ICMPv6: The Length in type DODAGConfiguration must be set to 14.");
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type DODAGConfiguration must be set to zero.") with BinaryEncoding{Width = 4};
+    bool AuthenticationEnabled  with BinaryEncoding{Width = 1};
+    byte PathControlSize  with BinaryEncoding{Width = 3};
+    byte DIOIntervalDoublings;
+    byte DIOIntervalMin;
+    byte DIORedundancyConstant;
+    ushort MaxRankIncrease;
+    ushort MinHopRankInc;
+    ushort ObjectiveCodePoint;
+    byte Reserved where ValidationCheck(value == 0, null, "ICMPv6: The Reserved in type DODAGConfiguration must be set to zero.");
+    byte DefaultLifetime;
+    ushort LifetimeUnit;
+}
+
+// type 5
+// MAY be present in DAO messages
+type RPLTarget
+{
+    byte Type; // 5
+    byte Length;
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type RPLTarget must be set to zero.");
+    byte PrefixLength;
+    binary Prefix with BinaryEncoding{LeadPadding = PrefixLength, Length = Length - 4};
+}
+
+// type 6
+// MAY be present in DAO messages
+type TransitInformation
+{
+    byte Type; // 6
+    byte Length;
+    bool External with BinaryEncoding{Width = 1};
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type TransitInformation must be set to zero.");
+    PathControl PathControl;
+    byte PathSequence;
+    byte PathLifetime;
+    optional [|Length == 20|] IPv6Address ParentAddress;
+}
+
+type PathControl
+{
+    byte PC1 with BinaryEncoding{Width = 2};
+    byte PC2 with BinaryEncoding{Width = 2};
+    byte PC3 with BinaryEncoding{Width = 2};
+    byte PC4 with BinaryEncoding{Width = 2};
+}
+
+// type 7
+// MAY be present in DIS messages
+type SolicitedInformation
+{
+    byte Type; // 7
+    byte Length where ValidationCheck(value == 19, null, "ICMPv6: The Length in type SolicitedInformation must be set to 19.");
+    byte RPLInstanceID;
+    bool V with BinaryEncoding{Width = 1};
+    bool I with BinaryEncoding{Width = 1};
+    bool D with BinaryEncoding{Width = 1};
+    byte Flags where ValidationCheck(value == 0, null, "ICMPv6: The Flags in type SolicitedInformation must be zero.") with BinaryEncoding{Width = 5};
+    binary DODAGID with BinaryEncoding{Length = 16};
+    byte VersionNumber;
+}
+
+// type 8
+// MAY be present in DIO messages
+type PrefixInformation155
+{
+    byte Type; // 8
+    byte Length where ValidationCheck(value == 30, null, "ICMPv6: The Length in type PrefixInformation155 must be 30.");
+    byte PrefixLength;
+    bool L with BinaryEncoding{Width = 1};
+    bool A with BinaryEncoding{Width = 1};
+    bool R with BinaryEncoding{Width = 1};
+    byte Reserved1 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved1 in type PrefixInformation155 must be zero.");
+    uint ValidLifetime;
+    uint PreferredLifetime;
+    uint Reserved2 where ValidationCheck(value == 0, null, "ICMPv6: The Reserved2 in type PrefixInformation155 must be zero.");
+    binary Prefix with BinaryEncoding{LeadPadding = PrefixLength, Length = 16};
+}
+
+// type 9
+type RPLTargetDescriptor
+{
+    byte Type; // 9
+    byte Length where ValidationCheck(value == 4, null, "ICMPv6: The Length in type RPLTargetDescriptor must be 4.");
+    uint Descriptor;
+}
+
+pattern DestinationUnreachableMessageCode = enum byte
+{
+    NoRouteToDestination                                   = 0,
+    CommunicationWithDestinationAdministrativelyProhibited = 1,
+    BeyondScopeOfSourceAddress                             = 2,
+    AddressUnreachable                                     = 3,
+    PortUnreachable                                        = 4,
+    SourceAddressFailedIngressEgressPolicy                 = 5,
+    RejectRouteToDestination                               = 6,
+};
+
+pattern TimeExceededMessageCode = enum byte
+{
+    HopLimitExceededInTransit       = 0,
+    FragmentReassemblyTimeExceeded  = 1,
+};
+
+pattern ParameterProblemMessageCode = enum byte
+{
+    ErroneousHeaderFieldEncountered         = 0,
+    UnrecognizedNextHeaderTypeEncountered   = 1,
+    UnrecognizedIPv6OptionEncountered       = 2,
+};
+
+pattern ExperimentalMobilityProtocolSubtype = enum byte
+{
+    CARD = 0,
+    CXTP = 1,
+};
+
+// RFC 4191 2.2.  Changes to Router Advertisement Message Format
+pattern RouterAdvertisement_Prf = enum byte
+{
+    Medium = 0x00,
+    High = 0x01,
+    Reserved = 0x10,
+    Low = 0x11,
+    ...
+};
+
+const set<byte> ValidRPLControlMessageCode = {0x00, 0x01, 0x02, 0x03, 0x80, 0x81, 0x82, 0x83, 0x8a};

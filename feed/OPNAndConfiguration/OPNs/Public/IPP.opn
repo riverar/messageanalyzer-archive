@@ -1,0 +1,308 @@
+protocol IPP with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Internet Printing Protocol/1.1",
+    ShortName = "IPP",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2910"},
+            new Reference{Name = "RFC 2911"},
+            new Reference{Name = "RFC 3380"},
+            new Reference{Name = "RFC 3382"},
+            new Reference{Name = "RFC 3995"},
+            new Reference{Name = "RFC 3996"},
+            new Reference{Name = "pwg5100.5", Link = "http://www.iana.org/assignments/ipp-registrations/ipp-registrations.xml"},
+            new Reference{Name = "Vendor Operation Codes", Link = "http://www.pwg.org/ipp/opcodes/ippopcodes.html"},
+            
+        ],
+    RevisionSummary =    
+        [
+            new Revision{Class = RevisionClass.Major, Version = "362740", Date = "04/18/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using HTTP;
+
+endpoint Server 
+    over HTTP.Server 
+    provides Messages consumes Messages;
+
+client endpoint Client connected to Server;
+
+autostart actor IPPOverHTTP(HTTP.Server server)
+{
+    process server accepts p:HttpContract.Request where p.HTTPContentType != null && (p.HTTPContentType as HeaderFieldType).Value.Contains("application/ipp") && p.Payload.Count != 0
+    {            
+        switch (p.Payload)
+        {
+            case m:Messages.Request from BinaryDecoder<Messages.Request> =>
+                dispatch endpoint IPP.Server accepts m;
+            default => 
+                ThrowDecodingException("IPP Request");
+        }
+    }
+    
+    process server issues p:HttpContract.Response where p.HTTPContentType != null && (p.HTTPContentType as HeaderFieldType).Value.Contains("application/ipp") && p.Payload.Count != 0
+    {
+        switch (p.Payload)
+        {
+            case m:Messages.Response from BinaryDecoder<Messages.Response> =>
+                dispatch endpoint IPP.Server issues m;
+            default => 
+                ThrowDecodingException("IPP Reponse");
+        }
+    }
+}
+
+contract Messages
+{
+    message Request
+    {
+        (byte where value == 0x01) Major;
+        (byte where value == 0x00) Minor;
+        OperationsID OperationId;
+        uint RequestId;
+        optional array<AttributeTypeGroup> AttributeTypeGroups;
+        EndOfAttributesTag EndOfAttributesTag;
+        binary Data;
+        
+        override string ToString()
+        {
+            return "Request, OperationId: " + EnumToString<IPP.OperationsID>(OperationId, false);
+        }
+    }
+
+    message Response
+    {
+        (byte where value == 0x01) Major;
+        (byte where value == 0x00) Minor;
+        StatusCode StatusCodes where ErrorCodeIf(!(value in {0, 1, 2, 3, 5, 7}), this, EnumToString<IPP.StatusCode>(value, false));
+        uint RequestId;
+        optional array<AttributeTypeGroup> AttributeTypeGroups;
+        EndOfAttributesTag EndOfAttributesTag;
+        binary Data;
+        
+        override string ToString()
+        {
+            return "Response, StatusCodes: " + EnumToString<IPP.StatusCode>(StatusCodes, false);
+        }
+    }
+}
+
+pattern EndOfAttributesTag = byte where value == 0x03;
+
+pattern DelimiterTags = enum byte
+{
+     // rfc 2910
+     ReservedFoeDefinition          = 0x00,
+     OperAtionAttributesTag         = 0x01,
+     JobAttributesTag               = 0x02,
+     PrinterAttributesTag           = 0x04,
+     UnsupportedAttributesTag       = 0x05,
+     SubscriptionAttributesTag      = 0x06,
+     EventNotificationAttributesTag = 0x07  // rfc 3996
+};
+
+pattern ValueTags = enum byte   // rfc 2910
+{
+    // rfc 2910
+    Unsupported                      = 0x10,
+    ReservedForDefaultForDefinition  = 0x11,
+    Unknown                          = 0x12,
+    NoValue                          = 0x13,
+    // rfc 3380
+    NotSettable                      = 0x15,
+    DeleteAttribute                  = 0x16,
+    AdminDefine                      = 0x17,
+    // rfc 2910
+    ReservedStandardstrackdocument   = 0x20,
+    Integer                          = 0x21,
+    Boolean                          = 0x22,
+    Enum                             = 0x23,
+    OctetString                      = 0x30,
+    DateTime                         = 0x31,
+    Resolution                       = 0x32,
+    RangeOfInteger                   = 0x33,
+    // rfc 3382
+    BegCollection                    = 0x34,
+    // rfc 2910
+    TextWithLanguage                 = 0x35,
+    NameWithLanguage                 = 0x36,
+    // rfc 3382
+    EndCollection                    = 0x37,
+    // rfc 2910
+    ReservedStandardstrackdocument2  = 0x40,
+    TextWithoutLanguage              = 0x41,
+    NameWithoutLanguage              = 0x42,
+    ReservedStandardstrackdocument3  = 0x43,
+    Keyword                          = 0x44,
+    Uri                              = 0x45,
+    UriScheme                        = 0x46,
+    Charset                          = 0x47,
+    NaturalLanguage                  = 0x48,
+    MimeMediaType                    = 0x49,
+    // rfc 3382
+    MemberAttrName                   = 0x4A,
+    // rfc 2910
+    Extending                        = 0x7F
+};
+
+pattern AttributeType =(AttributeWithOneValue | AdditionalValue);
+
+type AttributeTypeGroup
+{
+    DelimiterTags DelimiterTag;
+    array<AttributeType> Attributes;
+}
+
+type AttributeWithOneValue
+{
+    (ValueTags where value > 0x10) ValueTag;
+    (ushort where value != 0x0000) NameLength;
+    binary Name with BinaryEncoding{Length = NameLength};
+    ushort ValueLength;
+    binary Value with BinaryEncoding{Length = ValueLength};
+}
+
+type AdditionalValue
+{
+    (ValueTags where value > 0x10) ValueTag;
+    (ushort where value == 0x0000) NameLength ;
+    ushort ValueLength;
+    binary Value with BinaryEncoding{Length = ValueLength};
+}
+
+pattern OperationsID = enum ushort
+{
+    // rfc 2911
+    $"Print-Job"                      = 0x0002,
+    $"Print-URI"                      = 0x0003,
+    $"Validate-Job"                   = 0x0004,
+    $"Create-Job"                     = 0x0005,
+    $"Send-Document"                  = 0x0006,
+    $"Send-URI"                       = 0x0007,
+    $"Cancel-Job"                     = 0x0008,
+    $"Get-Job-Attributes"             = 0x0009,
+    $"Get-Job"                        = 0x000A,
+    $"Get-Printer-Attributes"         = 0x000B,
+    $"Hold-Job"                       = 0x000C,
+    $"Release-Job"                    = 0x000D,
+    $"Restart-Job"                    = 0x000E,
+    //Reserved3                  = 0x000F,
+    $"Pause-Printer"                  = 0x0010,
+    $"Resume-Printer"                 = 0x0011,
+    $"Purge-Jobs"                     = 0x0012,
+    $"Set-Printer-Attributes"         = 0x0013,
+    $"Set-Job-Attributes"             = 0x0014,
+    $"Get-Printer-Supported-Values"   = 0x0015,
+    // rfc 3995
+    $"Create-Printer-Subscriptions"   = 0x0016,
+    $"Create-Job-Subscriptions"       = 0x0017,
+    $"Get-Subscription-Attributes"    = 0x0018,
+    $"Get-Subscriptions"              = 0x0019,
+    $"Renew-Subscription"             = 0x001A,
+    $"Cancel-Subscription"            = 0x001B,
+    // rfc 3998
+    $"Enable-Priter"                  = 0x22, 
+    $"Disable-Printer"                = 0x23, 
+    $"Pause-Priter-After-Current-Job" = 0x24,
+    $"Hold-New-Jobs"                  = 0x25,
+    $"Release-Held-New-Jobs"          = 0x26,
+    $"Deactivate-Printer"             = 0x27,
+    $"Activate-Printer"               = 0x28,
+    $"Restart-Printer"                = 0x29,
+    $"Shutdown-Printer"               = 0x2A,
+    $"Startup-Printer"                = 0x2B,
+    $"Reprocess-Job"                  = 0x2C,
+    $"Cancel-Current-Job"             = 0x2D,
+    $"Suspend-Current-Job"            = 0x2E,
+    $"Resume-Job"                     = 0x2F,
+    $"Promote-Job"                    = 0x30,
+    $"Schedule-Job-After"             = 0x31,
+    // pwg5100.5
+    $"Cancel-Document"                = 0x33,
+    $"Get-Document-Attributes"        = 0x34,
+    $"Get-Documents"                  = 0x35,
+    $"Delete-Document"                = 0x36,
+    $"Set-Document-Attributes"        = 0x37,
+    // Vendor-Specific codes (0x4000-0xFFFF) (http://www.pwg.org/ipp/opcodes/ippopcodes.html)
+    $"Microsoft-Specific-Auth"        = 0x4000,
+    // http://www.cups.org/spec-ipp.htm
+    $"Cups-Get-Default"               = 0x4001,
+    $"Cups-Get-Printers"              = 0x4002,
+    $"Cups-Add-Modify-Printer"        = 0x4003,
+    $"Cups-Delete-Printer"            = 0x4004,
+    $"Cups-Get-Classes"               = 0x4005,
+    $"Cups-Add-Modify-Class"          = 0x4006,
+    $"Cups-Delete-Class"              = 0x4007,
+    $"Cups-Accept-Jobs"               = 0x4008,
+    $"Cups-Reject-Jobs"               = 0x4009,
+    $"Cups-Set-Default"               = 0x400A,
+    $"Cups-Get-Devices"               = 0x400B,
+    $"Cups-Get-PPDs"                  = 0x400C,
+    $"Cups-Move-Job"                  = 0x400D,
+    $"Cups-Authenticate-Job"          = 0x400E,
+    $"Cups-Get-PPD"                   = 0x400F,
+    $"Cups-Get-Document"              = 0x4027,
+    ...
+};
+
+pattern StatusCode = enum ushort
+{
+    // rfc 2911
+    $"successful-ok"                                       = 0x0000,
+    $"successful-ok-ignored-or-substituted-attributes"     = 0x0001,
+    $"successful-ok-conflicting-attributes"                = 0x0002,
+    // rfc 3995
+    $"successful-ok-ignored-subscriptions"                 = 0x0003,
+    $"successful-ok-too-many-events"                       = 0x0005,
+    // rfc 3996
+    $"successful-ok-events-complete"                       = 0x0007,
+    // rfc 2911
+    $"client-error-bad-request"                            = 0x0400,
+    $"client-error-forbidden"                              = 0x0401,
+    $"client-error-not-authenticated"                      = 0x0402,
+    $"client-error-not-authorized"                         = 0x0403,
+    $"client-error-not-possible"                           = 0x0404,
+    $"client-error-timeout"                                = 0x0405,
+    $"client-error-not-found"                              = 0x0406,
+    $"client-error-gone"                                   = 0x0407,
+    $"client-error-request-entity-too-large"               = 0x0408,
+    $"client-error-request-value-too-long"                 = 0x0409,
+    $"client-error-document-format-not-supported"          = 0x040A,
+    $"client-error-attributes-or-values-not-supported"     = 0x040B,
+    $"client-error-uri-scheme-not-supported"               = 0x040C,
+    $"client-error-charset-not-supported"                  = 0x040D,
+    $"client-error-conflicting-attributes"                 = 0x040E,
+    $"client-error-compression-not-supported"              = 0x040F,
+    $"client-error-compression-error"                      = 0x0410,
+    $"client-error-document-format-error"                  = 0x0411,
+    $"client-error-document-access-error"                  = 0x0412,
+    // should find rfc
+    $"client-error-attributes-not-settable"                = 0x0413,
+    // rfc 3995
+    $"client-error-ignored-all-subscriptions"              = 0x0414,
+    $"client-error-too-many-subscriptions"                 = 0x0415,
+    // rfc 2911
+    $"server-error-internal-error"                         = 0x0500,
+    $"server-error-operation-not-supported"                = 0x0501,
+    $"server-error-service-unavailable"                    = 0x0502,
+    $"server-error-version-not-supported"                  = 0x0503,
+    $"server-error-device-error"                           = 0x0504,
+    $"server-error-temporary-error"                        = 0x0505,
+    $"server-error-not-accepting-jobs"                     = 0x0506,
+    $"server-error-busy"                                   = 0x0507,
+    $"server-error-job-canceled"                           = 0x0508,
+    $"server-error-multiple-document-jobs-not-supported"   = 0x0509,
+    // rfc 3998
+    $"server-error-printer-is-deactivated"                 = 0x050A,
+    ...
+};

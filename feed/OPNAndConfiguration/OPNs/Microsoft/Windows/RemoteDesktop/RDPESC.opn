@@ -1,0 +1,2808 @@
+protocol RDPESC
+with Documentation
+{
+    ProtocolName = "Remote Desktop Protocol: Smart Card Virtual Channel Extension",
+    ShortName = "RDPESC",
+    DocumentName = "MS-RDPESC",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference {Name = "MS-RDPESC", Version = "12.0", Date = "06/01/2017", ProgramName = ProgramName.MCPP}
+        ],
+    RevisionSummary = 
+        [
+            new Revision {Class = RevisionClass.Major, Version = "", Date = "12/23/2015"}
+        ]
+};
+
+using Technologies.IDL;
+using DCOM;
+using DTYP;
+using RDPEFS;
+using ERREF;
+using Utility;
+using MSRPCE;
+using RemoteDesktopResources;
+using Diagnostics;
+
+//------------------------------------- Endpoint & Actor---------------------------------------//
+endpoint Server over RDPEFS.Server provides RdpescContract;
+
+autostart actor RdpescOverRdpefs(RDPEFS.Server server)
+{
+    // store the device ID of smart card.
+    set<uint> SmartCardDeviceIdList = null;
+    map<uint, RdpescCallMessageInfo> RdpescCallMessageCache = null;
+    RDPESC.Server RdpescServer = null;
+
+    observe server issues drDeviceListAnnounce:DR_DEVICELIST_ANNOUNCE
+    {
+        AddSmartCardDevice(drDeviceListAnnounce.DeviceList, ref SmartCardDeviceIdList);
+    }
+
+    observe server issues drDeviceListAnnounceReq:DR_CORE_DEVICELIST_ANNOUNCE_REQ
+    {
+        AddSmartCardDevice(drDeviceListAnnounceReq.DeviceList, ref SmartCardDeviceIdList);
+    }
+
+    observe server accepts drCoreDeviceAnnounceRsp:DR_CORE_DEVICE_ANNOUNCE_RSP
+        where SmartCardDeviceIdList != null && drCoreDeviceAnnounceRsp.DeviceId in SmartCardDeviceIdList
+    {
+        // remove device id if it does not success
+        if (drCoreDeviceAnnounceRsp.ResultCode.Sev != Severity.STATUS_SEVERITY_SUCCESS)
+        {
+            SmartCardDeviceIdList[drCoreDeviceAnnounceRsp.DeviceId] = false;
+        }
+    }
+
+    observe server issues drDeviceListRemove:DR_DEVICELIST_REMOVE where SmartCardDeviceIdList != null
+    {
+        foreach (var deviceId in drDeviceListRemove.DeviceIds)
+        {
+            if (deviceId in SmartCardDeviceIdList)
+            {
+                SmartCardDeviceIdList[deviceId] = false;
+            }
+        }
+    }
+
+    process server accepts drDrvieControlReq:DR_DRIVE_CONTROL_REQ
+        where SmartCardDeviceIdList != null && SmartCardDeviceIdList[drDrvieControlReq.DeviceControlRequest.DeviceIoRequest.DeviceId]
+    {
+        if (RdpescServer == null)
+        {
+            RdpescServer = endpoint RDPESC.Server over server;
+        }
+
+        switch (drDrvieControlReq.DeviceControlRequest.IoControlCode)
+        {
+            case RdpescIoCtrlCode.SCARD_IOCTL_ESTABLISHCONTEXT =>
+                DecodeAndCacheCallMessage<RdpescContract.EstablishContext_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_RELEASECONTEXT | RdpescIoCtrlCode.SCARD_IOCTL_ISVALIDCONTEXT | RdpescIoCtrlCode.SCARD_IOCTL_CANCEL) =>
+                DecodeAndCacheCallMessage<RdpescContract.Context_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSA | RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSW) =>
+                DecodeAndCacheCallMessage<RdpescContract.ListReaderGroups_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSA | RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSW) =>
+                DecodeAndCacheCallMessage<RdpescContract.ListReaders_Call[drDrvieControlReq.DeviceControlRequest.IoControlCode]>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERA) =>
+                DecodeAndCacheCallMessage<RdpescContract.ContextAndStringA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERW) =>
+                DecodeAndCacheCallMessage<RdpescContract.ContextAndStringW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERA | RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPA) =>
+                DecodeAndCacheCallMessage<RdpescContract.ContextAndTwoStringA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERW | RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPW) =>
+                DecodeAndCacheCallMessage<RdpescContract.ContextAndTwoStringW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSA =>
+                DecodeAndCacheCallMessage<RdpescContract.LocateCardsA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSW =>
+                DecodeAndCacheCallMessage<RdpescContract.LocateCardsW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEA =>
+                DecodeAndCacheCallMessage<RdpescContract.GetStatusChangeA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEW =>
+                DecodeAndCacheCallMessage<RdpescContract.GetStatusChangeW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONNECTA =>
+                DecodeAndCacheCallMessage<RdpescContract.ConnectA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONNECTW =>
+                DecodeAndCacheCallMessage<RdpescContract.ConnectW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_RECONNECT =>
+                DecodeAndCacheCallMessage<RdpescContract.Reconnect_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_DISCONNECT | RdpescIoCtrlCode.SCARD_IOCTL_BEGINTRANSACTION | RdpescIoCtrlCode.SCARD_IOCTL_ENDTRANSACTION) =>
+                DecodeAndCacheCallMessage<RdpescContract.HCardAndDisposition_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_STATE =>
+                DecodeAndCacheCallMessage<RdpescContract.State_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_STATUSA | RdpescIoCtrlCode.SCARD_IOCTL_STATUSW) =>
+                DecodeAndCacheCallMessage<RdpescContract.Status_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_TRANSMIT =>
+                DecodeAndCacheCallMessage<RdpescContract.Transmit_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONTROL =>
+                DecodeAndCacheCallMessage<RdpescContract.Control_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETATTRIB =>
+                DecodeAndCacheCallMessage<RdpescContract.GetAttrib_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_SETATTRIB =>
+                DecodeAndCacheCallMessage<RdpescContract.SetAttrib_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_ACCESSSTARTEDEVENT =>
+                any message callMessage = null;
+
+                // decoding message
+                if (BinaryDecoder<RdpescContract.ScardAccessStartedEvent_Call>(drDrvieControlReq.DeviceControlRequest.InputBuffer)
+                    is msg:RdpescContract.ScardAccessStartedEvent_Call)
+                {
+                    callMessage = msg;
+                    callMessage.Origins = [drDrvieControlReq];
+                }
+
+                CacheCallMessage(drDrvieControlReq, callMessage, ref RdpescCallMessageCache, RdpescServer);
+
+                // throw exception if decoding failed
+                if (callMessage == null)
+                {
+                    ThrowDecodingException("RDPESC", "ScardAccessStartedEvent Call Message");
+                }
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRA =>
+                DecodeAndCacheCallMessage<RdpescContract.LocateCardsByATRA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRW =>
+                DecodeAndCacheCallMessage<RdpescContract.LocateCardsByATRW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_READCACHEA =>
+                DecodeAndCacheCallMessage<RdpescContract.ReadCacheA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_READCACHEW =>
+                DecodeAndCacheCallMessage<RdpescContract.ReadCacheW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEA =>
+                DecodeAndCacheCallMessage<RdpescContract.WriteCacheA_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEW =>
+                DecodeAndCacheCallMessage<RdpescContract.WriteCacheW_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETTRANSMITCOUNT =>
+                DecodeAndCacheCallMessage<RdpescContract.GetTransmitCount_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_RELEASETARTEDEVENT =>
+                ThrowDecodingException("RDPESC", RDPESC_SCARD_IOCTL_RELEASETARTEDEVENT_NOT_USED, []);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETREADERICON =>
+                DecodeAndCacheCallMessage<RdpescContract.GetReaderIcon_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETDEVICETYPEID =>
+                DecodeAndCacheCallMessage<RdpescContract.GetDeviceTypeId_Call>(drDrvieControlReq, ref RdpescCallMessageCache, RdpescServer);
+            default =>
+                ThrowDecodingException("RDPESC",
+                    Format(RDPESC_IOCTRL_CODE_NOT_DEFINED, DecToHexFormat(drDrvieControlReq.DeviceControlRequest.IoControlCode)),
+                    []);
+        }
+    }
+
+    process server issues drDrvieControlRsp:DR_DRIVE_CONTROL_RSP
+        where SmartCardDeviceIdList != null && SmartCardDeviceIdList[drDrvieControlRsp.DeviceIoResponse.DeviceIoReply.DeviceId] &&
+            drDrvieControlRsp.DeviceIoResponse.DeviceIoReply.IoStatus.Sev == 0 // contains RDPESC message when it is successful
+    {
+        uint completionId = drDrvieControlRsp.DeviceIoResponse.DeviceIoReply.CompletionId;
+        if (RdpescCallMessageCache == null || !RdpescCallMessageCache.Keys[completionId])
+        {
+            ThrowDecodingException("RDPESC", RDPESC_RETURN_DECODING_FAILURE, []);
+        }
+
+        if (RdpescServer == null)
+        {
+            RdpescServer = endpoint RDPESC.Server over server;
+        }
+
+        RdpescCallMessageInfo callMessageInfo = RdpescCallMessageCache[completionId];
+        // remove cache
+        RdpescCallMessageCache = RdpescCallMessageCache.Remove(completionId);
+        switch (callMessageInfo.IoControlCode)
+        {
+            case RdpescIoCtrlCode.SCARD_IOCTL_ESTABLISHCONTEXT =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.EstablishContext_Return>(drDrvieControlRsp, ContructEstablishContextOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_RELEASECONTEXT | RdpescIoCtrlCode.SCARD_IOCTL_ISVALIDCONTEXT | RdpescIoCtrlCode.SCARD_IOCTL_CANCEL) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructContextOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSA | RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSW) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.ListReaderGroups_Return[callMessageInfo.IoControlCode]>(drDrvieControlRsp, ContructListReaderGroupsOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSA | RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSW) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.ListReaders_Return[callMessageInfo.IoControlCode]>(drDrvieControlRsp, ContructListReadersOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERA) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructContextAndStringAOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERW) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructContextAndStringWOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERA | RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPA | RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPA) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructContextAndTwoStringAOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERW | RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPW | RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPW) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructContextAndTwoStringWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.LocateCards_Return>(drDrvieControlRsp, ContructLocateCardsAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.LocateCards_Return>(drDrvieControlRsp, ContructLocateCardsWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetStatusChange_Return>(drDrvieControlRsp, ContructGetStatusChangeAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetStatusChange_Return>(drDrvieControlRsp, ContructGetStatusChangeWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONNECTA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Connect_Return>(drDrvieControlRsp, ContructConnectAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONNECTW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Connect_Return>(drDrvieControlRsp, ContructConnectWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_RECONNECT =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Reconnect_Return>(drDrvieControlRsp, ContructReconnectOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_DISCONNECT | RdpescIoCtrlCode.SCARD_IOCTL_BEGINTRANSACTION | RdpescIoCtrlCode.SCARD_IOCTL_ENDTRANSACTION) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructHCardAndDispositionOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_STATE =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.State_Return>(drDrvieControlRsp, ContructStateOperation, callMessageInfo, RdpescServer);
+            case (RdpescIoCtrlCode.SCARD_IOCTL_STATUSA | RdpescIoCtrlCode.SCARD_IOCTL_STATUSW) =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Status_Return[callMessageInfo.IoControlCode]>(drDrvieControlRsp, ContructStatusOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_TRANSMIT =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Transmit_Return>(drDrvieControlRsp, ContructTransmitOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_CONTROL =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Control_Return>(drDrvieControlRsp, ContructControlOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETATTRIB =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetAttrib_Return>(drDrvieControlRsp, ContructGetAttribOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_SETATTRIB =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructSetAttribOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_ACCESSSTARTEDEVENT =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructScardAccessStartedEventOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.LocateCards_Return>(drDrvieControlRsp, ContructLocateCardsByATRAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.LocateCards_Return>(drDrvieControlRsp, ContructLocateCardsByATRWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_READCACHEA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.ReadCache_Return>(drDrvieControlRsp, ContructReadCacheAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_READCACHEW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.ReadCache_Return>(drDrvieControlRsp, ContructReadCacheWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEA =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructWriteCacheAOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEW =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.Long_Return>(drDrvieControlRsp, ContructWriteCacheWOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETTRANSMITCOUNT =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetTransmitCount_Return>(drDrvieControlRsp, ContructGetTransmitCountOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_RELEASETARTEDEVENT =>
+                ThrowDecodingException("RDPESC", RDPESC_SCARD_IOCTL_RELEASETARTEDEVENT_NOT_USED);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETREADERICON =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetReaderIcon_Return>(drDrvieControlRsp, ContructGetReaderIconOperation, callMessageInfo, RdpescServer);
+            case RdpescIoCtrlCode.SCARD_IOCTL_GETDEVICETYPEID =>
+                DecodeReturnMessageAndDispatchOperation<RdpescContract.GetDeviceTypeId_Return>(drDrvieControlRsp, ContructGetDeviceTypeIdOperation, callMessageInfo, RdpescServer);
+            default =>
+                ThrowDecodingException("RDPESC", "IoControlCode is not defined in RDPESC", []);
+        }
+    }
+
+    ~endpoint(RDPEFS.Server server)
+    {
+        SmartCardDeviceIdList = null;
+        if (RdpescCallMessageCache != null)
+        {
+            // dispatch the cached request
+            foreach (var callMessageInfo in RdpescCallMessageCache.Values)
+                if (callMessageInfo.CallMessage != null)
+                {
+                    ReportInsufficientOperation(callMessageInfo.CallMessage, "RDPESC",
+                        IoCtrlOperationName[callMessageInfo.IoControlCode], false);
+                    dispatch (endpoint Server over server) accepts callMessageInfo.CallMessage;
+                }
+            
+            RdpescCallMessageCache = null;
+        }
+    }
+}
+
+//-------------------------------------- Constracts -------------------------------------------//
+contract RdpescContract
+{
+    accepts message EstablishContext_Call
+    {
+        RDPESC.EstablishContext_Call EstablishContext_Call;
+
+        override string ToString()
+        {
+            return "EstablishContext_Call, " + EstablishContext_Call.SummaryString();
+        }
+    }
+
+    issues message EstablishContext_Return
+    {
+        RDPESC.EstablishContext_Return EstablishContext_Return;
+
+        override string ToString()
+        {
+            return "EstablishContext_Return, " + EstablishContext_Return.SummaryString();
+        }
+    }
+
+    issues operation EstablishContext
+    {
+        RDPESC.EstablishContext_Call EstablishContext_Call;
+        RDPESC.EstablishContext_Return EstablishContext_Return;
+
+        override string ToString()
+        {
+            return "EstablishContext, " + EstablishContext_Return.SummaryString() +
+                ", " + EstablishContext_Call.SummaryString();
+        }
+    }
+
+    accepts message Context_Call
+    {
+        RDPESC.Context_Call Context_Call;
+
+        override string ToString()
+        {
+            return "Context_Call";
+        }
+    }
+
+    issues message Long_Return
+    {
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "Long_Return, " + Long_Return.SummaryString();
+        }
+    }
+
+    issues operation Context
+    {
+        RDPESC.Context_Call Context_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "Context, " + Long_Return.SummaryString();
+        }
+    }
+
+    accepts message ListReaderGroups_Call
+    {
+        RDPESC.ListReaderGroups_Call ListReaderGroups_Call;
+
+        override string ToString()
+        {
+            return "ListReaderGroups_Call, " + ListReaderGroups_Call.SummaryString();
+        }
+    }
+
+    issues message ListReaderGroups_Return[uint IoControlCode]
+    {
+        _longAndMultiString_Return[IoControlCode] ListReaderGroups_Return_Type;
+
+        override string ToString()
+        {
+            return "ListReaderGroups_Return, " + ListReaderGroups_Return_Type.SummaryString();
+        }
+    }
+
+    issues operation ListReaderGroups
+    {
+        RDPESC.ListReaderGroups_Call ListReaderGroups_Call;
+        RDPESC._longAndMultiString_Return ListReaderGroups_Return;
+
+        override string ToString()
+        {
+            return "ListReaderGroups, " + ListReaderGroups_Return.SummaryString() +
+                ", " + ListReaderGroups_Call.SummaryString();
+        }
+    }
+
+    accepts message ListReaders_Call[uint IoControlCode]
+    {
+        RDPESC.ListReaders_Call[IoControlCode] ListReaders_Call_Type;
+
+        override string ToString()
+        {
+            return "ListReaders_Call, " + ListReaders_Call_Type.SummaryString();
+        }
+    }
+
+    issues message ListReaders_Return[uint IoControlCode]
+    {
+        RDPESC._longAndMultiString_Return[IoControlCode] ListReaders_Return_Type;
+
+        override string ToString()
+        {
+            return "ListReaders_Return, " + ListReaders_Return_Type.SummaryString();
+        }
+    }
+
+    issues operation ListReaders
+    {
+        RDPESC.ListReaders_Call ListReaders_Call;
+        RDPESC._longAndMultiString_Return ListReaders_Return;
+
+        override string ToString()
+        {
+            return "ListReaders, " + ListReaders_Return.SummaryString() +
+                ", " + ListReaders_Return.SummaryString();
+        }
+    }
+
+    accepts message ContextAndStringA_Call
+    {
+        RDPESC.ContextAndStringA_Call ContextAndStringA_Call;
+
+        override string ToString()
+        {
+            return "ContextAndStringA_Call, " + ContextAndStringA_Call.SummaryString();
+        }
+    }
+
+    issues operation ContextAndStringA
+    {
+        RDPESC.ContextAndStringA_Call ContextAndStringA_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "ContextAndStringA, " + Long_Return.SummaryString() +
+                ", " + ContextAndStringA_Call.SummaryString();
+        }
+    }
+
+    accepts message ContextAndStringW_Call
+    {
+        RDPESC.ContextAndStringW_Call ContextAndStringW_Call;
+
+        override string ToString()
+        {
+            return "ContextAndStringW_Call, " + ContextAndStringW_Call.SummaryString();
+        }
+    }
+
+    issues operation ContextAndStringW
+    {
+        RDPESC.ContextAndStringW_Call ContextAndStringW_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "ContextAndStringW, " + Long_Return.SummaryString() +
+                ", " + ContextAndStringW_Call.SummaryString();
+        }
+    }
+
+    accepts message ContextAndTwoStringA_Call
+    {
+        RDPESC.ContextAndTwoStringA_Call ContextAndTwoStringA_Call;
+
+        override string ToString()
+        {
+            return "ContextAndTwoStringA_Call, " + ContextAndTwoStringA_Call.SummaryString();
+        }
+    }
+
+    issues operation ContextAndTwoStringA
+    {
+        RDPESC.ContextAndTwoStringA_Call ContextAndTwoStringA_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "ContextAndTwoStringA, " + Long_Return.SummaryString() +
+                ", " + ContextAndTwoStringA_Call.SummaryString();
+        }
+    }
+
+    accepts message ContextAndTwoStringW_Call
+    {
+        RDPESC.ContextAndTwoStringW_Call ContextAndTwoStringW_Call;
+
+        override string ToString()
+        {
+            return "ContextAndTwoStringW_Call, " + ContextAndTwoStringW_Call.SummaryString();
+        }
+    }
+
+    issues operation ContextAndTwoStringW
+    {
+        RDPESC.ContextAndTwoStringW_Call ContextAndTwoStringW_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "ContextAndTwoStringW, " + Long_Return.SummaryString() +
+                ", " + ContextAndTwoStringW_Call.SummaryString();
+        }
+    }
+
+    accepts message LocateCardsA_Call
+    {
+        RDPESC.LocateCardsA_Call LocateCardsA_Call;
+
+        override string ToString()
+        {
+            return "LocateCardsA_Call, " + LocateCardsA_Call.SummaryString();
+        }
+    }
+
+    issues message LocateCards_Return
+    {
+        RDPESC.LocateCards_Return LocateCards_Return;
+
+        override string ToString()
+        {
+            return "LocateCards_Return, " + LocateCards_Return.SummaryString();
+        }
+    }
+
+    issues operation LocateCardsA
+    {
+        RDPESC.LocateCardsA_Call LocateCardsA_Call;
+        RDPESC.LocateCards_Return LocateCards_Return;
+
+        override string ToString()
+        {
+            return "LocateCardsA, " + LocateCards_Return.SummaryString() +
+                ", " + LocateCardsA_Call.SummaryString();
+        }
+    }
+
+    accepts message LocateCardsW_Call
+    {
+        RDPESC.LocateCardsW_Call LocateCardsW_Call;
+
+        override string ToString()
+        {
+            return "LocateCardsW_Call, " + LocateCardsW_Call.SummaryString();
+        }
+    }
+
+    issues operation LocateCardsW
+    {
+        RDPESC.LocateCardsW_Call LocateCardsW_Call;
+        RDPESC.LocateCards_Return LocateCards_Return;
+
+        override string ToString()
+        {
+            return "LocateCardsW, " + LocateCards_Return.SummaryString() +
+                ", " + LocateCardsW_Call.SummaryString();
+        }
+    }
+
+    accepts message GetStatusChangeA_Call
+    {
+        RDPESC.GetStatusChangeA_Call GetStatusChangeA_Call;
+
+        override string ToString()
+        {
+            return "GetStatusChangeA_Call, " + GetStatusChangeA_Call.SummaryString();
+        }
+    }
+
+    issues message GetStatusChange_Return
+    {
+        RDPESC.LocateCards_Return GetStatusChange_Return;
+
+        override string ToString()
+        {
+            return "GetStatusChange_Return, " + GetStatusChange_Return.SummaryString();
+        }
+    }
+
+    issues operation GetStatusChangeA
+    {
+        RDPESC.GetStatusChangeA_Call GetStatusChangeA_Call;
+        RDPESC.LocateCards_Return GetStatusChange_Return;
+
+        override string ToString()
+        {
+            return "GetStatusChangeA, " + GetStatusChange_Return.SummaryString() +
+                ", " + GetStatusChangeA_Call.SummaryString();
+        }
+    }
+
+    accepts message GetStatusChangeW_Call
+    {
+        RDPESC.GetStatusChangeW_Call GetStatusChangeW_Call;
+
+        override string ToString()
+        {
+            return "GetStatusChangeW_Call, " + GetStatusChangeW_Call.SummaryString();
+        }
+    }
+
+    issues operation GetStatusChangeW
+    {
+        RDPESC.GetStatusChangeW_Call GetStatusChangeW_Call;
+        RDPESC.LocateCards_Return GetStatusChange_Return;
+
+        override string ToString()
+        {
+            return "GetStatusChangeW, " + GetStatusChange_Return.SummaryString() +
+                ", " + GetStatusChangeW_Call.SummaryString();
+        }
+    }
+
+    accepts message ConnectA_Call
+    {
+        RDPESC.ConnectA_Call ConnectA_Call;
+
+        override string ToString()
+        {
+            return "ConnectA_Call, " + ConnectA_Call.SummaryString();
+        }
+    }
+
+    issues operation ConnectA
+    {
+        RDPESC.ConnectA_Call ConnectA_Call;
+        RDPESC.Connect_Return Connect_Return;
+
+        override string ToString()
+        {
+            return "ConnectA, " + Connect_Return.SummaryString() +
+                ", " + ConnectA_Call.SummaryString();
+        }
+    }
+
+    accepts message ConnectW_Call
+    {
+        RDPESC.ConnectW_Call ConnectW_Call;
+
+        override string ToString()
+        {
+            return "ConnectW_Call, " + ConnectW_Call.SummaryString();
+        }
+    }
+
+    issues message Connect_Return
+    {
+        RDPESC.Connect_Return Connect_Return;
+
+        override string ToString()
+        {
+            return "Connect_Return, " + Connect_Return.SummaryString();
+        }
+    }
+
+    issues operation ConnectW
+    {
+        RDPESC.ConnectW_Call ConnectW_Call;
+        RDPESC.Connect_Return Connect_Return;
+
+        override string ToString()
+        {
+            return "ConnectW, " + Connect_Return.SummaryString() +
+                ", " + ConnectW_Call.SummaryString();
+        }
+    }
+
+    accepts message Reconnect_Call
+    {
+        RDPESC.Reconnect_Call Reconnect_Call;
+
+        override string ToString()
+        {
+            return "Reconnect_Call, " + Reconnect_Call.SummaryString();
+        }
+    }
+
+    issues message Reconnect_Return
+    {
+        RDPESC.Reconnect_Return Reconnect_Return;
+
+        override string ToString()
+        {
+            return "Reconnect_Return, " + Reconnect_Return.SummaryString();
+        }
+    }
+
+    issues operation Reconnect
+    {
+        RDPESC.Reconnect_Call Reconnect_Call;
+        RDPESC.Reconnect_Return Reconnect_Return;
+
+        override string ToString()
+        {
+            return "Reconnect, " + Reconnect_Call.SummaryString() +
+                ", " + Reconnect_Return.SummaryString();
+        }
+    }
+
+    accepts message HCardAndDisposition_Call
+    {
+        RDPESC.HCardAndDisposition_Call HCardAndDisposition_Call;
+
+        override string ToString()
+        {
+            return "HCardAndDisposition_Call, " + HCardAndDisposition_Call.SummaryString();
+        }
+    }
+
+    issues operation HCardAndDisposition
+    {
+        RDPESC.HCardAndDisposition_Call HCardAndDisposition_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "HCardAndDisposition, " + Long_Return.SummaryString() +
+                ", " + HCardAndDisposition_Call.SummaryString();
+        }
+    }
+
+    accepts message State_Call
+    {
+        RDPESC.State_Call State_Call;
+
+        override string ToString()
+        {
+            return "State_Call, " + State_Call.SummaryString();
+        }
+    }
+
+    issues message State_Return
+    {
+        RDPESC.State_Return State_Return;
+
+        override string ToString()
+        {
+            return "State_Return, " + State_Return.SummaryString();
+        }
+    }
+
+    issues operation State
+    {
+        RDPESC.State_Call State_Call;
+        RDPESC.State_Return State_Return;
+
+        override string ToString()
+        {
+            return "State, " + State_Return.SummaryString() +
+                ", " + State_Call.SummaryString();
+        }
+    }
+
+    accepts message Status_Call
+    {
+        RDPESC.Status_Call Status_Call;
+
+        override string ToString()
+        {
+            return "Status_Call, " + Status_Call.SummaryString();
+        }
+    }
+
+    issues message Status_Return[uint IoControlCode]
+    {
+        RDPESC.Status_Return[IoControlCode] Status_Return_Type;
+
+        override string ToString()
+        {
+            return "Status_Return, " + Status_Return_Type.SummaryString();
+        }
+    }
+
+    issues operation Status
+    {
+        RDPESC.Status_Call Status_Call;
+        RDPESC.Status_Return Status_Return;
+
+        override string ToString()
+        {
+            return "Status, " + Status_Return.SummaryString() +
+                ", " + Status_Call.SummaryString();
+        }
+    }
+
+    accepts message Transmit_Call
+    {
+        RDPESC.Transmit_Call Transmit_Call;
+
+        override string ToString()
+        {
+            return "Transmit_Call, " + Transmit_Call.SummaryString();
+        }
+    }
+
+    issues message Transmit_Return
+    {
+        RDPESC.Transmit_Return Transmit_Return;
+
+        override string ToString()
+        {
+            return "Transmit_Return, " + Transmit_Return.SummaryString();
+        }
+    }
+
+    issues operation Transmit
+    {
+        RDPESC.Transmit_Call Transmit_Call;
+        RDPESC.Transmit_Return Transmit_Return;
+
+        override string ToString()
+        {
+            return "Transmit, " + Transmit_Return.SummaryString() +
+                ", " + Transmit_Call.SummaryString();
+        }
+    }
+
+    accepts message Control_Call
+    {
+        RDPESC.Control_Call Control_Call;
+
+        override string ToString()
+        {
+            return "Control_Call, " + Control_Call.SummaryString();
+        }
+    }
+
+    issues message Control_Return
+    {
+        RDPESC.Control_Return Control_Return;
+
+        override string ToString()
+        {
+            return "Control_Return, " + Control_Return.SummaryString();
+        }
+    }
+
+    issues operation Control
+    {
+        RDPESC.Control_Call Control_Call;
+        RDPESC.Control_Return Control_Return;
+
+        override string ToString()
+        {
+            return "Control, " + Control_Return.SummaryString() +
+                ", " + Control_Call.SummaryString();
+        }
+    }
+
+    accepts message GetAttrib_Call
+    {
+        RDPESC.GetAttrib_Call GetAttrib_Call;
+
+        override string ToString()
+        {
+            return "GetAttrib_Call, " + GetAttrib_Call.SummaryString();
+        }
+    }
+
+    issues message GetAttrib_Return
+    {
+        RDPESC.GetAttrib_Return GetAttrib_Return;
+
+        override string ToString()
+        {
+            return "GetAttrib_Return, " + GetAttrib_Return.SummaryString();
+        }
+    }
+
+    issues operation GetAttrib
+    {
+        RDPESC.GetAttrib_Call GetAttrib_Call;
+        RDPESC.GetAttrib_Return GetAttrib_Return;
+
+        override string ToString()
+        {
+            return "GetAttrib, " + GetAttrib_Return.SummaryString() +
+                ", " + GetAttrib_Call.SummaryString();
+        }
+    }
+
+    accepts message SetAttrib_Call
+    {
+        RDPESC.SetAttrib_Call SetAttrib_Call;
+
+        override string ToString()
+        {
+            return "SetAttrib_Call, " + SetAttrib_Call.SummaryString();
+        }
+    }
+
+    issues operation SetAttrib
+    {
+        RDPESC.SetAttrib_Call SetAttrib_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "SetAttrib, " + Long_Return.SummaryString() +
+                ", " + SetAttrib_Call.SummaryString();
+        }
+    }
+
+    accepts message ScardAccessStartedEvent_Call
+    {
+        uint Unused;
+
+        override string ToString()
+        {
+            return "ScardAccessStartedEvent_Call";
+        }
+    }
+
+    issues operation ScardAccessStartedEvent
+    {
+        uint Unused;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "ScardAccessStartedEvent, " + Long_Return.SummaryString();
+        }
+    }
+
+    accepts message LocateCardsByATRA_Call
+    {
+        RDPESC.LocateCardsByATRA_Call LocateCardsByATRA_Call;
+
+        override string ToString()
+        {
+            return "LocateCardsByATRA_Call";
+        }
+    }
+
+    issues operation LocateCardsByATRA
+    {
+        RDPESC.LocateCardsByATRA_Call LocateCardsByATRA_Call;
+        RDPESC.LocateCards_Return LocateCards_Return;
+
+        override string ToString()
+        {
+            return "LocateCardsByATRA, " + LocateCards_Return.SummaryString();
+        }
+    }
+
+    accepts message LocateCardsByATRW_Call
+    {
+        RDPESC.LocateCardsByATRW_Call LocateCardsByATRW_Call;
+
+        override string ToString()
+        {
+            return "LocateCardsByATRW_Call";
+        }
+    }
+
+    issues operation LocateCardsByATRW
+    {
+        RDPESC.LocateCardsByATRW_Call LocateCardsByATRW_Call;
+        RDPESC.LocateCards_Return LocateCards_Return;
+
+        override string ToString()
+        {
+            return "LocateCardsByATRW, " + LocateCards_Return.SummaryString();
+        }
+    }
+
+    accepts message ReadCacheA_Call
+    {
+        RDPESC.ReadCacheA_Call ReadCacheA_Call;
+
+        override string ToString()
+        {
+            return "ReadCacheA_Call, " + ReadCacheA_Call.SummaryString();;
+        }
+    }
+
+    issues operation ReadCacheA
+    {
+        RDPESC.ReadCacheA_Call ReadCacheA_Call;
+        RDPESC.ReadCache_Return ReadCache_Return;
+
+        override string ToString()
+        {
+            return "ReadCacheA, " + ReadCache_Return.SummaryString() +
+                ", " + ReadCacheA_Call.SummaryString();
+        }
+    }
+
+    accepts message ReadCacheW_Call
+    {
+        RDPESC.ReadCacheW_Call ReadCacheW_Call;
+
+        override string ToString()
+        {
+            return "ReadCacheW_Call, " + ReadCacheW_Call.SummaryString();;
+        }
+    }
+
+    issues message ReadCache_Return
+    {
+        RDPESC.ReadCache_Return ReadCache_Return;
+
+        override string ToString()
+        {
+            return "ReadCache_Return, " + ReadCache_Return.SummaryString();;
+        }
+    }
+
+    issues operation ReadCacheW
+    {
+        RDPESC.ReadCacheW_Call ReadCacheW_Call;
+        RDPESC.ReadCache_Return ReadCache_Return;
+
+        override string ToString()
+        {
+            return "ReadCacheW, " + ReadCache_Return.SummaryString() +
+                ", " + ReadCacheW_Call.SummaryString();
+        }
+    }
+
+    accepts message WriteCacheA_Call
+    {
+        RDPESC.WriteCacheA_Call WriteCacheA_Call;
+
+        override string ToString()
+        {
+            return "WriteCacheA_Call, " + WriteCacheA_Call.SummaryString();;
+        }
+    }
+
+    issues operation WriteCacheA
+    {
+        RDPESC.WriteCacheA_Call WriteCacheA_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "WriteCacheA, " + Long_Return.SummaryString() +
+                ", " + WriteCacheA_Call.SummaryString();
+        }
+    }
+
+    accepts message WriteCacheW_Call
+    {
+        RDPESC.WriteCacheW_Call WriteCacheW_Call;
+
+        override string ToString()
+        {
+            return "WriteCacheW_Call, " + WriteCacheW_Call.SummaryString();;
+        }
+    }
+
+    issues operation WriteCacheW
+    {
+        RDPESC.WriteCacheW_Call WriteCacheW_Call;
+        RDPESC.Long_Return Long_Return;
+
+        override string ToString()
+        {
+            return "WriteCacheA, " + Long_Return.SummaryString() +
+                ", " + Long_Return.SummaryString();
+        }
+    }
+
+    accepts message GetTransmitCount_Call
+    {
+        RDPESC.GetTransmitCount_Call GetTransmitCount_Call;
+
+        override string ToString()
+        {
+            return "GetTransmitCount_Call";
+        }
+    }
+
+    issues message GetTransmitCount_Return
+    {
+        RDPESC.GetTransmitCount_Return GetTransmitCount_Return;
+
+        override string ToString()
+        {
+            return "GetTransmitCount_Return, " + GetTransmitCount_Return.SummaryString();;
+        }
+    }
+
+    issues operation GetTransmitCount
+    {
+        RDPESC.GetTransmitCount_Call GetTransmitCount_Call;
+        RDPESC.GetTransmitCount_Return GetTransmitCount_Return;
+
+        override string ToString()
+        {
+            return "GetTransmitCount, " + GetTransmitCount_Return.SummaryString();;
+        }
+    }
+
+    accepts message GetReaderIcon_Call
+    {
+        RDPESC.GetReaderIcon_Call GetReaderIcon_Call;
+
+        override string ToString()
+        {
+            return "GetReaderIcon_Call, " + GetReaderIcon_Call.SummaryString();;
+        }
+    }
+
+    issues message GetReaderIcon_Return
+    {
+        RDPESC.GetReaderIcon_Return GetReaderIcon_Return;
+
+        override string ToString()
+        {
+            return "GetReaderIcon_Return, " + GetReaderIcon_Return.SummaryString();;
+        }
+    }
+
+    issues operation GetReaderIcon
+    {
+        RDPESC.GetReaderIcon_Call GetReaderIcon_Call;
+        RDPESC.GetReaderIcon_Return GetReaderIcon_Return;
+
+        override string ToString()
+        {
+            return "GetReaderIcon, " + GetReaderIcon_Return.SummaryString() +
+                ", " + GetReaderIcon_Call.SummaryString();
+        }
+    }
+
+    accepts message GetDeviceTypeId_Call
+    {
+        RDPESC.GetDeviceTypeId_Call GetDeviceTypeId_Call;
+
+        override string ToString()
+        {
+            return "GetDeviceTypeId_Call, " + GetDeviceTypeId_Call.SummaryString();;
+        }
+    }
+
+    issues message GetDeviceTypeId_Return
+    {
+        RDPESC.GetDeviceTypeId_Return GetDeviceTypeId_Return;
+
+        override string ToString()
+        {
+            return "GetDeviceTypeId_Return, " + GetDeviceTypeId_Return.SummaryString();;
+        }
+    }
+
+    issues operation GetDeviceTypeId
+    {
+        RDPESC.GetDeviceTypeId_Call GetDeviceTypeId_Call;
+        RDPESC.GetDeviceTypeId_Return GetDeviceTypeId_Return;
+
+        override string ToString()
+        {
+            return "GetDeviceTypeId, " + GetDeviceTypeId_Call.SummaryString() +
+                ", " + GetDeviceTypeId_Return.SummaryString();
+        }
+    }
+}
+
+type EstablishContext_Call
+{
+    EstablishContextScope dwScope where ValidationCheckEnumValue(InRange<EstablishContextScope>(value), null, true, ReferenceType.Type,
+        "RDPESC", "dwScope", "EstablishContext_Call", "0x00000000, 0x00000001, 0x00000002", value) 
+        with Encoding{Decoder = PatternDecoder<EstablishContextScope>, SourcePattern = TypeOf<IDLUlong>()};
+
+    string SummaryString()
+    {
+        return "dwScope: " + EnumToStringInSummary<EstablishContextScope>(dwScope);
+    }
+}
+
+type EstablishContext_Return
+{
+    IDLLong ReturnCode;
+    REDIR_SCARDCONTEXT Context;
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type Context_Call
+{
+    REDIR_SCARDCONTEXT Context;
+}
+
+type Long_Return
+{
+    IDLLong ReturnCode;
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type ListReaderGroups_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    BooleanEnum fmszGroupsIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fmszGroupsIsNULL", "ListReaderGroups_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cchGroups with DisplayInfo{ToText = StringBufferCountToText};
+
+    string SummaryString()
+    {
+        return "fmszGroupsIsNULL: " + EnumToStringInSummary<BooleanEnum>(fmszGroupsIsNULL) +
+            ", cchGroups: " + StringBufferCountToText(cchGroups);
+    }
+}
+
+type ListReaders_Call[uint IoControlCode]
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cBytes with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<string> mszGroups with IDL{Size_is = [cBytes], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1},
+        Encoding{Decoder = MszDecoder, SourcePattern = TypeOf<array<byte>>()};
+    BooleanEnum fmszReadersIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fmszReadersIsNULL", "ListReaders_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cchReaders with DisplayInfo{ToText = StringBufferCountToText};
+
+    optional array<string> MszDecoder(binary data)
+    {
+        bool isUnicode = false; // by default ascii
+        if (IoControlCode == RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSW)
+        {
+            // unicode
+            isUnicode = true;
+        }
+
+        return DecodeMultistring(data, isUnicode);
+    }
+
+    string SummaryString()
+    {
+        return "mszGroups: " + mszGroups.ToString() +
+            "fmszReadersIsNULL: " + EnumToStringInSummary<BooleanEnum>(fmszReadersIsNULL) +
+            ", cchReaders: " + StringBufferCountToText(cchReaders);
+    }
+}
+
+
+type _longAndMultiString_Return[uint IoControlCode]
+{
+    IDLLong ReturnCode;
+    IDLUlong cBytes with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<string> msz with IDL{Size_is = [cBytes], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1},
+        Encoding{Decoder = MszDecoder, SourcePattern = TypeOf<array<byte>>()};
+
+    optional array<string> MszDecoder(binary data)
+    {
+        bool isUnicode = false; // by default ascii
+        if (IoControlCode == RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSW ||
+            IoControlCode == RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSW)
+        {
+            // unicode
+            isUnicode = true;
+        }
+        
+        return DecodeMultistring(data, isUnicode);
+    }
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) + ", msz: " + msz.ToString();
+    }
+}
+
+type ContextAndStringA_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string sz with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "sz: " + sz;
+    }
+}
+
+type ContextAndStringW_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string sz with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "sz: " + sz;
+    }
+}
+
+type ContextAndTwoStringA_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string sz1 with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+    string sz2 with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "sz1: " + sz1 + ", sz2: " + sz2;
+    }
+}
+
+type ContextAndTwoStringW_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string sz1 with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+    string sz2 with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "sz1: " + sz1 + ", sz2: " + sz2;
+    }
+}
+
+type LocateCardsA_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cBytes with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<string> mszCards with IDL{Size_is = [cBytes], IndirectionLevel = 1},
+        Encoding{Decoder = MszCardsDecoder, SourcePattern = TypeOf<array<byte>>()};
+    IDLUlong cReaders with Technologies.IDL.IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderStateA> rgReaderStates with Technologies.IDL.IDL{Size_is = [cReaders], IndirectionLevel = 1};
+
+    optional array<string> MszCardsDecoder(binary data)
+    {
+        return DecodeMultistring(data, false);
+    }
+
+    string SummaryString()
+    {
+        return "mszCards: " + mszCards.ToString();
+    }
+}
+
+type LocateCards_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderState_Return> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type LocateCardsW_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cBytes with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<string> mszCards with IDL{Size_is = [cBytes], IndirectionLevel = 1},
+        Encoding{Decoder = MszCardsDecoder, SourcePattern = TypeOf<array<byte>>()};
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderStateW> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+
+    optional array<string> MszCardsDecoder(binary data)
+    {
+        return DecodeMultistring(data, true);
+    }
+
+    string SummaryString()
+    {
+        return "mszCards: " + mszCards.ToString();
+    }
+}
+
+type GetStatusChangeA_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong dwTimeOutlong;
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderStateA> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "dwTimeOutlong: " + dwTimeOutlong.ToString();
+    }
+}
+
+type GetStatusChangeW_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong dwTimeOut;
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 11}};
+    array<ReaderStateW> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "dwTimeOut: " + dwTimeOut.ToString();
+    }
+}
+
+type ConnectA_Call
+{
+    string szReader with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+    Connect_Common Common;
+
+    string SummaryString()
+    {
+        return "szReader: " + szReader;
+    }
+}
+
+type ConnectW_Call
+{
+    string szReader with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+    Connect_Common Common;
+
+    string SummaryString()
+    {
+        return "szReader: " + szReader;
+    }
+}
+
+type Connect_Return
+{
+    IDLLong ReturnCode;
+    REDIR_SCARDHANDLE hCard;
+    ProtocolIdentifier dwActiveProtocol
+        where ValidationCheckProtocolIdentifier(value, "dwActiveProtocol", "Connect_Return")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) +
+            ", dwActiveProtocol: " + dwActiveProtocol.ToString();
+    }
+}
+
+type Reconnect_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    AccessModeFlags dwShareMode with Encoding{Decoder = PatternDecoder<AccessModeFlags>, SourcePattern = TypeOf<IDLUlong>()};
+    ProtocolIdentifier dwPreferredProtocols
+        where ValidationCheckProtocolIdentifier(value, "dwPreferredProtocols", "Reconnect_Call")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    InitializationType dwInitialization where ValidationCheckEnumValue(InRange<InitializationType>(value), null, true, ReferenceType.Type,
+        "RDPESC", "dwInitialization", "Reconnect_Call", "0x00000000, 0x00000001, 0x00000002", value) 
+        with Encoding{Decoder = PatternDecoder<InitializationType>, SourcePattern = TypeOf<IDLUlong>()};
+
+    string SummaryString()
+    {
+        return "dwShareMode: " + EnumToStringInSummary<AccessModeFlags>(dwShareMode) + 
+            ", dwPreferredProtocols: " + dwPreferredProtocols.ToString() +
+            ", dwInitialization: " + EnumToStringInSummary<AccessModeFlags>(dwInitialization);
+    }
+}
+
+type Reconnect_Return
+{
+    IDLLong ReturnCode;
+    ProtocolIdentifier dwActiveProtocol
+        where ValidationCheckProtocolIdentifier(value, "dwActiveProtocol", "Reconnect_Return")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) + ", dwActiveProtocol: " + dwActiveProtocol.ToString();
+    }
+}
+
+type HCardAndDisposition_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    DispositionEnumPattern dwDisposition where ValidationCheckEnumValue(InRange<DispositionEnumPattern>(value), null, true, ReferenceType.Type,
+        "RDPESC", "dwDisposition", "HCardAndDisposition_Call", "0x00000000, 0x00000001, 0x00000002, 0x00000003", value) 
+        with Encoding{Decoder = PatternDecoder<DispositionEnumPattern>, SourcePattern = TypeOf<IDLUlong>()};
+
+    string SummaryString()
+    {
+        return "dwDisposition: " + EnumToStringInSummary<DispositionEnumPattern>(dwDisposition);
+    }
+}
+
+type State_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    BooleanEnum fpbAtrIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fpbAtrIsNULL", "State_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cbAtrLen with DisplayInfo{ToText = StringBufferCountToText};
+
+    string SummaryString()
+    {
+        return "fpbAtrIsNULL: " + EnumToStringInSummary<BooleanEnum>(fpbAtrIsNULL) +
+            ", cbAtrLen: " + StringBufferCountToText(cbAtrLen);
+    }
+}
+
+type State_Return
+{
+    IDLLong ReturnCode;
+    CardReaderState dwState with Encoding{Decoder = PatternDecoder<CardReaderState>, SourcePattern = TypeOf<IDLUlong>()};
+    ProtocolIdentifier dwProtocol
+        where ValidationCheckProtocolIdentifier(value, "dwProtocol", "State_Return")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    IDLUlong cbAtrLen with IDL{Range = new RangePattern{Low = 0, High = 36}};
+    (ATRString | binary) rgAtr with IDL{Size_is = [cbAtrLen], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1},
+        Encoding{Decoder = (x) => ATRStringDecoder(x, cbAtrLen, "rgAtr", "State_Return"), SourcePattern = TypeOf<array<byte>>()};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) +
+            ", dwState: " + EnumToStringInSummary<CardReaderState>(dwState) +
+            ", dwProtocol: " + dwProtocol.ToString();
+    }
+}
+
+type Status_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    BooleanEnum fmszReaderNamesIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fmszReaderNamesIsNULL", "Status_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cchReaderLen with DisplayInfo{ToText = StringBufferCountToText};
+    IDLUlong cbAtrLen;
+
+    string SummaryString()
+    {
+        return ", fmszReaderNamesIsNULL: " + EnumToStringInSummary<BooleanEnum>(fmszReaderNamesIsNULL) +
+            ", cchReaderLen: " + StringBufferCountToText(cchReaderLen);
+    }
+}
+
+type Status_Return[uint IoControlCode]
+{
+    IDLLong ReturnCode;
+    IDLUlong cBytes with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<string> mszReaderNames with IDL{Size_is = [cBytes], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1},
+        Encoding{Decoder = MszReaderNamesDecoder, SourcePattern = TypeOf<array<byte>>()};
+    CardReaderState dwState with Encoding{Decoder = PatternDecoder<CardReaderState>, SourcePattern = TypeOf<IDLUlong>()};
+    ProtocolIdentifier dwProtocol
+        where ValidationCheckProtocolIdentifier(value, "dwProtocol", "Status_Return")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    (ATRString | binary) pbAtr with IDL{Dimensions = [32]},
+        Encoding{Decoder = (x) => ATRStringDecoder(x, cbAtrLen, "pbAtr", "Status_Return"), SourcePattern = TypeOf<array<byte>>()};
+    IDLUlong cbAtrLen with IDL{Range = new RangePattern{Low = 0, High = 32}};
+
+    optional array<string> MszReaderNamesDecoder(binary data)
+    {
+        bool isUnicode = false;
+        if (IoControlCode == RdpescIoCtrlCode.SCARD_IOCTL_STATUSW)
+        {
+            isUnicode = true;
+        }
+        return DecodeMultistring(data, isUnicode);
+    }
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) +
+            ", dwState: " + EnumToStringInSummary<CardReaderState>(dwState) +
+            ", dwProtocol: " + dwProtocol.ToString() +
+            ", mszReaderNames: " + mszReaderNames.ToString();
+    }
+}
+
+type Transmit_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    SCardIO_Request ioSendPci;
+    IDLUlong cbSendLength with IDL{Range = new RangePattern{Low = 0, High = 66560}};
+    array<byte> pbSendBuffer with IDL{Size_is = [cbSendLength], IndirectionLevel = 1};
+    SCardIO_Request pioRecvPci with IDL{PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+    BooleanEnum fpbRecvBufferIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fpbRecvBufferIsNULL", "Transmit_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cbRecvLength;
+
+    string SummaryString()
+    {
+        return "ioSendPci: " + ioSendPci.dwProtocol.ToString() +
+            (pioRecvPci == null ? "" : ", pioRecvPci: " + pioRecvPci.dwProtocol.ToString());
+    }
+}
+
+type Transmit_Return
+{
+    IDLLong ReturnCode;
+    SCardIO_Request pioRecvPci with IDL{PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+    IDLUlong cbRecvLength with IDL{Range = new RangePattern{Low = 0, High = 66560}};
+    array<byte> pbRecvBuffer with IDL{Size_is = [cbRecvLength], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) +
+            (pioRecvPci == null ? "" : ", pioRecvPci: " + pioRecvPci.dwProtocol.ToString());
+    }
+}
+
+type Control_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    IDLUlong dwControlCode;
+    IDLUlong cbInBufferSize with IDL{Range = new RangePattern{Low = 0, High = 66560}};
+    array<byte> pvInBuffer with IDL{Size_is = [cbInBufferSize], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+    BooleanEnum fpvOutBufferIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fpvOutBufferIsNULL", "Control_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cbOutBufferSize;
+
+    string SummaryString()
+    {
+        return "dwControlCode: " + dwControlCode.ToString() +
+            ", fpvOutBufferIsNULL: " + EnumToStringInSummary<BooleanEnum>(fpvOutBufferIsNULL);
+    }
+}
+
+type Control_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cbOutBufferSize with IDL{Range = new RangePattern{Low = 0, High = 66560}};
+    array<byte> pvOutBuffer with IDL{Size_is = [cbOutBufferSize], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type GetAttrib_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    IDLUlong dwAttrId;
+    BooleanEnum fpbAttrIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fpbAttrIsNULL", "GetAttrib_Call", "0x00000000, 0x00000001", value) 
+        with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cbAttrLen with DisplayInfo{ToText = StringBufferCountToText};
+
+    string SummaryString()
+    {
+        return "dwAttrId: " + dwAttrId.ToString() +
+            ", fpbAttrIsNULL: " + EnumToStringInSummary<BooleanEnum>(fpbAttrIsNULL) +
+            ", cbAttrLen: " + StringBufferCountToText(cbAttrLen);
+    }
+}
+
+type GetAttrib_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cbAttrLen with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<byte> pbAttr with IDL{Size_is = [cbAttrLen], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type SetAttrib_Call
+{
+    REDIR_SCARDHANDLE hCard;
+    IDLUlong dwAttrId;
+    IDLUlong cbAttrLen with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<byte> pbAttr with IDL{Size_is = [cbAttrLen], IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "dwAttrId: " + dwAttrId.ToString();
+    }
+}
+
+type LocateCardsByATRA_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cAtrs with IDL{Range = new RangePattern{Low = 0, High = 1000}};
+    array<LocateCards_ATRMask> rgAtrMasks with IDL{Size_is = [cAtrs], IndirectionLevel = 1};
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderStateA> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+}
+
+type LocateCardsByATRW_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cAtrs with IDL{Range = new RangePattern{Low = 0, High = 1000}};
+    array<LocateCards_ATRMask> rgAtrMasks with IDL{Size_is = [cAtrs], IndirectionLevel = 1};
+    IDLUlong cReaders with IDL{Range = new RangePattern{Low = 0, High = 10}};
+    array<ReaderStateW> rgReaderStates with IDL{Size_is = [cReaders], IndirectionLevel = 1};
+}
+
+type ReadCacheA_Call
+{
+    string szLookupName with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+    ReadCache_Common Common;
+
+    string SummaryString()
+    {
+        return "szLookupName: " + szLookupName;
+    }
+}
+
+type ReadCacheW_Call
+{
+    string szLookupName with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+    ReadCache_Common Common;
+
+    string SummaryString()
+    {
+        return "szLookupName: " + szLookupName;
+    }
+}
+
+type ReadCache_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cbDataLen with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<byte> pbData with IDL{Size_is = [cbDataLen], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type WriteCacheA_Call
+{
+    string szLookupName with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+    WriteCache_Common Common;
+
+    string SummaryString()
+    {
+        return "szLookupName: " + szLookupName;
+    }
+}
+
+type WriteCacheW_Call
+{
+    string szLookupName with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+    WriteCache_Common Common;
+
+    string SummaryString()
+    {
+        return "szLookupName: " + szLookupName;
+    }
+}
+
+type GetTransmitCount_Call
+{
+    REDIR_SCARDHANDLE hCard;
+}
+
+type GetTransmitCount_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cTransmitCount;
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type GetReaderIcon_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string szReaderName with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "szReaderName: " + szReaderName.ToString();
+    }
+}
+
+type GetReaderIcon_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong cbDataLen with IDL{Range = new RangePattern{Low = 0, High = 4194304}};
+    array<byte> pbData with IDL{Size_is = [cbDataLen], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint);
+    }
+}
+
+type GetDeviceTypeId_Call
+{
+    REDIR_SCARDCONTEXT Context;
+    string szReaderName with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+
+    string SummaryString()
+    {
+        return "szReaderName: " + szReaderName;
+    }
+}
+
+type GetDeviceTypeId_Return
+{
+    IDLLong ReturnCode;
+    IDLUlong dwDeviceId;
+
+    string SummaryString()
+    {
+        return "ReturnCode: " + HResultValuesToText(ReturnCode as uint) + ", dwDeviceId: " + dwDeviceId.ToString();
+    }
+}
+
+type REDIR_SCARDCONTEXT
+{
+    IDLUlong cbContext with IDL{Range = new RangePattern{Low = 0, High = 16}};
+    array<byte> pbContext with IDL{Size_is = [cbContext], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+}
+
+type REDIR_SCARDHANDLE
+{
+    REDIR_SCARDCONTEXT Context;
+    IDLUlong cbHandle with IDL{Range = new RangePattern{Low = 0, High = 16}};
+    array<byte> pbHandle with Technologies.IDL.IDL{Size_is = [cbHandle], IndirectionLevel = 1};
+}
+
+type ReaderState_Common_Call
+{
+    ReaderState dwCurrentState with Encoding{Decoder = ReaderStateDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    ReaderState dwEventState with Encoding{Decoder = ReaderStateDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    IDLUlong cbAtr with Technologies.IDL.IDL{Range = new RangePattern{Low = 0, High = 36}};
+    (ATRString | binary) rgbAtr with Technologies.IDL.IDL{Dimensions = [36]},
+        Encoding{Decoder = (x) => ATRStringDecoder(x, cbAtr, "rgbAtr", "ReaderState_Common_Call"), SourcePattern = TypeOf<array<byte>>()};
+
+    override string ToString()
+    {
+        return "ReaderState_Common_Call, dwCurrentState: " + EnumToString<ReaderStateFlags>(dwCurrentState.State) + ", dwEventState: " + EnumToString<ReaderStateFlags>(dwEventState.State);
+    }
+}
+
+type ReaderStateA
+{
+    string szReader with IDL{BaseStringType = TypeOf<char>(), String = true, IndirectionLevel = 1};
+    ReaderState_Common_Call Common;
+
+    override string ToString()
+    {
+        return "ReaderStateA, " + szReader + ", Common: " + Common.ToString();
+    }
+}
+
+type ReaderStateW
+{
+    string szReader with IDL{BaseStringType = TypeOf<wchar_t>(), String = true, IndirectionLevel = 1};
+    ReaderState_Common_Call Common;
+}
+
+type ReaderState_Return
+{
+    ReaderState dwCurrentState with Encoding{Decoder = ReaderStateDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    ReaderState dwEventState with Encoding{Decoder = ReaderStateDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    IDLUlong cbAtr with IDL{Range = new RangePattern{Low = 0, High = 36}};
+    (ATRString | binary) rgbAtr with IDL{Dimensions = [36]},
+        Encoding{Decoder = (x) => ATRStringDecoder(x, cbAtr, "rgbAtr", "ReaderState_Return"), SourcePattern = TypeOf<array<byte>>()};
+}
+
+type LocateCards_ATRMask
+{
+    IDLUlong cbAtr with IDL{Range = new RangePattern{Low = 0, High = 36}};
+    (ATRString | binary) rgbAtr with IDL{Dimensions = [36]},
+        Encoding{Decoder = (x) => ATRStringDecoder(x, cbAtr, "rgbAtr", "LocateCards_ATRMask"), SourcePattern = TypeOf<array<byte>>()};
+    array<byte> rgbMask with IDL{Dimensions = [36]};
+}
+
+type Connect_Common
+{
+    REDIR_SCARDCONTEXT Context;
+    AccessModeFlags dwShareMode with Encoding{Decoder = PatternDecoder<AccessModeFlags>, SourcePattern = TypeOf<IDLUlong>()};
+    ProtocolIdentifier dwPreferredProtocols
+        where ValidationCheckProtocolIdentifier(value, "dwPreferredProtocols", "Connect_Common")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+}
+
+type SCardIO_Request
+{
+    ProtocolIdentifier dwProtocol
+        where ValidationCheckProtocolIdentifier(value, "dwProtocol", "SCardIO_Request")
+        with Encoding{Decoder = ProtocolIdentifierDecoder, SourcePattern = TypeOf<IDLUlong>()};
+    IDLUlong cbExtraBytes with IDL{Range = new RangePattern{Low = 0, High = 1024}};
+    array<byte> pbExtraBytes with IDL{Size_is = [cbExtraBytes], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+
+    override string ToString()
+    {
+        return "SCardIO_Request, dwProtocol: " + dwProtocol.ToString();
+    }
+}
+
+type ReadCache_Common
+{
+    REDIR_SCARDCONTEXT Context;
+    UUID CardIdentifier with IDL{IndirectionLevel = 1};
+    IDLUlong FreshnessCounter;
+    BooleanEnum fPbDataIsNULL where ValidationCheckEnumValue(InRange<BooleanEnum>(value), null, true, ReferenceType.Type,
+        "RDPESC", "fPbDataIsNULL", "ReadCache_Common", "0x00000000, 0x00000001", value) 
+         with Encoding{Decoder = PatternDecoder<BooleanEnum>, SourcePattern = TypeOf<IDLLong>()};
+    IDLUlong cbDataLen;
+}
+
+type WriteCache_Common
+{
+    REDIR_SCARDCONTEXT Context;
+    UUID CardIdentifier with IDL{IndirectionLevel = 1};
+    IDLUlong FreshnessCounter;
+    IDLUlong cbDataLen with IDL{Range = new RangePattern{Low = 0, High = 65536}};
+    array<byte> pbData with IDL{Size_is = [cbDataLen], PointerType = PointerKind.UniquePtr, IndirectionLevel = 1};
+}
+
+//------------------------------------- Binary Codec ---------------------------------------------//
+pattern RdpescIoCtrlCode = enum uint
+{
+    SCARD_IOCTL_ESTABLISHCONTEXT          = 0x00090014,
+    SCARD_IOCTL_RELEASECONTEXT            = 0x00090018,
+    SCARD_IOCTL_ISVALIDCONTEXT            = 0x0009001C,
+    SCARD_IOCTL_LISTREADERGROUPSA         = 0x00090020,
+    SCARD_IOCTL_LISTREADERGROUPSW         = 0x00090024,
+    SCARD_IOCTL_LISTREADERSA              = 0x00090028,
+    SCARD_IOCTL_LISTREADERSW              = 0x0009002C,
+    SCARD_IOCTL_INTRODUCEREADERGROUPA     = 0x00090050,
+    SCARD_IOCTL_INTRODUCEREADERGROUPW     = 0x00090054,
+    SCARD_IOCTL_FORGETREADERGROUPA        = 0x00090058,
+    SCARD_IOCTL_FORGETREADERGROUPW        = 0x0009005C,
+    SCARD_IOCTL_INTRODUCEREADERA          = 0x00090060,
+    SCARD_IOCTL_INTRODUCEREADERW          = 0x00090064,
+    SCARD_IOCTL_FORGETREADERA             = 0x00090068,
+    SCARD_IOCTL_FORGETREADERW             = 0x0009006C,
+    SCARD_IOCTL_ADDREADERTOGROUPA         = 0x00090070,
+    SCARD_IOCTL_ADDREADERTOGROUPW         = 0x00090074,
+    SCARD_IOCTL_REMOVEREADERFROMGROUPA    = 0x00090078,
+    SCARD_IOCTL_REMOVEREADERFROMGROUPW    = 0x0009007C,
+    SCARD_IOCTL_LOCATECARDSA              = 0x00090098,
+    SCARD_IOCTL_LOCATECARDSW              = 0x0009009C,
+    SCARD_IOCTL_GETSTATUSCHANGEA          = 0x000900A0,
+    SCARD_IOCTL_GETSTATUSCHANGEW          = 0x000900A4,
+    SCARD_IOCTL_CANCEL                    = 0x000900A8,
+    SCARD_IOCTL_CONNECTA                  = 0x000900AC,
+    SCARD_IOCTL_CONNECTW                  = 0x000900B0,
+    SCARD_IOCTL_RECONNECT                 = 0x000900B4,
+    SCARD_IOCTL_DISCONNECT                = 0x000900B8,
+    SCARD_IOCTL_BEGINTRANSACTION          = 0x000900BC,
+    SCARD_IOCTL_ENDTRANSACTION            = 0x000900C0,
+    SCARD_IOCTL_STATE                     = 0x000900C4,
+    SCARD_IOCTL_STATUSA                   = 0x000900C8,
+    SCARD_IOCTL_STATUSW                   = 0x000900CC,
+    SCARD_IOCTL_TRANSMIT                  = 0x000900D0,
+    SCARD_IOCTL_CONTROL                   = 0x000900D4,
+    SCARD_IOCTL_GETATTRIB                 = 0x000900D8,
+    SCARD_IOCTL_SETATTRIB                 = 0x000900DC,
+    SCARD_IOCTL_ACCESSSTARTEDEVENT        = 0x000900E0,
+    SCARD_IOCTL_RELEASETARTEDEVENT        = 0x000900E4,
+    SCARD_IOCTL_LOCATECARDSBYATRA         = 0x000900E8,
+    SCARD_IOCTL_LOCATECARDSBYATRW         = 0x000900EC,
+    SCARD_IOCTL_READCACHEA                = 0x000900F0,
+    SCARD_IOCTL_READCACHEW                = 0x000900F4,
+    SCARD_IOCTL_WRITECACHEA               = 0x000900F8,
+    SCARD_IOCTL_WRITECACHEW               = 0x000900FC,
+    SCARD_IOCTL_GETTRANSMITCOUNT          = 0x00090100,
+    SCARD_IOCTL_GETREADERICON             = 0x00090104,
+    SCARD_IOCTL_GETDEVICETYPEID           = 0x00090108,
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+const map<uint, string> IoCtrlOperationName = 
+{
+    RdpescIoCtrlCode.SCARD_IOCTL_ESTABLISHCONTEXT -> "EstablishContext",
+    RdpescIoCtrlCode.SCARD_IOCTL_RELEASECONTEXT -> "Context",
+    RdpescIoCtrlCode.SCARD_IOCTL_ISVALIDCONTEXT -> "Context",
+    RdpescIoCtrlCode.SCARD_IOCTL_CANCEL -> "Context",
+    RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSA -> "ListReaderGroups",
+    RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERGROUPSW -> "ListReaderGroups",
+    RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSA -> "ListReaders",
+    RdpescIoCtrlCode.SCARD_IOCTL_LISTREADERSW -> "ListReaders",
+    RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPA -> "ContextAndStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPA -> "ContextAndStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERA -> "ContextAndStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERGROUPW -> "ContextAndStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERGROUPW -> "ContextAndStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_FORGETREADERW -> "ContextAndStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERA -> "ContextAndTwoStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPA -> "ContextAndTwoStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPA -> "ContextAndTwoStringA",
+    RdpescIoCtrlCode.SCARD_IOCTL_INTRODUCEREADERW -> "ContextAndTwoStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_ADDREADERTOGROUPW -> "ContextAndTwoStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_REMOVEREADERFROMGROUPW -> "ContextAndTwoStringW",
+    RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSA -> "LocateCardsA",
+    RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSW -> "LocateCardsW",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEA -> "GetStatusChangeA",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETSTATUSCHANGEW -> "GetStatusChangeW",
+    RdpescIoCtrlCode.SCARD_IOCTL_CONNECTA -> "ConnectA",
+    RdpescIoCtrlCode.SCARD_IOCTL_CONNECTW -> "ConnectW",
+    RdpescIoCtrlCode.SCARD_IOCTL_RECONNECT -> "Reconnect",
+    RdpescIoCtrlCode.SCARD_IOCTL_DISCONNECT -> "HCardAndDisposition",
+    RdpescIoCtrlCode.SCARD_IOCTL_BEGINTRANSACTION -> "HCardAndDisposition",
+    RdpescIoCtrlCode.SCARD_IOCTL_ENDTRANSACTION -> "HCardAndDisposition",
+    RdpescIoCtrlCode.SCARD_IOCTL_STATE -> "State",
+    RdpescIoCtrlCode.SCARD_IOCTL_STATUSA -> "Status",
+    RdpescIoCtrlCode.SCARD_IOCTL_STATUSW -> "Status",
+    RdpescIoCtrlCode.SCARD_IOCTL_TRANSMIT -> "Transmit",
+    RdpescIoCtrlCode.SCARD_IOCTL_CONTROL -> "Control",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETATTRIB -> "GetAttrib",
+    RdpescIoCtrlCode.SCARD_IOCTL_SETATTRIB -> "SetAttrib",
+    RdpescIoCtrlCode.SCARD_IOCTL_ACCESSSTARTEDEVENT -> "ScardAccessStartedEvent",
+    RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRA -> "LocateCardsByATRA",
+    RdpescIoCtrlCode.SCARD_IOCTL_LOCATECARDSBYATRW -> "LocateCardsByATRW",
+    RdpescIoCtrlCode.SCARD_IOCTL_READCACHEA -> "ReadCacheA",
+    RdpescIoCtrlCode.SCARD_IOCTL_READCACHEW -> "ReadCacheW",
+    RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEA -> "WriteCacheA",
+    RdpescIoCtrlCode.SCARD_IOCTL_WRITECACHEW -> "WriteCacheW",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETTRANSMITCOUNT -> "GetTransmitCount",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETREADERICON -> "GetReaderIcon",
+    RdpescIoCtrlCode.SCARD_IOCTL_GETDEVICETYPEID -> "GetDeviceTypeId",
+};
+
+pattern EstablishContextScope = enum uint
+{
+    SCARD_SCOPE_USER = 0x00000000,
+    SCARD_SCOPE_TERMINAL = 0x00000001,
+    SCARD_SCOPE_SYSTEM = 0x00000002,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern BooleanEnum = enum int
+{
+    True = 0x00000000,
+    False = 0x00000001,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern ReaderStateFlags = flags ushort
+{
+    SCARD_STATE_UNAWARE = 0x0000
+        with Documentation
+            {Description = "The application requires the current state but does not know it."},
+    SCARD_STATE_IGNORE = 0x0001
+        with Documentation
+            {Description = "The application requested that this reader be ignored."},
+    SCARD_STATE_CHANGED = 0x0002
+        with Documentation
+            {Description = "There is a difference between the state believed by the application, and the state known by Smart Cards for Windows."},
+    SCARD_STATE_UNKNOWN = 0x0004
+        with Documentation
+            {Description = "The reader name is not recognized by Smart Cards for Windows."},
+    SCARD_STATE_UNAVAILABLE = 0x0008
+        with Documentation
+            {Description = "The actual state of this reader is not available."},
+    SCARD_STATE_EMPTY = 0x0010
+        with Documentation
+            {Description = "There is no card in the reader."},
+    SCARD_STATE_PRESENT = 0x0020
+        with Documentation
+            {Description = "There is a card in the reader."},
+    SCARD_STATE_ATRMATCH = 0x0040
+        with Documentation
+            {Description = "There is a card in the reader with an ATR that matches one of the target cards."},
+    SCARD_STATE_EXCLUSIVE = 0x0080
+        with Documentation
+            {Description = "The card in the reader is allocated for exclusive use by another application."},
+    SCARD_STATE_INUSE = 0x0100
+        with Documentation
+            {Description = "The card in the reader is in use by one or more other applications, but it can be connected to in shared mode."},
+    SCARD_STATE_MUTE = 0x0200
+        with Documentation
+            {Description = "The card in the reader is unresponsive or is not supported by the reader or software."},
+    SCARD_STATE_UNPOWERED = 0x0400
+        with Documentation
+            {Description = "This implies that the card in the reader has not been turned on."},
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern AccessModeFlags = enum uint
+{
+    SCARD_SHARE_EXCLUSIVE = 0x00000001,
+    SCARD_SHARE_SHARED = 0x00000002,
+    SCARD_SHARE_DIRECT = 0x00000003,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+type RdpescCallMessageInfo
+{
+    any message CallMessage;
+    uint IoControlCode;
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+type ReaderState
+{
+    ushort Count;
+    ReaderStateFlags State where ValidationCheckCombinationValueTooManyItems(InRange<ReaderStateFlags>(value), null, true, ReferenceType.Type,
+        "RDPESC", "State", "ReaderState", "State", "[MS-RDPESC]");
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+type ProtocolIdentifier
+{
+    ProtocolIdentifierTableA TableA;
+    ProtocolIdentifierTableB TableB;
+
+    override string ToString()
+    {
+        return EnumToStringInSummary<ProtocolIdentifierTableA>(TableA) + "|" +
+            EnumToStringInSummary<ProtocolIdentifierTableB>(TableB);
+    }
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern ProtocolIdentifierTableA = enum uint
+{
+    SCARD_PROTOCOL_UNDEFINED = 0x00000000,
+    SCARD_PROTOCOL_T0 = 0x00000001,
+    SCARD_PROTOCOL_T1 = 0x00000002,
+    SCARD_PROTOCOL_Tx = 0x00000003,
+    SCARD_PROTOCOL_RAW = 0x00010000,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern ProtocolIdentifierTableB = enum ushort
+{
+    SCARD_PROTOCOL_DEFAULT = 0x80,
+    SCARD_PROTOCOL_OPTIMAL = 0x00,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern InitializationType = enum uint
+{
+    SCARD_LEAVE_CARD = 0x00000000,
+    SCARD_RESET_CARD = 0x00000001,
+    SCARD_UNPOWER_CARD = 0x00000002,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern DispositionEnumPattern = enum uint
+{
+    SCARD_LEAVE_CARD = 0x00000000,
+    SCARD_RESET_CARD = 0x00000001,
+    SCARD_UNPOWER_CARD = 0x00000002,
+    SCARD_EJECT_CARD = 0x00000003,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+pattern CardReaderState = enum uint
+{
+    SCARD_UNKNOWN = 0x00000000,
+    SCARD_ABSENT = 0x00000001,
+    SCARD_PRESENT = 0x00000002,
+    SCARD_SWALLOWED = 0x00000003,
+    SCARD_POWERED = 0x00000004,
+    SCARD_NEGOTIABLE = 0x00000005,
+    SCARD_SPECIFICMODE = 0x00000006,
+    ...
+} with IDL{DoNotGenerate = true}, Encoding{EncodingKind = EncodingKind.Binary};
+
+optional (ATRString | binary) ATRStringDecoder(binary data, uint len, string fieldName, string typeName)
+{
+    if (len == 0)
+    {
+        // if len is 0, there is no data for ATRString
+        // return data directly
+        return data;
+    }
+    switch (data)
+    {
+        case atrString:ATRString from BinaryDecoder<ATRString> =>
+            return atrString;
+        default =>
+            ValidationCheck(false, null, Format(RDPESC_ATR_STRING_DECODING_FAILURE, fieldName, typeName));
+            return data;
+    }
+}
+
+/**
+ * Answer to reset string, ISO/IEC 7816-3:2006  section 8
+ */
+type ATRString
+{
+    byte TS;
+    byte Y with BinaryEncoding{Width = 4};
+    byte K with BinaryEncoding{Width = 4};
+    ([|Y == 1|] TA1 | [|Y == 2|] TB1 | [|Y == 4|] TC1 | [|Y == 8|] TD1) T1;
+    HistoricalBytes[K] HistoricalBytes;
+    optional byte TCK;
+}
+
+type HistoricalBytes[byte Length]
+{
+    byte CategoryIndicatorByte;
+    ([|(CategoryIndicatorByte & 0x40) == 0x40|] string |
+        [|(CategoryIndicatorByte & 0x80) == 0x80|] binary) Data with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.ASCII};
+}
+
+type TA1
+{
+    byte Fi with BinaryEncoding{Width = 4};
+    byte Di with BinaryEncoding{Width = 4};
+
+    override string ToString()
+    {
+        return "Fi: " + Fi.ToString() + ", Di: " + Di.ToString();
+    }
+}
+
+type TB1
+{
+    byte P with BinaryEncoding{Width = 4};
+    byte I with BinaryEncoding{Width = 4};
+
+    override string ToString()
+    {
+        return "Deprecated";
+    }
+}
+
+type TC1
+{
+    byte N;
+
+    override string ToString()
+    {
+        return "Extra delay time: " + N.ToString();
+    }
+}
+
+type TD1
+{
+    byte Y with BinaryEncoding{Width = 4};
+    byte T with BinaryEncoding{Width = 4};
+    optional ([|Y == 1|] TA2 | [|Y == 2|] TB2 | [|Y == 4|] TC2 | [|Y == 8|] TD2) T2;
+}
+
+type TA2
+{
+    byte T;
+
+    override string ToString()
+    {
+        return "Protocol Parameter: " + T.ToString();
+    }
+}
+
+type TB2
+{
+    byte P;
+
+    override string ToString()
+    {
+        return "Deprecated";
+    }
+}
+
+type TC2
+{
+    byte T;
+
+    override string ToString()
+    {
+        return "Maximum waiting time: " + T.ToString();
+    }
+}
+
+type TD2
+{
+    byte Y with BinaryEncoding{Width = 4};
+    byte T with BinaryEncoding{Width = 4};
+    optional ([|Y == 1 || Y == 2 || Y == 4|] byte | [|Y == 8|] TD2) Ti;
+}
+
+//------------------------------------- Utilities ---------------------------------------------//
+void AddSmartCardDevice(array<DEVICE_ANNOUNCE> deviceAnnounceList, ref set<uint> smartCardDeviceIdList)
+{
+    foreach (var device in deviceAnnounceList)
+    {
+        if (device.DeviceType == DEVICE_ANNOUNCE_DeviceType.RDPDR_DTYP_SMARTCARD)
+        {
+            // add to smartCardDeviceIdList
+            if (smartCardDeviceIdList == null)
+            {
+                smartCardDeviceIdList = {device.DeviceId};
+            }
+            else
+            {
+                smartCardDeviceIdList += {device.DeviceId};
+            }
+        }
+    }
+}
+
+/*
+ * Decode request message and cache the request message for operation
+ */
+void DecodeAndCacheCallMessage<T>(DR_DRIVE_CONTROL_REQ drDrvieControlReq,
+    ref map<uint, RdpescCallMessageInfo> rdpescCallMessageCache, RDPESC.Server server)
+{
+    // decoding message
+    any message callMessage = null;
+    if (NDRTypeSerializationVersion1Decoder<T>(drDrvieControlReq.DeviceControlRequest.InputBuffer, true) is msg:T)
+    {
+        any anyCallMessage = msg as any;
+        callMessage = anyCallMessage as any message;
+        callMessage.Origins = [drDrvieControlReq];
+    }
+
+    CacheCallMessage(drDrvieControlReq, callMessage, ref rdpescCallMessageCache, server);
+
+    // throw exception if decoding failed
+    if (callMessage == null)
+    {
+        ThrowDecodingException("RDPESC", IoCtrlOperationName[drDrvieControlReq.DeviceControlRequest.IoControlCode] + " Call Message");
+    }
+}
+
+optional ReaderState ReaderStateDecoder(IDLUlong state)
+{
+    return new ReaderState
+    {
+        Count = (state >> 16) as ushort,
+        State = state as ushort,
+    };
+}
+
+void CacheCallMessage(DR_DRIVE_CONTROL_REQ drDrvieControlReq, any message callMessage,
+    ref map<uint, RdpescCallMessageInfo> rdpescCallMessageCache, RDPESC.Server server)
+{
+    uint completionId = drDrvieControlReq.DeviceControlRequest.DeviceIoRequest.CompletionId;
+    uint ioControlCode = drDrvieControlReq.DeviceControlRequest.IoControlCode;
+
+    RdpescCallMessageInfo callMessageInfo = new RdpescCallMessageInfo
+    {
+        IoControlCode = ioControlCode,
+        CallMessage = callMessage,
+    };
+
+    if (rdpescCallMessageCache == null)
+    {
+        rdpescCallMessageCache = {completionId -> callMessageInfo};
+    }
+    else
+    {
+        if (rdpescCallMessageCache.Keys[completionId])
+        {
+            // if the completion Id is re-used, the cached request's response is missing
+            any message dispatchingCallMessage = rdpescCallMessageCache[completionId].CallMessage;
+            if (dispatchingCallMessage != null)
+            {
+                ReportInsufficientOperation(dispatchingCallMessage, "RDPESC",
+                    IoCtrlOperationName[rdpescCallMessageCache[completionId].IoControlCode], false);
+                dispatch server accepts dispatchingCallMessage;
+            }
+        }
+        rdpescCallMessageCache += {completionId -> callMessageInfo};
+    }
+}
+
+void DecodeReturnMessageAndDispatchOperation<T>(DR_DRIVE_CONTROL_RSP drDriveControlRsp,
+    (any message)(any message /* call message */, any message /* return message*/)operationConstructor,
+    RdpescCallMessageInfo callMessageInfo, RDPESC.Server server)
+{
+    // decoding message
+    if (NDRTypeSerializationVersion1Decoder<T>(drDriveControlRsp.DeviceIoResponse.OutputBuffer, true) is msg:T)
+    {
+        any message returnMessage = null;
+        any anyReturnMessage = msg as any;
+        returnMessage = anyReturnMessage as any message;
+        returnMessage.Origins = [drDriveControlRsp];
+
+        if (callMessageInfo.CallMessage != null)
+        {
+            // call message is decoded successfully
+            any message op = operationConstructor(callMessageInfo.CallMessage, returnMessage);
+            op.Origins = [callMessageInfo.CallMessage, returnMessage];
+            dispatch server issues op;
+
+            return;
+        }
+        
+        // call message is not decoded successfully
+        ReportInsufficientOperation(returnMessage, "RDPESC", IoCtrlOperationName[callMessageInfo.IoControlCode], true);
+        dispatch server issues returnMessage;
+
+        return;
+    }
+
+    if (callMessageInfo.CallMessage != null)
+    {
+        // call message is decoded successfully
+        ReportInsufficientOperation(callMessageInfo.CallMessage, "RDPESC", IoCtrlOperationName[callMessageInfo.IoControlCode], false);
+        dispatch server accepts callMessageInfo.CallMessage;
+    }
+
+    // throw exception if decoding failed
+    ThrowDecodingException("RDPESC", IoCtrlOperationName[callMessageInfo.IoControlCode] + " Return Message");
+}
+
+optional ProtocolIdentifier ProtocolIdentifierDecoder(IDLUlong preferredProtocols)
+{
+    return new ProtocolIdentifier
+    {
+        TableA = (preferredProtocols & 0x00FFFFFF) as uint,
+        TableB = (preferredProtocols >> 24) as byte,
+    };
+}
+
+bool ValidationCheckProtocolIdentifier(ProtocolIdentifier protocolIdentifier, string fieldName, string typeName)
+{
+    return ValidationCheckEnumValueTooManyItems(InRange<ProtocolIdentifierTableA>(protocolIdentifier.TableA), null, true, ReferenceType.Type,
+        "RDPESC", fieldName + ".TableA", typeName, "Protocol Identifier TableA", "[MS-RDPESC]") &&
+        ValidationCheckEnumValue(InRange<ProtocolIdentifierTableB>(protocolIdentifier.TableB), null, true, ReferenceType.Type,
+        "RDPESC", fieldName + ".TableB", typeName, "0x00000000, 0x80000000", protocolIdentifier.TableB);
+}
+
+any message ContructEstablishContextOperation(any message c, any message r)
+{
+    RdpescContract.EstablishContext_Call callMessage = c as RdpescContract.EstablishContext_Call;
+    RdpescContract.EstablishContext_Return returnMessage = r as RdpescContract.EstablishContext_Return;
+
+    return new RdpescContract.EstablishContext
+    {
+        EstablishContext_Call = callMessage.EstablishContext_Call,
+        EstablishContext_Return = returnMessage.EstablishContext_Return,
+    };
+}
+
+any message ContructContextOperation(any message c, any message r)
+{
+    RdpescContract.Context_Call callMessage = c as RdpescContract.Context_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.Context
+    {
+        Context_Call = callMessage.Context_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructListReaderGroupsOperation(any message c, any message r)
+{
+    RdpescContract.ListReaderGroups_Call callMessage = c as RdpescContract.ListReaderGroups_Call;
+    RdpescContract.ListReaderGroups_Return returnMessage = r as RdpescContract.ListReaderGroups_Return;
+
+    return new RdpescContract.ListReaderGroups
+    {
+        ListReaderGroups_Call = callMessage.ListReaderGroups_Call,
+        ListReaderGroups_Return = returnMessage.ListReaderGroups_Return_Type,
+    };
+}
+
+any message ContructListReadersOperation(any message c, any message r)
+{
+    RdpescContract.ListReaders_Call callMessage = c as RdpescContract.ListReaders_Call;
+    RdpescContract.ListReaders_Return returnMessage = r as RdpescContract.ListReaders_Return;
+
+    return new RdpescContract.ListReaders
+    {
+        ListReaders_Call = callMessage.ListReaders_Call_Type,
+        ListReaders_Return = returnMessage.ListReaders_Return_Type,
+    };
+}
+
+any message ContructContextAndStringAOperation(any message c, any message r)
+{
+    RdpescContract.ContextAndStringA_Call callMessage = c as RdpescContract.ContextAndStringA_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.ContextAndStringA
+    {
+        ContextAndStringA_Call = callMessage.ContextAndStringA_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructContextAndStringWOperation(any message c, any message r)
+{
+    RdpescContract.ContextAndStringW_Call callMessage = c as RdpescContract.ContextAndStringW_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.ContextAndStringW
+    {
+        ContextAndStringW_Call = callMessage.ContextAndStringW_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructContextAndTwoStringAOperation(any message c, any message r)
+{
+    RdpescContract.ContextAndTwoStringA_Call callMessage = c as RdpescContract.ContextAndTwoStringA_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.ContextAndTwoStringA
+    {
+        ContextAndTwoStringA_Call = callMessage.ContextAndTwoStringA_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructContextAndTwoStringWOperation(any message c, any message r)
+{
+    RdpescContract.ContextAndTwoStringW_Call callMessage = c as RdpescContract.ContextAndTwoStringW_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.ContextAndTwoStringW
+    {
+        ContextAndTwoStringW_Call = callMessage.ContextAndTwoStringW_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructLocateCardsAOperation(any message c, any message r)
+{
+    RdpescContract.LocateCardsA_Call callMessage = c as RdpescContract.LocateCardsA_Call;
+    RdpescContract.LocateCards_Return returnMessage = r as RdpescContract.LocateCards_Return;
+
+    return new RdpescContract.LocateCardsA
+    {
+        LocateCardsA_Call = callMessage.LocateCardsA_Call,
+        LocateCards_Return = returnMessage.LocateCards_Return,
+    };
+}
+
+any message ContructLocateCardsWOperation(any message c, any message r)
+{
+    RdpescContract.LocateCardsW_Call callMessage = c as RdpescContract.LocateCardsW_Call;
+    RdpescContract.LocateCards_Return returnMessage = r as RdpescContract.LocateCards_Return;
+
+    return new RdpescContract.LocateCardsW
+    {
+        LocateCardsW_Call = callMessage.LocateCardsW_Call,
+        LocateCards_Return = returnMessage.LocateCards_Return,
+    };
+}
+
+any message ContructGetStatusChangeAOperation(any message c, any message r)
+{
+    RdpescContract.GetStatusChangeA_Call callMessage = c as RdpescContract.GetStatusChangeA_Call;
+    RdpescContract.GetStatusChange_Return returnMessage = r as RdpescContract.GetStatusChange_Return;
+
+    return new RdpescContract.GetStatusChangeA
+    {
+        GetStatusChangeA_Call = callMessage.GetStatusChangeA_Call,
+        GetStatusChange_Return = returnMessage.GetStatusChange_Return,
+    };
+}
+
+any message ContructGetStatusChangeWOperation(any message c, any message r)
+{
+    RdpescContract.GetStatusChangeW_Call callMessage = c as RdpescContract.GetStatusChangeW_Call;
+    RdpescContract.GetStatusChange_Return returnMessage = r as RdpescContract.GetStatusChange_Return;
+
+    return new RdpescContract.GetStatusChangeW
+    {
+        GetStatusChangeW_Call = callMessage.GetStatusChangeW_Call,
+        GetStatusChange_Return = returnMessage.GetStatusChange_Return,
+    };
+}
+
+any message ContructConnectAOperation(any message c, any message r)
+{
+    RdpescContract.ConnectA_Call callMessage = c as RdpescContract.ConnectA_Call;
+    RdpescContract.Connect_Return returnMessage = r as RdpescContract.Connect_Return;
+
+    return new RdpescContract.ConnectA
+    {
+        ConnectA_Call = callMessage.ConnectA_Call,
+        Connect_Return = returnMessage.Connect_Return,
+    };
+}
+
+any message ContructConnectWOperation(any message c, any message r)
+{
+    RdpescContract.ConnectW_Call callMessage = c as RdpescContract.ConnectW_Call;
+    RdpescContract.Connect_Return returnMessage = r as RdpescContract.Connect_Return;
+
+    return new RdpescContract.ConnectW
+    {
+        ConnectW_Call = callMessage.ConnectW_Call,
+        Connect_Return = returnMessage.Connect_Return,
+    };
+}
+
+any message ContructReconnectOperation(any message c, any message r)
+{
+    RdpescContract.Reconnect_Call callMessage = c as RdpescContract.Reconnect_Call;
+    RdpescContract.Reconnect_Return returnMessage = r as RdpescContract.Reconnect_Return;
+
+    return new RdpescContract.Reconnect
+    {
+        Reconnect_Call = callMessage.Reconnect_Call,
+        Reconnect_Return = returnMessage.Reconnect_Return,
+    };
+}
+
+any message ContructHCardAndDispositionOperation(any message c, any message r)
+{
+    RdpescContract.HCardAndDisposition_Call callMessage = c as RdpescContract.HCardAndDisposition_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.HCardAndDisposition
+    {
+        HCardAndDisposition_Call = callMessage.HCardAndDisposition_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructStateOperation(any message c, any message r)
+{
+    RdpescContract.State_Call callMessage = c as RdpescContract.State_Call;
+    RdpescContract.State_Return returnMessage = r as RdpescContract.State_Return;
+
+    return new RdpescContract.State
+    {
+        State_Call = callMessage.State_Call,
+        State_Return = returnMessage.State_Return,
+    };
+}
+
+any message ContructStatusOperation(any message c, any message r)
+{
+    RdpescContract.Status_Call callMessage = c as RdpescContract.Status_Call;
+    RdpescContract.Status_Return returnMessage = r as RdpescContract.Status_Return;
+
+    return new RdpescContract.Status
+    {
+        Status_Call = callMessage.Status_Call,
+        Status_Return = returnMessage.Status_Return_Type,
+    };
+}
+
+any message ContructTransmitOperation(any message c, any message r)
+{
+    RdpescContract.Transmit_Call callMessage = c as RdpescContract.Transmit_Call;
+    RdpescContract.Transmit_Return returnMessage = r as RdpescContract.Transmit_Return;
+
+    return new RdpescContract.Transmit
+    {
+        Transmit_Call = callMessage.Transmit_Call,
+        Transmit_Return = returnMessage.Transmit_Return,
+    };
+}
+
+any message ContructControlOperation(any message c, any message r)
+{
+    RdpescContract.Control_Call callMessage = c as RdpescContract.Control_Call;
+    RdpescContract.Control_Return returnMessage = r as RdpescContract.Control_Return;
+
+    return new RdpescContract.Control
+    {
+        Control_Call = callMessage.Control_Call,
+        Control_Return = returnMessage.Control_Return,
+    };
+}
+
+any message ContructGetAttribOperation(any message c, any message r)
+{
+    RdpescContract.GetAttrib_Call callMessage = c as RdpescContract.GetAttrib_Call;
+    RdpescContract.GetAttrib_Return returnMessage = r as RdpescContract.GetAttrib_Return;
+
+    return new RdpescContract.GetAttrib
+    {
+        GetAttrib_Call = callMessage.GetAttrib_Call,
+        GetAttrib_Return = returnMessage.GetAttrib_Return,
+    };
+}
+
+any message ContructSetAttribOperation(any message c, any message r)
+{
+    RdpescContract.SetAttrib_Call callMessage = c as RdpescContract.SetAttrib_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.SetAttrib
+    {
+        SetAttrib_Call = callMessage.SetAttrib_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructScardAccessStartedEventOperation(any message c, any message r)
+{
+    RdpescContract.ScardAccessStartedEvent_Call callMessage = c as RdpescContract.ScardAccessStartedEvent_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.ScardAccessStartedEvent
+    {
+        Unused = callMessage.Unused,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructLocateCardsByATRAOperation(any message c, any message r)
+{
+    RdpescContract.LocateCardsByATRA_Call callMessage = c as RdpescContract.LocateCardsByATRA_Call;
+    RdpescContract.LocateCards_Return returnMessage = r as RdpescContract.LocateCards_Return;
+
+    return new RdpescContract.LocateCardsByATRA
+    {
+        LocateCardsByATRA_Call = callMessage.LocateCardsByATRA_Call,
+        LocateCards_Return  = returnMessage.LocateCards_Return,
+    };
+}
+
+any message ContructLocateCardsByATRWOperation(any message c, any message r)
+{
+    RdpescContract.LocateCardsByATRW_Call callMessage = c as RdpescContract.LocateCardsByATRW_Call;
+    RdpescContract.LocateCards_Return returnMessage = r as RdpescContract.LocateCards_Return;
+
+    return new RdpescContract.LocateCardsByATRW
+    {
+        LocateCardsByATRW_Call = callMessage.LocateCardsByATRW_Call,
+        LocateCards_Return = returnMessage.LocateCards_Return,
+    };
+}
+
+any message ContructReadCacheAOperation(any message c, any message r)
+{
+    RdpescContract.ReadCacheA_Call callMessage = c as RdpescContract.ReadCacheA_Call;
+    RdpescContract.ReadCache_Return returnMessage = r as RdpescContract.ReadCache_Return;
+
+    return new RdpescContract.ReadCacheA
+    {
+        ReadCacheA_Call = callMessage.ReadCacheA_Call,
+        ReadCache_Return = returnMessage.ReadCache_Return,
+    };
+}
+
+any message ContructReadCacheWOperation(any message c, any message r)
+{
+    RdpescContract.ReadCacheW_Call callMessage = c as RdpescContract.ReadCacheW_Call;
+    RdpescContract.ReadCache_Return returnMessage = r as RdpescContract.ReadCache_Return;
+
+    return new RdpescContract.ReadCacheW
+    {
+        ReadCacheW_Call = callMessage.ReadCacheW_Call,
+        ReadCache_Return = returnMessage.ReadCache_Return,
+    };
+}
+
+any message ContructWriteCacheAOperation(any message c, any message r)
+{
+    RdpescContract.WriteCacheA_Call callMessage = c as RdpescContract.WriteCacheA_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.WriteCacheA
+    {
+        WriteCacheA_Call = callMessage.WriteCacheA_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructWriteCacheWOperation(any message c, any message r)
+{
+    RdpescContract.WriteCacheW_Call callMessage = c as RdpescContract.WriteCacheW_Call;
+    RdpescContract.Long_Return returnMessage = r as RdpescContract.Long_Return;
+
+    return new RdpescContract.WriteCacheW
+    {
+        WriteCacheW_Call = callMessage.WriteCacheW_Call,
+        Long_Return = returnMessage.Long_Return,
+    };
+}
+
+any message ContructGetTransmitCountOperation(any message c, any message r)
+{
+    RdpescContract.GetTransmitCount_Call callMessage = c as RdpescContract.GetTransmitCount_Call;
+    RdpescContract.GetTransmitCount_Return returnMessage = r as RdpescContract.GetTransmitCount_Return;
+
+    return new RdpescContract.GetTransmitCount
+    {
+        GetTransmitCount_Call = callMessage.GetTransmitCount_Call,
+        GetTransmitCount_Return = returnMessage.GetTransmitCount_Return,
+    };
+}
+
+any message ContructGetReaderIconOperation(any message c, any message r)
+{
+    RdpescContract.GetReaderIcon_Call callMessage = c as RdpescContract.GetReaderIcon_Call;
+    RdpescContract.GetReaderIcon_Return returnMessage = r as RdpescContract.GetReaderIcon_Return;
+
+    return new RdpescContract.GetReaderIcon
+    {
+        GetReaderIcon_Call = callMessage.GetReaderIcon_Call,
+        GetReaderIcon_Return = returnMessage.GetReaderIcon_Return,
+    };
+}
+
+any message ContructGetDeviceTypeIdOperation(any message c, any message r)
+{
+    RdpescContract.GetDeviceTypeId_Call callMessage = c as RdpescContract.GetDeviceTypeId_Call;
+    RdpescContract.GetDeviceTypeId_Return returnMessage = r as RdpescContract.GetDeviceTypeId_Return;
+
+    return new RdpescContract.GetDeviceTypeId
+    {
+        GetDeviceTypeId_Call = callMessage.GetDeviceTypeId_Call,
+        GetDeviceTypeId_Return = returnMessage.GetDeviceTypeId_Return,
+    };
+}
+
+string StringBufferCountToText(any v)
+{
+    if (v is count:IDLUlong && count == 0xFFFFFFFF)
+    {
+        return "SCARD_AUTOALLOCATE";
+    }
+
+    return v.ToString();
+}
+
+// Multistring: A series of null-terminated character strings terminated by a final null character stored in a contiguous block of memory
+array<string> DecodeMultistring(stream s, bool isUnicode)
+{
+    array<string> ret = [];
+    while (isUnicode ? s.RemainingByteLength() >= 2 && !s.PeekByteCompare(s.BitPosition, [0x00, 0x00])
+        : s.RemainingByteLength() >= 1 && s.CurrentByte() != 0x00)
+    {
+        if (BinaryStringDecoder(s, isUnicode ? TextEncoding.Unicode : TextEncoding.ASCII) is str:string)
+        {
+            ret += [str];
+        }
+        else
+        {
+            return ret;
+        }
+    }
+
+    return ret;
+}
+

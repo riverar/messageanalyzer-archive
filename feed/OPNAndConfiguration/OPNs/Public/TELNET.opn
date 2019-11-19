@@ -1,0 +1,1396 @@
+protocol TELNET with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Telnet",
+    ShortName = "TELNET",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 854"},
+            new Reference{Name = "RFC 859"},
+            new Reference{Name = "RFC 726"},
+            new Reference{Name = "RFC 652"},
+            new Reference{Name = "RFC 653"},
+            new Reference{Name = "RFC 654"},
+            new Reference{Name = "RFC 655"},
+            new Reference{Name = "RFC 656"},
+            new Reference{Name = "RFC 657"},
+            new Reference{Name = "RFC 658"},
+            new Reference{Name = "RFC 5198"},
+            new Reference{Name = "RFC 735"},
+            new Reference{Name = "RFC 732"},
+            new Reference{Name = "RFC 749"},
+            new Reference{Name = "RFC 1091"},
+            new Reference{Name = "RFC 927"},
+            new Reference{Name = "RFC 946"},
+            new Reference{Name = "RFC 1041"},
+            new Reference{Name = "RFC 1053"},
+            new Reference{Name = "RFC 1073"},
+            new Reference{Name = "RFC 1372"},
+            new Reference{Name = "RFC 1184"},
+            new Reference{Name = "RFC 1096"},
+            new Reference{Name = "RFC 2941"},
+            new Reference{Name = "RFC 2946"},
+            new Reference{Name = "RFC 1572"},
+            new Reference{Name = "RFC 2355"},
+            new Reference{Name = "RFC 2066"},
+            new Reference{Name = "RFC 2217"},
+            new Reference{Name = "RFC 2840"},
+            new Reference{Name = "RFC 861"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "380827", Date = "09/22/2015"}
+        ]
+};
+
+using Utility;
+using IANA;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using NLMP;
+
+annotation bool TELNET.Message#IsRequest;
+annotation ushort TELNET.Message#SrcPort;
+annotation ushort TELNET.Message#DstPort;
+annotation string TELNET.Message#TerminalType;
+
+endpoint Server 
+    over TELNET.ReassemblyServer | over TCP.Server
+    accepts TELNET.Message issues TELNET.Message;
+
+client endpoint Client connected to Server;
+
+// For SOCKS.opn to relay TELNET messages
+endpoint ReassemblyServer over TCP.Server
+    accepts TCP.Segment issues TCP.Segment
+{
+    TelnetDecodingHelper telnetDecodingHelper;
+    
+    process this accepts s:TCP.Segment where s.DestinationPort == Port.TELNET
+    {
+        if (telnetDecodingHelper == null)
+        {
+            telnetDecodingHelper = new TelnetDecodingHelper();
+            telnetDecodingHelper.InitializeTelnetDecodingHelper(this, s.SourcePort);
+        }
+        telnetDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process this issues s:TCP.Segment where s.SourcePort == Port.TELNET
+    {
+        if (telnetDecodingHelper == null)
+        {
+            telnetDecodingHelper = new TelnetDecodingHelper();
+            telnetDecodingHelper.InitializeTelnetDecodingHelper(this, s.DestinationPort);
+        }
+        telnetDecodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(ReassemblyServer server)
+    {
+        if (telnetDecodingHelper != null)
+        {
+            telnetDecodingHelper.ClearInDestructor();
+        }
+    }
+}
+
+// For TELNET to decode TELNET message from TCP segments
+autostart actor TELNETOverTCP(TCP.Server server)
+{
+    TelnetDecodingHelper telnetDecodingHelper;
+    
+    process server accepts s:TCP.Segment where s.DestinationPort == Port.TELNET
+    {
+        if (telnetDecodingHelper == null)
+        {
+            telnetDecodingHelper = new TelnetDecodingHelper();
+            telnetDecodingHelper.InitializeTelnetDecodingHelper(server, s.SourcePort);
+        }
+        telnetDecodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment where s.SourcePort == Port.TELNET
+    {
+        if (telnetDecodingHelper == null)
+        {
+            telnetDecodingHelper = new TelnetDecodingHelper();
+            telnetDecodingHelper.InitializeTelnetDecodingHelper(server, s.DestinationPort);
+        }
+        telnetDecodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+    
+    ~endpoint(TCP.Server server)
+    {
+        if (telnetDecodingHelper != null)
+        {
+            telnetDecodingHelper.ClearInDestructor();
+        }
+    }
+}
+
+message Message
+{
+    optional [|stream.RemainingByteLength() >= 2 && stream.CurrentByte == 0xFF|] TelCmd TelCmd;
+    optional [|stream.RemainingByteLength() > 0|] (binary | string) TelnetData with
+        Encoding{Decoder = TelnetDataDecoder, SourcePattern = TypeOf<binary>()};
+    
+    override string ToString()
+    {
+        string strSummary = "";
+        
+        if (this#IsRequest != nothing && this#IsRequest as bool)
+        {
+            strSummary = "To Server, SrcPort:" + Utility.DecToHexFormat(this#SrcPort as ushort);
+            // Bug#30229, Incorrect C# code  generated when compair ushort-type annotation with nothing.
+        }
+        else if (this#IsRequest != nothing && !(this#IsRequest as bool))
+        {
+            strSummary = "To Client, DstPort: " + Utility.DecToHexFormat(this#DstPort as ushort);
+        }
+        if (this#TerminalType != nothing)
+        {
+            strSummary += (", TerminalType: " + (this#TerminalType as string));
+        }
+        
+        return strSummary;
+    }
+    
+    // Besides decode the Telnet Data, it also assign annotation and embedded information
+    optional (binary | string) TelnetDataDecoder(binary data)
+    {
+        // if it is string, assign the value as string.
+        if (LiteralString(data) is str:string)
+        {
+            return str;
+        }
+        
+        return data;
+    }
+}
+
+type TelCmd
+{
+    array<TelnetCommand> TelCmds;
+    optional [|stream.RemainingByteLength() >= 2 && stream.PeekUShort(stream.BitPosition, Endian.Big) == 0xFFF0|] ushort EndCommand;
+}
+
+type TelnetCommand
+{
+    byte IACEscapeCharacter where value == 0xFF;
+    TelnetCommandEnum Command where value != 0xF0 && ValidationCheckEnumValueTooManyItems(InRange<TelnetCommandEnum>(value), null, true, ReferenceType.Message,
+        "TELNET", "Command", "TelnetCommand", "Command", "TELNET");
+    optional [|Command in {251, 252, 253, 254}|] byte OptionCode;
+    optional [|Command == TelnetCommandEnum.SB|] Options Option;
+}
+
+pattern TelnetCommandEnum = enum byte
+{
+    EOF = 236,
+    SUSP  = 237,
+    ABORT = 238,
+    EOR = 239,
+    SE = 240,
+    NOP = 241,
+    DM = 242,
+    BRK = 243,
+    IP = 244,
+    AO = 245,
+    AYT = 246,
+    EC = 247,
+    EL = 248,
+    GA = 249,
+    SB = 250,
+    WILL = 251,
+    WONT = 252,
+    DO = 253,
+    DONT = 254,
+    IAC = 255,
+    ...
+};
+
+syntax LiteralString = s:regex{[\x00-\x7F]*} => s with StreamEncoding{Encoding = TextEncoding.ASCII};
+
+type UShort
+{
+    ushort Value;
+}
+
+pattern Options =
+    [|stream.RemainingByteLength() >= 1|]
+    ([|stream.CurrentByte == 5|] SBStatusOption              |           // 5
+    [|stream.CurrentByte == 7|] SBRCTEOption                 |           // 7
+    [|stream.CurrentByte == 10|] SBNAOCRDOption              |           // 10
+    [|stream.CurrentByte == 11|] SBNAOHTSOption              |           // 11 
+    [|stream.CurrentByte == 12|] SBNAOHTDOption              |           // 12
+    [|stream.CurrentByte == 13|] SBNAOFFDOption              |           // 13
+    [|stream.CurrentByte == 14|] SBNAOVTSOption              |           // 14
+    [|stream.CurrentByte == 15|] SBNAOVTDOption              |           // 15
+    [|stream.CurrentByte == 16|] SBNAOLFDOption              |           // 16
+    [|stream.CurrentByte == 17|] SBEXTASCOption              |           // 17
+    [|stream.CurrentByte == 19|] SBBMOption                  |           // 19
+    [|stream.CurrentByte == 20|] SBDETOption                 |           // 20
+    [|stream.CurrentByte == 22|] SBSUPDUPOUTPUTOption        |           // 22
+    [|stream.CurrentByte == 23|] SBSendLocationOption        |           // 23
+    [|stream.CurrentByte == 24|] SBTerminalTypeOption        |           // 24
+    [|stream.CurrentByte == 26|] SBTUIDOption                |           // 26
+    [|stream.CurrentByte == 27|] SBOUTMRKOption              |           // 27
+    [|stream.CurrentByte == 28|] SBTTYLOCOption              |           // 28
+    [|stream.CurrentByte == 29|] SBRegimeOption              |           // 29
+    [|stream.CurrentByte == 30|] SBX3PADOption               |           // 30
+    [|stream.CurrentByte == 31|] SBNAWSOption                |           // 31
+    [|stream.CurrentByte == 32|] SBTerminalSpeedOption       |           // 32
+    [|stream.CurrentByte == 33|] SBToggleFlowControlOption   |           // 33
+    [|stream.CurrentByte == 34|] SBLINEMODEOption            |           // 34
+    [|stream.CurrentByte == 35|] SBXDisplayLocationOption    |           // 35
+    [|stream.CurrentByte == 36|] SBEnvironmentOption         |           // 36
+    [|stream.CurrentByte == 37|] SBAuthenticationOption      |           // 37
+    [|stream.CurrentByte == 38|] SBEncryptOption             |           // 38
+    [|stream.CurrentByte == 39|] SBNewEvironmentOption       |           // 39
+    [|stream.CurrentByte == 40|] SBTN3270EOption             |           // 40
+    [|stream.CurrentByte == 42|] SBCharestRequestOption      |           // 42
+    [|stream.CurrentByte == 44|] SBCOMPORTOption             |           // 44
+    [|stream.CurrentByte == 47|] SBKERMITOption              |           // 47
+    [|stream.CurrentByte == 255|] SBEXOPLOption);                        // 255
+
+// rfc 859   5
+// IAC SB STATUS SEND IAC SE
+// IAC SB STATUS IS ... IAC SE
+type SBStatusOption
+{
+    byte OptionCode;    // 5
+    byte CurrentStatus;
+    optional [|CurrentStatus == 0|] array<Options> Data;
+}
+
+// rfc 726   7
+// IAC SB RCTE <cmd> [BC1 BC2] [TC1 TC2] IAC SE
+type SBRCTEOption
+{
+    byte OptionCode;
+    byte Command;
+    optional ([|Command == 8|] BreakClass
+    | [|Command == 16|] TransmissionClass
+    | [|Command == 24|] BreakAndTransmissionClass) Class;
+}
+
+type BreakClass
+{
+    byte BC1;
+    byte BC2;
+}
+
+type TransmissionClass
+{
+    byte TC1;
+    byte TC2;
+}
+
+type BreakAndTransmissionClass
+{
+    byte BC1;
+    byte BC2;
+    byte TC1;
+    byte TC2;
+}
+
+// rfc 652   10
+// IAC SB NAOCRD DS <8-bit value> IAC SE
+type SBNAOCRDOption
+{
+    byte OptionCode;
+    byte DataStatus;
+    byte Value;
+}
+
+// rfc 653   11
+// IAC SB NAOHTS DS <8-bit value> ... <8-bit value> IAC SE
+// IAC SB NAOHTS DR <8-bit value> ... <8-bit value> IAC SE
+type SBNAOHTSOption
+{
+    byte OptionCode;
+    byte DataStatus;
+    array<SingleByte> Value;
+}
+
+pattern SingleByte = byte where value > 0 && value < 251;
+
+// rfc 654   12
+// IAC SB NAOHTD DS <8-bit value> IAC SE
+// IAC SB NAOHTD DR <8-bit value> IAC SE
+type SBNAOHTDOption
+{
+    byte OptionCode;
+    byte DataStatus;
+    byte Value;
+}
+
+// rfc 655   13
+// IAC SB NAOFFD DS <8-bit value> IAC SE
+// IAC SB NAOFFD DR <8-bit value> IAC SE
+type SBNAOFFDOption
+{
+    byte OptionCode;
+    byte DataStatus;
+    byte Value;
+}
+
+//rfc 656   14
+//IAC SB NAOVTS DS <8-bit value> ... <8-bit value> IAC SE
+//IAC SB NAOVTS DR <8-bit value> ... <8-bit value> IAC SE
+type  SBNAOVTSOption
+{
+    byte OptionCode;
+    byte Status;
+    array<SingleByte> Value;
+}
+
+//rfc 657   15
+//IAC SB NAOVTD DS <8-bit value> IAC SE
+//IAC SB NAOVTD DR <8-bit value> IAC SE
+type SBNAOVTDOption
+{
+    byte OptionCode;
+    byte Status;
+    byte Value;
+}
+
+// rfc 658   16
+// IAC SB NAOLFD DS <8-bit value> IAC SE
+// IAC SB NAOLFD DR <8-bit value> IAC SE
+type SBNAOLFDOption
+{
+    byte OptionCode;
+    byte Status;
+    byte Value;
+}
+
+// rfc 5198   17
+/* IAC SB EXTASC
+ * <high order bits (bits 15-8)><low order bits (bits 7-0)> IAC SE
+ */
+type SBEXTASCOption
+{
+    byte OptionCode;
+    byte HighBitsValue;
+    byte LowBitsValue;
+}
+
+// rfc 735   19
+/*
+IAC SB BM <DEFINE> <macro UINT8> <count>
+    <replacement string> IAC SE
+IAC SB BM <ACCEPT> <macro UINT8> IAC SE
+IAC SB BM <REFUSE> <macro UINT8> <REASON> IAC SE
+IAC SB BM <LITERAL> <macro UINT8> IAC SE
+IAC SB BM <PLEASE CANCEL> <macro UINT8> <REASON> IAC SE
+*/
+type SBBMOption
+{
+    byte OptionCode;
+    byte DataStatus;
+    optional ([|DataStatus == 1|] Define 
+    | [|DataStatus in {2, 4}|] Literal
+    | [|DataStatus in {3, 5}|] PleaseCancel) Value;
+}
+
+type Define
+{
+    byte Macro;
+    byte Count;
+    string ReplacementStr with BinaryEncoding{Length = Count};
+}
+
+type Literal
+{
+    byte Macro;
+}
+
+type PleaseCancel
+{
+    byte Macro;
+    byte Reason;
+}
+
+// rfc 732   20
+type SBDETOption
+{
+    byte OptionCode;
+    byte SubCode;
+    ([|SubCode == 1|] EditFacilityMap                   |
+     [|SubCode == 2|] EraseFacilityMap                  |
+     [|SubCode == 3|] TransmitFacilityMap               |
+     [|SubCode == 4|] FormatFacilityMap                 |
+     [|SubCode in {5, 18, 28, 45}|] Cursor              |
+     [|SubCode == 6|] LineNumber                        |
+     [|SubCode == 7|] XPosition                         |
+     [|SubCode == 36|] FormatData                       |
+     [|SubCode == 37|] Repeat                           |
+     [|SubCode == 38|] Negotiation                      |
+     [|SubCode == 40|] Code                             |
+     [|SubCode == 41|] Error                            |
+     // [|SubCode == 44|] Data                           | // rfc 1044
+     array<SingleByte>) Value;
+}
+
+type EditFacilityMap
+{
+    byte Reserved with BinaryEncoding{Width = 1};
+    bool ToroidalCursorAddressing with BinaryEncoding{Width = 1};
+    bool IncrementalCursorAddressing with BinaryEncoding{Width = 1};
+    bool ReadCursorAddress with BinaryEncoding{Width = 1};
+    bool LineInsertDelete with BinaryEncoding{Width = 1};
+    bool CharInsertDelete with BinaryEncoding{Width = 1};
+    bool BackTab with BinaryEncoding{Width = 1};
+    bool PositiveAddressionOnly with BinaryEncoding{Width = 1};
+}
+
+type EraseFacilityMap 
+{
+    byte Reserved with BinaryEncoding{Width = 3};
+    bool RraseField with BinaryEncoding{Width = 1};
+    bool RreaseFeild with BinaryEncoding{Width = 1};
+    bool EreaseResetOfScreen with BinaryEncoding{Width = 1};
+    bool EraseRestOfLine with BinaryEncoding{Width = 1};
+    bool EraseRestOfField with BinaryEncoding{Width = 1};
+}
+
+type TransmitFacilityMap
+{
+    byte Reserved with BinaryEncoding{Width = 2};
+    bool DateTransmit with BinaryEncoding{Width = 1};
+    bool TransmitLine with BinaryEncoding{Width = 1};
+    bool TransmitField with BinaryEncoding{Width = 1};
+    bool TransmitResetOfScreen with BinaryEncoding{Width = 1};
+    bool TransmitResetOfLine with BinaryEncoding{Width = 1};
+    bool TransmitRestOfField with BinaryEncoding{Width = 1};
+}
+
+type FormatFacilityMap
+{
+    byte Reserved with BinaryEncoding{Width = 1};
+    bool ProtectionOnOff with BinaryEncoding{Width = 1};
+    bool Protection with BinaryEncoding{Width = 1};
+    bool AlphabeticOnlyProtection with BinaryEncoding{Width = 1};
+    bool NumericOnlyProtection with BinaryEncoding{Width = 1};
+    byte Intensity with BinaryEncoding{Width = 3};
+    
+    bool FN with BinaryEncoding{Width = 1};
+    bool Modified with BinaryEncoding{Width = 1};
+    bool LigthPen with BinaryEncoding{Width = 1};
+    bool Repeat with BinaryEncoding{Width =1};
+    bool Blinking with BinaryEncoding{Width = 1};
+    bool ReverseVideo with BinaryEncoding{Width = 1};
+    bool RightJustification with BinaryEncoding{Width = 1};
+    bool OverStrike with BinaryEncoding{Width = 1};
+}
+
+type Cursor
+{
+    byte XPos;
+    byte YPos;
+}
+
+type LineNumber
+{
+    byte LineNum;
+}
+
+type XPosition
+{
+    byte XPos;
+}
+
+type FormatData
+{
+    FormatMap FormatMap;
+    ushort Count;
+}
+
+type FormatMap
+{
+    byte Reserved with BinaryEncoding{Width = 6};
+    bool Modified with BinaryEncoding{Width = 1};
+    bool Selectabel with BinaryEncoding{Width = 1};
+    bool Blinking with BinaryEncoding{Width = 1};
+    bool ReverseVideo with BinaryEncoding{Width = 1};
+    bool Justification with BinaryEncoding{Width = 1};
+    byte Protection with BinaryEncoding{Width = 2};
+    byte Intensity with BinaryEncoding{Width = 3};
+}
+
+type Repeat
+{
+    byte Count;
+    string Character with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 1};
+}
+
+type Negotiation
+{
+    byte Negotiation;
+}
+
+type Code
+{
+    byte Code;
+}
+
+type Error
+{
+    byte Command;
+    byte ErrorCode;
+}
+
+// rfc 749   22
+/*
+IAC SB SUPDUP-OUTPUT 1 byte1 byte2 ... byten IAC SE
+IAC SB SUPDUP-OUTPUT 2 N TD1 TD2 TD3 ... TDn SCx SCy IAC SE
+*/
+type SBSUPDUPOUTPUTOption
+{
+    byte OptionCode;
+    byte SubCode;
+    ([|SubCode == 2|] SubCode2 | SubCode1) Value;
+}
+
+type SubCode1
+{
+    array<SingleByte> Data;
+}
+
+type SubCode2
+{
+    byte Count;
+    string TD with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = Count};
+    byte ScreenX;
+    byte ScreenY;
+}
+
+// rfc 779   23
+/*
+IAC SB SEND-LOCATION <location> IAC SE
+*/
+type SBSendLocationOption
+{
+    byte OptionCode;
+    array<SingleByte> Location;
+}
+
+// rfc 1091  24
+/*
+IAC SB TERMINAL-TYPE SEND IAC SE
+IAC SB TERMINAL-TYPE IS ... IAC SE
+*/
+type SBTerminalTypeOption
+{
+    byte OptionCode;
+    byte SubCode;
+    optional [|SubCode == 0|] Terminal Value;
+}
+
+type Terminal
+{
+    array<SingleByte> Data;
+}
+
+// rfc 927   26
+/*
+IAC SB TUID <uuid> IAC SE
+*/
+type SBTUIDOption
+{
+    byte OptionCode;
+    uint UUID;
+}
+
+// rfc 933   27
+/*
+IAC SB OUTMRK CNTL data IAC SE
+IAC SB OUTMRK ACK IAC SE
+IAC SB OUTMRK NAK IAC SE
+*/
+type SBOUTMRKOption
+{
+    byte OptionCode;
+    ([|stream.RemainingByteLength() >= 1|]
+        ([|stream.CurrentByte == 6|] ACK |
+        [|stream.CurrentByte == 21|] NAKType |
+        CNTLData)) Value;
+}
+
+type ACK
+{
+    byte ACKValue;
+}
+
+type NAKType
+{
+    byte NAKValue;
+}
+
+type CNTLData
+{
+    array<CNTLType> CNTL;
+}
+
+type CNTLType
+{
+    (byte where value != 255) CNTL;
+    BannerType Banner;
+}
+
+type BannerType
+{
+    array<ByteExclude1D> Banner;
+    optional (byte where value == 29) GroupSeparetor;
+}
+
+type ByteExclude1D 
+{
+    (byte where value != 29 && value != 255) Byte;
+}
+
+// rfc 946   28
+/*
+IAC SB TTYLOC <format> <TTYLOC number with IAC doubling> IAC SE
+*/
+type SBTTYLOCOption
+{
+    byte OptionCode;
+    byte Format;
+    optional [|Format == 0|] FormatType FormatValue;
+}
+
+type FormatType
+{
+    uint HostNumber;
+    IPv4Address HostAddress;
+}
+
+// rfc 1041  29
+/*
+IAC SB 3270-REGIME ARE REGIME-LIST IAC SE
+IAC SB 3270-REGIME IS REGIME IAC SE
+*/
+type SBRegimeOption
+{
+    byte OptionCode;
+    byte Subcode where ValidationCheck(value in {0, 1}, null, "TELNET: The SubCode in type SBRegimeOption should be zero or 1.");
+}
+
+type SubCodeIs
+{
+    array<ByteExcludeFF> Data;
+}
+
+type ByteExcludeFF
+{
+    (byte where value != 255) Value;
+}
+
+type SubCodeAre
+{
+    array<ByteExcludeFF20> Reginme;
+    optional (byte where value == 32) Space;
+}
+
+type ByteExcludeFF20
+{
+    (byte where value != 255 && value != 32) Byte;
+}
+
+// rfc 1053  30
+/*
+Optioncode = 30
+    IAC SB  X.3-PAD  SET           <param1> <value1> ...  IAC SE
+    IAC SB  X.3-PAD  RESPONSE-SET  <param1> <value1> ...  IAC SE
+    IAC SB  X.3-PAD  SEND          IAC SE
+    IAC SB  X.3-PAD  IS            <param1> <value1> ...  IAC SE
+    IAC SB  X.3-PAD  RESPONSE-IS   <param1> <value1> ...  IAC SE
+*/
+type SBX3PADOption
+{
+    byte OptionCode;
+    byte SubCode;
+    array<SBX3PADType> Value;
+}
+
+type SBX3PADType
+{
+    byte Parameter where value != 255;
+    byte Value where value != 240;
+}
+
+// rfc 1073  31
+/*
+IAC SB NAWS <16-bit value> <16-bit value> IAC SE
+*/
+type SBNAWSOption
+{
+    byte OptionCode;
+    ushort Width;
+    ushort Height;
+}
+
+// rfc 1079  32
+/*
+IAC SB TERMINAL-SPEED SEND IAC SE
+IAC SB TERMINAL-SPEED IS ... IAC SE
+*/
+type SBTerminalSpeedOption
+{
+    byte OptionCode;
+    byte SubCode where ValidationCheck(value in {0, 1}, null, "TELNET: The SubCode in type SBTerminalSpeedOption should be zero or 1.");
+    array<SubCodeIs> Value;
+}
+
+// rfc 1372  33
+/*
+IAC SB TOGGLE-FLOW-CONTROL OFF IAC SE
+IAC SB TOGGLE-FLOW-CONTROL ON IAC SE
+IAC SB TOGGLE-FLOW-CONTROL RESTART-ANY IAC SE
+IAC SB TOGGLE-FLOW-CONTROL RESTART-XON IAC SE
+*/
+type SBToggleFlowControlOption
+{
+    byte OptionCode;
+    byte SubCode;
+}
+
+// rfc 1184  34
+/*
+IAC SB LINEMODE MODE mask IAC SE
+IAC SB LINEMODE DO FORWARDMASK mask0 mask1 ... mask31 IAC SE
+IAC SB LINEMODE DONT FORWARDMASK IAC SE
+IAC SB LINEMODE WILL FORWARDMASK IAC SE
+IAC SB LINEMODE WONT FORWARDMASK IAC SE
+IAC SB LINEMODE SLC <list of octet triplets> IAC SE
+Optioncode = 34
+*/
+type SBLINEMODEOption
+{
+    byte OptionCode;
+    ([|stream.RemainingByteLength() >= 1|]
+        ([|stream.CurrentByte == 1|] OptionMode |
+        [|stream.CurrentByte == 3|] OptionSlc |
+        OptionForwordMask)) Data;
+}
+
+type OptionMode
+{
+    byte SubCode;
+    byte Mask;
+}
+
+type OptionSlc
+{
+    byte SubCode;
+    array<Triplet> Triplets;
+}
+
+type Triplet
+{
+    (byte where value != 255) Func;
+    byte Ack with BinaryEncoding{Width = 1};
+    byte FlushIn with BinaryEncoding{Width = 1};
+    byte FlushOut with BinaryEncoding{Width = 1};
+    byte Bits with BinaryEncoding{Width = 5};
+    byte Value;
+}
+
+type OptionForwordMask
+{
+    byte Command;
+    byte SubCode;
+    array<ByteExcludeFD> Mask;
+}
+
+pattern ByteExcludeFD = byte where value != 253;
+
+// rfc 1096  35
+/*
+IAC SB X-DISPLAY-LOCATION SEND IAC SE
+IAC SB X-DISPLAY-LOCATION IS ... IAC SE
+*/
+type SBXDisplayLocationOption
+{
+    byte OptionCode;
+    byte SubCode where ValidationCheck(value in {0, 1}, null, "TELNET: The SubCode in type SBXDisplayLocationOption should be zero or 1.");
+    optional [|SubCode == 0|] array<ByteExcludeFF> XDisplayLocation;
+}
+
+// rfc 1408  36
+/*
+IAC SB ENVIRON SEND [ type ... [ type ... [ ... ] ] ] IAC SE
+IAC SB ENVIRON IS type ... [ VALUE ... ] [ type ... [ VALUE ... ] [
+IAC SB ENVIRON INFO type ... [ VALUE ... ] [ type ... [ VALUE ... ] [
+//#? there maybe errors in this option. please take notice of it.
+*/
+type SBEnvironmentOption
+{
+    byte OptionCode;
+    byte SubCode;
+    array<SBXDISPLAYLOCATION> Data;
+}
+
+type SBXDISPLAYLOCATION
+{
+    byte TypeOrValue where value != 255;
+    array<ByteExcludeFF> Value; // Future Reference: To be revisited.
+}
+
+// rfc 2941   37
+/*
+IAC SB AUTHENTICATION SEND authentication-type-pair-list IAC SE
+IAC SB AUTHENTICATION IS authentication-type-pair <auth data> IAC SE
+IAC SB AUTHENTICATION REPLY authentication-type-pair <auth data> IAC SE
+IAC SB AUTHENTICATION NAME remote-user IAC SE
+*/
+type SBAuthenticationOption
+{
+    byte OptionCode;
+    byte SubCode;
+    ([|SubCode in {0, 2}|] AuthenTypePair |
+        [|SubCode == 1|] IsAuthenTypePair |
+        [|SubCode == 3|] Name) Data;
+}
+
+type AuthenTypePair     // 0, 2
+{
+    byte AuthType;
+    bool AuthWhoMask with BinaryEncoding{Width = 1};
+    bool AuthHowMask with BinaryEncoding{Width = 1};
+    bool EncryptMask1 with BinaryEncoding{Width = 1};
+    bool IniCredFwdMask with BinaryEncoding{Width = 1};
+    bool EncryptMask2 with BinaryEncoding{Width = 1};
+    byte Unused where ValidationCheck(value == 0, null, "TELNET: The Reserved in type AuthenTypePair must be zero.") with BinaryEncoding{Width = 3};
+    
+    ([|AuthType == 1|] SubCommandKERBEROSV4Type     |
+        [|AuthType == 2|] SubCommandKERBEROSV5Type      |
+        [|AuthType == 5|]SubCommandSRPType              |
+        [|AuthType in {12, 13, 14}|] byte               |
+        [|AuthType == 15|] NTLMType                     |
+        array<ByteExcludeFF>) AuthData;
+}
+
+type NTLMType    // 15
+{
+    byte NTLMCommandCode;
+    optional [|NTLMCommandCode in {0, 1, 2}|] NTLMSizeAndType NTLMValue;
+} 
+
+type NTLMSizeAndType
+{
+    uint NTLMDataSize;
+    uint NTLMBufferType;
+    (NlmpMessage | binary) NTLMData with BinaryEncoding{Length = NTLMDataSize},
+        Encoding{Decoder = NlmpDataDecoder, SourcePattern = TypeOf<binary>()};
+    array<ByteExcludeFF> PadData;
+    
+    optional (NlmpMessage | binary) NlmpDataDecoder(binary data)
+    {
+        if (NlmpDecoder(data) is nlmpMessage:NlmpMessage)
+        {
+            return nlmpMessage;
+        }
+        return data;
+    }
+} with BinaryEncodingDefaults{Endian = Endian.Little};
+
+// RFC 1411
+type SubCommandKERBEROSV4Type
+{
+    byte SubCommandKERBEROSV4;
+    optional [|SubCommandKERBEROSV4 == 1|] string RejectReason with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional [|SubCommandKERBEROSV4 in {3, 4}|] Blob[8] Value;
+}
+
+// RFC 2942
+type SubCommandKERBEROSV5Type
+{
+    byte SubCommandKERBEROSV5;
+    // Future Reference: ASN coding
+}
+
+// RFC 2944
+type SubCommandSRPType
+{
+    byte SubCommandSRP;
+    optional [|SubCommandSRP == 1|] string RejectReason with BinaryEncoding{TextEncoding = TextEncoding.ASCII};
+    optional [|SubCommandSRP == 4|] binary ResponseData with BinaryEncoding{Length = 20};
+    optional [|SubCommandSRP == 8|] array<ByteExcludeFF> Residues;
+    optional [|SubCommandSRP == 9|] ParamsCommandType Params;
+}
+
+type ParamsCommandType
+{
+    ushort ModulusLength;
+    binary Modules with BinaryEncoding{Length = ModulusLength};
+    ushort GeneratorLength;
+    binary Generator with BinaryEncoding{Length = GeneratorLength};
+    ushort SaltLength;
+    binary Salt with BinaryEncoding{Length = SaltLength};
+}
+
+type IsAuthenTypePair
+{
+    (byte where value != 255) AuthType;
+    bool AuthWhoMask with BinaryEncoding{Width = 1};
+    bool AuthHowMask with BinaryEncoding{Width = 1};
+    bool EncryptMask1 with BinaryEncoding{Width = 1};
+    bool IniCredFwdMask with BinaryEncoding{Width = 1};
+    bool EncryptMask2 with BinaryEncoding{Width = 1};
+    byte Unused where ValidationCheck(value == 0, null, "TELNET: The Reserved in type IsAuthenTypePair must be zero.") with BinaryEncoding{Width = 3};
+}
+
+type Name 
+{
+    array<ByteExcludeFF> RemoteUser;
+}
+
+// rfc 2946  38
+/*
+IAC SB ENCRYPT SUPPORT encryption-type-list IAC SE
+IAC SB ENCRYPT IS encryption-type ... IAC SE
+IAC SB ENCRYPT REPLY encryption-type ... IAC SE
+IAC SB ENCRYPT START keyid IAC SE
+IAC SB ENCRYPT END IAC SE
+IAC SB ENCRYPT REQUEST-START keyid IAC SE
+IAC SB ENCRYPT REQUEST-END IAC SE
+IAC SB ENCRYPT ENC_KEYID keyid IAC SE
+IAC SB ENCRYPT DEC_KEYID keyid IAC SE
+*/
+type SBEncryptOption
+{
+    byte OptionCode;
+    byte SubCode;
+    ([|SubCode in {0, 2}|] EncreptionType   |
+    [|SubCode == 1|] EncryType              |
+    [|SubCode in {3, 5, 7, 8}|] KeyID       |
+    array<ByteExcludeFF>) Data;
+}
+
+type EncreptionType
+{
+    byte EncryType;
+    optional [|EncryType in {1, 2, 3, 4, 8, 9, 10 , 11}|] CAST128OFB64Type EncryptedData;
+    array<ByteExcludeFF> Data;
+}
+
+type CAST128OFB64Type
+{
+    byte SubOption;
+    optional [|SubOption == 11|] binary InitialVector with BinaryEncoding{Length = 8};
+    optional [|SubOption != 1|] byte SubOption2;
+}
+
+type EncryType
+{
+    byte Type;
+}
+type KeyID
+{
+    array<ByteExcludeFF> KeyId;
+}
+
+// rfc 1572  39
+/*
+IAC SB NEW-ENVIRON SEND [ type ... [ type ... [ ... ] ] ] IAC SE
+IAC SB NEW-ENVIRON IS type ... [ VALUE ... ] [ type ... [ VALUE ... ]
+   [ ... ] ] IAC SE
+IAC SB NEW-ENVIRON INFO type ... [ VALUE ... ] [ type ... [ VALUE ...
+   ] [ ... ] ] IAC SE
+*/
+// Bug#23980, even if all data is consumed, there are redundant elements at end of array.
+type SBNewEvironmentOption
+{
+    byte OptionCode;
+    byte SubCode;
+    array<EnvironVariableType> EnvironVariable;   // Future Reference: to be revisit
+}
+
+type EnvironVariableType
+{
+    byte TypeOrValue;
+    array<ByteExcludeFF000102> Data;
+}
+
+type ByteExcludeFF000102
+{
+    (byte where !(value in {0, 1, 3, 255})) Values;
+}
+
+//
+// rfc 2355  40
+/*
+IAC SB TN3270E SEND DEVICE-TYPE IAC SE
+IAC SB TN3270E DEVICE-TYPE REQUEST <device-type> [ [CONNECT <resource-name>] | [ASSOCIATE <device-name>] ] IAC SE
+IAC SB TN3270E DEVICE-TYPE IS <device-type> CONNECT <device-name> IAC SE
+IAC SB TN3270E DEVICE-TYPE REJECT REASON <reason-code> IAC SE
+IAC SB TN3270E FUNCTIONS REQUEST <function-list> IAC SE
+IAC SB TN3270E FUNCTIONS IS <function-list> IAC SE
+this option is very complex , i wil enriched it in future.
+*/
+type SBTN3270EOption
+{
+    byte OptionCode;
+    byte SubCode1;
+    byte SubCode2;
+    optional ([|SubCode1 == 2 && SubCode2 == 6|] ReasonCode     |
+    [|SubCode1 == 2 && SubCode2 == 4|] DeviceTypeAndName        |
+    [|SubCode1 == 2 && SubCode2 == 7|] Device                   |
+    [|SubCode1 == 3|] FunctionList) Data;
+}
+
+type ReasonCode
+{
+    (byte where value == 5) SubCode3;
+    byte ReasonCode;
+}
+
+type DeviceTypeAndName
+{
+    array<ByteExcludeFF0100> DeviceType;
+    array<ByteExcludeFF> DeviceName;
+}
+
+type ByteExcludeFF0100 
+{
+    (byte where value in {0, 1, 255}) Byte;
+}
+
+type Device
+{
+    array<ByteExcludeFF0100> DeviceType;
+}
+
+type ResourceName
+{
+    byte SubCode3;
+    array<ByteExcludeFF> ResourceName;
+}
+
+type DeviceName
+{
+    byte SubCode3;
+    array<ByteExcludeFF> DeviceName;
+}
+
+type FunctionList
+{
+    array<ByteExcludeFF> Function;
+}
+
+// rfc 2066  42
+/*
+IAC SB CHARSET REQUEST { "[TTABLE ]" <Version> } <char set
+   list> IAC SE
+IAC SB CHARSET ACCEPTED <Charset> IAC SE
+IAC SB CHARSET REJECTED IAC SE
+IAC SB CHARSET TTABLE-IS <version> <syntax for version> IAC SE
+IAC SB CHARSET TTABLE-ACK IAC SE
+IAC SB CHARSET TTABLE-NAK IAC SE
+IAC SB CHARSET TTABLE-REJECTED IAC SE
+*/
+type SBCharestRequestOption
+{
+    byte OptionCode;
+    byte SubCode;
+    ([|SubCode == 1|] CharsetRequest        |
+    [|SubCode == 2|] CharsetAccept          |
+    [|SubCode == 4|] CharsetTtableIs        | 
+    array<ByteExcludeFF>) Data;
+}
+
+type CharsetAccept
+{
+    array<ByteExcludeFF> Data;
+}
+
+type CharsetRequest
+{
+    optional String6 Ttable;          // Future Reference: To be revisited.
+    byte Version;
+    CharsetRequestType CharsetRequestData;
+}
+
+type String6
+{
+    string String with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = 6};
+}
+
+type CharsetRequestType
+{
+    byte Seq;
+    array<ByteExcludeFF> Charest;
+}
+
+type CharsetTtableIs
+{
+    byte Version;
+    byte Seq1;
+    array<ByteExcludeFF> Name1;
+    byte Seq2;
+    byte Size1;
+    byte Count1;
+    array<ByteExcludeFF> Name2;
+    byte Seq3;
+    byte Size2;
+    byte Count2;
+    string Map1 with BinaryEncoding{Length = Count1};
+    string Map2 with BinaryEncoding{Length = Count2};
+}
+
+// rfc 2217  44
+/*
+COM-PORT-OPTION
+*/
+type SBCOMPORTOption
+{
+    byte OptionCode;
+    byte SubCode;
+    optional ([|SubCode in {0, 100}|] Signature             |
+    [|SubCode in {1, 101}|] Value                           |
+    [|SubCode in {2, 102}|] DataSizeValue                   |
+    [|SubCode in {3, 103}|] ParityValue                     |
+    [|SubCode in {4, 104}|] StopSizeValue                   |
+    [|SubCode in {5, 105}|] ControlValue                    |
+    [|SubCode in {6, 106}|] LineStateValue                  |
+    [|SubCode in {7, 107}|] ModeStateValue                  |
+    [|SubCode in {10, 110}|] LineStateMaskValue             |
+    [|SubCode in {11, 111}|] ModeStateMaskValue             |
+    [|SubCode in {12, 112}|] PurgeDataValue) Data;
+}
+
+type Signature
+{
+    array<ByteExcludeFF> Text;
+}
+
+type Value
+{
+    byte Value;
+}
+
+type DataSizeValue
+{
+    byte Value;
+}
+
+type ParityValue
+{
+    byte Value;
+}
+
+type StopSizeValue
+{
+    byte Value;
+}
+
+type ControlValue
+{
+    byte Value;
+}
+
+pattern LineStateValue = flags byte
+{
+    TimeOut         = 0x80,
+    TransShift      = 0x40,
+    TransHolding    = 0x20,
+    BreakDetect     = 0x10,
+    Framing         = 0x08,
+    Party           = 0x04,
+    OverRun         = 0x02,
+    DataReady       = 0x01
+};
+
+pattern ModeStateValue = flags byte
+{
+    ReceiveLine     = 0x80,
+    RingIndicator   = 0x40,
+    DataSetReady    = 0x20,
+    ClearToSend     = 0x10,
+    DelataReceive   = 0x08,
+    TrailingEdge    = 0x04,
+    DeltaData       = 0x02,
+    DeltaClear      = 0x01
+};
+
+pattern LineStateMaskValue = flags byte
+{
+    TimeOut         = 0x80,
+    TransShift      = 0x40,
+    TransHolding    = 0x20,
+    BreakDetect     = 0x10,
+    Framing         = 0x08,
+    Parity          = 0x04,
+    OverRun         = 0x02,
+    DataReady       = 0x01
+};
+
+pattern ModeStateMaskValue = flags byte
+{
+    ReceiveLine     = 0x80,
+    RingIndicator   = 0x40,
+    DataSetReady    = 0x20,
+    ClearToSend     = 0x10,
+    DeltaReceive    = 0x08,
+    TrailingEdge    = 0x04,
+    DeltaData       = 0x02,
+    DeltaClear      = 0x01
+};
+
+type PurgeDataValue
+{
+    byte Value;
+}
+
+type UnknownSubCode
+{
+    array<ByteExcludeFF> Value;
+}
+
+// rfc 2840  47
+// KERMIT
+type SBKERMITOption
+{
+    byte OptionCode;
+    byte SubCode;
+    optional [|SubCode == 4|] byte Octet;
+}
+
+// rfc 861   255
+// EXOPL
+type SBEXOPLOption
+{
+    byte OptionCode;
+    byte SubCode;
+    byte SupOptCode;
+    optional [|SubCode == 250|] ExoplParameters ExoplParameters;
+}
+
+type ExoplParameters
+{
+    array<ByteExcludeF0> Parameter;
+    byte ParamEnd;
+}
+
+type ByteExcludeF0 
+{
+    (byte where value != 240) Byte;
+}
+
+// ---------------------------------- Utilities ---------------------------------------
+string ConvertArrayByteToString(array<SingleByte> arr)
+{
+    binary bin = arr as binary;
+    if (LiteralString(bin) is str:string)
+    {
+        return str;
+    }
+    return "";
+}
+
+// Decode TELNET message
+optional Message TelnetDecoder(binary buffer)
+{
+    switch (buffer)
+    {
+        case m:Message from BinaryDecoder<Message> =>
+            // assign the terminal type annotation and NLMP embedded
+            if (m.TelCmd is telCmd:TelCmd && telCmd.TelCmds.Count > 0)
+            {
+                foreach (var command in telCmd.TelCmds)
+                {
+                    if (command.Option is terminalTypeOption:SBTerminalTypeOption &&
+                        terminalTypeOption.Value is terminal:Terminal)
+                    {
+                        // update the terminal type byte message
+                        m#TerminalType = ConvertArrayByteToString(terminal.Data);
+                        break;
+                    }
+                    else if (command.Option is sbAuthenticationOption:SBAuthenticationOption &&
+                        sbAuthenticationOption.Data is authenTypePair:AuthenTypePair &&
+                        authenTypePair.AuthData is ntlmType:NTLMType &&
+                        ntlmType.NTLMValue is NTLMSizeAndType)
+                    {
+                        m#Embedded = {"NLMP" -> ""};
+                    }
+                }
+            }
+            
+            return m;
+        default =>
+            return nothing;
+    }
+}
+
+// ---------------------------------- TELNET Decoding ---------------------------------------
+type TelnetDecodingHelper: TCPDecodingHelper
+{
+    optional string terminalType = nothing;
+    
+    void InitializeTelnetDecodingHelper(any endpoint server, ushort localPort)
+    {
+        TelnetDecodingCache acceptsCache = new TelnetDecodingCache();
+        TelnetDecodingCache issuesCache = new TelnetDecodingCache();
+        
+        this.Initialize(acceptsCache, issuesCache,
+            "Telnet", (endpoint TELNET.Server over server),
+            (binary b) => true /*isCurrentProtocol*/,
+            (binary b) => 0 /*isSufficientForSingleMsg*/, 
+            (stream s) => nothing /*decodeSingleMessage*/,
+            (binary b) => nothing /*decodeIncompleteMessage*/);
+            
+        acceptsCache.telnetDecodingHelper = this;
+        acceptsCache.localPort = localPort;
+        issuesCache.telnetDecodingHelper = this;
+        issuesCache.localPort = localPort;
+    }
+    
+    void AssignTerminalType(TELNET.Message telnetMessage)
+    {
+        if (telnetMessage#TerminalType != nothing)
+        {
+            terminalType = telnetMessage#TerminalType;
+        }
+        else
+        {
+            telnetMessage#TerminalType = terminalType;
+        }
+    }
+}
+
+type TelnetDecodingCache : TCPDecodingCache
+{
+    TelnetDecodingHelper telnetDecodingHelper = null;
+    ushort localPort;
+
+    override void TryDecodeAndDispatchMessage()
+    {
+        assert Origins.Count > 0;
+        
+        switch (Buffer)
+        {
+            case m:Message from TelnetDecoder =>
+                m#IsRequest = Direction == MessageDirection.Accepts ? true : false;
+                m#DstPort = Direction == MessageDirection.Accepts ? Port.TELNET : localPort;
+                m#SrcPort = Direction == MessageDirection.Issues ? Port.TELNET : localPort;
+                telnetDecodingHelper.AssignTerminalType(m);
+                
+                m.Origins = Origins;
+                DispatchMessage(m);
+                CompleteMessages.Add(m, BufferStartSequenceNumber, BufferEndSequenceNumber);
+                ResetAfterSucceed(null);
+            default =>
+                // actually, TELNET Message will not decoding failed
+                return;
+        }
+    }
+}

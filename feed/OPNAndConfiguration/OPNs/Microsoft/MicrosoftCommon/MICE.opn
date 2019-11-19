@@ -1,0 +1,425 @@
+protocol MICE with 
+    BinaryEncodingDefaults {Endian = Endian.Big, TextEncoding = TextEncoding.ASCII},
+Documentation
+{
+    ProtocolName = "[MS-MICE]: Miracast over Infrastructure Connection Establishment Protocol",
+    ShortName = "MICE",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+    [
+        new Reference {Name = "MS-MICE", Version = "3.0", Date = "09/12/2018", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary = 
+    [
+    new Revision{Class = RevisionClass.Major, Version="382196", Date="10/14/2015"}
+    ]
+};
+
+using Standard;
+using Utility;
+using TCP;
+using IANA;
+using Diagnostics;
+using InfrastructureResources;
+
+endpoint Server accepts MiceMessage issues MiceMessage;
+
+autostart actor MiceOverTcp(TCP.Server server)
+{
+
+    TCPDecodingHelper decodingHelper = null;
+    
+    process server accepts s:TCP.Segment where s.DestinationPort == IANA.Port.MICE
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "MICE", endpoint Server over server, 
+                                    IsMICE,
+                                    IsSufficientForMICE,
+                                    (stream s) => BinaryDecoder<MiceMessage>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<IncompleteMiceMessage>(b) as optional any message);
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Accepts);
+    }
+    
+    process server issues s:TCP.Segment where s.SourcePort == IANA.Port.MICE
+    {
+        if (decodingHelper == null)
+        {
+            decodingHelper = new TCPDecodingHelper();
+            decodingHelper.Initialize(new TCPDecodingCache(), new TCPDecodingCache(),
+                                    "MICE", endpoint Server over server, 
+                                    IsMICE, 
+                                    IsSufficientForMICE,
+                                    (stream s) => BinaryDecoder<MiceMessage>(s) as optional any message, 
+                                    (binary b) => BinaryDecoder<IncompleteMiceMessage>(b) as optional any message);;
+        }
+        decodingHelper.TryDecode(s, MessageDirection.Issues);
+    }
+
+    ~endpoint(TCP.Server server)
+    {
+        if (decodingHelper != null)
+        {
+            decodingHelper.ClearInDestructor();
+            decodingHelper = null;
+        }
+    }
+}
+
+bool? IsMICE(binary b)
+{
+    if (b.Count < 4)
+        return null;
+    var CommandType = b[3] as CommandType;
+    if (InRange<MICE.CommandType>(CommandType))
+        return true;
+    else
+        return false;
+}
+
+uint? IsSufficientForMICE(binary b)
+{
+    if (b.Count < 2)
+        return null;
+    var length = ((b[0] as ushort) << 8) + b[1] + 2 as uint;
+
+    if (length <= b.Count)
+        return 0;
+    else
+        return length;
+}
+
+message MiceMessage
+{
+    ushort Size;
+    byte Version where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "MICE", "Version", "IMessage", "0x01", value);
+    CommandType Command where ValidationCheckEnumValue(InRange<CommandType>(value), null, true, ReferenceType.Message, "MICE", "Command", "MiceMessage", "0x01, 0x02, 0x03, 0x04, 0x05, 0x06", value);
+    ([|Command == 1|] array<SourceReady> |
+     [|Command == 2|] array<StopProjection> |
+     [|Command == 3|] array<SecurityHandshake> |
+     [|Command == 4|] array<SessionRequest> |
+     [|Command == 5|] array<PINChallenge> |
+     [|Command == 6|] array<PINResponse> |
+     binary) Body with BinaryEncoding{WidthForComposedType = (Size - 4) * 8};
+
+    override string ToString()
+    {
+        return "MICE Message, Version: " + Version.ToString() + ", Command: " +  EnumToStringInSummary<CommandType>(Command);
+    }
+}
+
+message IncompleteMiceMessage
+{
+    ushort Size;
+    byte Version where ValidationCheckValue(value == 1, null, true, ReferenceType.Type, "MICE", "Version", "IMessage", "0x01", value);
+    CommandType Command where ValidationCheckEnumValue(InRange<CommandType>(value), null, true, ReferenceType.Message, "MICE", "Command", "MiceMessage", "0x01, 0x02, 0x03, 0x04, 0x05, 0x06", value);
+    binary Body with BinaryEncoding{MaxLength = Size - 4};
+ 
+    override string ToString()
+    {
+        return "Incomplete MICE Message, Version: " + Version.ToString() + ", Command: " +  EnumToStringInSummary<CommandType>(Command);
+    }
+}
+
+type SourceReady
+{
+    FriendlyNameTLV FriendlyName;
+    RTSPPortTLV RtspPort;
+    SourceIDTLV SourceID;
+    override string ToString()
+    {
+        return Format("Source Ready, Friendly Name: {0}, Rtsp Port: {1}, Source ID: {2}", FriendlyName.ToString(),
+                        RtspPort.ToString(), SourceID.ToString());
+    }
+}
+
+type StopProjection
+{
+    FriendlyNameTLV FriendlyName;
+    SourceIDTLV SourceID;
+
+    override string ToString()
+    {
+        return Format("Stop Projection, Friendly Name: {0}, Source ID: {1}", FriendlyName.ToString(), SourceID.ToString());
+    }
+}
+
+// 2.2.3 Security Handshake Message
+type SecurityHandshake
+{
+    SecurityTokenTLV  SecurityToken;
+    SourceIDTLV SourceID;
+
+    override string ToString()
+    {
+        return Format("Security Handshake, Security Token: {0}, Source ID: {1}", SecurityToken.ToString(), SourceID.ToString());
+    }
+}
+
+// 2.2.4 Session Request Message
+type SessionRequest
+{
+    FriendlyNameTLV FriendlyName;
+    SourceIDTLV SourceID;
+    SecurityOptionsTLV SecurityOptions;
+
+    override string ToString()
+    {
+        return Format("Session Request,  Friendly Name: {0}, Source ID: {1}, Security Options: {2}", FriendlyName.ToString(), SourceID.ToString(), SecurityOptions.ToString());
+    }
+}
+
+// 2.2.5 PIN Challenge Message
+type PINChallenge
+{
+    SourceIDTLV SourceID;
+    PINChallengeTLV PINChallenge;
+
+    override string ToString()
+    {
+        return Format("Session Request,  Source ID: {0}, PIN Challenge: {1}", SourceID.ToString(), PINChallenge.ToString());
+    }
+}
+
+// 2.2.6 PIN Response Message
+type PINResponse
+{
+    SourceIDTLV SourceID;
+    PINChallengeTLV PINChallenge;
+    PINResponseReasonTLV PINResponseReason;
+
+    override string ToString()
+    {
+        return Format("Session Request,  Source ID: {0}, PIN Challenge: {1}, PIN Response Reason: {2}", SourceID.ToString(), PINChallenge.ToString(), PINResponseReason.ToString());
+    }
+}
+
+pattern TLVFlags = flags byte
+{
+    FriendlyNameTLV = 0x00,
+    RTSPPortTLV = 0x02,
+    SourceIDTLV = 0x03,
+    SecurityTokenTLV = 0x04,
+    SecurityOptionsTLV = 0x05,
+    PINChallengeTLV = 0x06,
+    PINResponseReasonTLV = 0x07,
+};
+
+type FriendlyNameTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 0, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "FriendlyNameTLV", "0x00", value);
+    ushort Length;
+    string Value with BinaryEncoding{TextEncoding = TextEncoding.UTF16, Length = Length};
+
+    override string ToString()
+    {
+        return Value;
+    }
+}
+
+type RTSPPortTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 2, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "RTSPPortTLV", "0x02", value);
+    ushort Length;
+    ushort Value with BinaryEncoding{Length = Length};
+
+    override string ToString()
+    {
+        return Value.ToString(); 
+    }
+}
+
+type SourceIDTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 3, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "SourceIDTLV", "0x03", value);
+    ushort Length;
+    binary Value with BinaryEncoding{Length = Length};
+
+    override string ToString()
+    {
+        return Value.ToString();
+    }
+}
+
+// 2.2.7.4 Security Token TLV
+type SecurityTokenTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 4, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "SecurityTokenTLV", "0x04", value);
+    ushort Length;
+    byte Value with BinaryEncoding{Length = Length};
+
+    override string ToString()
+    {
+        return Value.ToString();
+    }
+}
+
+// 2.2.7.5 Security Options TLV
+type SecurityOptionsTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 5, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "SecurityOptionsTLV", "0x05", value);
+    ushort Length;
+    SecurityOptionsTLVFlags securityOptionsTLVFlags where ValidationCheckCombinationValue(InRange<SecurityOptionsTLVFlags>(value), null, true, 
+        ReferenceType.Type, "MICE", "securityOptionsTLVFlags", "SecurityOptionsTLV", "0x01, 0x02", value);
+
+    override string ToString()
+    {
+        return "SecurityOptionsTLV Vaule:" + securityOptionsTLVFlags.ToString();
+    }
+}
+
+// A - UseDtlsStreamEncryption (1 bit): 0 = do not use, 1 = use.
+// B - SinkDisplaysPin (1 bit): 0 = PIN is not displayed by Sink, 1 = Sink displays random PIN and Source provides this PIN after DTLS handshake. Bit A MUST be set if bit B is set.
+pattern SecurityOptionsTLVFlags = flags byte
+{
+    UseDtlsStreamEncryption = 0x01,
+    SinkDisplaysPin = 0x02,
+    ...
+};
+ 
+
+// 2.2.7.6 PIN Challenge TLV
+type PINChallengeTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 6, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "PINChallengeTLV", "0x06", value);
+    ushort Length;
+    binary Value with BinaryEncoding{Length = Length};
+
+    override string ToString()
+    {
+        return "PINChallengeTLV, value : " + Value.ToString();
+    }
+}
+
+// 2.2.7.7 PIN Response Reason TLV
+type PINResponseReasonTLV
+{
+    TLVFlags Type where ValidationCheckValue(value == 7, null, true, 
+        ReferenceType.Type, "MICE", "TLVFlags", "PINResponseReasonTLV", "0x07", value);
+    ushort Length;
+    ReasonCode ReasonCode;
+
+    override string ToString()
+    {
+        return "ReasonCode: " + ReasonCode.ToString();
+    }
+}
+
+pattern ReasonCode = enum byte
+{
+    PINAccepted = 0x00,
+    WrongPIN = 0x01,
+    InvalidMessage = 0x02,
+    ...
+};
+
+
+pattern CommandType = enum byte
+{
+    SOURCE_READY = 0x01,
+    STOP_PROJECTION = 0x02,
+    SECURITY_HANDSHAKE = 0x03,
+    SESSION_REQUEST = 0x04,
+    PIN_CHALLENGE = 0x05,
+    PIN_RESPONSE = 0x06,
+    ...
+};
+
+pattern TLVType = enum byte
+{
+    FRIENDLY_NAME = 0x0,
+    RTSP_PORT = 0x2,
+    SOURCE_ID = 0x3,
+    ...
+};
+
+// Todo : the extensions are not implemented completely.
+// 2.2.3 Vendor Extension Attributes
+type VendorExtensionAttributes
+{
+    ushort WSCVEA where ValidationCheckValue(value == 0x1049, null, true, 
+        ReferenceType.Type, "MICE", "WSCVEA", "VendorExtensionAttributes", "0x1049", value);
+    ushort Length;
+    binary OUI where ValidationCheckValue(value == $[000137], null, true, 
+        ReferenceType.Type, "MICE", "OUI", "VendorExtensionAttributes", "$[000137]", value)
+        with BinaryEncoding{Length = 3};
+    ushort Type;
+    ([|Type == 0x2001|] CapabilityAttribute |
+     [|Type == 0x2002|] HostNameAttribute |
+     [|Type == 0x2003|] BSSIDAttribute |
+     [|Type == 0x2004|] ConnectionPreferenceAttribute |
+     [|Type == 0x2005|] IPAddressAttribute) P2PAttributes; // TODO: one or more?
+}
+
+// 2.2.3.1 Capability Attribute
+type CapabilityAttribute
+{
+    ushort Length;
+    byte MiracastOverInfrastructureSupport with BinaryEncoding{Width = 1};
+    byte StreamSecuritySupport with BinaryEncoding{Width = 1};
+    byte Version where ValidationCheckValue(value == 0x1, null, true, 
+        ReferenceType.Type, "MICE", "Version", "CapabilityAttribute", "0x1", value)
+        with BinaryEncoding{Width = 3};
+    byte PinSupported with BinaryEncoding{Width = 1};
+    byte Reserved with BinaryEncoding{Width = 2};
+}
+
+// 2.2.3.2 Host Name Attribute
+type HostNameAttribute
+{
+    ushort Length;
+    string HostName with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.UTF16};
+}
+
+// 2.2.3.3 BSSID Attribute
+type BSSIDAttribute
+{
+    ushort Length where ValidationCheckValue(value == 0x0006, null, true, 
+        ReferenceType.Type, "MICE", "Version", "CapabilityAttribute", "0x0006", value);
+    binary BSSID with BinaryEncoding{Length = 6};
+}
+
+// 2.2.3.4 Connection Preference Attribute
+type ConnectionPreferenceAttribute
+{
+    ushort Length where ValidationCheckValue(value == 0x0004, null, true, 
+        ReferenceType.Type, "MICE", "Version", "CapabilityAttribute", "0x0004", value);
+    array<TransportID> ConnectionPreferenceList with BinaryEncoding{Length = 8};
+}
+
+// 2.2.4.5 IP Address Attribute
+type IPAddressAttribute
+{
+    ushort Length;
+    string IPAddress with BinaryEncoding{Length = Length, TextEncoding = TextEncoding.UTF8};
+
+    override string ToString()
+    {
+        return IPAddress;
+    }
+}
+
+type TransportID
+{
+    TransportIDPattern ID with BinaryEncoding{Width = 4};
+}
+
+pattern TransportIDPattern = enum byte
+{
+    MiracastOverInfrastructure = 0x1,
+    WiFiDirect = 0x2,
+    ...
+};

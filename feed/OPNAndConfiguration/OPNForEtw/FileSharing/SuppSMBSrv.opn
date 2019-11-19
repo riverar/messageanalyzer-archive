@@ -1,0 +1,115 @@
+module SuppSMBSrv;
+
+using SMB2;
+using SMB;
+using Microsoft_Windows_SMBServer;
+using Standard;
+using Utility;
+using Etw;
+using EtwEvent;
+using WindowsReference;
+using SuppSMBSrvForSMBTransport;
+
+//SMB2 over ETW actor
+autostart actor SMB2ServerOverETW(ep_Microsoft_Windows_SMBServer e) precedes SuppSMBSrvForSMBTransport.SMB2ServerOverETW
+{
+    SMB2.Smb2DecodingContext dc = new Smb2DecodingContext{};
+    bool pduFull = true;
+    
+    // Propagates the EtwKeyword from the underlying message
+    observe e accepts m:Event_40000
+    {
+        // Assuming that the first origin is an EtwProviderMsg
+        var origin = (m.Origins[0] as EtwProviderMsg);
+        
+        m#EtwKeywords = origin.EventRecord.Header.Descriptor.Keywords;
+        pduFull = ((m#EtwKeywords as ulong) & 0x800000000000) != 0;
+    }
+    
+    // Decodes the SMB2 request/response messages
+    process e accepts m:Event_40000 where m.PacketData.Count > 3 && m.PacketData.Segment(0, 4) == SMB2ProtocolId
+    {
+        dc.pduFull = pduFull;
+        if (m.PacketData.Count >= 64) // The total size of SMB2 header
+        {
+            // Look ahead the ServerToRedir bit in the Header
+            bool isRequest = ((m.PacketData[16] as int) & 0x01) == 0;
+            
+            // Depending on the direction, it reuses the parsing function defined in SMB2 protocol
+            if (isRequest)
+            {
+                DecodeAndDispatchRequestMessages(dc, m.PacketData, SMB2.GetSMB2Server(GetEndpointIndex(m)));
+            }
+            else
+            {
+                DecodeAndDispatchResponseMessages(dc, m.PacketData, SMB2.GetSMB2Server(GetEndpointIndex(m)));            
+            }
+        }
+        else
+        {
+            ReportInsufficientData(m, DiagnosisLevel.Error,
+                "SuppSMBSrv: The PacketData in Event_40000 message is insufficient for SMB2 header. At least 64 bytes are required, but there are only " + (m.PacketData.Count as string) + " bytes in this message.");
+            reject;
+        }
+    }
+    
+    // Decodes the SMB request/response messages
+    process e accepts m:Event_40000 where m.PacketData.Count > 3 && m.PacketData.Segment(0, 4) == $[FF534D42]
+    {
+        LowestServer lowestServer = endpoint LowestServer over e;
+        lowestServer.dvar.pduFull = pduFull;
+        if (m.PacketData.Count > 32 && m.PacketData.PeekByte(32) == SMB.SmbCommand.SMB_COM_NEGOTIATE)
+        {
+            lowestServer.dvar.EndpointIndex = GetEndpointIndex(m);
+        }
+        DecodeAndDispatchMessages(lowestServer, m.PacketData, lowestServer.dvar);
+    }
+}
+
+ushort get PeerPort(this Event_40000 msg)
+{
+    ushort port = 0;
+    if (msg#EtwKeywords != nothing && msg.PeerAddress is peerAddr:WindowsReference.SocketAddress)
+    {
+        if (peerAddr.Address is sock:WindowsReference.SockAddrIn)
+        {
+            port = sock.Port;
+        }
+        else if (peerAddr.Address is sock6:WindowsReference.SockAddrIn6)
+        {
+            port = sock6.Port;
+        }
+    }
+    return port;    
+}
+
+binary GetEndpointIndex(Event_40000 msg)
+{
+    binary src = $[];
+    binary dst =$[];
+    if (msg.Source is ipv4:IPv4Address)
+    {
+        src = ipv4.FlatAddress;
+    }
+    else
+    {
+        src = (msg.Source as IPv6Address).FlatAddress;
+    }
+
+    if (msg.Destination is ipv4Dest:IPv4Address)
+    {
+        dst = ipv4Dest.FlatAddress;
+    }
+    else
+    {
+        dst = (msg.Destination as IPv6Address).FlatAddress;
+    }
+
+    if (src > dst)
+    {
+        binary temp = src;
+        src = dst;
+        dst = temp;
+    }  
+    return src + dst + msg.PeerPort.ToBinary();
+}

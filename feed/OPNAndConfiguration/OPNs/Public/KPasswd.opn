@@ -1,0 +1,219 @@
+protocol KPasswd with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Microsoft Windows 2000 Kerberos Change Password and Set Password Protocols",
+    ShortName = "KPasswd",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 3244"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "363782", Date = "05/09/2014"}
+        ]
+};
+
+using Standard;
+using Utility;
+using UDP;
+using KerberosV5;
+using TCP;
+using IANA;
+
+endpoint Server
+    over UDP.Host | over TCP.Server
+    accepts Request issues Reply;
+
+client endpoint Client connected to Server;
+
+const string MODULE_NAME = "KPasswd";
+
+autostart actor KPasswdOverUDP(UDP.Host host)
+{
+    process host accepts d:UDP.Datagram{DestinationPort is Port.KPasswd}
+    {
+        switch (d.Payload)
+        {
+            case kpreq:Request from BinaryDecoder<Request[false]> =>
+                var node = endpoint Server over host;
+                dispatch node accepts kpreq;
+            default =>
+                ThrowDecodingException("KPasswd", "Request");
+        }
+    }
+     
+    process host accepts d:UDP.Datagram{SourcePort is Port.KPasswd}
+    {
+        switch (d.Payload)
+        {
+            case kprep:Reply from BinaryDecoder<Reply[false]> =>
+                var node = endpoint Server over host;
+                dispatch node issues kprep;
+            default =>
+                ThrowDecodingException("KPasswd", "Reply");
+        }
+    }
+}
+
+autostart actor KPasswdOverTCP(TCP.Server server)
+{
+    TCPDecodingHelper helper = null;
+    
+    process server accepts d:TCP.Segment{DestinationPort is Port.KPasswd}
+    {
+        InitializeKPasswdCache();
+        helper.TryDecode(d, MessageDirection.Accepts);
+    }
+    
+    process server issues d:TCP.Segment{SourcePort is Port.KPasswd}
+    { 
+        InitializeKPasswdCache();
+        helper.TryDecode(d, MessageDirection.Issues);
+    }
+    
+    void InitializeKPasswdCache()
+    {
+        if (helper == null)
+        {
+            helper = new TCPDecodingHelper{};
+
+            var ept = endpoint Server over server;
+            var decodeIncompleteMessage = (binary bin) => BinaryDecoder<IncompleteKPasswdMessage>(bin) as optional any message;
+
+            var acceptsCache = new TCPDecodingCache();
+            acceptsCache.Initialize(
+                MODULE_NAME,
+                ept,
+                MessageDirection.Accepts,
+                IsKPasswd,
+                IsCompleteKPasswdMessage,
+                (stream s) => BinaryDecoder<Request[true]>(s) as optional any message,
+                decodeIncompleteMessage);
+
+            var issuesCache = new TCPDecodingCache();
+            issuesCache.Initialize(
+                MODULE_NAME,
+                ept,
+                MessageDirection.Issues,
+                IsKPasswd,
+                IsCompleteKPasswdMessage,
+                (stream s) => BinaryDecoder<Reply[true]>(s) as optional any message,
+                decodeIncompleteMessage);
+            
+            helper.AcceptsCache = acceptsCache;
+            helper.IssuesCache = issuesCache;
+        }
+    }
+    
+    ~endpoint(TCP.Server e)
+    {
+        if (helper != null)
+        {
+            helper.ClearInDestructor();
+        }
+    }
+}
+
+bool? IsKPasswd(binary bin)
+{
+    if (bin.Count < 8)
+    {
+        return null;
+    }
+
+    uint len1 = MakeDWord(bin[0], bin[1], bin[2], bin[3]);
+    uint len2 = MakeWord(bin[4], bin[5]);
+    uint pvn = MakeWord(bin[6], bin[7]);
+    return len1 == len2 && pvn in {0xff80, 0x0001};
+}
+
+uint? IsCompleteKPasswdMessage(binary bin)
+{
+    uint len = MakeDWord(bin[0], bin[1], bin[2], bin[3]) + 4;
+    return bin.Count >= len ? 0 : len;
+}
+
+message Request[bool HasHeader]
+{
+    optional [|HasHeader|] uint Header;
+    ushort MessageLength;
+    ushort ProtocolVersionNumber where ValidationCheckValue(value == 0xff80, this, true, ReferenceType.Message, "KPasswd", "ProtocolVersionNumber", "Request", "0xff80", value);
+    ushort ApReqLength;
+    optional [|ApReqLength > 0|] KrbMessage[false] ApReqData with BinaryEncoding{WidthForComposedType = ApReqLength * 8};
+    KrbMessage[false] KrbMessage;
+    
+    override string ToString()
+    {
+        return "Request, MessageLength: " + MessageLength.ToString();
+    }
+}
+
+message Reply[bool HasHeader]
+{
+    optional [|HasHeader|] uint Header;
+    ushort MessageLength;
+    ushort ProtocolVersionNumber where ValidationCheckValue(value == 0x0001, this, true, ReferenceType.Message, "KPasswd", "ProtocolVersionNumber", "Reply", "0x0001", value);
+    ushort ApRepLength;
+    optional [|ApRepLength > 0|] KrbMessage[false] ApRepData with BinaryEncoding{WidthForComposedType = ApRepLength * 8};
+    KrbMessage[false] KrbMessage;
+    
+    override string ToString()
+    {
+        return "Reply, MessageLength: " + MessageLength.ToString();
+    }
+}
+
+// This message only exists on Server over ResseambleTCP.Server.
+message IncompleteKPasswdMessage
+{
+    uint Header;
+    binary IncompleteKPasswdMessageData with BinaryEncoding{MaxLength = Header};
+    
+    override string ToString()
+    {
+        return "IncompleteKPasswdMessage";
+    }
+}
+
+type EData
+{
+    ResultCode ResultCode;
+    string ResultString with BinaryEncoding{TextEncoding = TextEncoding.UTF8};
+}
+
+pattern ResultCode = enum ushort
+{
+    KrbsKpasswdSuccess                = 0,
+    KrbsKapasswdMalFormed             = 1,
+    KrbsKpasswdHardError              = 2,
+    KrbsKpasswdAuthError              = 3,
+    KrbsKpasswdSoftError              = 4,
+    KrbsKpasswdAccessDenied           = 5,
+    KrbsKpasswdBadVersion             = 6,
+    KrbsKpasswdInitialFlageNeeded     = 7,
+    RequestFailsWithOtherReason       = 0xFFFF,
+    ...
+};
+
+string GetName(ResultCode code)
+{
+    switch (code)
+    {
+        case 0 => return "request succeeds ";
+        case 1 => return "request fails due to being malformed";
+        case 2 => return "request fails due to 'hard' error in processing the request";
+        case 3 => return "request fails due to an error in authentication processing";
+        case 4 => return "request fails due to 'soft' error in processing the request";
+        case 5 => return "requestor not authorized";
+        case 6 => return "protocol version unsupported";
+        case 7 => return "initial flag required";
+        case 0xFFFF => return "request fails with some other reason";
+        default => return "Unknown Result Code(" + Utility.DecToHexFormat(code) + ")";
+    }
+}

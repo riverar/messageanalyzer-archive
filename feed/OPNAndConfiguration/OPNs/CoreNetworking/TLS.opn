@@ -1,0 +1,2738 @@
+﻿protocol TLS with 
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Transport Layer Security (TLS) Protocol",
+    ShortName = "TLS",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 2246"},
+            new Reference{Name = "RFC 4346"},
+            new Reference{Name = "RFC 5246"},
+            new Reference{Name = "RFC 6066"},
+        ],
+    RevisionSummary = 
+        [
+            new Revision{Class = RevisionClass.Major, Version = "382130", Date = "10/12/2015"}
+        ]
+};
+
+using IANA;
+using Utility;
+using Diagnostics;
+using TCP;
+using DecodingUtility; // WORKAROUND: compiler bug#3131164, When type A inherit from type B, module C use tye A, and A, B, C is in different module file, compiler will give a compilation error
+using X509;
+using OCSP;
+using Standard;
+using HTTP;
+using InfrastructureResources;
+
+endpoint Server over encryServer:TCP.EncryptionServer
+    accepts RecordLayers issues RecordLayers
+    accepts V2ClientHello issues V2ClientHello
+{
+    // These fields will be used when trying to decrypt the message. The lower transport is responsible for setting these fields 
+    // in order to give the chance for decryption. All those fields are supposed to be set together.
+    binary ClientAddress = null;
+    binary ServerAddress = null;
+    ushort ClientPort;
+    ushort ServerPort;
+    
+    // Application name negotiated by TLS
+    string NegotiatedAppName = null;
+
+    // This function is used for dispatching the decrypted binary back. 
+    // It always reconstructs a new message which accepts/issues by the target endpoint.
+    // The "binary" will be filled with the decrypted payload
+    // The "RecordLayers" will be filled with the original TLS message. The implementation can reuse the information in its origins.
+    // The "TLS.Server" will be filled with current TLS endpoint, which will be the under layer of the target endpoint.
+    // The "MessageDirection" will be filled with the dispatching direction.
+    internal void(binary, RecordLayers, TLS.Server, MessageDirection) DispatchBack = null;
+    
+    // Flag denotes that whether the context has been set.
+    internal bool IsInitialized = false;
+    
+    void InitializeContext(binary serverAddr, binary clientAddr, ushort serverPort, ushort clientPort, void(binary, RecordLayers, TLS.Server, MessageDirection) dispatchBackFunc)
+    {
+        if (IsInitialized)
+        {
+            return;
+        }
+        
+        ServerAddress = serverAddr;
+        ClientAddress = clientAddr;
+        ServerPort = serverPort;
+        ClientPort = clientPort;
+        DispatchBack = dispatchBackFunc;
+        
+        IsInitialized = true;
+    }
+    
+    bool IsContextSet()
+    {
+        // Assume the port would be set together with the address.
+        return IsInitialized;
+    }
+}
+    
+client endpoint Client connected to Server;
+
+const set<byte> MinorVersions = {0x01, 0x02, 0x03};
+
+message RecordLayers
+{
+    array<RecordLayer> records;
+    
+    override string ToString()
+    {
+        string summary = "Records: [";
+        
+        string sep = "";
+        foreach (RecordLayer record in records)
+        {
+            summary += sep + record.ToString();
+            sep = ", ";
+        }
+        
+        summary += "]";
+        
+        return summary;
+    }
+}
+
+message IncompleteRecordLayer
+{
+    ContentType $"type";
+    ProtocolVersion version;
+    ushort length;
+    binary fragment; // Consume all the remaining bytes
+    
+    override string ToString()
+    {
+        return "Incomplete " + GetMessageNameFromContentType($"type");
+    }
+}
+
+message V2ClientHello
+{
+    ushort msg_length where (value & 0x8000) != 0;
+    HandshakeType msg_type where value is HandshakeType.client_hello;
+    ProtocolVersion version where value.major == 3 && (value.minor in MinorVersions || value.minor == 0x00); // Tolerate "value == 0x00" to be compatible with SSL 3.0
+    ushort cipher_spec_length;
+    ushort session_id_length;
+    ushort challenge_length;
+    array<V2CipherSpec> cipher_specs with BinaryEncoding{MaxLength = (cipher_spec_length / 3)};
+    binary session_id with BinaryEncoding{MaxLength = session_id_length};
+    binary challenge with BinaryEncoding{MaxLength = challenge_length};
+    
+    override string ToString()
+    {
+        return "V2ClientHello, " + version.ToString();
+    }
+}
+
+pattern V2CipherSpec = uint with BinaryEncoding{Width = 24},DisplayInfo{ToText = V2CipherSpecToText};
+
+string V2CipherSpecToText(any input)
+{
+    string str = "";
+    if (input is val:uint)
+    {
+        if (val < 0x10000)
+        {
+            str = EnumToString<IANA.CipherSuite>(val as ushort);
+        }
+        else
+        {
+            str = EnumToString<TLS.V2CipherKindValues>(val);
+        }
+    }
+    
+    return str;
+}
+
+pattern V2CipherKindValues = enum uint
+{
+    SSL_CK_RC4_128_WITH_MD5 = 0x010080,
+    SSL_CK_RC4_128_EXPORT40_WITH_MD5 = 0x020080,
+    SSL_CK_RC2_128_CBC_WITH_MD5 = 0x030080,
+    SSL_CK_RC2_128_CBC_EXPORT40_WITH_MD5 = 0x040080,
+    SSL_CK_IDEA_128_CBC_WITH_MD5 = 0x050080,
+    SSL_CK_DES_64_CBC_WITH_MD5 = 0x060040,
+    SSL_CK_DES_192_EDE3_CBC_WITH_MD5 = 0x0700C0,
+    ...
+};
+
+type RecordLayer[bool IsEncrypted, uint MACLength]
+{
+    ContentType $"type";
+    ProtocolVersion version;
+    ushort length;
+    optional [|(IsEncrypted ? length : ((length as long) - MACLength)) > 0|] 
+        ([|$"type" is ContentType.change_cipher_spec|] ChangeCipherSpec
+        | [|!IsEncrypted && $"type" is ContentType.alert|] Alert
+        | [|!IsEncrypted && $"type" is ContentType.handshake|] array<Handshake[version]>
+        | [|!IsEncrypted && $"type" is ContentType.heartbeat|] HeartbeatMessage
+        | binary) fragment with BinaryEncoding{WidthForComposedType = ((IsEncrypted ? length : (length - MACLength)) * 8) as int};
+    optional [|!IsEncrypted && MACLength > 0|] binary MAC with BinaryEncoding{Length = MACLength};
+    
+    bool GetIsEncrypted()
+    {
+        return IsEncrypted;
+    }
+    
+    override string ToString()
+    {
+        string summary = GetMessageNameFromContentType($"type");
+        if (IsEncrypted)
+        {
+            summary += "(Encrypted)";
+        }
+        else if ($"type" is ContentType.handshake &&
+                length != 0)
+        {
+            summary += ": " + GetAllHandshakeType();
+        }
+        return summary;
+    }
+    
+    string GetAllHandshakeType()
+    {
+        string str = "";
+        
+        if (fragment is hsArray:array<Handshake>)
+        {
+            string sep = "[";
+            foreach (Handshake hs in hsArray)
+            {
+                str += sep + GetHandshakeNameFromHandshakeType(hs.msg_type);
+                sep = ", ";
+            }
+            str += "]";
+        }
+        
+        return str;
+    }
+}
+
+pattern ContentType = enum byte
+{
+    change_cipher_spec = 20,
+    alert = 21,
+    handshake = 22,
+    application_data = 23,
+    heartbeat = 24,
+    ...
+};
+
+string GetMessageNameFromContentType(ContentType cType)
+{
+    switch (cType)
+    {
+        case ContentType.handshake => return "Handshake";
+        case ContentType.change_cipher_spec => return "ChangeCipherSpec";
+        case ContentType.alert => return "Alert";
+        case ContentType.application_data => return "ApplicationData";
+        case ContentType.heartbeat => return "Heartbeat";
+        default => return "Unknown Content Type(" + Utility.DecToHexFormat(cType) + ")";
+    }
+}
+
+type ProtocolVersion
+{
+    byte major;
+    byte minor;
+    
+    override string ToString()
+    {
+        ushort version = ((major << 8) + minor) as ushort;
+        switch (version)
+        {
+            case 0x0300 => return "SSL 3.0";
+            case 0x0301 => return "TLS 1.0";
+            case 0x0302 => return "TLS 1.1";
+            case 0x0303 => return "TLS 1.2";
+            default => return base.ToString();
+        }
+    }
+}
+
+Standard.ProtocolVersion operator as(TLS.ProtocolVersion version)
+{
+    return new Standard.ProtocolVersion{major = version.major, minor = version.minor};
+}
+
+type ChangeCipherSpec
+{
+    ChangeCipherSpec_Type $"type";
+}
+
+pattern ChangeCipherSpec_Type = enum byte
+{
+    change_cipher_spec = 1,
+    ...
+};
+
+type Alert
+{
+    AlertLevel level;
+    AlertDescription description;
+}
+
+pattern AlertLevel = enum byte
+{
+    warning = 1,
+    fatal = 2,
+    ...
+};
+
+pattern AlertDescription = enum byte
+{
+    close_notify = 0,
+    unexpected_message = 10,
+    bad_record_mac = 20,
+    decryption_failed = 21,
+    record_overflow = 22,
+    decompression_failure = 30,
+    handshake_failure = 40,
+    no_certificate_RESERVED = 41,
+    bad_certificate = 42,
+    unsupported_certificate = 43,
+    certificate_revoked = 44,
+    certificate_expired = 45,
+    certificate_unknown = 46,
+    illegal_parameter = 47,
+    unknown_ca = 48,
+    access_denied = 49,
+    decode_error = 50,
+    decrypt_error = 51,
+    export_restriction_RESERVED = 60,
+    protocol_version = 70,
+    insufficient_security = 71,
+    internal_error = 80,
+    user_canceled = 90,
+    no_renegotiation = 100,
+    unsupported_extension = 110,
+    certificate_unobtainable = 111,
+    unrecognized_name = 112,
+    bad_certificate_status_response = 113,
+    bad_certificate_hash_value = 114,
+    unknown_psk_identity = 115,
+    ...
+};
+
+type Handshake[ProtocolVersion version]
+{
+    HandshakeType msg_type;
+    uint length with BinaryEncoding{Width = 24};
+    optional [|length > 0|] 
+        ([|msg_type is HandshakeType.client_hello|] ClientHello[length]
+        | [|msg_type is HandshakeType.server_hello|] ServerHello[length]
+        | [|msg_type is HandshakeType.session_ticket|] NewSessionTicket
+        | [|msg_type is HandshakeType.certificate|] Certificate
+        | [|msg_type is HandshakeType.certificate_request && version.major == 3 && version.minor < 3|] CertificateRequest
+        | [|msg_type is HandshakeType.certificate_request && version.major == 3 && version.minor >= 3|] CertificateRequestV12
+        | [|msg_type is HandshakeType.finished|] Finished
+        | [|msg_type is HandshakeType.certificate_url|] CertificateURL
+        | [|msg_type is HandshakeType.certificate_status|] CertificateStatus
+        | [|msg_type is HandshakeType.supplemental_data|] SupplementalData
+        | binary) body with BinaryEncoding{WidthForComposedType = (length * 8) as int};
+        
+    override string ToString()
+    {
+        return GetHandshakeNameFromHandshakeType(msg_type);
+    }
+}
+
+pattern HandshakeType = enum byte
+{
+    hello_request = 0,
+    client_hello = 1,
+    server_hello = 2,
+    hello_verify_request = 3, // RFC 4347 DTLS
+    session_ticket = 4,
+    certificate = 11,
+    server_key_exchange = 12,
+    certificate_request = 13,
+    server_hello_done = 14,
+    certificate_verify = 15,
+    client_key_exchange = 16,
+    finished = 20,
+    certificate_url = 21,
+    certificate_status = 22,
+    supplemental_data = 23,
+    ...
+};
+
+string GetHandshakeNameFromHandshakeType(HandshakeType hst)
+{
+    switch (hst)
+    {
+        case HandshakeType.hello_request => return "Hello Request";
+        case HandshakeType.client_hello => return "Client Hello";
+        case HandshakeType.server_hello => return "Server Hello";
+        case HandshakeType.hello_verify_request => return "Hello Verify Request";
+        case HandshakeType.session_ticket => return "New Session Ticket";
+        case HandshakeType.certificate => return "Certificate";
+        case HandshakeType.server_key_exchange => return "Server Key Exchange";
+        case HandshakeType.certificate_request => return "Certificate Request";
+        case HandshakeType.server_hello_done => return "Server Hello Done";
+        case HandshakeType.certificate_verify => return "Certificate Verify";
+        case HandshakeType.client_key_exchange => return "Client Key Exchange";
+        case HandshakeType.finished => return "Finished";
+        case HandshakeType.certificate_url => return "Certificate Url";
+        case HandshakeType.certificate_status => return "Certificate Status";
+        case HandshakeType.supplemental_data => return "Supplemental Data";
+        default => return "Unknown Handshake Type(" + Utility.DecToHexFormat(hst) + ")";
+    }
+}
+
+type Random
+{
+    uint gmt_unix_time 
+        with DisplayInfo{ToText = (any data) => CreateDateTime(1970, 1, 1).AddSeconds(data as uint).ToString("MM/dd/yyyy HH:mm:ss K")};
+    binary random_bytes with BinaryEncoding{Length = 28};
+}
+
+pattern CompressionMethod = enum byte
+{
+    NULL = 0,
+    DEFLATE = 1,
+    LZS = 64,
+    ...
+};
+
+type SessionID
+{
+    byte length_in_bytes;
+    optional [|length_in_bytes > 0|] binary session_id with BinaryEncoding{Length = length_in_bytes};
+}
+
+type ClientHello[uint Length]
+{
+    ProtocolVersion client_version;
+    Random random;
+    SessionID session_id;
+    ushort cipher_suites_length_in_bytes;
+    array<IANA.CipherSuite> cipher_suites with BinaryEncoding{WidthForComposedType = (cipher_suites_length_in_bytes * 8) as int};
+    byte compression_methods_length_in_bytes;
+    array<CompressionMethod> compression_methods with BinaryEncoding{WidthForComposedType = (compression_methods_length_in_bytes * 8) as int};
+    optional [|Length - 38 - session_id.length_in_bytes - cipher_suites_length_in_bytes - compression_methods_length_in_bytes > 0|] ushort extensions_length_in_bytes;
+    optional [|extensions_length_in_bytes != nothing && extensions_length_in_bytes > 0|] 
+        array<Extension[false]> extensions with BinaryEncoding{WidthForComposedType = (extensions_length_in_bytes != nothing ? (extensions_length_in_bytes * 8) : 0) as int};
+}
+
+type ServerHello[uint Length]
+{
+    ProtocolVersion server_version;
+    Random random;
+    SessionID session_id;
+    IANA.CipherSuite cipher_suite;
+    CompressionMethod compression_method;
+    optional [|Length - 38 - session_id.length_in_bytes > 0|] ushort extensions_length_in_bytes;
+    optional [|extensions_length_in_bytes != nothing && extensions_length_in_bytes > 0|] 
+        array<Extension[true]> extensions with BinaryEncoding{WidthForComposedType = (extensions_length_in_bytes != nothing ? (extensions_length_in_bytes * 8) : 0) as int};
+}
+
+// Section 2.3, RFC 3546
+type Extension[bool IsServer]
+{
+    ExtensionType extension_type;
+    ushort extension_data_length_in_bytes;
+    // Reference page: http://www.iana.org/assignments/tls-extensiontype-values
+    optional [|extension_data_length_in_bytes > 0|] 
+        ([|extension_type is ExtensionType.server_name|] ServerNameList
+        | [|extension_type is ExtensionType.max_fragment_length|] MaxFragmentLength
+        | [|extension_type is ExtensionType.trusted_ca_keys|] TrustedAuthorities
+        | [|extension_type is ExtensionType.status_request|] CertificateStatusRequest
+        | [|extension_type is ExtensionType.user_mapping|] UserMappingTypeList
+        | [|extension_type in {ExtensionType.client_authz, ExtensionType.server_authz}|] AuthzDataFormats
+        | [|extension_type is ExtensionType.cert_type|] CertificateTypeExtension[IsServer]
+        | [|extension_type is ExtensionType.elliptic_curves|] EllipticCurveList
+        | [|extension_type is ExtensionType.ec_point_formats|] ECPointFormatList
+        | [|extension_type is ExtensionType.srp|] srp_I
+        | [|extension_type is ExtensionType.signature_algorithms|] SupportedSignatureAlgorithms
+        | [|extension_type is ExtensionType.application_layer_protocol_negotiation|] ProtocolNameList
+        | [|extension_type is ExtensionType.renegotiation_info|] RenegotiationInfo
+        | [|extension_type is ExtensionType.heartbeat|] HeartbeatExtension
+        | binary) extension with BinaryEncoding{WidthForComposedType = (extension_data_length_in_bytes * 8) as int};
+        
+    override string ToString()
+    {
+        return "extension_type: " + EnumToString<TLS.ExtensionType>(extension_type);
+    }
+}
+
+pattern ExtensionType = enum ushort
+{
+    server_name = 0,
+    max_fragment_length = 1,
+    client_certificate_url = 2,
+    trusted_ca_keys = 3,
+    truncated_hmac = 4,
+    status_request = 5,
+    user_mapping = 6,
+    client_authz = 7,
+    server_authz = 8,
+    cert_type = 9,
+    elliptic_curves = 10,
+    ec_point_formats = 11,
+    srp = 12,
+    signature_algorithms = 13,
+    use_srtp = 14,
+    heartbeat = 15,
+    application_layer_protocol_negotiation = 16, // draft-friedl-tls-applayerprotoneg
+    extended_master_secret   = 23, // https://tools.ietf.org/html/rfc7627
+    SessionTicket_TLS = 35,
+    next_protocol_negotiation = 13172, // [MS-TLSP] Section 2.2.3 Extended Hello Messages [NPN]
+    renegotiation_info = 65281,
+    ...
+};
+
+pattern HashAlgorithm = enum byte
+{
+    none   = 0,
+    md5    = 1,
+    sha1   = 2,
+    sha224 = 3,
+    sha256 = 4,
+    sha384 = 5,
+    sha512 = 6,
+    ...
+};
+
+pattern SignatureAlgorithm = enum byte
+{
+    anonymous = 0,
+    rsa       = 1,
+    dsa       = 2,
+    ecdsa     = 3,
+    ...
+};
+
+type SignatureAndHashAlgorithm
+{
+    HashAlgorithm hash;
+    SignatureAlgorithm signature;
+}
+
+type SupportedSignatureAlgorithms
+{
+    ushort length_in_bytes;
+    array<SignatureAndHashAlgorithm> supported_signature_algorithms 
+        with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+pattern ClientCertificateType = enum byte
+{
+    rsa_sign = 1,
+    dss_sign = 2,
+    rsa_fixed_dh = 3,
+    dss_fixed_dh = 4,
+    rsa_ephemeral_dh_RESERVED = 5,
+    dss_ephemeral_dh_RESERVED = 6,
+    fortezza_dms_RESERVED = 20,
+    ecdsa_sign = 64,
+    rsa_fixed_ecdh = 65,
+    ecdsa_fixed_ecdh = 66,
+    ...
+};
+
+type Certificate
+{
+    uint certificate_list_length_in_bytes with BinaryEncoding{Width = 24};
+    optional [|certificate_list_length_in_bytes > 0|] array<ASN1Cert> certificate_list with BinaryEncoding{WidthForComposedType = (certificate_list_length_in_bytes * 8) as int};
+}
+
+type ASN1Cert
+{
+    uint length_in_bytes with BinaryEncoding{Width = 24};
+    optional [|length_in_bytes > 0|] X509.Certificate x509_cert with Encoding{Decoder = Asn1BerDecoder<X509.Certificate>};
+}
+
+type CertificateRequest
+{
+    byte certificate_types_length_in_bytes;
+    array<ClientCertificateType> certificate_types with BinaryEncoding{WidthForComposedType = (certificate_types_length_in_bytes * 8) as int};
+    ushort certificate_authorities_length_in_bytes;
+    optional [|certificate_authorities_length_in_bytes > 0|] array<DistinguishedName> certificate_authorities 
+        with BinaryEncoding{WidthForComposedType = (certificate_authorities_length_in_bytes * 8) as int};
+}
+
+// TLS 1.2 re-defined Certificate Request struct in RFC 5246, section 7.4.4.
+type CertificateRequestV12
+{
+    byte certificate_types_length_in_bytes;
+    array<ClientCertificateType> certificate_types with BinaryEncoding{WidthForComposedType = (certificate_types_length_in_bytes * 8) as int};
+    ushort supported_signature_algorithms_length_in_bytes;
+    optional [|supported_signature_algorithms_length_in_bytes > 0|] array<SignatureAndHashAlgorithm> supported_signature_algorithms
+        with BinaryEncoding{WidthForComposedType = ((supported_signature_algorithms_length_in_bytes as ushort) * 8) as int};
+    ushort certificate_authorities_length_in_bytes;
+    optional [|certificate_authorities_length_in_bytes > 0|] array<DistinguishedName> certificate_authorities 
+        with BinaryEncoding{WidthForComposedType = (certificate_authorities_length_in_bytes * 8) as int};
+}
+
+type DistinguishedName
+{
+    ushort length_in_bytes;
+    X509.DistinguishedName x509_DistinguishedName with Encoding{Decoder = Asn1BerDecoder<X509.DistinguishedName>};
+}
+
+type Finished
+{
+    binary verify_data;
+}
+
+// RFC 5077 3.3. NewSessionTicket Handshake Message
+type NewSessionTicket
+{
+    uint ticket_lifetime_hint;
+    ushort ticket_length_in_bytes;
+    optional [|ticket_length_in_bytes > 0|] binary ticket with BinaryEncoding{Length = ticket_length_in_bytes};
+}
+
+// RFC 6066 5. Client Certificate URLs
+pattern CertChainType = enum byte
+{
+    individual_certs = 0,
+    pkipath = 1,
+    ...
+};
+
+type CertificateURL
+{
+    CertChainType $"type";
+    ushort url_and_hash_list_length_in_bytes;
+    array<URLAndHash> url_and_hash_list with BinaryEncoding{WidthForComposedType = (url_and_hash_list_length_in_bytes * 8) as int};
+}
+
+type URLAndHash
+{
+    ushort url_length_in_bytes;
+    string url with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = url_length_in_bytes};
+    byte padding where ValidationCheck(value == 1, null, DiagnosisLevel.Error, "TLS: The padding in type URLAndHash must be set to 0x01.");
+    SHA1Hash SHA1Hash;
+}
+
+// RFC 6066 8. Certificate Status Request
+pattern CertificateStatusType = enum byte
+{
+    ocsp = 1,
+    ...
+};
+
+type CertificateStatusRequest
+{
+    CertificateStatusType status_type;
+    optional [|status_type is CertificateStatusType.ocsp|] OCSPStatusRequest request;
+}
+
+type OCSPStatusRequest
+{
+    ushort responder_id_list_length_in_bytes;
+    optional [|responder_id_list_length_in_bytes > 0|] array<ResponderID> responder_id_list 
+        with BinaryEncoding{WidthForComposedType = (responder_id_list_length_in_bytes * 8) as int};
+    Extensions request_extensions;
+}
+
+type ResponderID
+{
+    ushort length_in_bytes;
+    OCSP.ResponderID responder_id with Encoding{Decoder = Asn1BerDecoder<OCSP.ResponderID>};
+}
+
+type Extensions
+{
+    ushort length_in_bytes;
+    optional [|length_in_bytes > 0|] X509.Extensions extensions
+        with Encoding{Decoder = Asn1BerDecoder<X509.Extensions>};
+}
+
+type CertificateStatus
+{
+    CertificateStatusType status_type;
+    optional [|status_type is CertificateStatusType.ocsp|] OCSPResponse reponse;
+}
+
+type OCSPResponse
+{
+    uint length_in_bytes with BinaryEncoding{Width = 24};
+    OCSP.OCSPResponse ocspResponse with Encoding{Decoder = Asn1BerDecoder<OCSP.OCSPResponse>};
+}
+
+// RFC 4680 2. Supplemental Data Handshake Message
+type SupplementalData
+{
+    uint supp_data_length_in_bytes with BinaryEncoding{Width = 24};
+    array<SupplementalDataEntry> supp_data with BinaryEncoding{WidthForComposedType = (supp_data_length_in_bytes * 8) as int};
+}
+
+type SupplementalDataEntry
+{
+    SupplementalDataType supp_data_type;
+    ushort supp_data_length;
+    optional [|supp_data_length > 0|] 
+        ([|supp_data_type is SupplementalDataType.user_mapping_data|] UserMappingDataList
+        | [|supp_data_type is SupplementalDataType.authz_data|] AuthorizationData
+        | binary) supplementalData with BinaryEncoding{WidthForComposedType = (supp_data_length * 8) as int};
+}
+
+pattern SupplementalDataType = enum ushort
+{
+    user_mapping_data = 0,
+    authz_data = 16386,
+    ...
+};
+
+// RFC 4681 3. User Mapping Handshake Exchange
+type UserMappingDataList
+{
+    ushort user_mapping_data_list_length_in_bytes;
+    array<UserMappingData> user_mapping_data_list with BinaryEncoding{WidthForComposedType = (user_mapping_data_list_length_in_bytes * 8) as int};
+}
+
+pattern UserMappingType = enum byte
+{
+    upn_domain_hint = 64,
+    ...
+};
+
+type UserMappingData
+{
+    UserMappingType user_mapping_version;
+    ushort user_mapping_length;
+    ([|user_mapping_version is UserMappingType.upn_domain_hint|] UpnDomainHint
+    | binary) userMappingData with BinaryEncoding{WidthForComposedType = (user_mapping_length * 8) as int};
+}
+
+type UpnDomainHint
+{
+    ushort user_principal_name_length_in_bytes;
+    optional [|user_principal_name_length_in_bytes > 0|] string user_principal_name 
+        with BinaryEncoding{WidthForComposedType = (user_principal_name_length_in_bytes * 8) as int, TextEncoding = TextEncoding.UTF8};
+    ushort domain_name_length_in_bytes;
+    optional [|domain_name_length_in_bytes > 0|] string domain_name 
+        with BinaryEncoding{Length = domain_name_length_in_bytes, TextEncoding = TextEncoding.ASCII};
+}
+
+// RFC 5878 2.3. AuthzDataFormat Type
+pattern AuthzDataFormat = enum byte
+{
+    x509_attr_cert = 0,
+    saml_assertion = 1,
+    x509_attr_cert_url = 2,
+    saml_assertion_url = 3,
+    ...
+};
+
+type AuthzDataFormats
+{
+    byte length_in_bytes;
+    array<AuthzDataFormat> authz_format_list with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+// RFC 5878 3.3 AuthorizationData Type
+type AuthorizationData
+{
+    ushort authz_data_list_length_in_bytes;
+    array<AuthorizationDataEntry> authz_data_list with BinaryEncoding{WidthForComposedType = (authz_data_list_length_in_bytes * 8) as int};
+}
+
+type AuthorizationDataEntry
+{
+    AuthzDataFormat authz_format;
+    ([|authz_format is AuthzDataFormat.x509_attr_cert|] X509AttrCert
+    | [|authz_format is AuthzDataFormat.saml_assertion|] SAMLAssertion
+    | [|authz_format in {AuthzDataFormat.x509_attr_cert_url, AuthzDataFormat.saml_assertion_url}|] URLandHash) authz_data;
+}
+
+type X509AttrCert
+{
+    ushort X509AttrCert_length_in_bytes;
+    binary X509AttrCert with BinaryEncoding{Length = X509AttrCert_length_in_bytes};
+}
+
+type SAMLAssertion
+{
+    ushort SAMLAssertion_length_in_bytes;
+    (xml | binary) SAMLAssertion with Encoding{Decoder = SAMLAssertionDecoder, SourcePattern = TypeOf<binary>()},
+                                    BinaryEncoding{WidthForComposedType = (SAMLAssertion_length_in_bytes * 8) as int};
+    
+    optional (xml | binary) SAMLAssertionDecoder(binary bin)
+    {
+        var xmlData = BuildXml(bin);
+        return xmlData == null ? bin : xmlData;
+    }
+}
+
+// Note that this type is different from the type "URLAndHash" which also defined in this OPN
+type URLandHash
+{
+    ushort url_length_in_bytes;
+    string url with BinaryEncoding{TextEncoding = TextEncoding.ASCII, Length = url_length_in_bytes};
+    HashAlgorithm hash_alg;
+    ([|hash_alg is HashAlgorithm.md5|] MD5Hash
+    | [|hash_alg is HashAlgorithm.sha1|] SHA1Hash
+    | [|hash_alg is HashAlgorithm.sha224|] SHA224Hash
+    | [|hash_alg is HashAlgorithm.sha256|] SHA256Hash
+    | [|hash_alg is HashAlgorithm.sha384|] SHA384Hash
+    | [|hash_alg is HashAlgorithm.sha512|] SHA512Hash) hash;
+}
+
+pattern MD5Hash = binary with BinaryEncoding{Length = 16};
+pattern SHA1Hash = binary with BinaryEncoding{Length = 20};
+pattern SHA224Hash = binary with BinaryEncoding{Length = 28};
+pattern SHA256Hash = binary with BinaryEncoding{Length = 32};
+pattern SHA384Hash = binary with BinaryEncoding{Length = 48};
+pattern SHA512Hash = binary with BinaryEncoding{Length = 64};
+
+// RFC 6066 3. Server Name Indication
+type ServerNameList
+{
+    ushort server_name_list_length_in_bytes;
+    optional [|server_name_list_length_in_bytes > 0|] array<ServerName> server_name_list 
+        with BinaryEncoding{WidthForComposedType = (server_name_list_length_in_bytes * 8) as int};
+}
+
+type ServerName
+{
+    NameType name_type;
+    ([|name_type is NameType.host_name|] HostName | DefaultName) name;
+}
+
+pattern NameType = enum byte
+{
+    host_name = 0,
+    ...
+};
+
+type HostName
+{
+    ushort length_in_bytes;
+    string host_name with BinaryEncoding{Length = length_in_bytes, TextEncoding = TextEncoding.ASCII};
+}
+
+type DefaultName
+{
+    ushort length_in_bytes;
+    string default_name with BinaryEncoding{Length = length_in_bytes, TextEncoding = TextEncoding.ASCII};
+}
+
+// RFC 6066 4. Maximum Fragment Length Negotiation
+pattern MaxFragmentLength = enum byte
+{
+    $"2^9" = 1,
+    $"2^10" = 2,
+    $"2^11" = 3,
+    $"2^12" = 4,
+    ...
+};
+
+// RFC 6066 6. Trusted CA Indication
+type TrustedAuthorities
+{
+    ushort trusted_authorities_list_length_in_bytes;
+    optional [|trusted_authorities_list_length_in_bytes > 0|] array<TrustedAuthority> trusted_authorities_list 
+        with BinaryEncoding{WidthForComposedType = (trusted_authorities_list_length_in_bytes * 8) as int};
+}
+
+type TrustedAuthority
+{
+    IdentifierType identifier_type;
+    optional [|identifier_type in {IdentifierType.key_sha1_hash, IdentifierType.x509_name, IdentifierType.cert_sha1_hash}|] 
+        ([|identifier_type is IdentifierType.x509_name|] DistinguishedName
+        | binary) identifier with BinaryEncoding{Length = 20};
+}
+
+pattern IdentifierType = enum byte
+{
+    pre_agreed = 0,
+    key_sha1_hash = 1,
+    x509_name = 2,
+    cert_sha1_hash = 3,
+    ...
+};
+
+// RFC 4681 2. User Mapping Extension
+type UserMappingTypeList
+{
+    byte length_in_bytes;
+    array<UserMappingType> user_mapping_types with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+// RFC 6091 3.1. Client Hello
+type CertificateTypeExtension[bool IsServer]
+{
+    optional [|!IsServer|] byte length_in_bytes;
+    ([|!IsServer|] array<CertificateType>
+    | CertificateType) certificateTypes with BinaryEncoding{WidthForComposedType = ((IsServer ? 1 : (length_in_bytes as byte)) * 8) as int};
+}
+
+pattern CertificateType = enum byte
+{
+    $"X.509" = 0,
+    OpenPGP = 1,
+    ...
+};
+
+// RFC 4492 5.1.1. Supported Elliptic Curves Extension
+type EllipticCurveList
+{
+    ushort length_in_bytes;
+    array<NamedCurve> elliptic_curve_list with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+pattern NamedCurve = enum ushort
+{
+    sect163k1 = 1,
+    sect163r1 = 2,
+    sect163r2 = 3,
+    sect193r1 = 4,
+    sect193r2 = 5,
+    sect233k1 = 6,
+    sect233r1 = 7,
+    sect239k1 = 8,
+    sect283k1 = 9,
+    sect283r1 = 10,
+    sect409k1 = 11,
+    sect409r1 = 12,
+    sect571k1 = 13,
+    sect571r1 = 14,
+    secp160k1 = 15,
+    secp160r1 = 16,
+    secp160r2 = 17,
+    secp192k1 = 18,
+    secp192r1 = 19,
+    secp224k1 = 20,
+    secp224r1 = 21,
+    secp256k1 = 22,
+    secp256r1 = 23,
+    secp384r1 = 24,
+    secp521r1 = 25,
+    brainpoolP256r1 = 26,
+    brainpoolP384r1 = 27,
+    brainpoolP512r1 = 28,
+    arbitrary_explicit_prime_curves = 65281,
+    arbitrary_explicit_char2_curves = 65282,
+    ...
+};
+
+type ECPointFormatList
+{
+    byte length_in_bytes;
+    array<ECPointFormat> ec_point_format_list with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+pattern ECPointFormat = enum byte
+{
+    uncompressed = 0,
+    ansiX962_compressed_prime = 1,
+    ansiX962_compressed_char2 = 2,
+    ...
+};
+
+// RFC 5054 2.8.1. Client Hello
+type srp_I
+{
+    byte length_in_bytes;
+    string srp_I with BinaryEncoding{Length = length_in_bytes, TextEncoding = TextEncoding.UTF8};
+}
+
+// RFC 5746 3.2. Extension Definition
+type RenegotiationInfo
+{
+    byte length_in_bytes;
+    optional [|length_in_bytes > 0|] binary renegotiated_connection
+        with BinaryEncoding{Length = length_in_bytes};
+}
+
+// draft-friedl-tls-applayerprotoneg
+type ProtocolNameList
+{
+    ushort length_in_bytes;
+    array<ProtocolName> protocol_name_list with BinaryEncoding{WidthForComposedType = (length_in_bytes * 8) as int};
+}
+
+type ProtocolName
+{
+    byte length_in_bytes;
+    string ProtocolName with BinaryEncoding{Length = length_in_bytes, TextEncoding = TextEncoding.ASCII};
+}
+
+// RFC 6520 2. Heartbeat Hello Extension
+pattern HeartbeatMode = enum byte
+{
+    peer_allowed_to_send     = 0x01,
+    peer_not_allowed_to_send = 0x02,
+    ...
+};
+
+type HeartbeatExtension
+{
+    HeartbeatMode mode;
+}
+
+// RFC 6520 3. Heartbeat Protocol
+pattern HeartbeatMessageType = enum byte
+{
+    heartbeat_request  = 0x01,
+    heartbeat_response = 0x02,
+    ...
+};
+
+// RFC 6520 4. Heartbeat Request and Response Messages
+type HeartbeatMessage
+{
+    HeartbeatMessageType $"type";
+    ushort payload_length;
+    binary payload with BinaryEncoding{Length = payload_length};
+    binary padding;
+}
+
+// Type for recording TLS session context.
+type SessionContext
+{
+    bool IsEncryptedCipher;
+    bool HasChangeCipherSent;
+    uint mac_length;
+    // If set, it will be called when decoding Handshake message with ServerHello.
+    // It must be set to the client-side Context.UpdateContext when initializing.
+    // Thus, the changed context of server will be updated to client's context.
+    void(SessionContext) ContextChanged;
+
+    string NegotiatedAppName;
+
+    SessionContext()
+    {
+        Reset();
+        ContextChanged = null;
+    }
+    
+    // If the ChangeCipherSuite message is missing, we should take the assumption that the application data is encrypted.
+    bool IsEncrypted(byte contentType)
+    {
+        return HasChangeCipherSent ? IsEncryptedCipher : (contentType == ContentType.application_data);
+    }
+    
+    uint GetMacLength()
+    {
+        return HasChangeCipherSent ? mac_length : 0;
+    }
+    
+    void Reset()
+    {
+        IsEncryptedCipher = true;
+        HasChangeCipherSent = false;
+        mac_length = 0;
+    }
+    
+    void UpdateContext(SessionContext context)
+    {
+        if (context != null)
+        {
+            IsEncryptedCipher = context.IsEncryptedCipher;
+            HasChangeCipherSent = context.HasChangeCipherSent;
+            mac_length = context.mac_length;
+        }
+    }
+}
+
+void InitializeContextPair(ref SessionContext clientContext, ref SessionContext serverContext)
+{
+    clientContext = new SessionContext();
+    serverContext = new SessionContext();
+    serverContext.ContextChanged = clientContext.UpdateContext;
+}
+
+const set<ushort> UnencryptedCipher = 
+{
+    CipherSuite.TLS_NULL_WITH_NULL_NULL, 
+    CipherSuite.TLS_RSA_WITH_NULL_MD5,
+    CipherSuite.TLS_RSA_WITH_NULL_SHA,
+    CipherSuite.TLS_PSK_WITH_NULL_SHA,
+    CipherSuite.TLS_DHE_PSK_WITH_NULL_SHA,
+    CipherSuite.TLS_RSA_PSK_WITH_NULL_SHA,
+    CipherSuite.TLS_RSA_WITH_NULL_SHA256, 
+    CipherSuite.TLS_PSK_WITH_NULL_SHA256,
+    CipherSuite.TLS_PSK_WITH_NULL_SHA384, 
+    CipherSuite.TLS_DHE_PSK_WITH_NULL_SHA256,
+    CipherSuite.TLS_DHE_PSK_WITH_NULL_SHA384, 
+    CipherSuite.TLS_RSA_PSK_WITH_NULL_SHA256, 
+    CipherSuite.TLS_RSA_PSK_WITH_NULL_SHA384,
+    CipherSuite.TLS_ECDH_ECDSA_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDHE_ECDSA_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDH_RSA_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDHE_RSA_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDH_anon_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDHE_PSK_WITH_NULL_SHA, 
+    CipherSuite.TLS_ECDHE_PSK_WITH_NULL_SHA256,
+    CipherSuite.TLS_ECDHE_PSK_WITH_NULL_SHA384
+};
+
+uint GetMACLength(CipherSuite cipher)
+{
+    string cipherString = EnumToString(cipher, "IANA.CipherSuite");
+    string hashMethod = cipherString.Segment(cipherString.LastIndexOf("_") + 1);
+    switch (hashMethod)
+    {
+        case "SHA" => return 20;
+        case "SHA256" => return 32;
+        case "SHA384" => return 48;
+        case "MD5" => return 16;
+        default => return 0;
+    }
+}
+
+// Decoding TLS message and dispatch
+void TryDecodingAndDispatchingTLSMessage(binary bin, SessionContext context, Server server, MessageDirection direction)
+{
+    bool isV2ClientHello = IsV2ClientHello(bin);
+        
+    var res = TLSDecoder(bin, context);
+    if (res is rls:RecordLayers)
+    {
+        if (direction == MessageDirection.Accepts)
+        {
+            dispatch server accepts rls;
+        }
+        else
+        {
+            dispatch server issues rls;
+        }
+    }
+    else
+    {
+        ThrowDecodingException("TLS", isV2ClientHello ? "V2ClientHello" : "RecordLayers");
+    }
+}
+
+const int TLSHelloMessage_Length = 11;
+
+bool IsUnencryptedHelloMessage(binary bin)
+{
+    if (bin.Count >= TLSHelloMessage_Length && bin[0] == ContentType.handshake
+        && (bin[5] == HandshakeType.client_hello || bin[5] == HandshakeType.server_hello)
+        && bin[9] == 3 && bin[10] in {0, 1, 2, 3} // version field in hello message
+        )
+    {
+        return true;
+    }
+    
+    return false;
+}
+
+// -------------------------------- TLS Decoding --------------------------------
+type TLSDecodingHelper : TCPDecodingHelper
+{
+    void InitializeTLSHelper(Server ept)
+    {
+        TLSOverTCPDecodingCache acceptsCache;
+        TLSOverTCPDecodingCache issuesCahce;
+        InitializeTLSOverTCPDecodingCachePair(ref acceptsCache, ref issuesCahce, ept);
+        AcceptsCache = acceptsCache;
+        IssuesCache = issuesCahce;
+    }
+    /*
+     * Try Decode TLS message from Segment
+     * It is used for the case that not all the payload bytes of Segment belong to TLS message.
+     * It decode the TLS part and dispatch the non-TLS part to TCP
+     */
+    void TryDecodeTLSFromPartialTCPPayload(Segment seg, MessageDirection direction)
+    {
+        if (direction == MessageDirection.Accepts)
+        {
+            if (seg.PayloadLength > 0)
+            {
+                if (AcceptsCache.AddDataSegment(seg))
+                {
+                    IssuesCache.RemoveCompleteMessageByAck(seg.AcknowledgementNumber);
+                    CheckAndDispatchNonTLSData(seg, MessageDirection.Accepts, ref AcceptsCache.Buffer);
+                    AcceptsCache.TryDecodeAndDispatchMessage();
+                }
+            }
+            else
+            {
+                IssuesCache.AddPureAckSegment(seg);
+            }
+        }
+        else if (direction == MessageDirection.Issues)
+        {
+            if (seg.PayloadLength > 0)
+            {
+                if (IssuesCache.AddDataSegment(seg))
+                {
+                    AcceptsCache.RemoveCompleteMessageByAck(seg.AcknowledgementNumber);
+                    CheckAndDispatchNonTLSData(seg, MessageDirection.Issues, ref IssuesCache.Buffer);
+                    IssuesCache.TryDecodeAndDispatchMessage();
+                }
+            }
+            else
+            {
+                AcceptsCache.AddPureAckSegment(seg);
+            }
+        }
+    }
+
+    void CheckAndDispatchNonTLSData(Segment seg, MessageDirection direction, ref binary buffer)
+    {
+        // Calculate the length of Recordlayers
+        int curBytePos = 0;
+        int length = 0;
+        binary binSeg;
+        while (curBytePos + 5 <= buffer.Count)
+        {
+            binSeg = buffer.Segment(curBytePos, 5);
+            if (!IsTlsHeader(binSeg))
+            {
+                break;
+            }
+            length = GetTLSRecordLength(binSeg);
+            curBytePos += length;
+        }
+
+        // If curBytePos < bin.Count, it means TLS message is complete and there is other data in the buffer.
+        if (curBytePos < buffer.Count)
+        {
+            if (curBytePos + 5 > buffer.Count)
+            {
+                // if the remaining data less than 5 bytes and not a illegal TLS header,
+                // no need dispatch the remaining data to TCP
+                if (IsPossibleTlsHeader(buffer)) 
+                {
+                    return;
+                }
+            }
+            binary bin = buffer.Segment(curBytePos, buffer.Count - curBytePos);
+            Segment newSeg = new Segment
+            {
+                SourcePort = seg.SourcePort,
+                DestinationPort = seg.DestinationPort,
+                SequenceNumber = seg.SequenceNumber,
+                AcknowledgementNumber = seg.AcknowledgementNumber,
+                DataOffset = seg.DataOffset,
+                Flags = new TCP.Flags{ACK = true, PSH = true},
+                Window = seg.Window,
+                Options = seg.Options,
+                Payload = bin
+            };
+            newSeg.SourceData = bin;
+            newSeg.Origins= [seg];
+            if (bin != null && bin.Count != 0)
+            {
+                AssociateFieldPosition(newSeg, "Payload", bin, 0, bin.Count * 8);
+            }
+            
+            newSeg#SourceAddrBin = seg#SourceAddrBin;
+            newSeg#DestinationAddrBin = seg#DestinationAddrBin;
+            newSeg#SegmentLost = seg#SegmentLost;
+            newSeg#InitialSequenceNumber = seg#InitialSequenceNumber;
+            newSeg#NextSeqNumber = seg.NextSequenceNumber;
+
+            binary sourceAddrBin = seg#SourceAddrBin is b1:binary ? b1 : EmptyBinary;
+            binary destinationAddrBin = seg#DestinationAddrBin is b2:binary ? b2 : EmptyBinary;
+            
+            if (direction == MessageDirection.Accepts)
+            {
+                var ept = endpoint TCP.Server[sourceAddrBin, destinationAddrBin, seg.SourcePort, seg.DestinationPort];
+                ept.IsFromTLS = false;
+                dispatch ept accepts newSeg;
+            }
+            else
+            {
+                var ept = endpoint TCP.Server[destinationAddrBin, sourceAddrBin, seg.DestinationPort, seg.SourcePort];
+                ept.IsFromTLS = false;
+                dispatch ept issues newSeg;
+            }
+            buffer = buffer.Segment(0, curBytePos); // remove the non-tls part from Buffer
+        }
+    }
+}
+
+type DecodingCacheContextWrapper
+{
+    SessionContext Context;
+    int(any message) GetPayloadLength;
+
+    // Flag to indicate whether it is in endpoint's destructor now.
+    bool IsInDestructor = false;
+
+    // Cache the expected tls start position
+    internal int tlsStartPos;
+}
+
+// If the input binary has at least 1 TLS message and the last byte of the binary is the message's boundary, this method will return true
+uint? IsCompleteTlsRL(binary bin, ref DecodingCacheContextWrapper contextWrapper)
+{
+    contextWrapper.tlsStartPos = IsCompleteTls(bin, contextWrapper.tlsStartPos);
+    return contextWrapper.tlsStartPos == 0 ? 0 : null;
+}
+
+optional any message DecodeTLSMessage(stream s, ref DecodingCacheContextWrapper contextWrapper, any decodingCache)
+{
+    var dc = decodingCache as DecodingUtility.StreamDecodingCache;
+    var res = TLSDecoder(s, contextWrapper.Context);
+    if (res != nothing)
+    {
+        if (contextWrapper.Context.NegotiatedAppName is StringNotNullOrEmpty &&
+            dc.EPT is server:TLS.Server)
+        {
+            server.NegotiatedAppName = contextWrapper.Context.NegotiatedAppName;
+            contextWrapper.Context.NegotiatedAppName = null;
+        }
+        return res as any message;
+    }
+    return nothing;
+}
+
+optional any message DecodeIncompleteTLSRecordLayer(binary buffer, ref DecodingCacheContextWrapper contextWrapper, any decodingCache)
+{
+    var dc = decodingCache as DecodingUtility.StreamDecodingCache;
+    if (buffer != null && IsTlsHeader(buffer))
+    {
+        if (IsV2ClientHello(buffer))
+        {
+            contextWrapper.Context.HasChangeCipherSent = false;
+            if (BinaryDecoder<V2ClientHello>(buffer) is v2ClientHello:V2ClientHello)
+            {
+                return v2ClientHello;
+            }
+        }
+        else
+        {
+            stream s = buffer;
+            var res = TLSDecoder(s, contextWrapper.Context);
+            if (res is rls:RecordLayers)
+            {
+                ResetAfterDecodeIncompleteMessage(rls, s, ref contextWrapper, dc);
+                if (contextWrapper.IsInDestructor)
+                {
+                    DisplayTopLevelMessage(rls);
+                }
+                else
+                {
+                    dc.DispatchMessage(rls);
+                }
+            }
+            if (s.RemainingByteLength >= 5 &&
+                IsTlsHeader(s.PeekBytes(s.BitPosition, 5)) &&
+                BinaryDecoder<IncompleteRecordLayer>(dc.Buffer) is m:IncompleteRecordLayer)
+            {
+                return m as any message;
+            }
+        }
+    }
+    return nothing;
+}
+
+// Reset the Buffer and Origins according to the end of the consumed bytes. 
+// For TLS RecordLayers, the end of the decoded message will not always locate at the last origin.
+// So we should calculate its end to decide which origins to remain.
+void ResetAfterDecodeIncompleteMessage(RecordLayers rls, stream s, ref DecodingCacheContextWrapper contextWrapper, DecodingUtility.StreamDecodingCache dc)
+{
+    if (s == null || s.BytePosition == s.ByteLength)
+    {
+        rls.Origins = dc.Origins;
+        dc.Buffer = $[];
+        dc.Origins = [];
+    }
+    else // Buffer has data, keep the origins which have not been consumed.
+    {
+        dc.Buffer = s.PeekBytes(s.BitPosition);
+
+        int remainingLength = s.RemainingByteLength;
+        int index;
+        int payloadLength;
+        for (index = dc.Origins.Count - 1; index >= 0; index--)
+        {
+            payloadLength = contextWrapper.GetPayloadLength(dc.Origins[index]);
+            assert payloadLength >= 0;
+            remainingLength -= payloadLength;
+            if (remainingLength <= 0)
+            {
+                break;
+            }
+        }
+
+        rls.Origins = dc.Origins.Segment(0, index + 1);
+        dc.Origins = dc.Origins.Segment(index);
+    }
+}
+
+type TLSOverTCPDecodingCache: TCP.TCPDecodingCache
+{
+    DecodingCacheContextWrapper Wrapper = new DecodingCacheContextWrapper();
+    map<any message, int> segmentLengthInfoMap = {};
+    
+    void InitializeTLSCache(any endpoint ept, MessageDirection direction)
+    {
+        base.Initialize("TLS", ept, direction, IsTlsHeaderNulable, IsCompleteTlsRL, DecodeTLSMessage, DecodeIncompleteTLSRecordLayer);
+        Wrapper.Context = new SessionContext();
+        Wrapper.tlsStartPos = 0;
+        Wrapper.GetPayloadLength = GetTCPSegmentPayloadLength;
+    }
+
+    uint? IsCompleteTlsRL(binary bin)
+    {
+        return IsCompleteTlsRL(bin, ref Wrapper);
+    }
+
+    optional any message DecodeTLSMessage(stream s)
+    {
+        return DecodeTLSMessage(s, ref Wrapper, this);
+    }
+    optional any message DecodeIncompleteTLSRecordLayer(binary buffer)
+    {
+        return DecodeIncompleteTLSRecordLayer(buffer, ref Wrapper, this);
+    }
+
+    int GetTCPSegmentPayloadLength(any message msg)
+    {
+        return segmentLengthInfoMap[msg];
+    }
+
+    override bool AddDataSegment(Segment s)
+    {
+        // cache current buffer and origins count
+        var bufferCount = Buffer.Count();
+
+        bool ret = base.AddDataSegment(s);
+
+        // If detect TCP segment-lost, clear cache first.
+        if (IsTrue(s#SegmentLost))
+        {
+            // clear the buffer if segment lost
+            bufferCount = 0;
+        }
+        
+        /*
+         * Several situation should be consider in AddDataSegment.
+         * 1. Previous Buffer is not cleared, the segment may be partial-retransmitted, full-retransmitted
+         *    or normal TCP segment. It can calculate the length of payload inserted into Buffer, according
+         *    to Buffer delta length between before base.AddDataSegment and after base.AddDataSegment.
+         *    And in this situation, if segment is inserted in Origins, Origins.Count must be 
+         *    segmentLengthInfoMap.Count + 1.
+         * 2. Previous Buffer is cleared, segmentLengthInfoMap must be empty (cleared in ClearExceptionally). In this situation,
+         *    it should treat original Buffer Count as 0.
+         */
+        int mapCount = segmentLengthInfoMap.Count;
+        if (Origins.Count() > mapCount)
+            // for full retransmission situation, we should not add tcp payload information
+            segmentLengthInfoMap += {s -> Buffer.Count() - (mapCount == 0 ? 0 : bufferCount)};
+
+        assert segmentLengthInfoMap.Count == Origins.Count;
+        return ret;
+    }
+
+    override void AddPureAckSegment(Segment s)
+    {
+        base.AddPureAckSegment(s);
+        
+        if (Origins.Count > segmentLengthInfoMap.Count)
+        {
+            // the Pure ACK is inserted into Origins
+            segmentLengthInfoMap += {s -> 0};
+        }
+
+        assert segmentLengthInfoMap.Count == Origins.Count;
+    }
+
+    override void ResetAfterSucceed(stream s)
+    {
+        base.ResetAfterSucceed(s);
+        Wrapper.tlsStartPos = 0;
+
+        // sync map with Origins after ResetAfterSucceed
+        // the base ResetAfterSucceed will clear Origins or
+        // Origins array contains only one message.
+        if (Origins.Count == 1)
+        {
+            segmentLengthInfoMap = {Origins[0] -> Buffer.Count()};
+        }
+        else
+        {
+            segmentLengthInfoMap = {};
+        }
+
+        assert segmentLengthInfoMap.Count == Origins.Count;
+    }
+
+    override void ClearExceptionally()
+    {
+        base.ClearExceptionally();
+        Wrapper.tlsStartPos = 0;
+
+        segmentLengthInfoMap = {};
+        assert segmentLengthInfoMap.Count == Origins.Count;
+    }
+
+    override void ClearInDestructor()
+    {
+        Wrapper.IsInDestructor = true;
+        base.ClearInDestructor();
+        IsCurProtocol = false;
+        Wrapper.IsInDestructor = false;
+
+        segmentLengthInfoMap = {};
+        assert segmentLengthInfoMap.Count == Origins.Count;
+    }
+
+    /*
+    * The TLS message itself will not come from TLS decryption.
+    */
+    override bool IsFromTLS()
+    {
+        return false;
+    }
+}
+
+void InitializeTLSOverTCPDecodingCachePair(ref TLSOverTCPDecodingCache requestCache, ref TLSOverTCPDecodingCache responseCache, TLS.Server server)
+{
+    requestCache = new TLSOverTCPDecodingCache();
+    requestCache.InitializeTLSCache(server, MessageDirection.Accepts);
+        
+    responseCache = new TLSOverTCPDecodingCache();
+    responseCache.InitializeTLSCache(server, MessageDirection.Issues);
+        
+    responseCache.Wrapper.Context.ContextChanged = requestCache.Wrapper.Context.UpdateContext;
+}
+
+type TLSStreamDecodingCache: DecodingUtility.StreamDecodingCache
+{
+    DecodingCacheContextWrapper Wrapper = new DecodingCacheContextWrapper();
+    
+    void InitializeTLSCache(any endpoint ept, MessageDirection direction, int(any message) getPayloadLengthFunc)
+    {
+        assert getPayloadLengthFunc != null;
+
+        base.Initialize("TLS", ept, direction, IsTlsHeaderNulable, IsCompleteTlsRL, DecodeTLSMessage, DecodeIncompleteTLSRecordLayer);
+        Wrapper.Context = new SessionContext();
+        Wrapper.tlsStartPos = 0;
+        Wrapper.GetPayloadLength = getPayloadLengthFunc;
+    }
+
+    /*
+     * Accumulate decoding buffer, and origins. 
+     * Store HTTP diagnosis status.
+     */
+    void AddHttpPayload(HttpContract.HTTPPayload httpPayload)
+    {
+        assert Initliazed == true;
+
+        TCP.Segment seg = null;
+        if ((httpPayload.Origins).Count > 0
+            && (httpPayload.Origins)[0] is v:TCP.Segment)
+        {
+            seg = v;
+        }
+        
+        if (seg != null && IsTrue(seg#SegmentLost) && BufferCount() > 0)
+        {
+            ClearExceptionally();
+        }
+
+        Buffer += httpPayload.Payload;
+        Origins += [httpPayload];
+    }
+
+    uint? IsCompleteTlsRL(binary bin)
+    {
+        return IsCompleteTlsRL(bin, ref Wrapper);
+    }
+
+    optional any message DecodeTLSMessage(stream s)
+    {
+        return DecodeTLSMessage(s, ref Wrapper, this);
+    }
+    optional any message DecodeIncompleteTLSRecordLayer(binary buffer)
+    {
+        return DecodeIncompleteTLSRecordLayer(buffer, ref Wrapper, this);
+    }
+
+    override void ResetAfterSucceed(stream s)
+    {
+        base.ResetAfterSucceed(s);
+        Wrapper.tlsStartPos = 0;
+    }
+
+    override void ClearExceptionally()
+    {
+        base.ClearExceptionally();
+        Wrapper.tlsStartPos = 0;
+    }
+
+    override void ClearInDestructor()
+    {
+        Wrapper.IsInDestructor = true;
+        base.ClearInDestructor();
+        IsCurProtocol = false;
+        Wrapper.IsInDestructor = false;
+    }
+}
+
+void InitializeTLSStreamDecodingCachePair(ref TLSStreamDecodingCache requestCache, ref TLSStreamDecodingCache responseCache, TLS.Server server, int(any message) getPayloadLength)
+{
+    requestCache = new TLSStreamDecodingCache();
+    requestCache.InitializeTLSCache(server, MessageDirection.Accepts, getPayloadLength);
+        
+    responseCache = new TLSStreamDecodingCache();
+    responseCache.InitializeTLSCache(server, MessageDirection.Issues, getPayloadLength);
+        
+    responseCache.Wrapper.Context.ContextChanged = requestCache.Wrapper.Context.UpdateContext;
+}
+
+int GetHttpPayloadLength(any message msg)
+{
+    if (msg is http:HttpContract.HTTPPayload)
+    {
+        return http.Payload.Count;
+    }
+
+    return -1;
+}
+
+binary GetApplicationDataFromRecordLayer(RecordLayers recordLayers)
+{
+    binary data = $[];
+    foreach (var record in recordLayers.records)
+    {
+        if (record.$"type" is ContentType.application_data &&
+            !record.GetIsEncrypted() &&
+            record.fragment is bin:binary)
+        {
+            data += bin;
+        }
+    }
+    return data;
+}
+
+bool HasEncryptedApplicationData(RecordLayers recordLayers)
+{
+    foreach (var record in recordLayers.records)
+    {
+        if (record.$"type" is ContentType.application_data)
+        {
+            return record.GetIsEncrypted(); // The encryption status for all the records in RecordLayers are the same.
+        }
+    }
+    
+    return false;
+}
+
+bool HasApplicationData(RecordLayers recordLayers)
+{
+    foreach (var record in recordLayers.records)
+    {
+        if (record.$"type" is ContentType.application_data)
+        {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+bool IsTlsHeader(binary data)
+{
+    return IsTlsHeaderNulable(data) == true;
+}
+bool? IsTlsHeaderNulable(binary data)
+{
+    if (data.Count < 5)
+        return null;
+        
+    // For V2ClientHello message, the highest bit MUST be 1.
+    if ((data[0] & 0x80) != 0)
+    {
+        return IsV2ClientHello(data);
+    }
+    else if (data[1] == 0x03 &&
+            data[2] in MinorVersions &&
+            InRange<TLS.ContentType>(data[0]))
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+bool IsTlsHeaderBySegment(TCP.TCPDecodingCache cache, Segment s)
+{
+    if (cache == null)
+    {
+        return false;
+    }
+
+    binary bin = cache.GetPayloadWithoutOverlapping(s);
+    return bin == null || IsTlsHeader(bin); // bin == null means it is a fully-retransmitted segment
+}
+
+bool IsPossibleTlsHeader(binary data)
+{
+    if (data.Count == 0)
+    {
+        return true;
+    }
+    // For V2ClientHello message, the highest bit MUST be 1.
+    if ((data[0] & 0x80) != 0)
+    {
+        if (data.Count > 2 && data[2] != 1)
+        {
+            return false;
+        }
+        else if (data.Count > 3 && data[2] != 3)
+        {
+            return false;
+        }
+        else if (data.Count > 4 && !(data[4] in MinorVersions))
+        {
+            return false;
+        }
+        else 
+        {
+            return true;
+        }
+    }
+    else if (!InRange<TLS.ContentType>(data[0]))
+    {
+        return false;
+    }
+    else if (data.Count > 1 && data[1] != 0x03)
+    {
+        return false;
+    } 
+    else if (data.Count > 2 && !(data[2] in MinorVersions))
+    {
+        return false;
+    }
+    else
+    {
+        return true;
+    }
+}
+
+// Try to peek the length field in TLS message
+ushort GetTLSRecordLength(binary bin)
+{
+    return bin.Count >= 5 ? ((((bin[0] & 0x80) != 0 ? (MakeWord(((bin[0] & 0x7F) as byte), bin[1]) + 2) : (MakeWord(bin[3], bin[4]) + 5))) as ushort) : 0;
+}
+
+// 0 for complete tls
+// other for the last expected end pos for complete tls.
+int IsCompleteTls(binary bin, int startPos)
+{
+    int curBytePos = startPos;
+    int length = 0;
+    while (curBytePos + 5 <= bin.Count)
+    {
+        length = GetTLSRecordLength(bin.Segment(curBytePos, 5));
+        curBytePos += length;
+    }
+        
+    return curBytePos == bin.Count ? 0 : curBytePos;
+}
+
+optional (RecordLayers | V2ClientHello) TLSDecoder(stream s, SessionContext context)
+{
+    if (s.RemainingByteLength < 5)
+    {
+        return nothing;
+    }
+    
+    if (IsV2ClientHello(s.PeekBytes(s.BitPosition, 5)))
+    {
+        context.Reset();
+        return (GetTLSRecordLength(s.PeekBytes(s.BitPosition, 5)) <= s.RemainingByteLength) ? BinaryDecoder<V2ClientHello>(s) : nothing;
+    }
+    
+    array<RecordLayer> recordArray = [];
+    int prePos = s.BitPosition;
+    int startPos = prePos;
+    array<DataChunks> chunks = [];
+    while (s.RemainingByteLength >= 5 && GetTLSRecordLength(s.PeekBytes(s.BitPosition, 5)) <= s.RemainingByteLength)
+    {
+        if (s.RemainingByteLength >= TLSHelloMessage_Length 
+            && IsUnencryptedHelloMessage(s.PeekBytes(s.BitPosition, 11)))
+        {
+            context.Reset();
+        }
+        
+        var res = BinaryDecoder<RecordLayer[context.IsEncrypted(s.CurrentByte), context.GetMacLength()]>(s);
+        if (res == nothing)
+        {
+            break;
+        }
+        
+        RecordLayer msg = res as RecordLayer;
+        if (msg.$"type" is ContentType.handshake &&
+            msg.fragment is hsArray:array<Handshake>)
+        {
+            foreach (Handshake hs in hsArray)
+            {
+                if (hs.msg_type is HandshakeType.server_hello &&
+                    hs.body is sh:ServerHello)
+                {
+                    context.IsEncryptedCipher = !(sh.cipher_suite in UnencryptedCipher);
+                    context.mac_length = GetMACLength(sh.cipher_suite);
+                    context.HasChangeCipherSent = false;
+                    if (context.ContextChanged != null)
+                    {
+                        context.ContextChanged(context);
+                    }
+                    context.NegotiatedAppName = GetNegotiatedAppName(sh.extensions);
+                }
+                else if (hs.msg_type is HandshakeType.client_hello)
+                {
+                    context.HasChangeCipherSent = false;
+                }
+            }
+        }
+        else if (msg.$"type" is ContentType.change_cipher_spec)
+        {
+            context.HasChangeCipherSent = true;
+        }
+        
+        recordArray += [msg];
+        chunks += [new DataChunks{DataSource = s, Chunks = [new BinaryChunk{BitPosition = prePos, BitLength = s.BitPosition - prePos}]}];
+        prePos = s.BitPosition;
+    }
+    
+    if (recordArray.Count == 0)
+    {
+        return nothing;
+    }
+    
+    RecordLayers recordLayers = new RecordLayers{records = recordArray};
+    recordLayers.SourceData = s.PeekBytes(startPos, (s.BytePosition - startPos / 8) as int);
+    DataChunks payloadChunk = new DataChunks
+    {
+        DataSource = s, 
+        Chunks = [new BinaryChunk{BitPosition = startPos, BitLength = s.BitPosition - startPos}]
+    };
+    recordLayers.AssociateArrayField("records", chunks);
+    recordLayers.AssociateField("records", payloadChunk);
+    
+    return recordLayers;
+}
+
+bool IsV2ClientHello(binary data)
+{
+    if (data.Count >= 5 && 
+        ((data[0] & 0x80) != 0) &&
+        data[2] == 1 &&
+        data[3] == 3 &&
+        data[4] in MinorVersions)
+        {
+            return true;
+        }
+
+    return false;
+}
+
+int GetTLSHeaderLength(binary bin)
+{
+    // The highest bit of first byte must be 1 for V2ClientHello message
+    return bin.Count >= 1 ? ((bin[0] & 0x80) == 0 ? 5 : 11) : 0;
+}
+
+string GetNegotiatedAppName(optional array<Extension> extensions)
+{
+    if (extensions is exts:array<Extension> && exts != null && exts.Count > 0)
+    {
+        foreach (Extension ext in exts)
+        {
+            if (ext.extension_type == ExtensionType.application_layer_protocol_negotiation &&
+                ext.extension is protocolList:ProtocolNameList &&
+                protocolList.protocol_name_list.Count > 0)
+            {
+                return protocolList.protocol_name_list[0].ProtocolName; 
+            }
+        }
+    }
+    return null;
+}
+
+bool SupportExtendedMasterSecret(optional array<Extension> extensions)
+{
+    if (extensions is exts:array<Extension> && exts != null && exts.Count > 0)
+    {
+        foreach (Extension ext in exts)
+        {
+            if (ext.extension_type == ExtensionType.extended_master_secret)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// -------------------------------- TLS Decryption --------------------------------
+
+// This DummyEndpoint is just defined to provide session unique scope. It will be removed once 
+// we support session specified global variable.  
+endpoint DummyEndpoint accepts any message issues any message
+{
+    // Cache all the session IDs. The key is the sever identifier composed with IP and port.
+    map<binary, map<binary,DecryptInfo>> DecryptionSessionMap = {};
+};
+
+autostart actor Decryption(Server server)
+{
+    DecryptionHelper decryptHelper = new DecryptionHelper();
+    
+    observe server accepts s:V2ClientHello where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting()
+    {
+        decryptHelper.CollectInfoFromV2ClientHello(s, server.ClientAddress, server.ServerAddress);
+    }
+    
+    observe server issues s:V2ClientHello where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting()
+    {
+        decryptHelper.CollectInfoFromV2ClientHello(s, server.ServerAddress, server.ClientAddress);
+    }
+    
+    observe server accepts s:RecordLayers where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting() && 
+        !(HasApplicationData(s))
+    {
+        decryptHelper.CollectInfoFromRecordLayers(s, server.ClientAddress, server.ServerAddress, server.ClientPort, server.ServerPort);
+    }
+    
+    observe server issues s:RecordLayers where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting() && 
+        !(HasApplicationData(s))
+    {
+        decryptHelper.CollectInfoFromRecordLayers(s, server.ServerAddress, server.ClientAddress, server.ServerPort, server.ClientPort);
+    }
+    
+    process server accepts s:RecordLayers where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting() && 
+        HasEncryptedApplicationData(s)
+    {
+        var bin = decryptHelper.DecryptApplicationData(s, server.ClientAddress, server.ServerAddress, server.ClientPort, server.ServerPort);
+        
+        if (s#DecryptDetails is StringNotNullOrEmpty) // Error occurs if the DecryptDetails is not a empty string
+        {
+            reject;
+        }
+        
+        s#DecryptDetails = "Decrypted";
+        server.DispatchBack(bin, s, server, MessageDirection.Accepts);
+    }
+    
+    process server issues s:RecordLayers where decryptHelper.CanBeDecrypted && server.IsContextSet() && IsCertificateExisting() && 
+        HasEncryptedApplicationData(s)
+    {
+        var bin = decryptHelper.DecryptApplicationData(s, server.ServerAddress, server.ClientAddress, server.ServerPort, server.ClientPort);
+        
+        if (s#DecryptDetails is StringNotNullOrEmpty) // Error occurs if the DecryptDetails is not a empty string
+        {
+            reject;
+        }
+        
+        s#DecryptDetails = "Decrypted";
+        server.DispatchBack(bin, s, server, MessageDirection.Issues);
+    }
+    
+    // The following 2 rules handle with the unencrypted cipher suite cases
+    // The encryption status for all the records in RecordLayers are the same.
+    process server accepts s:RecordLayers where server.IsContextSet() && HasApplicationData(s) && !HasEncryptedApplicationData(s)
+    {
+        var bin = GetApplicationDataFromRecordLayer(s);
+        
+        if (bin == null || bin.Count == 0)
+        {
+            reject;
+        }
+        
+        server.DispatchBack(bin, s, server, MessageDirection.Accepts);
+    }
+    
+    process server issues s:RecordLayers where server.IsContextSet() && HasApplicationData(s) && !HasEncryptedApplicationData(s)
+    {
+        var bin = GetApplicationDataFromRecordLayer(s);
+        
+        if (bin == null || bin.Count == 0)
+        {
+            reject;
+        }
+        
+        server.DispatchBack(bin, s, server, MessageDirection.Issues);
+    }
+}
+
+// keeps track of states
+pattern State = enum {NoAction, ClientHelloDone, ServerHelloDone, ComputeKeys, CKEDone, ErrorComputeKeys};
+    
+// the type stored in map used to keep information about messages
+type DecryptInfo
+{
+    Random cHelloRand;
+    Random sHelloRand;
+    IANA.CipherSuite cipherSuite;
+    Standard.ProtocolVersion version;
+    array<byte> certSerialNum;
+    State state;
+    array<byte> clientMacWriteKey;
+    array<byte> serverMacWriteKey;
+    array<byte> clientWriteKey;
+    array<byte> serverWriteKey;
+    array<byte> clientCipherDataIV;
+    array<byte> serverCipherDataIV;
+    array<byte> masterSecretKey;
+    bool ckeReceived;
+    bool certReceived;
+    bool? supportExtendedMasterSecret = null;
+    // RFC 7627, section 3:
+    //"handshake_messages" refers to all handshake messages sent or
+    // received, starting at the ClientHello up to and including the
+    // ClientKeyExchange message, including the type and length fields of
+    // the handshake messages
+    binary handshakeMessages = $[];
+}
+
+CipherSuiteInfo GetSelectedCipherSuiteInfo(IANA.CipherSuite selectedCipherSuite, Standard.ProtocolVersion version)
+{
+    CipherSuiteInfo cipherInfo;
+    switch (selectedCipherSuite)
+    {
+        // TLS_RSA_WITH_NULL_MD5
+        case 0x0001 =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 0,
+                MacType = 0, CipherMode = 2, BlockSize = 0
+            };
+        // TLS_RSA_WITH_NULL_SHA
+        case 0x0002 =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 0,
+                MacType = 1, CipherMode = 2, BlockSize = 0
+            };
+        // TLS_RSA_WITH_RC4_128_MD5 
+        case 0x0004 =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 4,
+                MacType = 0, CipherMode = 2, BlockSize = 0
+            };
+        // TLS_RSA_WITH_RC4_128_SHA
+        case 0x0005 =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 4,
+                MacType = 1, CipherMode = 2, BlockSize = 0
+            };
+        // TLS_RSA_WITH_3DES_EDE_CBC_SHA
+        case 0x000A =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 1,
+                MacType = 1, CipherMode = 0, BlockSize = 8
+            };
+        // TLS_RSA_WITH_AES_128_CBC_SHA
+        case 0x002F =>
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 2,
+                MacType = 1, CipherMode = 0, BlockSize = 16
+            };
+        // TLS_RSA_WITH_AES_256_CBC_SHA
+        case 0x0035 => 
+            cipherInfo = new CipherSuiteInfo
+            {
+                SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 3,
+                MacType = 1, CipherMode = 0, BlockSize = 16
+            };
+        // TLS_RSA_WITH_AES_128_CBC_SHA256
+        case 0x003c =>
+            cipherInfo = new CipherSuiteInfo
+                {
+                    SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 2,
+                    MacType = 2, CipherMode = 0, BlockSize = 16
+                };
+        // TLS_RSA_WITH_AES_256_CBC_SHA256
+        case 0x003d =>
+            cipherInfo = new CipherSuiteInfo
+                {
+                    SslVersion = version, KeyExchangeAlg = 0, DataEncryption = 3,
+                    MacType = 2, CipherMode = 0, BlockSize = 16
+                };
+    }
+    return cipherInfo;
+}
+
+bool CalculateKeyLengths(IANA.CipherSuite selectedCipherSuite, out int macWriteKeyLength, out int writeKeyLength, out int lengthIV)
+{
+    bool succeed = true;
+    switch (selectedCipherSuite)
+    {
+        // TLS_RSA_WITH_NULL_MD5
+        case 0x0001 => macWriteKeyLength = 16; writeKeyLength = 0; lengthIV = 0;
+        // TLS_RSA_WITH_NULL_SHA
+        case 0x0002 => macWriteKeyLength = 20; writeKeyLength = 0; lengthIV = 0;
+        // TLS_RSA_WITH_RC4_128_MD5 
+        case 0x0004 => macWriteKeyLength = 16; writeKeyLength = 16; lengthIV = 0;
+        // TLS_RSA_WITH_RC4_128_SHA
+        case 0x0005 => macWriteKeyLength = 20; writeKeyLength = 16; lengthIV = 0;
+        // TLS_RSA_WITH_3DES_EDE_CBC_SHA
+        case 0x000A => macWriteKeyLength = 20; writeKeyLength = 24; lengthIV = 8;
+        // TLS_RSA_WITH_AES_128_CBC_SHA
+        case 0x002F => macWriteKeyLength = 20; writeKeyLength = 16; lengthIV = 16;
+        // TLS_RSA_WITH_AES_256_CBC_SHA
+        case 0x0035 => macWriteKeyLength = 20; writeKeyLength = 32; lengthIV = 16;
+        // TLS_RSA_WITH_AES_128_CBC_SHA256
+        case 0x003c => macWriteKeyLength = 32; writeKeyLength = 16; lengthIV = 16;
+        // TLS_RSA_WITH_AES_256_CBC_SHA256
+        case 0x003d => macWriteKeyLength = 32; writeKeyLength = 32; lengthIV = 16;
+        default => succeed = false;
+    }
+    return succeed;
+}
+
+// Decryption Helper
+type DecryptionHelper
+{
+    map<string, DecryptInfo> DecryptInfos = {};
+    bool CanBeDecrypted = true;
+
+    // SessionID sent in the ClientHello if exists.
+    binary ClientSessionID = null;
+    
+    void CollectInfoFromRecordLayers(RecordLayers rls, binary sourceIP, binary destinationIP, ushort srcPort, ushort dstPort)
+    {
+        assert sourceIP != null && destinationIP != null;
+        
+        // keys (from source to dest and dest to source) to be used as indices with map
+        string k1 = BinaryToIP(sourceIP) + BinaryToIP(destinationIP);
+        string k2 = BinaryToIP(destinationIP) + BinaryToIP(sourceIP);
+        binary serverID = sourceIP + srcPort.ToBinary();
+        
+        // Iterates over each recordlayer
+        string errorMessage = "";
+        foreach (RecordLayer r1 in rls.records)
+        {
+            errorMessage = CollectInfoFromNonAppData(r1, k1, k2, serverID);
+            if (errorMessage is StringNotNullOrEmpty)
+            {
+                rls#DecryptDetails = errorMessage;
+                break;
+            }
+        }
+    }
+    
+    void CollectInfoFromV2ClientHello(V2ClientHello v2ClientHello, binary sourceIP, binary destinationIP)
+    {
+        Random clientRand = MakeBinaryToRandom(v2ClientHello.challenge);
+        
+        if (v2ClientHello.session_id_length > 0)
+        {
+            ClientSessionID = v2ClientHello.session_id;
+        }
+        
+        string k = BinaryToIP(sourceIP) + BinaryToIP(destinationIP);
+                        
+        // Dummy values assigned where necessary
+        if (!(k in DecryptInfos))
+        {
+            DecryptInfo v = new DecryptInfo
+            {
+                cHelloRand = clientRand, sHelloRand = clientRand, cipherSuite = 0x0001, version = new Standard.ProtocolVersion{major = 0x00, minor = 0x00},
+                clientMacWriteKey = [], serverMacWriteKey = [], clientWriteKey = [], serverWriteKey = [], 
+                clientCipherDataIV = [], serverCipherDataIV = [], masterSecretKey = [], certSerialNum = [], state = 1, ckeReceived = false, certReceived = false
+            };
+            DecryptInfos += {k -> v};
+        }
+        else
+        {
+            DecryptInfo v = DecryptInfos[k];
+            v.cHelloRand = clientRand;
+            v.state = State.ClientHelloDone;
+        }
+    }
+    
+    binary DecryptApplicationData(RecordLayers rls, binary sourceIP, binary destinationIP, ushort srcPort, ushort dstPort)
+    {
+        assert sourceIP != null && destinationIP != null;
+        
+        // keys (from source to dest and dest to source) to be used as indices with map
+        string k1 = BinaryToIP(sourceIP) + BinaryToIP(destinationIP);
+        string k2 = BinaryToIP(destinationIP) + BinaryToIP(sourceIP);
+        binary serverID = sourceIP + srcPort.ToBinary();
+        
+        binary decryptedPayload = $[];
+        
+        binary payload;
+        string errorMessage;
+        // Iterates over each recordlayer
+        foreach (RecordLayer r1 in rls.records)
+        {
+            if (r1.$"type" is ContentType.application_data)
+            {
+                payload = null;
+                errorMessage = TryDecryptAppData(r1, k1, k2, sourceIP, destinationIP, out payload);
+                if (payload != null)
+                {
+                    decryptedPayload += payload;
+                }
+            }
+            // after new set of client and server hellos, there will be an encrypted handshake and need to recompute keys
+            else
+            {
+                errorMessage = CollectInfoFromNonAppData(r1, k1, k2, serverID);
+            }
+            
+            if (errorMessage is StringNotNullOrEmpty)
+            {
+                rls#DecryptDetails = errorMessage;
+                break;
+            }
+        }
+        
+        return decryptedPayload;
+    }
+            
+    string CollectInfoFromNonAppData(RecordLayer r, string s2dkey, string d2skey, binary serverID)
+    {
+        string errorMessage = "";
+        if (r.$"type" is ContentType.handshake)
+        {
+            if (r.GetIsEncrypted())
+            {
+                // source to dest
+                if (s2dkey in DecryptInfos || d2skey in DecryptInfos)
+                {
+                    bool isClient = s2dkey in DecryptInfos;
+                    DecryptInfo v = isClient? DecryptInfos[s2dkey] : DecryptInfos[d2skey];
+
+                    if (v.state == State.ServerHelloDone || v.state == State.CKEDone)
+                    {
+                        if (!v.certReceived)
+                        {
+                            v.state = State.ServerHelloDone;
+                        }
+                        else if (!v.ckeReceived)
+                        {
+                            v.state = State.ComputeKeys;
+                        }
+                        else
+                        {
+                            v.state = State.ErrorComputeKeys;
+                        }
+                        
+                        bool result = ComputeKeys(v, false, v.masterSecretKey as binary, out errorMessage);
+                    
+                        if (result)
+                        {
+                            binary apData = r.fragment as binary;
+                            bool isDecrypted = false;
+                            var cipher = GetSelectedCipherSuiteInfo(v.cipherSuite, v.version);
+                            var clientIV = v.clientCipherDataIV;
+                            var serverIV = v.serverCipherDataIV;
+
+                            DecryptAppData(s2dkey, isClient?s2dkey : d2skey, cipher, apData, v.clientMacWriteKey, 
+                            v.serverMacWriteKey, v.clientWriteKey, v.serverWriteKey, ref clientIV, ref serverIV, ref isDecrypted);
+                          
+                            v.clientCipherDataIV = clientIV;
+                            v.serverCipherDataIV = serverIV;
+                          
+                            if (cipher.DataEncryption != DataEncryptionMethod.RC4_128)
+                            {
+                                // encrypted handshakes also mean a change in IV
+                                binary content = r.fragment as binary;
+                                int IVLength = v.clientCipherDataIV.Count;
+                                if (content.Count >= IVLength)
+                                {
+                                    for (int i = 0; i < IVLength; i++)
+                                    {
+                                        if (isClient)
+                                        {
+                                            v.clientCipherDataIV[i] = content[content.Count - IVLength + i];
+                                        }
+                                        else
+                                        {
+                                            v.serverCipherDataIV[i] = content[content.Count - IVLength + i];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            CanBeDecrypted = false;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                array<Handshake> bodies = r.fragment as array<Handshake>;
+                
+                int sourceDataOffset = 5; // 5-byte header: type + version + length
+                foreach (Handshake b1 in bodies)
+                {
+                    if (b1.body is ch:ClientHello)
+                    {
+                        Random clientRand = ch.random;
+                        
+                        if (ch.session_id.session_id is bin:binary)
+                        {
+                            ClientSessionID = bin;
+                        }
+                        
+                        // Dummy values assigned where necessary
+                        if (!(s2dkey in DecryptInfos))
+                        {
+                            DecryptInfo v1 = new DecryptInfo
+                            {
+                                cHelloRand = null, sHelloRand = null, cipherSuite = 0x0001, version = new Standard.ProtocolVersion{major = 0x00, minor = 0x00},
+                                clientMacWriteKey = [], serverMacWriteKey = [], clientWriteKey = [], serverWriteKey = [],
+                                clientCipherDataIV = [], serverCipherDataIV = [], masterSecretKey = [], certSerialNum = [], ckeReceived = false, certReceived = false
+                            };
+                            DecryptInfos += {s2dkey -> v1};
+                        }
+
+                        DecryptInfo v = DecryptInfos[s2dkey];
+                        v.cHelloRand = clientRand;
+                        v.state = State.ClientHelloDone;
+
+                        if (SupportExtendedMasterSecret(ch.extensions))
+                        {
+                            v.supportExtendedMasterSecret = false;
+                            // 'SourData' gets whole message source data, need to pick the handshake data only.
+                            binary sourceData = b1.SourceData as binary;
+                            v.handshakeMessages += sourceData.Segment(sourceDataOffset, (b1.length as int) + 4);
+                            sourceDataOffset += (b1.length as int) + 4;
+                        }
+                        else
+                        {
+                            v.supportExtendedMasterSecret = null;
+                            v.handshakeMessages = $[];
+                        }                
+                    }
+                    else if (b1.body is ServerHello)
+                    {                        
+                        ServerHello sh = b1.body as ServerHello;
+                        Random serverRand = sh.random;
+                        Standard.ProtocolVersion pv = sh.server_version as Standard.ProtocolVersion;
+                        CipherSuite cs = sh.cipher_suite;
+                        
+                        if (d2skey in DecryptInfos)
+                        {                            
+                            DecryptInfo v = DecryptInfos[d2skey];
+                            
+                            if (sh.session_id.session_id != nothing)
+                            {
+                                var s = sh.session_id.session_id as binary;
+                                var dummy = endpoint DummyEndpoint;
+                                
+                                if (!(serverID in dummy.DecryptionSessionMap))
+                                {
+                                    // new entry for this server
+                                    dummy.DecryptionSessionMap[serverID] = {};
+                                }
+                                
+                                var sessionIDs = dummy.DecryptionSessionMap[serverID];
+                                                            
+                                if (!(s in sessionIDs))
+                                {
+                                    if (v.state == State.ClientHelloDone && s == ClientSessionID)
+                                    {
+                                       CanBeDecrypted = false;
+                                       errorMessage = "Message Analyzer cannot decrypt a resumed session, because TLS is reusing a previous Session ID and some handshake messages required for decryption are missing.";
+                                       break;
+                                    }
+                                    else
+                                    {
+                                        // new session, cache the session ID
+                                        sessionIDs[s] = v;
+                                        dummy.DecryptionSessionMap[serverID] = sessionIDs; 
+                                    }
+                                }
+                                else
+                                {
+                                    if (s == ClientSessionID) 
+                                    {
+                                        v.sHelloRand = serverRand;
+                                          
+                                        // resume session, directly use the previously negotiated info.
+                                        var resumeInfo = sessionIDs[s];
+                                        
+                                        if (resumeInfo.state == State.CKEDone)
+                                        {
+                                            v.cipherSuite = resumeInfo.cipherSuite;
+                                            v.version = resumeInfo.version;
+                                            v.certSerialNum = resumeInfo.certSerialNum;
+                                            v.masterSecretKey = resumeInfo.masterSecretKey;
+                                            v.certReceived = true;
+                                            v.ckeReceived = true;
+                                            var cipher = GetSelectedCipherSuiteInfo(v.cipherSuite, v.version);
+                                            if (cipher.DataEncryption != DataEncryptionMethod.RC4_128)
+                                            {
+                                                v.clientCipherDataIV = resumeInfo.clientCipherDataIV;
+                                                v.serverCipherDataIV = resumeInfo.serverCipherDataIV;
+                                            }
+                                            v.state = State.CKEDone;
+                                        }
+                                        else
+                                        {
+                                            CanBeDecrypted = false;
+                                            break;
+                                        }
+                                    }
+                                }                                
+                            }
+                            
+                            if (v.state == State.ClientHelloDone) 
+                            {
+                                v.sHelloRand = serverRand;
+                                v.cipherSuite = cs;
+                                v.version = pv;
+                                v.state = State.ServerHelloDone;
+                                
+                                if (v.supportExtendedMasterSecret == false && SupportExtendedMasterSecret(sh.extensions))
+                                {
+                                    v.supportExtendedMasterSecret = true;
+                                    binary sourceData = b1.SourceData as binary; 
+                                    // different direction has different key
+                                    v.handshakeMessages += sourceData.Segment(sourceDataOffset, (b1.length as int)  + 4);
+                                    sourceDataOffset += (b1.length as int) + 4;
+                                }
+                                else
+                                {
+                                    // Server doesn't supports extend master secret, reset related variables
+                                    v.supportExtendedMasterSecret = null;
+                                    v.handshakeMessages = $[];
+                                }
+                            }
+                        }
+                    }
+                    else if (b1.msg_type is HandshakeType.client_key_exchange)
+                    {                        
+                        binary ckxData = b1.body as binary;
+                        
+                        if (s2dkey in DecryptInfos)
+                        {
+                            DecryptInfo v = DecryptInfos[s2dkey];
+
+                            bool result = false;
+                            if (v.supportExtendedMasterSecret == true)
+                            {
+                                 binary sourceData = b1.SourceData as binary;
+                                 v.handshakeMessages += sourceData.Segment(sourceDataOffset, (b1.length as int) + 4);
+                                 sourceDataOffset += (b1.length as int) + 4;
+                            }
+
+                            if (v.state == State.ComputeKeys)
+                            {
+                                v.ckeReceived = true;
+                                v.state = State.ErrorComputeKeys;
+                                result = ComputeKeys(v, true, ckxData, out errorMessage);
+                            }
+                            
+                            if (!result)
+                            {
+                                CanBeDecrypted = false;
+                            }
+                        }
+                    }
+                    else if (b1.body is Certificate)
+                    {
+                        // Ensure server sends the certificate to client and not the other way around
+                        if (d2skey in DecryptInfos)
+                        {
+                            DecryptInfo v = DecryptInfos[d2skey];
+
+                            if (v.supportExtendedMasterSecret == true)
+                            {
+                                binary sourceData = b1.SourceData as binary;
+                                v.handshakeMessages += sourceData.Segment(sourceDataOffset, (b1.length as int) + 4);
+                                sourceDataOffset += (b1.length as int) + 4;
+                            }
+                            
+                            if (v.state == State.ServerHelloDone)
+                            {
+                                v.certReceived = true;
+                                Certificate crt = b1.body as Certificate;
+                                                                
+                                array<ASN1Cert> arrCrt = crt.certificate_list as array<ASN1Cert>;
+                                
+                                // we only use the first such cert found in the array, the other certs are expired certs
+                                if (arrCrt[0].x509_cert is cert:X509.Certificate)
+                                {
+                                    var serialNum = cert.TbsCertificate.SerialNumber as array<byte>;
+                                    v.certSerialNum = serialNum;
+                                    v.state = State.ComputeKeys;
+                                }
+                                else
+                                {
+                                    errorMessage = "Missing certificate.";
+                                }
+                            }
+                        }
+                    }
+                    else if (!(b1.msg_type in [HandshakeType.hello_request, HandshakeType.certificate_verify,
+                                                HandshakeType.hello_verify_request, HandshakeType.finished]))
+                    {
+                        DecryptInfo v;
+                        if (d2skey in DecryptInfos)
+                        {
+                            v = DecryptInfos[d2skey];
+                        }
+                        else if (s2dkey in DecryptInfos)
+                        {
+                            v = DecryptInfos[s2dkey];
+                        }
+
+                        if (v != null && v.supportExtendedMasterSecret == true && !v.ckeReceived)
+                        {
+                            binary sourceData = b1.SourceData as binary;
+                            v.handshakeMessages += sourceData.Segment(sourceDataOffset, (b1.length as int) + 4);
+                            sourceDataOffset += (b1.length as int) + 4;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return errorMessage;
+    }
+    
+    string TryDecryptAppData(RecordLayer s, string s2dKey, string d2sKey, binary sourceIP, binary destinationIP, out binary payload)
+    {
+        payload = null;
+        
+        binary apData = s.fragment as binary;
+        
+        string errorMessage = "Decryption Failed";
+        
+        if (s2dKey in DecryptInfos || d2sKey in DecryptInfos)
+        {
+            bool isClient = s2dKey in DecryptInfos;
+                
+            string cliIP;
+            string servIP;
+
+            cliIP = BinaryToIP(isClient? sourceIP : destinationIP);
+            servIP = BinaryToIP(isClient? destinationIP : sourceIP);
+                            
+            DecryptInfo v = isClient ? DecryptInfos[s2dKey] : DecryptInfos[d2sKey];
+            var cipher = GetSelectedCipherSuiteInfo(v.cipherSuite, v.version);
+
+            if (v.state == State.CKEDone)
+            {
+                bool isDecrypted = false;
+                var clientIV = v.clientCipherDataIV;
+                var serverIV = v.serverCipherDataIV;
+                payload = DecryptAppData(cliIP, isClient?cliIP : servIP, cipher, apData, v.clientMacWriteKey, 
+                v.serverMacWriteKey, v.clientWriteKey, v.serverWriteKey, ref clientIV, ref serverIV, ref isDecrypted);
+                v.clientCipherDataIV = clientIV;
+                v.serverCipherDataIV = serverIV;
+                        
+                if (isDecrypted)
+                {
+                    errorMessage = ""; // Clear up the errorMessage
+                }
+            }
+            else
+            {
+                switch (v.state)
+                {
+                    case State.ClientHelloDone  => errorMessage = "Server Hello missing";
+                    case State.ServerHelloDone  => errorMessage = "Server Certificate missing";
+                    case State.ComputeKeys  => errorMessage = "Client Key Exchange missing";
+                    case State.ErrorComputeKeys  => errorMessage = "Error while computing keys or missing certificate";
+                    default =>;
+                }
+            }
+            if (cipher.DataEncryption != DataEncryptionMethod.RC4_128)
+            {
+               // calculate next IV
+                int apLength = s.length as int;
+                int IVLength = v.clientCipherDataIV.Count;
+                for (int i = 0; i < IVLength; i++)
+                {
+                    if (isClient)
+                    {
+                        v.clientCipherDataIV[i] = apData[apLength - IVLength + i];
+                    }
+                    else
+                    {
+                        v.serverCipherDataIV[i] = apData[apLength - IVLength + i];
+                    }
+                }
+            }
+        }
+        // Future Reference: add annotations saying app data cannot be decrypted
+        
+        return errorMessage;
+    }
+    
+    Random MakeBinaryToRandom(binary bin)
+    {
+        binary padding = $[00000000000000000000000000000000]; // New a 16 bytes long's binary
+        binary randomBytes = (padding + bin).Segment(bin.Count + 16 - 32, 32); // Peek the last 32 bytes as the random binary.
+        return BinaryDecoder<Random>(randomBytes) as Random;
+    }
+    
+    // not a client key exchange means that master secret key is passed into compute keys function via where key exchange data normally is
+    // this bool will cause the api to not compute the premaster secret and master secret again and instead use passed in master key parameter
+    bool ComputeKeys(DecryptInfo v, bool isClientKeyExchange, binary keyExchangeData, out string errorMessage)
+    {
+        // certificate serial number used by api to find correct certificate from store
+        var certSerialNum = v.certSerialNum;
+        int macWriteKeyLength = 0;
+        int writeKeyLength = 0;
+        int lengthIV = 0;
+        CalculateKeyLengths(v.cipherSuite, out macWriteKeyLength, out writeKeyLength, out lengthIV);
+        array<int> keyLengths = [macWriteKeyLength, writeKeyLength, lengthIV];
+        CipherSuiteInfo csInfo = GetSelectedCipherSuiteInfo(v.cipherSuite, v.version);
+        if (csInfo == null)
+        {
+            errorMessage = "The cipher suite is unsupported";
+            return false;
+        }
+        
+        bool isKeyBlockComputed = false;
+        
+        array<byte> clientMacWriteKey;
+        array<byte> serverMacWriteKey;
+        array<byte> clientWriteKey;
+        array<byte> serverWriteKey;
+        array<byte> clientCipherDataIV;
+        array<byte> serverCipherDataIV;
+        array<byte> masterSecretKey;
+
+        // time date stamp of client hello random needs to be converted to byte array and prepended to the random number
+        byte a = ((v.cHelloRand.gmt_unix_time >> 24)) as byte;
+        byte b = ((v.cHelloRand.gmt_unix_time >> 16)) as byte;
+        byte c = ((v.cHelloRand.gmt_unix_time >> 8)) as byte;
+        byte d = (v.cHelloRand.gmt_unix_time) as byte;
+        binary preClientRand = [a, b, c, d] as binary;
+        binary clientRandomNumber = preClientRand + v.cHelloRand.random_bytes;
+
+        byte e = ((v.sHelloRand.gmt_unix_time >> 24)) as byte;
+        byte f = ((v.sHelloRand.gmt_unix_time >> 16)) as byte;
+        byte g = ((v.sHelloRand.gmt_unix_time >> 8)) as byte;
+        byte h = (v.sHelloRand.gmt_unix_time) as byte;
+        binary preServerRand = [e, f, g, h] as binary;
+        binary serverRandomNumber= preServerRand + v.sHelloRand.random_bytes;
+                
+        bool result = false;
+        if (v.supportExtendedMasterSecret == true)
+        {
+            result = ComputeExtendedKeys(isClientKeyExchange, clientRandomNumber, serverRandomNumber, v.handshakeMessages, 
+                keyExchangeData, csInfo, ref isKeyBlockComputed, certSerialNum, keyLengths, 
+                out clientMacWriteKey, out serverMacWriteKey, out clientWriteKey, out serverWriteKey, 
+                out clientCipherDataIV, out serverCipherDataIV, out masterSecretKey, out errorMessage);
+        }
+        else
+        {
+            result = ComputeKeys(isClientKeyExchange, clientRandomNumber, serverRandomNumber, 
+                keyExchangeData, csInfo, ref isKeyBlockComputed, certSerialNum, keyLengths, 
+                out clientMacWriteKey, out serverMacWriteKey, out clientWriteKey, out serverWriteKey, 
+                out clientCipherDataIV, out serverCipherDataIV, out masterSecretKey, out errorMessage);
+        }
+        
+        if (result)
+        {
+            v.state = State.CKEDone;
+            v.clientMacWriteKey = clientMacWriteKey;
+            v.serverMacWriteKey = serverMacWriteKey;
+            v.clientWriteKey = clientWriteKey;
+            v.serverWriteKey = serverWriteKey;
+            
+            if (isClientKeyExchange)
+            {
+                v.clientCipherDataIV = clientCipherDataIV;
+                v.serverCipherDataIV = serverCipherDataIV;
+                v.masterSecretKey = masterSecretKey;
+            }
+        }
+        
+        return result;
+    }
+}
+
+void InitializeTLSServerFromTCP(Segment s, MessageDirection direction, void(binary, RecordLayers, TLS.Server, MessageDirection) dispatchBackFunc, TLS.Server tlsServer)
+{
+    if (direction == MessageDirection.Accepts)
+    {
+        tlsServer.InitializeContext(s#DestinationAddrBin as binary, s#SourceAddrBin as binary, s.DestinationPort, s.SourcePort, dispatchBackFunc);
+    }
+    else
+    {
+        tlsServer.InitializeContext(s#SourceAddrBin as binary, s#DestinationAddrBin as binary, s.SourcePort, s.DestinationPort, dispatchBackFunc);
+    }
+}
+
+// Find the last data segment
+Segment GetLastDataSegment(array<any message> msgs)
+{
+    Segment res = null;
+
+    if (msgs != null && msgs.Count > 0)
+    {
+        for (int i = msgs.Count - 1; i >= 0; i--)
+        {
+            if (msgs[i] is seg:Segment &&
+                seg.Payload.Count > 0)
+            {
+                res = seg;
+                break;
+            }
+        }
+    }
+
+    return res;
+}
+
+// Reconstruct Segment with the decrypted binary from the referred Segment
+void DispathBackToTCP(binary bin, TLS.Server e, MessageDirection direction, TCP.Segment referedSegfirst, TCP.Segment referedSeglast)
+{
+    Segment newSeg = new Segment
+    {
+        SourcePort = referedSegfirst.SourcePort,
+        DestinationPort = referedSegfirst.DestinationPort,
+        SequenceNumber = referedSegfirst.SequenceNumber,
+        AcknowledgementNumber = referedSeglast.AcknowledgementNumber,
+        DataOffset = referedSegfirst.DataOffset,
+        Flags = new TCP.Flags{ACK = true, PSH = true},
+        Window = referedSegfirst.Window,
+        Options = referedSegfirst.Options,
+        Payload = bin
+    };
+    newSeg.SourceData = bin;
+    if (bin != null && bin.Count != 0)
+    {
+        AssociateFieldPosition(newSeg, "Payload", bin, 0, bin.Count * 8);
+    }
+            
+    newSeg#SourceAddrBin = referedSegfirst#SourceAddrBin;
+    newSeg#DestinationAddrBin = referedSegfirst#DestinationAddrBin;
+    newSeg#SegmentLost = referedSegfirst#SegmentLost;
+    newSeg#InitialSequenceNumber = referedSegfirst#InitialSequenceNumber;
+    newSeg#NextSeqNumber = referedSeglast.NextSequenceNumber;
+            
+    var ept = endpoint TCP.Server[e.ClientAddress, e.ServerAddress, e.ClientPort, e.ServerPort];
+    ept.IsFromTLS = true;
+    if (ept.NegotiatedAppNameByTLS == null && e.NegotiatedAppName is StringNotNullOrEmpty)
+    {
+        ept.NegotiatedAppNameByTLS = e.NegotiatedAppName;
+    }
+    if (direction == MessageDirection.Accepts)
+    {
+        dispatch ept accepts newSeg;
+    }
+    else
+    {
+        dispatch ept issues newSeg;
+    }
+}
+
+const binary EmptyBinary = $[];

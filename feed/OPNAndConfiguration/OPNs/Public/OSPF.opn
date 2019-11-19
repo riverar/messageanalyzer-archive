@@ -1,0 +1,1277 @@
+protocol OSPF with
+BinaryEncodingDefaults{Endian = Endian.Big},
+Documentation
+{
+    ProtocolName = "Open Shortest Path First Routing Protocol",
+    ShortName = "OSPF",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References = 
+        [
+            new Reference{Name = "RFC 1583"},
+            new Reference{Name = "RFC 1584"},
+            new Reference{Name = "RFC 1793"},
+            new Reference{Name = "RFC 1812"},
+            new Reference{Name = "RFC 2328"},
+            new Reference{Name = "RFC 2370"},
+            new Reference{Name = "RFC 2740"},
+            new Reference{Name = "RFC 3101"},
+            new Reference{Name = "RFC 3623"},
+            new Reference{Name = "RFC 3630"},
+            new Reference{Name = "RFC 4124"},
+            new Reference{Name = "RFC 4203"},
+        ],
+    RevisionSummary =
+        [
+            new Revision{Class = RevisionClass.Major, Version = "376094", Date = "03/30/2015"},
+        ]
+};
+
+using IANA;
+using IPv4;
+using IPv6;
+using Standard;
+using Utility;
+
+//-------------------------------------------
+// Endpoints
+endpoint Node[binary LocalAddress]
+    provides Messages;
+
+autostart actor OSPFOverIPv4(IPv4.Node node)
+{
+    process node accepts ipv4:IPv4.Datagram where ipv4.Protocol == ProtocolType.OSPFIGP
+    {
+        DecodeAndDispatchPacket(ipv4.DestinationAddress.FlatAddress, ipv4.Payload);
+    }
+}
+
+autostart actor OSPFOverIPv6(IPv6.Node node)
+{
+    process node accepts ipv6: IPv6.Datagram where ipv6.NextProtocol == ProtocolType.OSPFIGP
+    {
+        DecodeAndDispatchPacket(ipv6.DestinationAddress.FlatAddress, ipv6.Payload);
+    }
+}
+
+void DecodeAndDispatchPacket(binary destinationAddress, stream s)
+{
+    // The first byte is the version number
+    switch (s.CurrentByte)
+    {
+        // Version 2
+        case $2 =>
+            // The 2nd byte of is the packet type
+            switch (s.PeekByte(8))
+            {
+                case PacketTypes.Hello =>
+                    switch (s)
+                    {
+                        case m: Messages.HelloPacket from BinaryDecoder<Messages.HelloPacket> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                        default =>
+                            ThrowDecodingException("OSPF", "HelloPacket");
+                    }
+                case PacketTypes.DatabaseDescription =>
+                    switch (s)
+                    {
+                        case m: Messages.DatabaseDescriptionPacket from BinaryDecoder<Messages.DatabaseDescriptionPacket> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                       default =>
+                            ThrowDecodingException("OSPF", "DatabaseDescriptionPacket");
+                    }
+                case PacketTypes.LinkStateRequest =>
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateRequestPacket from BinaryDecoder<Messages.LinkStateRequestPacket> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+
+                        default =>
+                            ThrowDecodingException("OSPF", "LinkStateRequestPacket");
+                    }
+                case PacketTypes.LinkStateUpdate =>
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateUpdatePacket from BinaryDecoder<Messages.LinkStateUpdatePacket> =>
+                            // Decode SubTlvs manually
+                            foreach (var lsa in m.LinkStateAdvertisements)
+                            {
+                                if (lsa.LinkStateAdvertisement is TrafficEngineeringLsa)
+                                {
+                                    TrafficEngineeringLsa trafficEngineeringLsa = lsa.LinkStateAdvertisement as TrafficEngineeringLsa;
+                                    
+                                    foreach (var tlv in trafficEngineeringLsa.Tlvs)
+                                    {
+                                        if (tlv.Tlv is LinkTlv)
+                                        {
+                                            LinkTlv linkTlv = tlv.Tlv as LinkTlv;
+                                            
+                                            if (linkTlv.SubTlvs is Blob)
+                                            {
+                                                // WORKAROUND: Bug #35720 - BinaryDecoder cannot decode array<T> dicrectly
+                                                //array<SubTlv> subTlvs = BinaryDecoder((linkTlv.SubTlvs as Blob).Data);
+                                                array<SubTlv> subTlvs = [];
+                                                stream sData = (linkTlv.SubTlvs as Blob).Data;
+                                                while (sData.BytePosition < sData.ByteLength)
+                                                {
+                                                    switch (sData)
+                                                    {
+                                                        case t: SubTlv from BinaryDecoder<SubTlv> =>
+                                                            subTlvs += [t];
+                                                        default =>
+                                                            throw "OSPF SubTlvs cannot be decoded successfully.";
+                                                    }
+                                                }
+                                                linkTlv.SubTlvs = subTlvs;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                        default =>
+                            ThrowDecodingException("OSPF", "LinkStateUpdatePacket");
+                    }
+                case PacketTypes.LinkStateAcknowledgment =>
+                {
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateAcknowledgmentPacket from BinaryDecoder<Messages.LinkStateAcknowledgmentPacket> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                        default =>
+                            ThrowDecodingException("OSPF", "LinkStateAcknowledgmentPacket");
+                    }
+                }
+            }
+        
+        // Version 3
+        case $3 =>
+            // The 2nd byte of Binary is the packet type
+            switch (s.PeekByte(s.BitPosition + 8))
+            {
+                case PacketTypes.Hello =>
+                    switch (s)
+                    {
+                        case m: Messages.HelloPacketV3 from BinaryDecoder<Messages.HelloPacketV3> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                       default =>
+                            ThrowDecodingException("OSPF", "HelloPacketV3");
+                    }
+                case PacketTypes.DatabaseDescription =>
+                    switch (s)
+                    {
+                        case m: Messages.DatabaseDescriptionPacketV3 from BinaryDecoder<Messages.DatabaseDescriptionPacketV3> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                       default =>
+                            ThrowDecodingException("OSPF", "DatabaseDescriptionPacketV3");
+                    }
+                case PacketTypes.LinkStateRequest =>
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateRequestPacketV3 from BinaryDecoder<Messages.LinkStateRequestPacketV3> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                       default =>
+                            ThrowDecodingException("OSPF", "LinkStateRequestPacketV3");
+                    }
+                case PacketTypes.LinkStateUpdate =>
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateUpdatePacketV3 from BinaryDecoder<Messages.LinkStateUpdatePacketV3> =>
+                           dispatch (endpoint Node[destinationAddress]) accepts m;
+                        default =>
+                            ThrowDecodingException("OSPF", "LinkStateUpdatePacketV3");
+                    }
+                case PacketTypes.LinkStateAcknowledgment =>
+                    switch (s)
+                    {
+                        case m: Messages.LinkStateAcknowledgmentPacketV3 from BinaryDecoder<Messages.LinkStateAcknowledgmentPacketV3> =>
+                            dispatch (endpoint Node[destinationAddress]) accepts m;
+                        default =>
+                            ThrowDecodingException("OSPF", "LinkStateAcknowledgmentPacketV3");
+                    }
+            }
+    }
+}
+
+//-------------------------------------------
+// Contracts
+contract Messages
+{
+    // In order to pass message as parameter in dispatcher
+    accepts message IMessage
+    {
+    }
+    
+    // RFC 1583 A.3.1 The OSPF packet header
+    accepts message PacketHeader: IMessage
+    {
+        (byte where value == 2) Version;
+        PacketTypes Type;
+        ushort PacketLength;
+        IPv4Address RouterID;
+        IPv4Address AreaID;
+        ushort Checksum;
+        AuType AuType;
+        // RFC 2328 D.3 Cryptographic authentication
+        ([|AuType == 2|] CryptographicAuthentication | ulong) Authentication;
+    }
+
+    // RFC 2740 A.3.1 The OSPF packet header
+    accepts message PacketHeaderV3: IMessage
+    {
+        (byte where value == 3) Version;
+        PacketTypes Type;
+        ushort PacketLength;
+        IPv4Address RouterID;
+        IPv4Address AreaID;
+        ushort Checksum;
+        byte InstanceID;
+        byte ReservedInHeader where ValidationCheck(value == 0, this, "ReservedInHeader must be zero.");
+    }
+
+    // RFC 1583 A.3.2 The Hello packet
+    accepts message HelloPacket: PacketHeader
+    {
+        invariant Type == 1;
+        IPv4Address NetworkMask;
+        ushort HelloInterval;
+        Options Options;
+        byte RouterPriority;
+        uint RouterDeadInterval;
+        IPv4Address DesignatedRouter;
+        IPv4Address BackupDesignatedRouter;
+        array<IPv4Address> Neighbor with BinaryEncoding{Length = ((PacketLength - 44) / 4)};
+        
+        override string ToString()
+        {
+            string opFlag = (Options.E ? "|E" : "") + (Options.T ? "|T" : "");
+            
+            return  "Hello Packet, HelloInterval: " + (HelloInterval as string) 
+                    + " seconds, RouterDeadInterval: " + (RouterDeadInterval as string) 
+                    + " seconds, RouterPriority: " + (RouterPriority as string) + ", Options: " + ((opFlag.Count == 0) ? "0" : opFlag.Segment(1));
+        }
+    }
+    
+    // RFC 1583 A.3.3 The Database Description packet
+    accepts message DatabaseDescriptionPacket: PacketHeader
+    {
+        invariant Type == 2;
+        ushort InterfaceMtu; // RFC 2328
+        Options Options;
+        DatabaseDescriptionFlag Flag;
+        uint DDSequenceNumber;
+        array<LinkStateAdvertisementHeader> LsaHeader with BinaryEncoding{Length = ((PacketLength - 32) / 20)};
+        
+        override string ToString()
+        {
+            string opFlag = (Options.E ? "|E" : "") + (Options.T ? "|T" : "");
+            string flag = EnumToString<OSPF.DatabaseDescriptionFlag>(Flag, false);
+            
+            return "Database Description Packet, Options: " + ((opFlag.Count == 0) ? "0" : opFlag.Segment(1)) 
+                   + ", Database Description Flag: " + ((flag.Count == 0) ? "0" : flag)
+                   + ", DD Sequence Number: " + (DDSequenceNumber as string);
+        }
+    }
+    
+    // RFC 1583 A.3.4 The Link State Request packet
+    accepts message LinkStateRequestPacket: PacketHeader
+    {
+        invariant Type == 3;
+        array<LinkStateRequestPacketEntry> LinkStateRequestPacket with BinaryEncoding{Length = ((PacketLength - 24) / 12)};
+
+        override string ToString()
+        {
+            string lsType = "";
+            for(int i = 0; i < LinkStateRequestPacket.Count; i++)
+            {
+                if(i != 0) 
+                {
+                    lsType += ",";
+                }
+                lsType += (LinkStateRequestPacket[i].LSType as string);
+            }
+            
+            return "Link State Request Packet" + (lsType.Count == 0 ? "" : (", LSType: " + ((LinkStateRequestPacket.Count == 1) ? lsType : ("[" + lsType + "]"))));
+        }
+    }
+    
+    // RFC 1583 A.3.5 The Link State Update packet
+    accepts message LinkStateUpdatePacket: PacketHeader
+    {
+        invariant Type == 4;
+        uint AdvertisementsNumber;
+        array<LinkStateAdvertisement> LinkStateAdvertisements with BinaryEncoding{Length = AdvertisementsNumber};
+    
+        override string ToString()
+        {
+            return "Link State Update Packet, Advertisements Number: " + (AdvertisementsNumber as string);
+        }
+    }
+    
+    // RFC 1583 A.3.6 The Link State Acknowledgment packet
+    accepts message LinkStateAcknowledgmentPacket: PacketHeader
+    {
+        invariant Type == 5;
+        array<LinkStateAdvertisementHeader> LinkStateAdvertisementHeaders with BinaryEncoding{Length = ((PacketLength - 24) / 20)};
+        
+        override string ToString()
+        {
+            return "Link State Acknowledgment Packet";
+        }
+    }
+    
+    // RFC 2740 A.3.2 The Hello packet
+    accepts message HelloPacketV3: PacketHeaderV3
+    {
+        invariant Type == 1;
+        uint InterfaceID;
+        byte RouterPriority;
+        OptionsV3 Options;
+        ushort HelloInterval;
+        ushort RouterDeadInterval;
+        IPv4Address DesignatedRouter;
+        IPv4Address BackupDesignatedRouter;
+        array<IPv4Address> NeighborID with BinaryEncoding{Length = ((PacketLength - 36) / 4)};
+    
+        override string ToString()
+        {
+            string option = EnumToString<OSPF.OptionsV3>(Options, false);
+            return "Hello Packet, HelloInterval: " + (HelloInterval as string) 
+                    + " seconds, RouterDeadInterval: " + (RouterDeadInterval as string) 
+                    + " seconds, RouterPriority: " + (RouterPriority as string) + ", Options: " + ((option.Count == 0) ? "0" : option);
+            
+        }
+    }
+    
+    // RFC 2740 A.3.3 The Database Description packet
+    accepts message DatabaseDescriptionPacketV3: PacketHeaderV3
+    {
+        invariant Type == 2;
+        byte Reserved where ValidationCheck(value == 0, this, "Reserved must be zero.");
+        OptionsV3 Options;
+        ushort InterfaceMtu;
+        byte Reserved1 where ValidationCheck(value == 0, this, "Reserved1 must be zero.");
+        DatabaseDescriptionFlag Flag;
+        uint DDSequenceNumber;
+        array<LinkStateAdvertisementHeaderV3> LsaHeader with BinaryEncoding{Length = ((PacketLength - 28) / 20)};
+    
+        override string ToString()
+        {
+            string option = EnumToString<OSPF.OptionsV3>(Options, false);
+            return "Database Description Packet, Options: " + ((option.Count == 0) ? "0" : option)
+                   + ", Database Description Flag: " + EnumToString<OSPF.DatabaseDescriptionFlag>(Flag, false)
+                   + ", DD Sequence Number: " + (DDSequenceNumber as string);
+        }
+    }
+    
+    // RFC 2740 A.3.4 The Link State Request packet
+    accepts message LinkStateRequestPacketV3: PacketHeaderV3
+    {
+        invariant Type == 3;
+        array<LinkStateRequestPacketV3Entry> LinkStateRequestPacket with BinaryEncoding{Length = ((PacketLength - 16) / 12)};
+        
+        override string ToString()
+        {
+            string lsType = "";
+            for(int i = 0; i < LinkStateRequestPacket.Count; i++)
+            {
+                var typeV3 = LinkStateRequestPacket[i].LSType as LSTypeV3;
+                lsType += (lsType.Count == 0) ? "" : ", ";
+                lsType += GetTypeV3Flag(typeV3);
+            }
+            
+            return "Link State Request Packet" + (lsType.Count == 0 ? "" : (", LSType: " + ((LinkStateRequestPacket.Count == 1) ? lsType : ("[" + lsType + "]"))));
+        }
+    }
+    
+    // RFC 2740 A.3.5 The Link State Update packet
+    accepts message LinkStateUpdatePacketV3: PacketHeaderV3
+    {
+        invariant Type == 4;
+        uint AdvertisementsNumber;
+        array<LinkStateAdvertisementV3> LinkStateAdvertisements with BinaryEncoding{Length = AdvertisementsNumber};
+
+        override string ToString()
+        {
+            return "Link State Update Packet";
+        }
+    }
+    
+    // RFC 2740 A.3.6 The Link State Acknowledgment packet
+    accepts message LinkStateAcknowledgmentPacketV3: PacketHeaderV3
+    {
+        invariant Type == 5;
+        array<LinkStateAdvertisementHeaderV3> LinkStateAdvertisementHeaders with BinaryEncoding{Length = ((PacketLength - 16) / 20)};
+        
+        override string ToString()
+        {
+            return "Link State Acknowledgment Packet";
+        }
+    }
+}
+
+type LinkStateRequestPacketEntry
+{
+    uint LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+}
+
+type LinkStateRequestPacketV3Entry
+{
+    ushort Reserved where ValidationCheck(value == 0, null, "OSPF: LinkStateRequestPacketV3Entry.Reserved must be zero.");
+    LSTypeV3 LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+}
+
+// RFC 1583 A.4 Link state advertisement formats
+type LinkStateAdvertisement
+{
+    (RouterLinksAdvertisements | 
+     NetworkLinksAdvertisements | 
+     SummaryLinkAdvertisements | 
+     ASExternalLinkAdvertisements | 
+     GroupMembershipLsa | 
+     GraceLsaFormat | 
+     TrafficEngineeringLsa | 
+     OpaqueLsa) LinkStateAdvertisement;
+}
+
+// RFC 2740 A.4 LSA formats
+type LinkStateAdvertisementV3
+{
+    (RouterLsasV3 | 
+     NetworkLsas | 
+     InterAreaPrefixLsas | 
+     InterAreaRouterLsas | 
+     ASExternalLsas | 
+     IntraAreaPrefixLsas | 
+     LinkLsas) LinkStateAdvertisement;
+}
+
+// RFC 1583 A.4.1 The Link State Advertisement header
+type LinkStateAdvertisementHeader
+{
+    ushort LSAge;
+    Options Options;
+    LSType Type;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+}
+
+// RFC 2740 A.4.2 The LSA header
+type LinkStateAdvertisementHeaderV3
+{
+    ushort LSAge;
+    LSTypeV3 LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+}
+
+// RFC 2740 A.4.3 Router-LSAs
+type RouterLsasV3
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && value.S1 && value.Reserved == 0 && value.FunctionCode == 1) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    LsaFlags Flags;
+    OptionsV3 Options;
+    array<RouterInterface> RouterInterfaces with BinaryEncoding{Length = ((Length - 24) / 16)};
+}
+
+type RouterInterface
+{
+    RouterLinkType Type;
+    byte Reserved where ValidationCheck(value == 0, null, "OSPF: RouterInterface.Reserved must be zero.");
+    ushort Metric;
+    uint InterfaceID;
+    uint NeighborInterfaceID;
+    uint NeighborRouterID;
+}
+
+// RFC 1583 A.4.2 Router links advertisements
+type RouterLinksAdvertisements
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 1) Type;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    LsaFlags Flags;
+    ushort LinksNumber;
+    array<RouterLink> RouterLinks with BinaryEncoding{Length = LinksNumber};
+}
+
+type RouterLink
+{
+    IPv4Address LinkID;
+    IPv4Address LinkData;
+    RouterLinkType RouterLinkType;
+    byte TosNumber;
+    ushort Tos0Metric;
+    array<Tos> Metrics with BinaryEncoding{Length = TosNumber};
+}
+
+type Tos
+{
+    TosType TosType;
+    byte Reserved where ValidationCheck(value == 0, null, "OSPF: Tos.Reserved must be zero.");
+    ushort Metric;
+}
+
+// RFC 2740 A.4.4 Network-LSAs
+type NetworkLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && value.S1 && value.Reserved == 0 && value.FunctionCode == 2) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    byte Reserved where ValidationCheck(value == 0, null, "OSPF: NetworkLsas.Reserved must be zero.");
+    OptionsV3 Options;
+    array<IPv4Address> AttachedRouters with BinaryEncoding{Length = ((Length - 24) / 4)};
+}
+
+// RFC 2740 A.4.5 Inter-Area-Prefix-LSAs
+type InterAreaPrefixLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && value.S1 && value.Reserved == 0 && value.FunctionCode == 3) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    byte Reserved where ValidationCheck(value == 0, null, "OSPF: InterAreaPrefixLsas.Reserved must be zero.");
+    uint Metric with BinaryEncoding{Width = 24};
+    IPv6AddressPrefixRepresentation IPv6AddressPrefix where ValidationCheck(value.Metric == 0, null, "OSPF: InterAreaPrefixLsas.IPv6AddressPrefix.Metric must be zero.");
+}
+
+// RFC 2740 A.4.1 IPv6 Prefix Representation
+type IPv6AddressPrefixRepresentation
+{
+    byte PrefixLength;
+    PrefixOptions PrefixOptions;
+    ushort Metric;
+    string AddressPrefix with BinaryEncoding{Length = (((PrefixLength + 31) / 32) * 4)};
+}
+
+// RFC 2740 A.4.1.1 Prefix Options
+// WORKAROUND: Use flags when bug # 27596 is resolved
+type PrefixOptions
+{
+    ushort Reserved where ValidationCheck(value == 0, null, "OSPF: PrefixOptions.Reserved must be zero.") with BinaryEncoding{Length = 4};
+    bool P  with BinaryEncoding{Width = 1};
+    bool MC with BinaryEncoding{Width = 1};
+    bool LA with BinaryEncoding{Width = 1};
+    bool NU with BinaryEncoding{Width = 1};
+}
+
+// RFC 2740 A.4.6 Inter-Area-Router-LSAs
+type InterAreaRouterLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && value.S1 && value.Reserved == 0 && value.FunctionCode == 4) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    byte Reserved where ValidationCheck(value == 0, null, "OSPF: InterAreaRouterLsas.Reserved must be zero.");
+    OptionsV3 Options;
+    byte Reserved1 where ValidationCheck(value == 0, null, "OSPF: InterAreaRouterLsas.Reserved1 must be zero.");
+    uint Metric with BinaryEncoding{Width = 24};
+    IPv4Address DestinationRouterID;
+}
+
+// RFC 2740 A.4.7 AS-external-LSAs
+type ASExternalLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && value.S2 && !value.S1 && value.Reserved == 0 && value.FunctionCode == 5) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    byte Reserved   with BinaryEncoding{Width = 5};
+    bool E          with BinaryEncoding{Width = 1};
+    bool F          with BinaryEncoding{Width = 1};
+    bool T          with BinaryEncoding{Width = 1};
+    uint Metric     with BinaryEncoding{Width = 24};
+    byte PrefixLength;
+    PrefixOptions PrefixOptions;
+    ushort ReferencedLSType;
+    string AddressPrefix with BinaryEncoding{Length = ((PrefixLength + 31) / 32) * 4};
+    optional [|F|] IPv6Address ForwardingAddress;
+    optional [|T|] uint ExternalRouteTag;
+    optional [|ReferencedLSType != 0|] IPv4Address ReferencedLinkStateID;
+}
+
+// RFC 2740 A.4.8 Link-LSAs
+type LinkLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && !value.S1 && value.Reserved == 0 && value.FunctionCode == 8) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    byte RouterPriority;
+    OptionsV3 Options;
+    IPv6Address LinkLocalInterfaceAddress;
+    uint PrefixesNumber;
+    array<IPv6AddressPrefixRepresentation> AddressPrefixs with BinaryEncoding{Length = PrefixesNumber};
+}
+
+// RFC 2740 A.4.9 Intra-Area-Prefix-LSAs
+type IntraAreaPrefixLsas
+{
+    ushort LSAge;
+    (LSTypeV3 where !value.U && !value.S2 && value.S1 && value.Reserved == 0 && value.FunctionCode == 9) LSType;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    ushort PrefixesNumber;
+    ushort ReferencedLSType;
+    IPv4Address ReferencedLinkStateID;
+    IPv4Address ReferencedAdvertisingRouter;
+    array<IPv6AddressPrefixRepresentation> AddressPrefixs with BinaryEncoding{Length = PrefixesNumber};
+}
+
+// RFC 1583 A.4.3 Network links advertisements
+type NetworkLinksAdvertisements
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 2) Type;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    IPv4Address NetworkMask;
+    array<IPv4Address> AttachedRouters with BinaryEncoding{Length = ((Length - 24) / 4)};
+}
+
+// RFC 1583 A.4.4 Summary link advertisements
+type SummaryLinkAdvertisements
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value in {3, 4}) Type;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    IPv4Address NetworkMask;
+    array<TosMetric> TosMetric with BinaryEncoding{Length = ((Length - 24) / 4)};
+}
+
+// RFC 2328 A.4.4 Summary-LSAs
+type TosMetric
+{
+    TosType TosIPType;
+    uint Metric with BinaryEncoding{Width = 24};
+}
+
+// RFC 2328 A.4.5 AS-external-LSAs
+type EtosMetric
+{
+    byte E          with BinaryEncoding{Width = 1};
+    TosType TosType with BinaryEncoding{Width = 7};
+    uint Metric     with BinaryEncoding{Width = 24};
+}
+
+// RFC 1583 A.4.5 AS external link advertisements
+type ASExternalLinkAdvertisements
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value in {5, 7}) Type; // rfc 3101 Appendix C: Type-7 LSA Packet Format
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    IPv4Address NetworkMask;
+    array<ExternalLinkAdvertisementEntry> ExternalLinkAdvertisements with BinaryEncoding{Length = ((Length - 24) / 12)};
+}
+
+type ExternalLinkAdvertisementEntry
+{
+    EtosMetric Metric;
+    IPv4Address ForwardingAddress;
+    uint ExternalRoutTag;
+}
+
+// RFC 1584 A.3 Group-membership-LSA
+type GroupMembershipLsa
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 6) Type;
+    IPv4Address LinkStateID;
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    array<Vertiex> Vertices with BinaryEncoding{Length = ((Length - 20) / 8)};
+}
+
+// RFC 2370 A.2 The Opaque LSA
+type OpaqueLsa
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 11) Type;
+    byte OpaqueType;
+    uint OpaqueID with BinaryEncoding{Width = 24};
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    binary OpaqueInformation with BinaryEncoding{Length = (Length - 20)};
+}
+
+// RFC 3630 2.  LSA Format
+type TrafficEngineeringLsa
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 10) Type;
+    (byte where value == 1) OpaqueType;
+    uint Instance with BinaryEncoding{Width = 24};
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    //array<RouterAddressTlv | LinkTlv> Tlvs;
+    array<TrafficEngineeringLsaTlv> Tlvs;
+}
+
+// WORKAROUND: Bug #19153 - [BinaryCodec] Nesting of patterns is not supported in the Binary Codec
+type TrafficEngineeringLsaTlv
+{
+    (RouterAddressTlv | LinkTlv) Tlv;
+}
+
+// RFC 3623 A.  Grace-LSA Format
+type GraceLsaFormat
+{
+    ushort LSAge;
+    Options Options;
+    (LSType where value == 9) Type;
+    byte OpaqueType where ValidationCheck(value == 3, null, "OSPF: GraceLsaFormat.OpaqueType must be 3.");
+    uint OpaqueID where ValidationCheck(value == 0, null, "OSPF: GraceLsaFormat.OpaqueID must be 0.") with BinaryEncoding{Width = 24};
+    IPv4Address AdvertisingRouter;
+    uint LSSequenceNumber;
+    ushort LSChecksum;
+    ushort Length;
+    //array<GracePeriod | GracefulRestartReason | IPInterfaceAddress> TVLs;
+    array<GraceLsaTlv> Tlvs;
+}
+
+// WORKAROUND: Bug #19153 - [BinaryCodec] Nesting of patterns is not supported in the Binary Codec
+type GraceLsaTlv
+{
+    (GracePeriod | GracefulRestartReason | IPInterfaceAddress) GraceLsaTlv;
+}
+
+type GracePeriod
+{
+    (GraceLsaTlvType where value == GraceLsaTlvType.GracePeriod) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: GracePeriod.Length must be 4.");
+    uint GracePeriod;
+}
+
+type GracefulRestartReason
+{
+    (GraceLsaTlvType where value == GraceLsaTlvType.GracefulRestartReason) Type;
+    ushort Length where ValidationCheck(value == 1, null, "OSPF: GracefulRestartReason.Length must be 1.");
+    GracefulRestartReasonType GracefulRestartReason;
+    array<byte> Padding with BinaryEncoding{Length = 3};
+}
+
+type IPInterfaceAddress
+{
+    (GraceLsaTlvType where value == GraceLsaTlvType.GracefulRestartReason) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: IPInterfaceAddress.Length must be 4.");
+    IPv4Address IPInterfaceAddress;
+}
+
+// RFC 3630 2.4.1.  Router Address TLV
+type RouterAddressTlv
+{
+    (TopLevleTlvType where value == 1) Type;
+    ushort Lenght where ValidationCheck(value == 4, null, "OSPF: RouterAddressTlv.Length must be 4.");
+    IPv4Address RouterAddress;
+}
+
+// RFC 3630 2.4.2.  Link TLV
+type LinkTlv
+{
+    (TopLevleTlvType where value == 2) Type;
+    ushort Length;
+    // Array of SubTlv, will decode manually.
+    // WORKAROUND: Bug #18057 - [BinaryCodec] DCR: [equivalent DataFramelength feature]: Support using "Width" attribtue in BinaryEncoding aspect to specify a field's size.
+    (Blob[Length as uint] | array<SubTlv>) SubTlvs;
+}
+
+type SubTlv
+{
+    (LinkType | 
+    LinkID | 
+    LocalInterfaceIPAddress | 
+    RemoteInterfaceIPAddress | 
+    TrafficEngineeringMetric | 
+    MaximumBandwidth | 
+    MaximumReservableBandwidth | 
+    UnreservedBandwidth | 
+    AdministrativeGroup | 
+    LinkLocalRemoteIdentifiers | 
+    LinkProtectionType | 
+    SharedRiskLinkGroup | 
+    InterfaceSwitchingCapabilityDescriptor) SubTlv;
+}
+
+// RFC 3630 2.5.1.  Link Type
+type LinkType
+{
+    (SubTlvType where value == 1) Type;
+    ushort Length where ValidationCheck(value == 1, null, "OSPF: LinkType.Length must be 1.");
+    LinkTypeSubTlvType LinkType;
+    array<byte> Padding with BinaryEncoding{Length = 3};
+}
+
+// RFC 3630 2.5.2.  Link ID
+type LinkID
+{
+    (SubTlvType where value == 2) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: LinkID.Length must be 4.");
+    IPv4Address LinkID;
+}
+
+// RFC 3630 2.5.3.  Local Interface IP Address
+type LocalInterfaceIPAddress
+{
+    (SubTlvType where value == 3) Type;
+    ushort Length where ValidationCheck((value !=0) && (value % 4 == 0), null, "OSPF: LocalInterfaceIPAddress.Length must be 4N.");
+    array<IPv4Address> LocalInterfaceIPAddress with BinaryEncoding{Length = (Length / 4)};
+}
+
+// RFC 3630 2.5.4.  Remote Interface IP Address
+type RemoteInterfaceIPAddress
+{
+    (SubTlvType where value == 4) Type;
+    ushort Length where ValidationCheck((value !=0) && (value % 4 == 0), null, "OSPF: RemoteInterfaceIPAddress.Length must be 4N.");
+    array<IPv4Address> Neighbors with BinaryEncoding{Length = (Length / 4)};
+}
+
+// RFC 3630 2.5.5.  Traffic Engineering Metric
+type TrafficEngineeringMetric
+{
+    (SubTlvType where value == 5) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: TrafficEngineeringMetric.Length must be 4.");
+    uint LinkMetric;
+}
+
+// RFC 3630 2.5.6.  Maximum Bandwidth
+type MaximumBandwidth
+{
+    (SubTlvType where value == 6) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: MaximumBandwidth.Length must be 4.");
+    float MaximumBandwidth;
+}
+
+// RFC 3630 2.5.7.  Maximum Reservable Bandwidth
+type MaximumReservableBandwidth
+{
+    (SubTlvType where value == 7) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: MaximumReservableBandwidth.Length must be 4.");
+    float MaximumReservableBandwidth;
+}
+
+// RFC 3630 2.5.8.  Unreserved Bandwidth
+type UnreservedBandwidth
+{
+    (SubTlvType where value == 8) Type;
+    ushort Length where ValidationCheck(value == 32, null, "OSPF: UnreservedBandwidth.Length must be 32.");
+    float BandwidthPriority0;
+    float BandwidthPriority1;
+    float BandwidthPriority2;
+    float BandwidthPriority3;
+    float BandwidthPriority4;
+    float BandwidthPriority5;
+    float BandwidthPriority6;
+    float BandwidthPriority7;
+}
+
+// RFC 3630 2.5.9.  Administrative Group
+type AdministrativeGroup
+{
+    (SubTlvType where value == 9) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: AdministrativeGroup.Length must be 4.");
+    AdministrativeGroupFlags AdminGroupBitMask;
+}
+
+// RFC 4203 1.1.  Link Local/Remote Identifiers
+type LinkLocalRemoteIdentifiers
+{
+    (SubTlvType where value == 11) Type;
+    ushort Length where ValidationCheck(value == 8, null, "OSPF: LinkLocalRemoteIdentifiers.Length must be 8.");
+    IPv4Address LinkLocalIdentifier;
+    IPv4Address LinkRemoteIdentifier;
+}
+
+// RFC 4203 1.2.  Link Protection Type
+type LinkProtectionType
+{
+    (SubTlvType where value == 14) Type;
+    ushort Length where ValidationCheck(value == 4, null, "OSPF: LinkProtectionType.Length must be 4.");
+    LinkProtectionTypeFlags ProtectionCap;
+    array<byte> Reserved with BinaryEncoding{Length = 3};
+}
+
+// RFC 4203 1.3.  Shared Risk Link Group (SRLG)
+type SharedRiskLinkGroup
+{
+    (SubTlvType where value == 16) Type;
+    ushort Length;
+    array<uint> SharedRiskLinkGroupValue with BinaryEncoding{Length = (Length / 4)};
+}
+
+// RFC 4203 1.4.  Interface Switching Capability Descriptor
+type InterfaceSwitchingCapabilityDescriptor
+{
+    (SubTlvType where value == 15) Type;
+    ushort Length;
+    SwitchingCapability SwitchingCap;
+    byte Encoding;
+    ushort Reserved;
+    float MaxLspBandwidthAtPriority0;
+    float MaxLspBandwidthAtPriority1;
+    float MaxLspBandwidthAtPriority2;
+    float MaxLspBandwidthAtPriority3;
+    float MaxLspBandwidthAtPriority4;
+    float MaxLspBandwidthAtPriority5;
+    float MaxLspBandwidthAtPriority6;
+    float MaxLspBandwidthAtPriority7;
+    ([|SwitchingCap in {SwitchingCapability.PacketSwitchCapable1, 
+                        SwitchingCapability.PacketSwitchCapable2, 
+                        SwitchingCapability.PacketSwitchCapable3, 
+                        SwitchingCapability.PacketSwitchCapable4}|]PscSpecificInformation        |
+     [|SwitchingCap == SwitchingCapability.TimeDivisionMultiplexCapable|]TdmSpecificInformation |
+     (Blob[(Length - 40) as uint])) SwitchingCapabilitySpecificInformation;
+}
+
+type PscSpecificInformation
+{
+    float MinimumLspBandwidth;
+    ushort InterfaceMtu;
+    array<byte> Padding with BinaryEncoding{Length = 2};
+}
+
+type TdmSpecificInformation
+{
+    float MinimumLspBandwidth;
+    byte Indication;
+    array<byte> Padding with BinaryEncoding{Length = 3};
+}
+
+pattern GraceLsaTlvType = enum ushort
+{
+    GracePeriod             = 1,
+    GracefulRestartReason   = 2,
+    IPInterfaceAddress      = 3,
+};
+
+pattern GracefulRestartReasonType = enum byte
+{
+    Unknown                             = 0,
+    SoftwareRestart                     = 1,
+    SoftwareReloadOrUpgrade             = 2,
+    SwitchToRedundantControlProcessor   = 3,
+};
+
+pattern LinkTypeSubTlvType = enum byte
+{
+    PointToPoint                    = 1,
+    MultiAccess                     = 2,
+};
+
+pattern SwitchingCapability = enum byte
+{
+    PacketSwitchCapable1            = 1,
+    PacketSwitchCapable2            = 2,
+    PacketSwitchCapable3            = 3,
+    PacketSwitchCapable4            = 4,
+    Layer2SwitchCapable             = 51,
+    TimeDivisionMultiplexCapable    = 100,
+    LambdaSwitchCapable             = 150,
+    FiberSwitchCapable              = 200,
+};
+
+pattern LinkProtectionTypeFlags = flags byte
+{
+    ExtraTraffic        = 0x1,
+    Unprotected         = 0x2,
+    Shared              = 0x4,
+    Dedicated           = 0x8,
+    Dedicated1          = 0x10,
+    Enhanced            = 0x20,
+    Reserved            = 0xC0,
+};
+
+pattern AdministrativeGroupFlags = flags uint
+{
+    Group0 = 0x1,
+    Group1 = 0x2,
+    Group2 = 0x4,
+    Group3 = 0x8,
+    Group4 = 0x10,
+    Group5 = 0x20,
+    Group6 = 0x40,
+    Group7 = 0x80,
+    Group8 = 0x100,
+    Group9 = 0x200,
+    Group10 = 0x400,
+    Group11 = 0x800,
+    Group12 = 0x1000,
+    Group13 = 0x2000,
+    Group14 = 0x4000,
+    Group15 = 0x8000,
+    Group16 = 0x10000,
+    Group17 = 0x20000,
+    Group18 = 0x40000,
+    Group19 = 0x80000,
+    Group20 = 0x100000,
+    Group21 = 0x200000,
+    Group22 = 0x400000,
+    Group23 = 0x800000,
+    Group24 = 0x1000000,
+    Group25 = 0x2000000,
+    Group26 = 0x4000000,
+    Group27 = 0x8000000,
+    Group28 = 0x10000000,
+    Group29 = 0x20000000,
+    Group30 = 0x40000000,
+    Group31 = 0x80000000,
+};
+
+// RFC 3630 2.4.  LSA payload details
+pattern TopLevleTlvType = enum ushort
+{
+    RouterAddress   = 1,
+    Link            = 2,
+};
+
+// RFC 3630 2.4.2.  Link TLV
+pattern SubTlvType = enum ushort
+{
+    LinkType                                = 1, // 1 octest
+    LinkID                                  = 2, // 4 octets
+    LocalInterfaceIPAddress                 = 3, // 4 octets
+    RemoteInterfaceIPAddress                = 4, // 4 octets
+    TrafficEngineeringMetric                = 5, // 4 octets
+    MaximumBandwidth                        = 6, // 4 octets
+    MaximumReservableBandwidth              = 7, // 4 octets
+    UnreservedBandwidth                     = 8, // 32 octets
+    AdministrativeGroup                     = 9, // 4 octets
+    LinkLocalRemoteIdentifiers              = 11, // rfc 4203, 8 octets
+    LinkProtectionType                      = 14, // rfc 4203, 4 octets
+    InterfaceSwitchingCapabilityDescriptor  = 15, // rfc 4203, variable
+    SharedRiskLinkGroup                     = 16, // rfc 4203, variable
+};
+
+type Vertiex
+{
+    uint VertexType;
+    uint VertexID;
+}
+
+pattern RouterLinkType = enum byte
+{
+    PointToPoint            = 1,
+    ConnectionToTransit     = 2,
+    ConnectionToStub        = 3,
+    VritualLink             = 4,
+};
+
+pattern TosType = enum byte
+{
+    NormalService           = 0,
+    MinimizeMonetaryCost    = 2,
+    MaximizeReliability     = 4,
+    MaximizeThroughput      = 8,
+    MinimizeDelay           = 16,
+};
+
+pattern PacketTypes = enum byte
+{
+    Hello                   = 1,
+    DatabaseDescription     = 2,
+    LinkStateRequest        = 3,
+    LinkStateUpdate         = 4,
+    LinkStateAcknowledgment = 5,
+};
+
+const map<byte, string> MapPacketType =
+{
+    1 -> "Hello",
+    2 -> "Database Description",
+    3 -> "Link State Request",
+    4 -> "Link State Update",
+    5 -> "Link State Acknowledgment",
+};
+
+string PacketTypesToString(PacketTypes packetType)
+{
+    if (packetType in MapPacketType)
+    {
+        return MapPacketType[packetType];
+    }
+    else
+    {
+        return "Unknown packet type(" + (packetType as string) + ")";
+    }
+}
+
+pattern AuType = enum ushort
+{
+    NoAuthentication            = 0,
+    SimplePassword              = 1,
+    CryptographicAuthentication = 2,
+};
+
+// RFC 2328 D.3 Cryptographic authentication
+type CryptographicAuthentication
+{
+    ushort Reserved where ValidationCheck(value == 0, null, "OSPF: CryptographicAuthentication.Reserved must be set to zero.");
+    byte KeyID;
+    byte AuthDataLength;
+    uint CryptographicSequenceNumber;
+}
+
+// RFC 2370 A.1 The Options Field
+// WORKAROUND: Use flags when bug # 27596 is resolved
+type Options
+{
+    byte Reserved   with BinaryEncoding{Width = 1};
+    bool O          with BinaryEncoding{Width = 1}; 
+    bool DC         with BinaryEncoding{Width = 1}; 
+    bool EA         with BinaryEncoding{Width = 1}; 
+    bool NP         with BinaryEncoding{Width = 1}; 
+    bool MC         with BinaryEncoding{Width = 1}; 
+    bool E          with BinaryEncoding{Width = 1}; 
+    bool T          with BinaryEncoding{Width = 1}; //RFC 1583
+}
+
+// WORKAROUND: Use flags when bug # 27596 is resolved
+pattern LsaFlags = flags ushort
+{
+    Nt = 0x1000,
+    W  = 0x0800, // rfc 3101
+    V  = 0x0400, // rfc 1584 A.2 Router-LSA: rtype
+    E  = 0x0200,
+    B  = 0x0100,
+    ...
+};
+
+pattern LSType = enum byte
+{
+    RouterLinks             = 1,
+    NetworkLinks            = 2,
+    SummaryLinkIPNetwork    = 3,
+    SummaryLinkAsbr         = 4,
+    ASExternalLink          = 5,
+    GroupMembership         = 6, // rfc 1584
+    LinkLocal               = 9, // rfc 2370
+    AreaLocal               = 10, // rfc 2370
+    ThrougthoutAS           = 11, // rfc 2370
+};
+
+// RFC 2740 A.4.2.1 LS type
+type LSTypeV3
+{
+    bool U          with BinaryEncoding{Length = 1};
+    bool S2         with BinaryEncoding{Length = 1};
+    bool S1         with BinaryEncoding{Length = 1};
+    byte Reserved   with BinaryEncoding{Length = 5};
+    FunctionCode FunctionCode;
+}
+
+pattern FunctionCode = enum byte
+{
+    RouterLsa           = 1,
+    NetworkLsa          = 2,
+    InterAreaPrefixLsa  = 3,
+    InterAreaRouterLsa  = 4,
+    ASExternalLsa       = 5,
+    GroupMembershipLsa  = 6,
+    Type7Lsa            = 7,
+    LinkLsa             = 8,
+    IntraAreaPrefixLsa  = 9,
+};
+
+string GetTypeV3Flag(LSTypeV3 typeV3)
+{
+        string lsType = "";
+        if (typeV3.U)
+        {
+            lsType += "|U";
+        }
+        if (typeV3.S2)
+        {
+            lsType += "|S2";
+        }
+        if (typeV3.S1)
+        {
+            lsType += "|S1";
+        }
+        return (lsType.Count == 0) ? "0" : lsType.Segment(1);
+}
+
+// RFC 2740 A.2 The Options field
+pattern OptionsV3 = flags uint
+{
+    DC = 0x00000020,
+    R  = 0x00000010,
+    N  = 0x00000008,
+    MC = 0x00000004,
+    E  = 0x00000002,
+    V6 = 0x00000001,
+    ...
+} with BinaryEncoding{Width = 24};
+
+pattern DatabaseDescriptionFlag = flags byte
+{
+    I = 0x04,
+    M = 0x02,
+    MS = 0x01,
+    ...
+};

@@ -1,0 +1,284 @@
+protocol DVRJ with
+Documentation
+{
+    ProtocolName = "Device Registration Join Protocol",
+    ShortName = "DVRJ",
+    DocumentName = "MS-DVRJ",
+    Description = ""
+},
+OPNAuthoring
+{
+    Copyright = "(c) Microsoft Corporation",
+    References =
+    [
+        new Reference {Name = "MS-DVRJ", Version = "1.0", Date = "07/14/2016", ProgramName = ProgramName.WSPP}
+    ],
+    RevisionSummary =
+    [
+        new Revision {Class = RevisionClass.Major, Version = "", Date = ""}
+    ]
+};
+
+using Utility;
+using Standard;
+using X509;
+using HTTP;
+using JWT;
+
+endpoint Server
+    over HTTP.Server
+    accepts CreateDeviceRequest
+    accepts DeleteDeviceRequest
+    issues CreateDeviceResponse
+    issues DeleteDeviceResponse
+    issues ErrorResponse;
+
+client endpoint Client connected to Server;
+
+// --------------------------------- actor ---------------------------------------------
+
+autostart actor DVRJServerOverHTTP(HTTP.Server server)
+{
+    bool isCreateDeviceRequestRecv = false;
+    bool isDeleteDeviceRequestRecv = false;
+
+    process server accepts httpRequest:HttpContract.Request where IsDVRJCreateDeviceRequest(httpRequest)
+    {
+        if (httpRequest.Uri.Query is parameters:map<string, string>
+            && ParsePercentEncodedQuery(parameters)["api-version"] is string
+            && httpRequest.Headers["Authorization"] is cred:Credentials
+            && cred.AuthParam is authParam:string
+            && DecodeJWS<DVRJJWSHeader, DVRJJWTClaims>(authParam) is authJWTParam:JWT.JWS
+            && JsonDecoder<CreateDeviceRequest>(httpRequest.Payload) is createDeviceRequest:CreateDeviceRequest)
+        {
+            DVRJCredentials dvrjCredentials = new DVRJCredentials();
+            dvrjCredentials.AuthSchema = cred.AuthSchema;
+            dvrjCredentials.AuthParam = authJWTParam;
+            httpRequest.Headers["Authorization"] = dvrjCredentials;
+
+            isCreateDeviceRequestRecv = true;
+            dispatch (endpoint DVRJ.Server over server) accepts createDeviceRequest;
+        }
+        else
+        {
+            ThrowDecodingException("DVRJ", "CreateDeviceRequest");
+        }
+    }
+
+    process server accepts httpRequest:HttpContract.Request where IsDVRJDeleteDeviceRequest(httpRequest)
+    {
+        if (httpRequest.Uri.Query is parameters:map<string, string>
+            && ParsePercentEncodedQuery(parameters)["api-version"] is string)
+        {
+            isDeleteDeviceRequestRecv = true;
+            dispatch (endpoint DVRJ.Server over server) accepts new DeleteDeviceRequest();
+        }
+        else
+        {
+            ThrowDecodingException("DVRJ", "DeleteDeviceRequest");
+        }
+    }
+
+    process server issues httpResponse:HttpContract.Response where isCreateDeviceRequestRecv
+    {
+        isCreateDeviceRequestRecv = false;
+
+        if (httpResponse.StatusCode == 200)
+        {
+            if (JsonDecoder<CreateDeviceResponse>(httpResponse.Payload) is createDeviceResponse:CreateDeviceResponse)
+            {
+                dispatch (endpoint DVRJ.Server over server) issues createDeviceResponse;
+            }
+            else
+            {
+                ThrowDecodingException("DVRJ", "CreateDeviceResponse");
+            }
+        }
+        else
+        {
+            if (JsonDecoder<ErrorResponse>(httpResponse.Payload) is errorResponse:ErrorResponse)
+            {
+                dispatch (endpoint DVRJ.Server over server) issues errorResponse;
+            }
+            else
+            {
+                ThrowDecodingException("DVRJ", "ErrorResponse");
+            }
+        }
+    }
+
+    process server issues httpResponse:HttpContract.Response where isDeleteDeviceRequestRecv
+    {
+        isDeleteDeviceRequestRecv = false;
+
+        if (httpResponse.StatusCode == 200)
+        {
+            if (JsonDecoder<DeleteDeviceResponse>(httpResponse.Payload) is deleteDeviceResponse:DeleteDeviceResponse)
+            {
+                dispatch (endpoint DVRJ.Server over server) issues deleteDeviceResponse;
+            }
+            else
+            {
+                ThrowDecodingException("DVRJ", "DeleteDeviceResponse");
+            }
+        }
+        else
+        {
+            if (JsonDecoder<ErrorResponse>(httpResponse.Payload) is errorResponse:ErrorResponse)
+            {
+                dispatch (endpoint DVRJ.Server over server) issues errorResponse;
+            }
+            else
+            {
+                ThrowDecodingException("DVRJ", "ErrorResponse");
+            }
+        }
+    }
+}
+
+// ---------------------------- message & types ----------------------------------------
+message ErrorResponse
+{
+    string ErrorType;
+    string Message;
+    string TraceId;
+    string Time;
+
+    override string ToString()
+    {
+        return "ErrorResponse" +
+            ", ErrorType: " + ErrorType +
+            ", Message: " + Message +
+            ", TraceId: " + TraceId +
+            ", Time: " + Time;
+    }
+}
+
+message CreateDeviceRequest
+{
+    CertificateRequestType CertificateRequest;
+    binary TransportKey with Encoding{SourcePattern = TypeOf<string>(), SourceConverter = Base64StringToBinary};
+    string TargetDomain;
+    string DeviceType;
+    string OSVersion;
+    string DeviceDisplayName;
+    int JoinType;
+
+    override string ToString()
+    {
+        return "CreateDeviceRequest" +
+            ", TargetDomain: " + TargetDomain +
+            ", DeviceType: " + DeviceType +
+            ", OSVersion: " + OSVersion +
+            ", DeviceDisplayName: " + DeviceDisplayName +
+            ", JoinType: " + JoinType.ToString();
+    }
+}
+
+message CreateDeviceResponse
+{
+    CertificateType Certificate;
+    UserType User;
+    array<MembershipChangesType> MembershipChanges;
+
+    override string ToString()
+    {
+        return "CreateDeviceResponse" +
+            ", CertificateThumbprint: " + Certificate.Thumbprint+
+            ", UserUpn:" + User.Upn;
+    }
+}
+
+message DeleteDeviceRequest
+{
+    override string ToString()
+    {
+        return "DeleteDeviceRequest";
+    }
+}
+
+message DeleteDeviceResponse
+{
+    optional AttestationResult AttestationResult;
+
+    override string ToString()
+    {
+        return "DeleteDeviceResponse";
+    }
+}
+
+type DVRJCredentials : HTTP.Credentials
+{
+    new JWT.JWS AuthParam;
+
+    override string ToString()
+    {
+        return "DVRJCredentials";
+    }
+}
+
+type AttestationResult
+{
+    optional string KeyId;
+}
+
+// Future Reference: The JWT definition of DVRJ is not completed, waiting for PG's response.
+type DVRJJWSHeader : JWT.JWS_Header
+{   
+}
+
+type DVRJJWTClaims : JWT.JWT_Claims
+{
+}
+
+type CertificateRequestType
+{
+    string Type where ValidationCheck(value.IndexOf("pkcs10") >= 0, null, "CreateDeviceRequest.CertificateRequest.Type, value must contain \"pkcs10\"");
+    X509.CertReqMsg CertificateRequest with JsonEncoding{Name = "Data"}, Encoding{SourcePattern = TypeOf<string>(), SourceConverter = Base64StringToBinary, Decoder = Asn1BerDecoder<X509.CertReqMsg>};
+}
+
+type CertificateType
+{
+    string Thumbprint;
+    X509.Certificate Certificate with JsonEncoding{Name = "RawBody"}, Encoding{SourcePattern = TypeOf<string>(), SourceConverter = Base64StringToBinary, Decoder = Asn1BerDecoder<X509.Certificate>};
+}
+
+type UserType
+{
+    string Upn;
+}
+
+type MembershipChangesType
+{
+    string LocalSID;
+    array<string> AddSIDs;
+}
+
+// -------------------------------- syntax ---------------------------------------------
+
+syntax GUID = regex{[0-9A-Fa-f]{8}[-]?([0-9A-Fa-f]{4}[-]?){3}[0-9A-Fa-f]{12}};
+syntax DVRJBaseUri = regex{/EnrollmentServer/device[/]?};
+syntax DVRJCreateDeviceUri = DVRJBaseUri;
+syntax DVRJDeleteDeviceUri = DVRJBaseUri id:GUID;
+
+// -------------------------------- utility --------------------------------------------
+
+bool IsDVRJDeleteDeviceRequest(HttpContract.Request request)
+{
+    return request.Method == "DELETE" && request.Uri.AbsPath is path:string && DVRJDeleteDeviceUri(path) is string;
+}
+
+bool IsDVRJCreateDeviceRequest(HttpContract.Request request)
+{
+    return request.Method == "POST" && request.Uri.AbsPath is path:string && DVRJCreateDeviceUri(path) is string;
+}
+
+optional string BinaryToString(optional binary bin)
+{
+    if (bin is b:binary)
+    {
+        return BinaryStringDecoder(b, TextEncoding.ASCII);
+    }
+
+    return nothing;
+}
